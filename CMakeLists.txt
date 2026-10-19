@@ -20,6 +20,8 @@ set(OPENCLAW_SOURCES
   src/gateway/methods.cpp
   src/config/config.cpp
   src/channels/registry.cpp
+  src/memory/store.cpp
+  src/cron/scheduler.cpp
 )
 
 add_executable(openclaw-cpp ${OPENCLAW_SOURCES})

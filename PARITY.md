@@ -7,15 +7,15 @@
 |----------|----------|------|
 | CLI chat / agent loop | **部分** | `chat` + tool loop + mock self-test |
 | Provider DeepSeek | **部分** | chat completions + tools；402/401/429 清晰错误 |
-| Tools registry | **部分** | `echo`, `time_now`；`/tools/invoke` |
+| Tools registry | **部分** | `echo`, `time_now`, `memory_get/set`；`/tools/invoke` |
 | Session store | **部分** | JSON 文件；session_id 挂到 chat API |
 | Gateway HTTP | **部分** | `/health` `/v1/status` `/v1/models` `/v1/chat/completions` `/tools/invoke` |
 | Gateway WebSocket | **部分** | Upgrade + hello + DispatchRpc（health/sessions/tools/config/chat.send/…） |
 | Channels (WhatsApp/Telegram/…) | **骨架** | registry + `/v1/channels`；真实适配器 TODO |
-| Memory / context-engine | TODO | |
+| Memory / context-engine | **骨架** | JSON KV store + memory_get/set tools；context-engine TODO |
 | Plugins / skills | TODO | sibling: openclaw-cpp-tools |
 | MCP | TODO | |
-| Cron / hooks / daemon | TODO | |
+| Cron / hooks / daemon | **骨架** | Scheduler 注册表；表达式求值 / daemon TODO |
 | Nodes / companion apps | TODO | |
 | Control UI | TODO | |
 | Config / secrets | **骨架** | JSON config load/save；secrets TODO |

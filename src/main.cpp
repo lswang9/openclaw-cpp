@@ -9,6 +9,8 @@
 #include "openclaw/channels/registry.hpp"
 #include "openclaw/config/config.hpp"
 #include "openclaw/gateway/methods.hpp"
+#include "openclaw/memory/store.hpp"
+#include "openclaw/cron/scheduler.hpp"
 
 #include <curl/curl.h>
 
@@ -52,6 +54,8 @@ void PrintUsage() {
         << "  openclaw-cpp channels\n"
         << "  openclaw-cpp config\n"
         << "  openclaw-cpp methods\n"
+        << "  openclaw-cpp memory [set KEY VAL | get KEY]\n"
+        << "  openclaw-cpp cron\n"
         << "  openclaw-cpp status\n"
         << "  openclaw-cpp self-test\n"
         << "  openclaw-cpp <message...>          # shorthand for chat\n";
@@ -318,6 +322,40 @@ int CmdMethods() {
     return 0;
 }
 
+
+int CmdMemory(int argc, char** argv, int argi) {
+    openclaw::memory::Store store(
+        std::filesystem::path(openclaw::EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")));
+    if (argi >= argc) {
+        std::cout << store.Dump().dump(2) << '\n';
+        return 0;
+    }
+    const std::string sub = argv[argi++];
+    if (sub == "set" && argi + 1 < argc) {
+        store.Set(argv[argi], argv[argi + 1]);
+        std::cout << "{\"ok\":true}\n";
+        return 0;
+    }
+    if (sub == "get" && argi < argc) {
+        auto v = store.Get(argv[argi]);
+        if (!v) {
+            std::cout << "{\"found\":false}\n";
+            return 1;
+        }
+        std::cout << nlohmann::json{{"found", true}, {"value", *v}}.dump() << '\n';
+        return 0;
+    }
+    std::cerr << "usage: openclaw-cpp memory [set KEY VAL | get KEY]\n";
+    return 1;
+}
+
+int CmdCron() {
+    // demo empty scheduler listing — persist later
+    openclaw::cron::Scheduler sch;
+    std::cout << sch.ListJson().dump(2) << '\n';
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -338,6 +376,12 @@ int main(int argc, char** argv) {
         }
         if (cmd == "methods") {
             return CmdMethods();
+        }
+        if (cmd == "memory") {
+            return CmdMemory(argc, argv, 2);
+        }
+        if (cmd == "cron") {
+            return CmdCron();
         }
         if (cmd == "config") {
             return CmdConfig();

@@ -82,6 +82,43 @@ Registry MakeDefaultRegistry() {
     };
     r.Register(std::move(now));
 
+
+    // Process-local memory tools (file-backed Store wired at higher layers later).
+    static nlohmann::json g_mem = nlohmann::json::object();
+
+    ToolSpec mset;
+    mset.name = "memory_set";
+    mset.description = "Store a short memory note by key.";
+    mset.parameters = {
+        {"type", "object"},
+        {"properties",
+         {{"key", {{"type", "string"}}},
+          {"value", {{"type", "string"}}}}},
+        {"required", nlohmann::json::array({"key", "value"})},
+    };
+    mset.handler = [](const nlohmann::json& args) -> std::string {
+        g_mem[args.at("key").get<std::string>()] = args.at("value").get<std::string>();
+        return nlohmann::json{{"ok", true}}.dump();
+    };
+    r.Register(std::move(mset));
+
+    ToolSpec mget;
+    mget.name = "memory_get";
+    mget.description = "Retrieve a memory note by key.";
+    mget.parameters = {
+        {"type", "object"},
+        {"properties", {{"key", {{"type", "string"}}}}},
+        {"required", nlohmann::json::array({"key"})},
+    };
+    mget.handler = [](const nlohmann::json& args) -> std::string {
+        const auto key = args.at("key").get<std::string>();
+        if (!g_mem.contains(key)) {
+            return nlohmann::json{{"found", false}}.dump();
+        }
+        return nlohmann::json{{"found", true}, {"value", g_mem[key]}}.dump();
+    };
+    r.Register(std::move(mget));
+
     return r;
 }
 

@@ -7,7 +7,9 @@ OpenClaw 的 **C++ 全量重写**（非 Node 包装）。对齐目标：**OpenCl
 ## 当前能力（0.2.0-dev）
 
 - **Agent loop**：messages → model → tool_calls → tool result → model → stop
-- **Tools**：内置 `echo`、`time_now`；OpenAI tools 协议
+- **Tools**：内置 `echo`、`time_now`、`memory_get`/`memory_set`；OpenAI tools 协议
+- **Memory / Cron**：JSON KV memory；cron 注册表骨架
+- **Channels / Config**：通道注册表 + JSON 配置；Gateway RPC 子集（13 methods）
 - **Provider**：DeepSeek chat completions（含 402/401/429 错误处理）
 - **Session**：JSON 文件会话存储
 - **Gateway**（默认 `127.0.0.1:18789`）：HTTP + WebSocket Upgrade
