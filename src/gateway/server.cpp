@@ -31,7 +31,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.1.0-dev";
+constexpr const char* kVersion = "1.2.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -169,6 +169,29 @@ bool ParseWsClientFrame(const std::string& buf, std::string& out_payload) {
 }
 
 }  // namespace
+
+
+agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& override_body = nlohmann::json::object()) {
+    agent::LoopOptions o;
+    const auto& raw = deps.config.raw;
+    nlohmann::json agent = raw.value("agent", nlohmann::json::object());
+    if (raw.contains("agents") && raw["agents"].contains("defaults")) {
+        auto& d = raw["agents"]["defaults"];
+        if (d.contains("max_turns")) agent["max_turns"] = d["max_turns"];
+        if (d.contains("rate_limit_per_minute")) agent["rate_limit_per_minute"] = d["rate_limit_per_minute"];
+    }
+    o.max_turns = static_cast<std::size_t>(override_body.value(
+        "max_turns", agent.value("max_turns", raw.value("max_turns", 8))));
+    o.rate_limit_per_minute = static_cast<std::size_t>(override_body.value(
+        "rate_limit_per_minute",
+        agent.value("rate_limit_per_minute", raw.value("rate_limit_per_minute", 0))));
+    o.identical_tool_warn_after = static_cast<std::size_t>(
+        agent.value("identical_tool_warn_after", 2));
+    o.identical_tool_break_after = static_cast<std::size_t>(
+        agent.value("identical_tool_break_after", 4));
+    if (o.max_turns == 0) o.max_turns = 1;
+    return o;
+}
 
 Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {}
 Server::~Server() { Stop(); if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; } }
@@ -315,8 +338,7 @@ void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bo
         return;
     }
 
-    agent::LoopOptions lopts;
-    lopts.max_turns = body.value("max_turns", 8);
+    agent::LoopOptions lopts = MakeLoopOpts(deps_, body);
     auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, lopts);
     if (!session_id.empty() && result.ok) deps_.sessions.Save(session_id, result.messages);
     if (!result.ok) {
@@ -384,10 +406,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     context::AssembleOptions aopts;
     aopts.system_prompt = deps_.system_prompt;
     auto assembled = context::Assemble(messages, aopts);
-    agent::LoopOptions lopts;
-    lopts.max_turns = 8;
-    lopts.identical_tool_warn_after = 2;
-    lopts.identical_tool_break_after = 4;
+    agent::LoopOptions lopts = MakeLoopOpts(deps_);
     provider::Provider* prov = &deps_.provider;
     if (deps_.router) prov = deps_.router;
     auto result = agent::RunAgentLoop(*prov, deps_.tools, assembled, lopts);
@@ -582,9 +601,14 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             auto body = nlohmann::json::parse(BodyOf(req));
             auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
             auto result = adapter->HandleHttpInbound(body, deliver);
-            // Feishu URL verification expects top-level {"challenge":"..."}
+            // Feishu/Slack URL verification
             if (result.contains("challenge") && result.value("mode", "") == "url_verification") {
                 send(HttpResponse(200, "OK", nlohmann::json{{"challenge", result["challenge"]}}.dump()));
+                return;
+            }
+            // Discord Interactions PING
+            if (result.value("mode", "") == "discord_ping") {
+                send(HttpResponse(200, "OK", nlohmann::json{{"type", 1}}.dump()));
                 return;
             }
             send(HttpResponse(200, "OK", result.dump(2)));

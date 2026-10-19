@@ -1,8 +1,40 @@
 #include "openclaw/agent/loop.hpp"
 
 #include <iostream>
+#include <chrono>
 
 namespace openclaw::agent {
+
+RateBucket& RateBucket::Global() {
+    static RateBucket b;
+    return b;
+}
+
+bool RateBucket::TryAcquire(std::size_t limit_per_minute) {
+    if (limit_per_minute == 0) return true;
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    const auto window = std::chrono::minutes(1);
+    std::lock_guard<std::mutex> lock(mu_);
+    while (!hits_.empty() && now - hits_.front() > window) hits_.pop_front();
+    if (hits_.size() >= limit_per_minute) return false;
+    hits_.push_back(now);
+    return true;
+}
+
+std::size_t RateBucket::RecentCount() const {
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    const auto window = std::chrono::minutes(1);
+    std::lock_guard<std::mutex> lock(mu_);
+    std::size_t n = 0;
+    for (auto it = hits_.rbegin(); it != hits_.rend(); ++it) {
+        if (now - *it > window) break;
+        ++n;
+    }
+    return n;
+}
+
 
 LoopResult RunAgentLoop(provider::Provider& provider,
                         tools::Registry& registry,
@@ -20,6 +52,13 @@ LoopResult RunAgentLoop(provider::Provider& provider,
         if (opts.verbose) {
             std::cerr << "[agent] turn " << out.turns << " messages=" << out.messages.size()
                       << '\n';
+        }
+
+        if (!RateBucket::Global().TryAcquire(opts.rate_limit_per_minute)) {
+            out.ok = false;
+            out.error = "rate limit exceeded (" + std::to_string(opts.rate_limit_per_minute) +
+                        " Completes/min)";
+            return out;
         }
 
         auto completion = provider.Complete(out.messages, tools);

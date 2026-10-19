@@ -30,8 +30,8 @@ Registry MakeDefaultChannels() {
     r.Register({"webhook", "HTTP inbound POST /api/channels/webhook/inbound", true});
     r.Register({"websocket", "Gateway WebSocket control plane (partial RPC)", true});
     r.Register({"telegram", "Telegram Bot API (TODO)", false});
-    r.Register({"discord", "Discord gateway (TODO)", false});
-    r.Register({"slack", "Slack Events API (TODO)", false});
+    r.Register({"discord", "Discord inbound+outbound", true});
+    r.Register({"slack", "Slack Events API inbound", true});
     r.Register({"whatsapp", "WhatsApp (TODO)", false});
     r.Register({"feishu", "Feishu/Lark inbound+outbound", true});
     return r;

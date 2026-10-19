@@ -19,3 +19,5 @@
 - **1.0.0-dev**: real ExtraDispatch bulk, daemon pidfile start/stop, plugin C SDK+.so, media upload/serve
 
 - **1.1.0-dev**: TTS HTTP/record, http_get+browser stub, Feishu inbound, catalog real expand, GHA CI
+
+- **1.2.0-dev**: Slack/Discord inbound, session export/import, backup restore, max_turns+rate_limit

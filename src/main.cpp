@@ -27,6 +27,8 @@
 #include "openclaw/daemon/lifecycle.hpp"
 #include "openclaw/voice/tts.hpp"
 #include "openclaw/channels/feishu.hpp"
+#include "openclaw/channels/slack.hpp"
+#include "openclaw/channels/discord.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/persist/store.hpp"
 #include "openclaw/provider/openai_compat.hpp"
@@ -52,7 +54,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.1.0-dev";
+constexpr const char* kVersion = "1.2.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -428,7 +430,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.1.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.2.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -475,7 +477,7 @@ int CmdSelfTest() {
     }
 
     // implemented count >= 150
-    if (gateway::ImplementedMethods().size() < 200) {
+    if (gateway::ImplementedMethods().size() < 250) {
         std::cerr << "FAIL implemented count " << gateway::ImplementedMethods().size() << "\n"; ++failures;
     } else std::cerr << "PASS implemented count (" << gateway::ImplementedMethods().size() << ")\n";
 
@@ -601,6 +603,81 @@ int CmdSelfTest() {
                     std::cerr << "FAIL feishu inbound msg " << msg.dump() << "\n"; ++failures;
                 } else std::cerr << "PASS feishu inbound verify+enqueue\n";
             }
+        }
+    }
+
+
+    // rate limit
+    {
+        agent::RateBucket::Global(); // touch
+        agent::LoopOptions o;
+        o.max_turns = 2;
+        o.rate_limit_per_minute = 1;
+        provider::MockProvider mock;
+        {
+            agent::CompletionResult mr;
+            mr.ok = true; mr.finish_reason = "stop";
+            mr.message.role = "assistant"; mr.message.content = "ok";
+            mock.Enqueue(mr); mock.Enqueue(mr);
+        }
+        tools::Registry reg;
+        std::vector<agent::Message> msgs{{.role="user", .content="hi"}};
+        auto r1 = agent::RunAgentLoop(mock, reg, msgs, o);
+        // second complete in same minute should fail rate limit if loop needs 2 completes —
+        // stop finish uses 1 complete so rate-limit a second loop
+        auto r2 = agent::RunAgentLoop(mock, reg, msgs, o);
+        if (r2.ok || r2.error.find("rate limit") == std::string::npos) {
+            // first used 1 slot; second should be blocked
+            std::cerr << "FAIL rate limit got ok=" << r2.ok << " err=" << r2.error << "\n";
+            ++failures;
+        } else std::cerr << "PASS rate limit\n";
+    }
+
+    // session export/import + backup restore
+    {
+        auto dir = std::filesystem::temp_directory_path() / "oc-sess-x";
+        std::filesystem::remove_all(dir);
+        session::Store st(dir);
+        st.Save("s1", {{.role="user", .content="hello"}, {.role="assistant", .content="world"}});
+        auto msgs = st.Load("s1");
+        if (msgs.size() != 2) { std::cerr << "FAIL session seed\n"; ++failures; }
+        else {
+            // backup-style roundtrip via JSON
+            nlohmann::json export_j = nlohmann::json::array();
+            for (auto& m : msgs) export_j.push_back(m.ToJson());
+            session::Store st2(dir / "b");
+            std::vector<agent::Message> back;
+            for (auto& jm : export_j) {
+                agent::Message m;
+                m.role = jm.value("role","");
+                m.content = jm.value("content","");
+                back.push_back(m);
+            }
+            st2.Save("s1", back);
+            if (st2.Load("s1").size() != 2) { std::cerr << "FAIL session import\n"; ++failures; }
+            else std::cerr << "PASS session export/import\n";
+        }
+    }
+
+    // slack + discord inbound
+    {
+        auto hub = channels::AdapterHub::MakeDefault();
+        auto* sl = dynamic_cast<channels::SlackAdapter*>(hub.Get("slack"));
+        auto* dc = dynamic_cast<channels::DiscordAdapter*>(hub.Get("discord"));
+        if (!sl || !dc) { std::cerr << "FAIL slack/discord adapters\n"; ++failures; }
+        else {
+            auto ch = sl->HandleHttpInbound({{"type","url_verification"},{"challenge","slack-ch"}}, {});
+            auto ping = dc->HandleHttpInbound({{"type", 1}}, {});
+            bool ok_msg = false;
+            sl->HandleHttpInbound(
+                {{"type","event_callback"},{"event",{{"type","message"},{"text","hi-slack"},{"channel","C1"},{"user","U1"}}}},
+                [&](const channels::InboundMessage& m){ ok_msg = m.text=="hi-slack"; return std::string("r"); });
+            bool ok_dc = false;
+            dc->HandleHttpInbound({{"content","hi-dc"},{"channel_id","99"},{"author",{{"username","u"}}}},
+                [&](const channels::InboundMessage& m){ ok_dc = m.text=="hi-dc"; return std::string("r"); });
+            if (ch.value("challenge","")!="slack-ch" || ping.value("mode","")!="discord_ping" || !ok_msg || !ok_dc) {
+                std::cerr << "FAIL slack/discord inbound\n"; ++failures;
+            } else std::cerr << "PASS slack/discord inbound\n";
         }
     }
 

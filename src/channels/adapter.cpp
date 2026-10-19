@@ -1,6 +1,8 @@
 #include "openclaw/channels/adapter.hpp"
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/feishu.hpp"
+#include "openclaw/channels/slack.hpp"
+#include "openclaw/channels/discord.hpp"
 
 namespace openclaw::channels {
 
@@ -85,12 +87,8 @@ AdapterHub AdapterHub::MakeDefault() {
         "telegram",
         "TODO: live Telegram Bot API; outbound payloads recorded locally",
         "/bot<token>/sendMessage"));
-    hub.Add(std::make_unique<OutboundRecordAdapter>(
-        "discord",
-        "Outbound via DISCORD_BOT_TOKEN; inbound Gateway WS TODO",
-        "/api/v10/channels/{id}/messages"));
-    hub.Add(std::make_unique<StubAdapter>(
-        "slack", "TODO: Slack Events API + Socket Mode (OpenClaw channels/slack)"));
+    hub.Add(std::make_unique<DiscordAdapter>());
+    hub.Add(std::make_unique<SlackAdapter>());
     hub.Add(std::make_unique<FeishuAdapter>());
     hub.Add(std::make_unique<StubAdapter>(
         "whatsapp", "TODO: WhatsApp Cloud API / Baileys-style bridge"));

@@ -1,4 +1,5 @@
 #include "openclaw/gateway/extra.hpp"
+#include "openclaw/agent/types.hpp"
 #include "openclaw/gateway/methods.hpp"
 #include "openclaw/config/config.hpp"
 #include "openclaw/channels/outbound.hpp"
@@ -232,7 +233,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     if (starts("update.")) {
         r.handled = true;
         r.payload = Real({{"status", "idle"},
-                          {"current", "1.1.0-dev"},
+                          {"current", "1.2.0-dev"},
                           {"align_target", "OpenClaw 2026.10.5"},
                           {"auto_update", false},
                           {"method", method}});
@@ -665,28 +666,150 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     if (starts("backup.")) {
         r.handled = true;
         auto& bk = EnsureObj(deps.config.raw, "backup");
+        auto dest = DataRoot(deps) / "backups";
         if (method.find("create") != std::string::npos || method.find("run") != std::string::npos) {
             auto id = "bak-" + std::to_string(
                 std::chrono::system_clock::now().time_since_epoch().count());
-            auto dest = DataRoot(deps) / "backups";
             std::filesystem::create_directories(dest);
             auto path = dest / (id + ".json");
+            nlohmann::json sess = nlohmann::json::object();
+            for (const auto& sid : deps.sessions.List()) {
+                nlohmann::json msgs = nlohmann::json::array();
+                for (const auto& m : deps.sessions.Load(sid)) msgs.push_back(m.ToJson());
+                sess[sid] = msgs;
+            }
             nlohmann::json snap{{"id", id},
-                                {"sessions", deps.sessions.List()},
-                                {"memory_keys", deps.memory.Keys()},
-                                {"cron", deps.cron.ListJson()}};
+                                {"version", 1},
+                                {"sessions", sess},
+                                {"memory", deps.memory.Dump()},
+                                {"cron", deps.cron.ListJson()},
+                                {"config_raw", deps.config.raw}};
             std::ofstream out(path);
             out << snap.dump(2);
             auto& hist = EnsureArr(bk, "history");
             hist.push_back({{"id", id}, {"path", path.string()}});
             PersistCfg(deps);
             Audit(deps, "backup.create", {{"id", id}});
-            r.payload = Real({{"id", id}, {"path", path.string()}, {"bytes", snap.dump().size()}});
+            r.payload = Real({{"id", id}, {"path", path.string()}, {"bytes", snap.dump().size()},
+                              {"session_count", sess.size()}});
+            return r;
+        }
+        if (method.find("restore") != std::string::npos) {
+            auto id = params.value("id", "");
+            auto path_s = params.value("path", "");
+            std::filesystem::path path;
+            if (!path_s.empty()) path = path_s;
+            else if (!id.empty()) path = dest / (id + ".json");
+            else { r.ok = false; r.error = "id or path required"; return r; }
+            if (!std::filesystem::exists(path)) { r.ok = false; r.error = "backup not found"; return r; }
+            std::ifstream in(path);
+            nlohmann::json snap;
+            in >> snap;
+            int restored = 0;
+            if (snap.contains("sessions") && snap["sessions"].is_object()) {
+                for (auto it = snap["sessions"].begin(); it != snap["sessions"].end(); ++it) {
+                    std::vector<agent::Message> msgs;
+                    for (const auto& jm : it.value()) {
+                        agent::Message m;
+                        m.role = jm.value("role", "user");
+                        m.content = jm.value("content", "");
+                        if (jm.contains("name")) m.name = jm.value("name", "");
+                        if (jm.contains("tool_call_id")) m.tool_call_id = jm.value("tool_call_id", "");
+                        msgs.push_back(m);
+                    }
+                    deps.sessions.Save(it.key(), msgs);
+                    ++restored;
+                }
+            }
+            if (snap.contains("memory") && snap["memory"].is_object()) {
+                for (auto it = snap["memory"].begin(); it != snap["memory"].end(); ++it) {
+                    if (it.value().is_string()) deps.memory.Set(it.key(), it.value().get<std::string>());
+                    else deps.memory.Set(it.key(), it.value().dump());
+                }
+            }
+            Audit(deps, "backup.restore", {{"id", id}, {"path", path.string()}, {"sessions", restored}});
+            r.payload = Real({{"restored_sessions", restored}, {"path", path.string()}, {"id", snap.value("id", id)}});
+            return r;
+        }
+        if (method.find("status") != std::string::npos || method.find("list") != std::string::npos) {
+            nlohmann::json files = nlohmann::json::array();
+            if (std::filesystem::exists(dest)) {
+                for (const auto& e : std::filesystem::directory_iterator(dest)) {
+                    if (e.is_regular_file())
+                        files.push_back({{"name", e.path().filename().string()},
+                                         {"path", e.path().string()},
+                                         {"bytes", e.file_size()}});
+                }
+            }
+            r.payload = Real({{"history", bk.value("history", nlohmann::json::array())},
+                              {"files", files},
+                              {"dir", dest.string()}});
+            return r;
+        }
+        if (method.find("recordOutcome") != std::string::npos) {
+            auto& hist = EnsureArr(bk, "outcomes");
+            hist.push_back({{"ok", params.value("ok", true)}, {"detail", params}});
+            PersistCfg(deps);
+            r.payload = Real({{"recorded", true}});
             return r;
         }
         r.payload = Real({{"history", bk.value("history", nlohmann::json::array())}, {"method", method}});
         return r;
     }
+
+    // ---- sessions export / import ----
+    if (method == "sessions.export" || method == "sessions.exportOne") {
+        r.handled = true;
+        auto key = params.value("sessionKey", params.value("key", params.value("id", "")));
+        nlohmann::json out;
+        if (key.empty()) {
+            nlohmann::json all = nlohmann::json::object();
+            for (const auto& sid : deps.sessions.List()) {
+                nlohmann::json msgs = nlohmann::json::array();
+                for (const auto& m : deps.sessions.Load(sid)) msgs.push_back(m.ToJson());
+                all[sid] = msgs;
+            }
+            out = {{"sessions", all}, {"count", all.size()}};
+        } else {
+            nlohmann::json msgs = nlohmann::json::array();
+            for (const auto& m : deps.sessions.Load(key)) msgs.push_back(m.ToJson());
+            out = {{"id", key}, {"messages", msgs}};
+        }
+        r.payload = Real(out);
+        return r;
+    }
+    if (method == "sessions.import") {
+        r.handled = true;
+        int n = 0;
+        if (params.contains("sessions") && params["sessions"].is_object()) {
+            for (auto it = params["sessions"].begin(); it != params["sessions"].end(); ++it) {
+                std::vector<agent::Message> msgs;
+                for (const auto& jm : it.value()) {
+                    agent::Message m;
+                    m.role = jm.value("role", "user");
+                    m.content = jm.value("content", "");
+                    msgs.push_back(m);
+                }
+                deps.sessions.Save(it.key(), msgs);
+                ++n;
+            }
+        } else {
+            auto key = params.value("sessionKey", params.value("key", params.value("id", "imported")));
+            std::vector<agent::Message> msgs;
+            auto arr = params.value("messages", nlohmann::json::array());
+            for (const auto& jm : arr) {
+                agent::Message m;
+                m.role = jm.value("role", "user");
+                m.content = jm.value("content", "");
+                msgs.push_back(m);
+            }
+            deps.sessions.Save(key, msgs);
+            n = 1;
+        }
+        r.payload = Real({{"imported", n}});
+        return r;
+    }
+
     if (starts("environments.") || starts("worktrees.")) {
         r.handled = true;
         auto key = starts("environments.") ? "environments" : "worktrees";
@@ -960,7 +1083,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         if (starts("gateway.") && (method.find("status") != std::string::npos || method.find("health") != std::string::npos)) {
-            r.payload = Real({{"runtime", "running"}, {"version", "1.1.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
+            r.payload = Real({{"runtime", "running"}, {"version", "1.2.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
             return r;
         }
         r.payload = Real({{key, store}, {"method", method}});
@@ -985,6 +1108,105 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         r.payload = Real({{"implemented", false},
                           {"method", method},
                           {"hint", "no bundled search index; use http_get tool for URLs"}});
+        return r;
+    }
+
+
+    // ---- device / exec / connect (local pairing-ish state) ----
+    if (starts("device.") || starts("exec.") || starts("connect.")) {
+        r.handled = true;
+        auto& dev = EnsureObj(deps.config.raw, "devices");
+        if (starts("device.pair") || method.find("pair") != std::string::npos) {
+            auto& pairs = EnsureArr(dev, "pairs");
+            if (method.find("rename") != std::string::npos) {
+                auto id = params.value("id", "");
+                for (auto& p : pairs) {
+                    if (p.value("id", "") == id) p["name"] = params.value("name", p.value("name", ""));
+                }
+                PersistCfg(deps);
+                r.payload = Real({{"pairs", pairs}});
+                return r;
+            }
+            if (method.find("request") != std::string::npos || method.find("setup") != std::string::npos) {
+                nlohmann::json p{{"id", params.value("id", "dev-" + std::to_string(pairs.size() + 1))},
+                                 {"name", params.value("name", "device")},
+                                 {"status", "pending"}};
+                pairs.push_back(p);
+                PersistCfg(deps);
+                r.payload = Real({{"pair", p}, {"pairing", deps.pairing.ListJson()}});
+                return r;
+            }
+            if (method.find("resolve") != std::string::npos || method.find("completed") != std::string::npos) {
+                auto id = params.value("id", "");
+                for (auto& p : pairs) {
+                    if (p.value("id", "") == id) p["status"] = params.value("status", "resolved");
+                }
+                PersistCfg(deps);
+                r.payload = Real({{"pairs", pairs}});
+                return r;
+            }
+            r.payload = Real({{"pairs", pairs}, {"pairing", deps.pairing.ListJson()}, {"method", method}});
+            return r;
+        }
+        if (starts("device.token") || starts("device.scopes")) {
+            auto& tok = EnsureObj(dev, "tokens");
+            if (method.find("rotate") != std::string::npos || method.find("request") != std::string::npos) {
+                auto id = params.value("id", "main");
+                tok[id] = "tok-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+                PersistCfg(deps);
+                r.payload = Real({{"id", id}, {"token_set", true}});  // never echo secret full
+                return r;
+            }
+            if (method.find("revoke") != std::string::npos) {
+                tok.erase(params.value("id", "main"));
+                PersistCfg(deps);
+                r.payload = Real({{"revoked", true}});
+                return r;
+            }
+            {
+                nlohmann::json ids = nlohmann::json::array();
+                for (auto it = tok.begin(); it != tok.end(); ++it) ids.push_back(it.key());
+                r.payload = Real({{"token_ids", ids}, {"method", method}});
+            }
+            return r;
+        }
+        if (starts("exec.")) {
+            r.payload = Real({{"approvals", deps.approvals.ListJson()},
+                              {"note", "exec gated via approvals; shell tool is mock by default"},
+                              {"method", method}});
+            return r;
+        }
+        if (starts("connect.")) {
+            r.payload = Real({{"challenge", "oc-" + std::to_string(deps.bus.ListenerCount())},
+                              {"method", method}});
+            return r;
+        }
+        r.payload = Real({{"devices", dev}, {"nodes", deps.nodes.ListJson()}, {"method", method}});
+        return r;
+    }
+
+    // ---- agent loop config (max_turns / rate limit) ----
+    if (method == "config.set" || method == "config.apply" || method == "config.get" ||
+        method == "config.openFile") {
+        r.handled = true;
+        if (method == "config.get" || method == "config.openFile") {
+            r.payload = Real({{"config", deps.config.ToJson()}});
+            return r;
+        }
+        // merge params into raw.agent / top-level
+        auto& agent = EnsureObj(deps.config.raw, "agent");
+        if (params.contains("max_turns")) agent["max_turns"] = params["max_turns"];
+        if (params.contains("rate_limit_per_minute"))
+            agent["rate_limit_per_minute"] = params["rate_limit_per_minute"];
+        if (params.contains("agent") && params["agent"].is_object()) {
+            for (auto it = params["agent"].begin(); it != params["agent"].end(); ++it)
+                agent[it.key()] = it.value();
+        }
+        if (params.contains("raw") && params["raw"].is_object()) {
+            deps.config.raw.merge_patch(params["raw"]);
+        }
+        PersistCfg(deps);
+        r.payload = Real({{"saved", true}, {"agent", agent}, {"config", deps.config.ToJson()}});
         return r;
     }
 
