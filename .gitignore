@@ -19,3 +19,7 @@ compile_commands.json
 /conan_data/
 graph_info.json
 conan.lock
+
+# native plugin build artifacts
+plugins/**/*.so
+plugins/**/*.so.*

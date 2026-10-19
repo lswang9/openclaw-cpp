@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 0.9.0 LANGUAGES CXX)
+project(openclaw-cpp VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,7 @@ set(OPENCLAW_SOURCES
   src/agent/loop.cpp
   src/agent/files.cpp
   src/acp/session.cpp
+  src/daemon/lifecycle.cpp
   src/provider/deepseek.cpp
   src/provider/mock.cpp
   src/provider/openai_compat.cpp
@@ -59,10 +60,19 @@ target_link_libraries(openclaw-cpp PRIVATE
   CURL::libcurl
   OpenSSL::SSL
   OpenSSL::Crypto
-  Threads::Threads)
+  Threads::Threads
+  ${CMAKE_DL_LIBS})
+
+# Sample native plugin (.so) — Linux
+add_library(openclaw_sample_echo SHARED plugins/sample_echo/plugin.c)
+target_include_directories(openclaw_sample_echo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(openclaw_sample_echo PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/plugins/sample_echo
+  OUTPUT_NAME openclaw_sample_echo
+  PREFIX "lib")
 
 install(TARGETS openclaw-cpp RUNTIME DESTINATION bin)
-# ship control UI source for reference
 install(FILES web/control.html DESTINATION share/openclaw-cpp OPTIONAL)
+install(FILES include/openclaw/plugins/sdk.h DESTINATION include/openclaw/plugins)
 enable_testing()
 add_test(NAME self_test COMMAND openclaw-cpp self-test)

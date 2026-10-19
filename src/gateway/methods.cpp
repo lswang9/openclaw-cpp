@@ -4,6 +4,7 @@ namespace openclaw::gateway {
 
 std::vector<std::string> ImplementedMethods() {
     return {
+        "media.list","media.get","media.upload","media.delete", "artifacts.upload","artifacts.delete", "sessions.fork","sessions.rewind","sessions.resolve","sessions.catalog","sessions.storage", "agents.list","agents.create","agents.upsert","agents.delete", "channels.status","channels.send", "plugins.invoke", "backup.create","backup.list", "themes.get","themes.set","themes.list", "fs.list","fs.read", "audit.list", "memory.list","memory.get","memory.set","memory.delete","memory.dump",
         "acp.status", "acp.sessions.list", "acp.sessions.create", "acp.sessions.prompt",
         "health",
         "status",

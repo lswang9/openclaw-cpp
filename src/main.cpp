@@ -24,6 +24,7 @@
 #include "openclaw/tools/registry.hpp"
 #include "openclaw/util.hpp"
 #include "openclaw/acp/session.hpp"
+#include "openclaw/daemon/lifecycle.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/persist/store.hpp"
 #include "openclaw/provider/openai_compat.hpp"
@@ -40,6 +41,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <unistd.h>
+#include <sys/types.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -47,7 +50,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.9.0-dev";
+constexpr const char* kVersion = "1.0.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -69,7 +72,8 @@ std::string ReadStdin() {
 void PrintUsage() {
     std::cerr
         << "openclaw-cpp " << kVersion << " — align OpenClaw 2026.10.5\n"
-        << "  chat [-s SESSION] <msg> | gateway [--port N] | cron-daemon | mcp-mock-server | self-test\n"
+        << "  chat [-s SESSION] <msg> | gateway [--port N] | gateway start|stop|status\n"
+        << "  cron-daemon | mcp-mock-server | self-test\n"
         << "  status | tools | channels | config | methods | skills | memory | cron\n";
 }
 
@@ -422,7 +426,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "0.9.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.0.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -499,6 +503,46 @@ int CmdSelfTest() {
         }
     }
 
+
+    // media pipeline
+    {
+        auto dir = std::filesystem::temp_directory_path() / "oc-media-test";
+        std::filesystem::remove_all(dir);
+        media::Store ms(dir);
+        auto a = ms.Put("hi.txt", "text/plain", "hello-media");
+        auto b = ms.ReadBytes(a.id);
+        if (!b || *b != "hello-media") { std::cerr << "FAIL media put/read\n"; ++failures; }
+        else if (!ms.Remove(a.id)) { std::cerr << "FAIL media remove\n"; ++failures; }
+        else std::cerr << "PASS media pipeline\n";
+    }
+
+    // daemon pidfile
+    {
+        auto p = std::filesystem::temp_directory_path() / "oc-test.pid";
+        daemon::WritePidFile(p, getpid());
+        auto r = daemon::ReadPidFile(p);
+        if (!r || *r != getpid() || !daemon::ProcessAlive(*r)) {
+            std::cerr << "FAIL daemon pidfile\n"; ++failures;
+        } else {
+            daemon::RemovePidFile(p);
+            std::cerr << "PASS daemon pidfile\n";
+        }
+    }
+
+    // plugin sdk sample if .so present
+    {
+        plugins::Registry preg;
+        preg.Scan(RepoRoot() / "plugins");
+        int n = preg.LoadNatives();
+        if (n > 0) {
+            auto j = preg.InvokeNative("sample_echo", "ping", {{"x", 1}});
+            if (!j.value("ok", false)) { std::cerr << "FAIL plugin invoke " << j.dump() << "\n"; ++failures; }
+            else std::cerr << "PASS plugin native invoke\n";
+        } else {
+            std::cerr << "PASS plugin scan (no .so yet — build sample)\n";
+        }
+    }
+
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
     return 1;
@@ -535,8 +579,84 @@ int CmdChat(int argc, char** argv, int argi) {
     return 0;
 }
 
+
+openclaw::gateway::Server* g_gateway_server = nullptr;
+void GatewayStopSignal() {
+    if (g_gateway_server) g_gateway_server->Stop();
+}
+
+int CmdGatewayStop() {
+    using namespace openclaw;
+    auto path = daemon::DefaultPidPath();
+    auto pid = daemon::ReadPidFile(path);
+    if (!pid) {
+        std::cerr << "no pidfile at " << path << "\n";
+        return 1;
+    }
+    if (!daemon::ProcessAlive(*pid)) {
+        std::cerr << "stale pidfile pid=" << *pid << " — removing\n";
+        daemon::RemovePidFile(path);
+        return 1;
+    }
+    if (!daemon::StopPid(*pid)) {
+        std::cerr << "kill(" << *pid << ", SIGTERM) failed\n";
+        return 1;
+    }
+    for (int i = 0; i < 50; ++i) {
+        if (!daemon::ProcessAlive(*pid)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (daemon::ProcessAlive(*pid)) {
+        std::cerr << "process " << *pid << " still alive after SIGTERM\n";
+        return 2;
+    }
+    daemon::RemovePidFile(path);
+    std::cout << nlohmann::json{{"stopped", true}, {"pid", *pid}, {"pidfile", path.string()}}.dump(2) << "\n";
+    return 0;
+}
+
+int CmdGatewayStatusDaemon() {
+    using namespace openclaw;
+    auto path = daemon::DefaultPidPath();
+    auto pid = daemon::ReadPidFile(path);
+    bool alive = pid && daemon::ProcessAlive(*pid);
+    std::cout << nlohmann::json{
+        {"pidfile", path.string()},
+        {"pid", pid ? *pid : 0},
+        {"running", alive},
+        {"version", kVersion},
+    }.dump(2) << "\n";
+    return alive ? 0 : 1;
+}
+
 int CmdGateway(int argc, char** argv, int argi) {
     using namespace openclaw;
+    // daemon lifecycle subcommands: gateway start|stop|status
+    if (argi < argc) {
+        std::string sub = argv[argi];
+        if (sub == "stop") return CmdGatewayStop();
+        if (sub == "status") return CmdGatewayStatusDaemon();
+        if (sub == "start") {
+            ++argi;
+            auto path = daemon::DefaultPidPath();
+            if (auto old = daemon::ReadPidFile(path); old && daemon::ProcessAlive(*old)) {
+                std::cerr << "already running pid=" << *old << " (" << path << ")\n";
+                return 1;
+            }
+            pid_t child = fork();
+            if (child < 0) { std::cerr << "fork failed\n"; return 1; }
+            if (child > 0) {
+                // parent
+                daemon::WritePidFile(path, child);
+                std::cout << nlohmann::json{{"started", true}, {"pid", child}, {"pidfile", path.string()}}.dump(2) << "\n";
+                return 0;
+            }
+            // child — detach session
+            setsid();
+            // fall through to run gateway foreground in child
+        }
+    }
+
     gateway::ServerOptions opts;
     opts.bind_host = EnvOr("OPENCLAW_GATEWAY_HOST", "127.0.0.1");
     opts.port = static_cast<std::uint16_t>(std::stoi(EnvOr("OPENCLAW_GATEWAY_PORT", "18789")));
@@ -585,6 +705,10 @@ int CmdGateway(int argc, char** argv, int argi) {
     auto skills = LoadSkills();
     plugins::Registry plugins;
     plugins.Scan(RepoRoot() / "plugins");
+    {
+        int pn = plugins.LoadNatives();
+        if (pn) std::cerr << "[gateway] native plugins loaded: " << pn << "\n";
+    }
     cron::Scheduler cron;
     auth::PairingStore pairing;
     session::Store sessions(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
@@ -657,14 +781,30 @@ int CmdGateway(int argc, char** argv, int argi) {
 
 
     gateway::Server server(opts, deps);
+    g_gateway_server = &server;
+    daemon::InstallStopSignals(GatewayStopSignal);
+    auto pid_path = daemon::DefaultPidPath();
+    // Foreground (non-start) also records pid for stop
+    if (!daemon::ReadPidFile(pid_path) || !daemon::ProcessAlive(*daemon::ReadPidFile(pid_path))) {
+        daemon::WritePidFile(pid_path, static_cast<int>(getpid()));
+    }
+    int rc = 0;
     try { server.Run(); }
     catch (const std::exception& e) {
         std::cerr << "gateway error: " << e.what() << '\n';
-        curl_global_cleanup();
-        return 1;
+        rc = 1;
+    }
+    g_gateway_server = nullptr;
+    if (auto cur = daemon::ReadPidFile(pid_path); cur && *cur == static_cast<int>(getpid())) {
+        daemon::RemovePidFile(pid_path);
+    }
+    if (deps.persist) {
+        deps.persist->SaveCron(cron);
+        deps.persist->SavePairing(pairing);
+        deps.persist->SaveNodes(nodes);
     }
     curl_global_cleanup();
-    return 0;
+    return rc;
 }
 
 int CmdCronDaemon() {

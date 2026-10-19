@@ -1,0 +1,6 @@
+{
+  "name": "sample_echo",
+  "enabled": true,
+  "native": "libopenclaw_sample_echo.so",
+  "abi": 1
+}

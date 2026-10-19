@@ -31,7 +31,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "0.9.0-dev";
+constexpr const char* kVersion = "1.0.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -491,6 +491,38 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             arr.push_back({{"id", id}, {"messages", deps_.sessions.Load(id).size()}});
         }
         send(HttpResponse(200, "OK", nlohmann::json{{"sessions", arr}}.dump(2)));
+        return;
+    }
+    if (method == "GET" && path.rfind("/v1/media/", 0) == 0) {
+        auto id = path.substr(std::string("/v1/media/").size());
+        auto bytes = deps_.media.ReadBytes(id);
+        if (!bytes) { send(HttpResponse(404, "Not Found", nlohmann::json{{"error","not found"},{"id",id}}.dump())); return; }
+        auto meta = deps_.media.Find(id);
+        std::string ctype = meta ? meta->content_type : "application/octet-stream";
+        std::string hdr =
+            "HTTP/1.1 200 OK\r\nContent-Type: " + ctype +
+            "\r\nContent-Length: " + std::to_string(bytes->size()) +
+            "\r\nConnection: close\r\n\r\n";
+        send(hdr);
+        send(*bytes);
+        return;
+    }
+    if (method == "GET" && path == "/v1/media") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"media", deps_.media.ListJson()}}.dump(2)));
+        return;
+    }
+    if (method == "POST" && path == "/v1/media") {
+        try {
+            auto j = nlohmann::json::parse(BodyOf(req));
+            std::string data = j.value("text", j.value("data", ""));
+            if (j.contains("base64")) data = media::Store::DecodeBase64(j.value("base64", ""));
+            auto asset = deps_.media.Put(j.value("filename", "upload.bin"),
+                                         j.value("content_type", "application/octet-stream"), data);
+            send(HttpResponse(200, "OK", nlohmann::json{{"id", asset.id}, {"filename", asset.filename},
+                {"bytes", asset.bytes}, {"url", "/v1/media/" + asset.id}, {"impl", "real"}}.dump(2)));
+        } catch (const std::exception& e) {
+            send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", e.what()}}.dump()));
+        }
         return;
     }
     if (method == "GET" && path == "/v1/skills") {

@@ -15,3 +15,5 @@
 3. 行为对齐 2026.10.5，不是 Node 包装层。详见 [PARITY.md](PARITY.md)。
 
 - **0.9.0-dev**: real local-state ExtraDispatch, Control UI sessions/SSE/tools, ACP skeleton+gap, live TG/Discord/Feishu curl when tokens
+
+- **1.0.0-dev**: real ExtraDispatch bulk, daemon pidfile start/stop, plugin C SDK+.so, media upload/serve

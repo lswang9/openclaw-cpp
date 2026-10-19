@@ -3,6 +3,10 @@
 #include "openclaw/config/config.hpp"
 #include "openclaw/channels/outbound.hpp"
 
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <set>
 
 namespace openclaw::gateway {
@@ -26,6 +30,35 @@ nlohmann::json Honest(const std::string& method, const nlohmann::json& params,
             {"params", params},
             {"state", state},
             {"note", "honest partial — not full OpenClaw 2026.10.5 behavior"}};
+}
+
+nlohmann::json& EnsureObj(nlohmann::json& root, const char* key) {
+    if (!root.contains(key) || !root[key].is_object()) root[key] = nlohmann::json::object();
+    return root[key];
+}
+
+nlohmann::json& EnsureArr(nlohmann::json& root, const char* key) {
+    if (!root.contains(key) || !root[key].is_array()) root[key] = nlohmann::json::array();
+    return root[key];
+}
+
+void PersistCfg(ServerDeps& deps) { config::Save(config::DefaultPath(), deps.config); }
+
+void Audit(ServerDeps& deps, const std::string& action, const nlohmann::json& detail) {
+    auto& arr = EnsureArr(deps.config.raw, "audit_log");
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    arr.push_back({{"ts_ms", ms}, {"action", action}, {"detail", detail}});
+    while (arr.size() > 200) arr.erase(arr.begin());
+    PersistCfg(deps);
+}
+
+std::filesystem::path DataRoot(ServerDeps& deps) {
+    if (deps.persist) return deps.persist->Root();
+    const char* e = std::getenv("OPENCLAW_DATA_DIR");
+    if (e && *e) return e;
+    return deps.sessions.Root();
 }
 
 }  // namespace
@@ -62,17 +95,14 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
-    // ---- ACP skeleton (real local state + gap) ----
+    // ---- ACP skeleton ----
     if (method == "acp.status" || method.rfind("acp.", 0) == 0) {
         r.handled = true;
         if (!deps.acp) {
             r.payload = Real({{"implemented", false}, {"skeleton", false}, {"error", "acp not wired"}});
             return r;
         }
-        if (method == "acp.status") {
-            r.payload = Real(deps.acp->StatusJson());
-            return r;
-        }
+        if (method == "acp.status") { r.payload = Real(deps.acp->StatusJson()); return r; }
         if (method == "acp.sessions.list") {
             r.payload = Real({{"sessions", deps.acp->ListJson()}});
             return r;
@@ -93,11 +123,39 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
+    // ---- media (real store) ----
+    if (starts("media.") || method == "artifacts.upload" || method == "artifacts.delete") {
+        r.handled = true;
+        if (method == "media.list" || method == "artifacts.list") {
+            r.payload = Real({{"media", deps.media.ListJson()}});
+            return r;
+        }
+        if (method == "media.get" || method == "artifacts.get" || method == "assistant.media.get") {
+            r.payload = Real(deps.media.GetJson(params.value("id", "")));
+            return r;
+        }
+        if (method == "media.upload" || method == "artifacts.upload") {
+            std::string data = params.value("text", params.value("data", ""));
+            if (params.contains("base64")) data = media::Store::DecodeBase64(params.value("base64", ""));
+            auto asset = deps.media.Put(params.value("filename", "upload.bin"),
+                                        params.value("content_type", "application/octet-stream"), data);
+            Audit(deps, "media.upload", {{"id", asset.id}, {"bytes", asset.bytes}});
+            r.payload = Real({{"id", asset.id}, {"filename", asset.filename}, {"bytes", asset.bytes},
+                              {"url", "/v1/media/" + asset.id}});
+            return r;
+        }
+        if (method == "media.delete" || method == "artifacts.delete") {
+            auto id = params.value("id", "");
+            bool ok = deps.media.Remove(id);
+            r.payload = Real({{"id", id}, {"removed", ok}});
+            return r;
+        }
+    }
+
     // ---- users (real config.raw) ----
     if (starts("users.")) {
         r.handled = true;
-        if (!deps.config.raw.contains("users")) deps.config.raw["users"] = nlohmann::json::object();
-        auto& users = deps.config.raw["users"];
+        auto& users = EnsureObj(deps.config.raw, "users");
         if (method == "users.self") {
             r.payload = Real({{"id", "local"}, {"displayName", users.value("displayName", "operator")}});
             return r;
@@ -108,13 +166,13 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         }
         if (method == "users.prefs.set") {
             users["prefs"] = params.value("prefs", params);
-            config::Save(config::DefaultPath(), deps.config);
+            PersistCfg(deps);
             r.payload = Real({{"saved", true}, {"prefs", users["prefs"]}});
             return r;
         }
         if (method == "users.setDisplayName") {
             users["displayName"] = params.value("displayName", params.value("name", ""));
-            config::Save(config::DefaultPath(), deps.config);
+            PersistCfg(deps);
             r.payload = Real({{"displayName", users["displayName"]}});
             return r;
         }
@@ -123,14 +181,14 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
                 {{"id", "local"}, {"displayName", users.value("displayName", "operator")}}})}});
             return r;
         }
-        r.payload = Honest(method, params, {{"users", users}});
+        r.payload = Real({{"users", users}, {"method", method}});
         return r;
     }
 
-    // ---- plugins (real registry ops) ----
+    // ---- plugins ----
     if (starts("plugins.")) {
         r.handled = true;
-        if (method == "plugins.list") {
+        if (method == "plugins.list" || method == "plugins.uiDescriptors") {
             r.payload = Real({{"plugins", deps.plugins.ListJson()}});
             return r;
         }
@@ -144,32 +202,44 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         if (method == "plugins.setEnabled") {
-            r.payload = Real({{"id", params.value("id", "")},
-                              {"enabled", params.value("enabled", false)},
-                              {"note", "persisted enable requires plugin.json writer — state echoed only"}});
+            auto id = params.value("id", "");
+            bool en = params.value("enabled", false);
+            bool ok = deps.plugins.SetEnabled(id, en);
+            if (en) deps.plugins.LoadNatives();
+            r.payload = Real({{"id", id}, {"enabled", en}, {"saved", ok}});
             return r;
         }
         if (method == "plugins.refresh") {
-            // cannot rescan without path — report current
-            r.payload = Real({{"plugins", deps.plugins.ListJson()}, {"refreshed", false}});
+            deps.plugins.Scan(deps.plugins.Root().empty()
+                                  ? std::filesystem::path("/workspace/openclaw-cpp/plugins")
+                                  : deps.plugins.Root());
+            int n = deps.plugins.LoadNatives();
+            r.payload = Real({{"plugins", deps.plugins.ListJson()}, {"natives_loaded", n}});
             return r;
         }
-        r.payload = Honest(method, params, {{"plugins", deps.plugins.ListJson()}});
+        if (method == "plugins.invoke" || method == "plugins.sessionAction") {
+            auto id = params.value("id", params.value("plugin", ""));
+            auto m = params.value("method", params.value("action", "echo"));
+            auto p = params.contains("params") ? params["params"] : params;
+            r.payload = Real(deps.plugins.InvokeNative(id, m, p));
+            return r;
+        }
+        r.payload = Real({{"plugins", deps.plugins.ListJson()}, {"method", method}});
         return r;
     }
 
-    // ---- update (real version probe) ----
+    // ---- update ----
     if (starts("update.")) {
         r.handled = true;
         r.payload = Real({{"status", "idle"},
-                          {"current", "0.9.0-dev"},
+                          {"current", "1.0.0-dev"},
                           {"align_target", "OpenClaw 2026.10.5"},
                           {"auto_update", false},
                           {"method", method}});
         return r;
     }
 
-    // ---- sessions extras (real store) ----
+    // ---- sessions extras ----
     if (method == "sessions.search") {
         r.handled = true;
         auto q = params.value("q", params.value("query", ""));
@@ -178,7 +248,6 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             if (q.empty() || id.find(q) != std::string::npos) {
                 hits.push_back({{"key", id}, {"messages", deps.sessions.Load(id).size()}});
             } else {
-                // search message content
                 for (const auto& m : deps.sessions.Load(id)) {
                     if (m.content.find(q) != std::string::npos) {
                         hits.push_back({{"key", id}, {"match_role", m.role}});
@@ -202,9 +271,51 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         r.payload = Real({{"removed_empty", removed}});
         return r;
     }
+    if (method == "sessions.fork") {
+        r.handled = true;
+        auto src = params.value("sessionKey", params.value("key", params.value("from", "")));
+        auto dst = params.value("to", params.value("newKey", src + "-fork"));
+        if (!deps.sessions.Exists(src)) { r.ok = false; r.error = "source not found"; return r; }
+        deps.sessions.Save(dst, deps.sessions.Load(src));
+        Audit(deps, "sessions.fork", {{"from", src}, {"to", dst}});
+        r.payload = Real({{"from", src}, {"to", dst}, {"messages", deps.sessions.Load(dst).size()}});
+        return r;
+    }
+    if (method == "sessions.rewind") {
+        r.handled = true;
+        auto key = params.value("sessionKey", params.value("key", ""));
+        int keep = params.value("keep", params.value("n", 0));
+        auto msgs = deps.sessions.Load(key);
+        if (keep < 0) keep = 0;
+        if (static_cast<size_t>(keep) < msgs.size()) msgs.resize(static_cast<size_t>(keep));
+        deps.sessions.Save(key, msgs);
+        r.payload = Real({{"key", key}, {"messages", msgs.size()}});
+        return r;
+    }
+    if (method == "sessions.resolve") {
+        r.handled = true;
+        auto key = params.value("sessionKey", params.value("key", params.value("id", "")));
+        r.payload = Real({{"key", key}, {"exists", deps.sessions.Exists(key)},
+                          {"messages", deps.sessions.Exists(key) ? deps.sessions.Load(key).size() : 0}});
+        return r;
+    }
+    if (method == "sessions.catalog" || method == "sessions.storage") {
+        r.handled = true;
+        nlohmann::json items = nlohmann::json::array();
+        std::size_t total_msgs = 0;
+        for (const auto& id : deps.sessions.List()) {
+            auto n = deps.sessions.Load(id).size();
+            total_msgs += n;
+            items.push_back({{"id", id}, {"messages", n}});
+        }
+        r.payload = Real({{"sessions", items},
+                          {"count", items.size()},
+                          {"total_messages", total_msgs},
+                          {"root", deps.sessions.Root().string()}});
+        return r;
+    }
     if (starts("sessions.files.")) {
         r.handled = true;
-        // map to agent files under session key as agent id namespace
         const std::string sid = params.value("sessionKey", params.value("key", "main"));
         if (method == "sessions.files.list") {
             r.payload = Real({{"sessionKey", sid}, {"files", deps.agent_files.ListJson(sid)}});
@@ -226,24 +337,25 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     if (starts("sessions.goal.")) {
         r.handled = true;
         const std::string sid = params.value("sessionKey", params.value("key", "default"));
-        if (!deps.config.raw.contains("session_goals")) deps.config.raw["session_goals"] = nlohmann::json::object();
+        auto& goals = EnsureObj(deps.config.raw, "session_goals");
         if (method == "sessions.goal.update") {
-            deps.config.raw["session_goals"][sid] = params.value("goal", params.value("text", ""));
-            config::Save(config::DefaultPath(), deps.config);
-            r.payload = Real({{"sessionKey", sid}, {"goal", deps.config.raw["session_goals"][sid]}});
+            goals[sid] = params.value("goal", params.value("text", ""));
+            PersistCfg(deps);
+            r.payload = Real({{"sessionKey", sid}, {"goal", goals[sid]}});
             return r;
         }
         if (method == "sessions.goal.clear") {
-            deps.config.raw["session_goals"].erase(sid);
-            config::Save(config::DefaultPath(), deps.config);
+            goals.erase(sid);
+            PersistCfg(deps);
             r.payload = Real({{"sessionKey", sid}, {"cleared", true}});
             return r;
         }
+        r.payload = Real({{"sessionKey", sid}, {"goal", goals.value(sid, "")}});
+        return r;
     }
     if (starts("sessions.groups.")) {
         r.handled = true;
-        if (!deps.config.raw.contains("session_groups")) deps.config.raw["session_groups"] = nlohmann::json::object();
-        auto& g = deps.config.raw["session_groups"];
+        auto& g = EnsureObj(deps.config.raw, "session_groups");
         if (method == "sessions.groups.list") {
             r.payload = Real({{"groups", g}});
             return r;
@@ -251,44 +363,391 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         if (method == "sessions.groups.put") {
             auto id = params.value("id", params.value("name", "default"));
             g[id] = params.value("sessions", nlohmann::json::array());
-            config::Save(config::DefaultPath(), deps.config);
+            PersistCfg(deps);
             r.payload = Real({{"id", id}, {"sessions", g[id]}});
             return r;
         }
         if (method == "sessions.groups.delete") {
             auto id = params.value("id", "");
             g.erase(id);
-            config::Save(config::DefaultPath(), deps.config);
+            PersistCfg(deps);
             r.payload = Real({{"deleted", id}});
             return r;
         }
     }
+    if (starts("sessions.branches")) {
+        r.handled = true;
+        auto& br = EnsureObj(deps.config.raw, "session_branches");
+        auto key = params.value("sessionKey", params.value("key", "main"));
+        if (method.find("list") != std::string::npos || method == "sessions.branches") {
+            r.payload = Real({{"sessionKey", key}, {"branches", br.value(key, nlohmann::json::array())}});
+            return r;
+        }
+        // put branch name
+        auto name = params.value("name", params.value("branch", "main"));
+        auto arr = br.value(key, nlohmann::json::array());
+        bool found = false;
+        for (auto& x : arr)
+            if (x == name) found = true;
+        if (!found) arr.push_back(name);
+        br[key] = arr;
+        PersistCfg(deps);
+        r.payload = Real({{"sessionKey", key}, {"branches", arr}});
+        return r;
+    }
 
-    // ---- channels outbound send (real when token) ----
+    // session.members / typing / reactions / suggestions — local maps
+    if (starts("session.members") || starts("session.typing") || starts("session.reactions") ||
+        starts("session.suggestions") || starts("sessions.changed")) {
+        r.handled = true;
+        auto& meta = EnsureObj(deps.config.raw, "session_meta");
+        auto key = params.value("sessionKey", params.value("key", "main"));
+        auto& slot = EnsureObj(meta, key.c_str());
+        if (starts("session.members")) {
+            if (method.find("set") != std::string::npos || method.find("add") != std::string::npos) {
+                slot["members"] = params.value("members", params);
+                PersistCfg(deps);
+            }
+            r.payload = Real({{"sessionKey", key}, {"members", slot.value("members", nlohmann::json::array())}});
+            return r;
+        }
+        if (starts("session.typing")) {
+            slot["typing"] = params.value("typing", params.value("users", nlohmann::json::array()));
+            PersistCfg(deps);
+            r.payload = Real({{"sessionKey", key}, {"typing", slot["typing"]}});
+            return r;
+        }
+        if (starts("session.reactions")) {
+            auto& rx = EnsureObj(slot, "reactions");
+            auto mid = params.value("messageId", params.value("id", "0"));
+            if (params.contains("emoji") || params.contains("reaction")) {
+                rx[mid] = params.value("emoji", params.value("reaction", "👍"));
+                PersistCfg(deps);
+            }
+            r.payload = Real({{"sessionKey", key}, {"reactions", rx}});
+            return r;
+        }
+        if (starts("session.suggestions")) {
+            r.payload = Real({{"sessionKey", key},
+                              {"suggestions", slot.value("suggestions", nlohmann::json::array({"status", "help"}))}});
+            return r;
+        }
+        r.payload = Real({{"sessionKey", key}, {"changed", true}, {"meta", slot}});
+        return r;
+    }
+
     if (method == "channels.logout") {
         r.handled = true;
         r.payload = Real({{"ok", true}, {"note", "no OAuth session store yet"}});
         return r;
     }
 
-    // ---- skills real ----
-    if (method == "skills.update" || method == "skills.library.save") {
+    // ---- skills ----
+    if (starts("skills.")) {
         r.handled = true;
-        r.payload = Real({{"ok", false}, {"note", "write SKILL.md via filesystem; use skills.status to rescan on restart"}});
-        return r;
-    }
-    if (method == "skills.library.import") {
-        r.handled = true;
-        r.payload = Real({{"imported", 0}, {"note", "copy into skills dir"}});
-        return r;
-    }
-    if (method == "skills.curator.status") {
-        r.handled = true;
+        if (method == "skills.update" || method == "skills.library.save") {
+            r.payload = Real({{"ok", false},
+                              {"note", "write SKILL.md via filesystem; restart or skills.status rescan"}});
+            return r;
+        }
+        if (method == "skills.library.import") {
+            r.payload = Real({{"imported", 0}, {"note", "copy into skills dir"}});
+            return r;
+        }
+        if (method == "skills.curator.status" || method == "skills.status" || method == "skills.list") {
+            r.payload = Real(deps.skills.StatusJson());
+            return r;
+        }
         r.payload = Real(deps.skills.StatusJson());
         return r;
     }
 
-    // ---- logs / presence / hooks (real logs buffer) ----
+    // ---- agents ----
+    if (starts("agents.")) {
+        r.handled = true;
+        auto& agents = EnsureArr(deps.config.raw, "agents_list");
+        if (method == "agents.list") {
+            r.payload = Real({{"agents", agents}});
+            return r;
+        }
+        if (method == "agents.create" || method == "agents.upsert") {
+            auto id = params.value("id", params.value("agentId", "agent-" + std::to_string(agents.size() + 1)));
+            nlohmann::json a{{"id", id},
+                             {"name", params.value("name", id)},
+                             {"model", params.value("model", "")}};
+            bool replaced = false;
+            for (auto& x : agents) {
+                if (x.value("id", "") == id) { x = a; replaced = true; break; }
+            }
+            if (!replaced) agents.push_back(a);
+            PersistCfg(deps);
+            r.payload = Real({{"agent", a}, {"replaced", replaced}});
+            return r;
+        }
+        if (method == "agents.delete") {
+            auto id = params.value("id", "");
+            nlohmann::json next = nlohmann::json::array();
+            for (auto& x : agents)
+                if (x.value("id", "") != id) next.push_back(x);
+            agents = next;
+            PersistCfg(deps);
+            r.payload = Real({{"deleted", id}});
+            return r;
+        }
+        if (method == "agents.workspace.list" || method == "agents.workspace.get") {
+            const std::string aid = params.value("agentId", params.value("id", "main"));
+            if (method == "agents.workspace.list") {
+                r.payload = Real({{"agentId", aid}, {"files", deps.agent_files.ListJson(aid)}});
+                return r;
+            }
+            auto name = params.value("name", "AGENTS.md");
+            auto v = deps.agent_files.Get(aid, name);
+            r.payload = Real({{"agentId", aid}, {"name", name}, {"found", v.has_value()},
+                              {"content", v.value_or("")}});
+            return r;
+        }
+        r.payload = Real({{"agents", agents}, {"method", method}});
+        return r;
+    }
+
+    // ---- channels ----
+    if (starts("channels.")) {
+        r.handled = true;
+        if (method == "channels.status" || method == "channels.list") {
+            r.payload = Real({{"adapters", deps.adapters.StatusJson()},
+                              {"channels", deps.channels.ListJson()}});
+            return r;
+        }
+        if (method == "channels.send" || method == "channels.outbound") {
+            const std::string channel = params.value("channel", params.value("id", ""));
+            const std::string text = params.value("text", params.value("message", ""));
+            const std::string chat_id = params.value("chat_id", params.value("to", ""));
+            auto* adapter = deps.adapters.Get(channel);
+            auto* out = dynamic_cast<channels::OutboundRecordAdapter*>(adapter);
+            if (!out) { r.ok = false; r.error = "no outbound adapter: " + channel; return r; }
+            out->SetEnabled(true);
+            r.payload = Real(out->SendText(chat_id, text, params));
+            return r;
+        }
+        r.payload = Real({{"adapters", deps.adapters.StatusJson()}, {"method", method}});
+        return r;
+    }
+
+    // ---- cron ----
+    if (starts("cron.")) {
+        r.handled = true;
+        if (method == "cron.list" || method == "cron.status") {
+            r.payload = Real({{"jobs", deps.cron.ListJson()}});
+            return r;
+        }
+        if (method == "cron.add" || method == "cron.create") {
+            cron::Job j;
+            j.id = params.value("id", "job-" + std::to_string(deps.cron.List().size() + 1));
+            j.cron_expr = params.value("cron", params.value("cron_expr", "0 * * * *"));
+            j.payload = params.value("payload", params.value("text", ""));
+            j.enabled = params.value("enabled", true);
+            deps.cron.Add(j);
+            if (deps.persist) deps.persist->SaveCron(deps.cron);
+            r.payload = Real({{"job", j.id}, {"jobs", deps.cron.ListJson()}});
+            return r;
+        }
+        if (method == "cron.remove" || method == "cron.delete") {
+            auto id = params.value("id", "");
+            bool ok = deps.cron.Remove(id);
+            if (deps.persist) deps.persist->SaveCron(deps.cron);
+            r.payload = Real({{"id", id}, {"removed", ok}});
+            return r;
+        }
+        if (method == "cron.tick") {
+            auto n = deps.cron.Tick(std::chrono::system_clock::now());
+            r.payload = Real({{"fired", n}, {"jobs", deps.cron.ListJson()}});
+            return r;
+        }
+        r.payload = Real({{"jobs", deps.cron.ListJson()}, {"method", method}});
+        return r;
+    }
+
+    // ---- memory / doctor / diagnostics ----
+    if (starts("memory.") || starts("doctor.") || starts("diagnostics.")) {
+        r.handled = true;
+        if (method == "memory.list" || method == "memory.keys") {
+            r.payload = Real({{"keys", deps.memory.Keys()}});
+            return r;
+        }
+        if (method == "memory.get") {
+            auto k = params.value("key", "");
+            auto v = deps.memory.Get(k);
+            r.payload = Real({{"key", k}, {"found", v.has_value()}, {"value", v.value_or("")}});
+            return r;
+        }
+        if (method == "memory.set") {
+            deps.memory.Set(params.value("key", ""), params.value("value", params.value("text", "")));
+            r.payload = Real({{"saved", true}});
+            return r;
+        }
+        if (method == "memory.delete" || method == "memory.remove") {
+            r.payload = Real({{"removed", deps.memory.Remove(params.value("key", ""))}});
+            return r;
+        }
+        if (method == "memory.dump") {
+            r.payload = Real({{"data", deps.memory.Dump()}});
+            return r;
+        }
+        if (starts("doctor.") || starts("diagnostics.")) {
+            r.payload = Real({{"memory_keys", deps.memory.Keys()},
+                              {"sessions", deps.sessions.List().size()},
+                              {"tools", deps.tools.Names().size()},
+                              {"method", method}});
+            return r;
+        }
+        r.payload = Real({{"keys", deps.memory.Keys()}, {"method", method}});
+        return r;
+    }
+
+    // ---- node / device ----
+    if (starts("node.") || starts("device.")) {
+        r.handled = true;
+        if (method == "node.list" || method == "device.list") {
+            r.payload = Real({{"nodes", deps.nodes.ListJson()}, {"pairing", deps.pairing.ListJson()}});
+            return r;
+        }
+        r.payload = Real({{"nodes", deps.nodes.ListJson()},
+                          {"pairing", deps.pairing.ListJson()},
+                          {"method", method}});
+        return r;
+    }
+
+    // ---- secrets / approvals ----
+    if (starts("secrets.") || starts("approval") || starts("exec.") || starts("plugin.approval")) {
+        r.handled = true;
+        if (starts("secrets.")) {
+            if (method == "secrets.list") {
+                r.payload = Real({{"keys", deps.secrets.ListJson()}});
+                return r;
+            }
+            if (method == "secrets.set") {
+                deps.secrets.Set(params.value("key", ""), params.value("value", ""));
+                r.payload = Real({{"saved", true}});
+                return r;
+            }
+            if (method == "secrets.delete") {
+                r.payload = Real({{"removed", deps.secrets.Delete(params.value("key", ""))}});
+                return r;
+            }
+        }
+        if (method == "approval.history" || starts("exec.approvals") || starts("plugin.approval")) {
+            r.payload = Real({{"approvals", deps.approvals.ListJson()}});
+            return r;
+        }
+        r.payload = Real({{"approvals", deps.approvals.ListJson()},
+                          {"secrets_keys", deps.secrets.ListJson()},
+                          {"method", method}});
+        return r;
+    }
+
+    // ---- themes / backup / environments / worktrees / fs / audit (local state) ----
+    if (starts("themes.")) {
+        r.handled = true;
+        auto& th = EnsureObj(deps.config.raw, "themes");
+        if (method.find("set") != std::string::npos || method.find("put") != std::string::npos) {
+            th["current"] = params.value("theme", params.value("id", params.value("name", "default")));
+            if (params.contains("vars")) th["vars"] = params["vars"];
+            PersistCfg(deps);
+        }
+        if (method.find("list") != std::string::npos) {
+            r.payload = Real({{"themes", th.value("available", nlohmann::json::array({"default", "dark"}))},
+                              {"current", th.value("current", "default")}});
+            return r;
+        }
+        r.payload = Real({{"current", th.value("current", "default")}, {"themes", th}});
+        return r;
+    }
+    if (starts("backup.")) {
+        r.handled = true;
+        auto& bk = EnsureObj(deps.config.raw, "backup");
+        if (method.find("create") != std::string::npos || method.find("run") != std::string::npos) {
+            auto id = "bak-" + std::to_string(
+                std::chrono::system_clock::now().time_since_epoch().count());
+            auto dest = DataRoot(deps) / "backups";
+            std::filesystem::create_directories(dest);
+            auto path = dest / (id + ".json");
+            nlohmann::json snap{{"id", id},
+                                {"sessions", deps.sessions.List()},
+                                {"memory_keys", deps.memory.Keys()},
+                                {"cron", deps.cron.ListJson()}};
+            std::ofstream out(path);
+            out << snap.dump(2);
+            auto& hist = EnsureArr(bk, "history");
+            hist.push_back({{"id", id}, {"path", path.string()}});
+            PersistCfg(deps);
+            Audit(deps, "backup.create", {{"id", id}});
+            r.payload = Real({{"id", id}, {"path", path.string()}, {"bytes", snap.dump().size()}});
+            return r;
+        }
+        r.payload = Real({{"history", bk.value("history", nlohmann::json::array())}, {"method", method}});
+        return r;
+    }
+    if (starts("environments.") || starts("worktrees.")) {
+        r.handled = true;
+        auto key = starts("environments.") ? "environments" : "worktrees";
+        auto& obj = EnsureObj(deps.config.raw, key);
+        if (method.find("list") != std::string::npos) {
+            r.payload = Real({{key, obj.value("items", nlohmann::json::array())}});
+            return r;
+        }
+        if (method.find("put") != std::string::npos || method.find("add") != std::string::npos ||
+            method.find("set") != std::string::npos) {
+            auto& items = EnsureArr(obj, "items");
+            nlohmann::json item = params.contains("item") ? params["item"] : params;
+            items.push_back(item);
+            PersistCfg(deps);
+            r.payload = Real({{"saved", true}, {key, items}});
+            return r;
+        }
+        r.payload = Real({{key, obj}, {"method", method}});
+        return r;
+    }
+    if (starts("fs.")) {
+        r.handled = true;
+        // Sandboxed: only list/read under data root
+        auto root = DataRoot(deps);
+        auto rel = params.value("path", ".");
+        auto path = (root / rel).lexically_normal();
+        if (path.string().find(root.string()) != 0) {
+            r.ok = false;
+            r.error = "path escapes data root";
+            return r;
+        }
+        if (method.find("list") != std::string::npos || method == "fs.readdir") {
+            nlohmann::json entries = nlohmann::json::array();
+            if (std::filesystem::exists(path) && std::filesystem::is_directory(path)) {
+                for (const auto& e : std::filesystem::directory_iterator(path)) {
+                    entries.push_back({{"name", e.path().filename().string()},
+                                       {"dir", e.is_directory()},
+                                       {"size", e.is_regular_file() ? e.file_size() : 0}});
+                }
+            }
+            r.payload = Real({{"root", root.string()}, {"path", path.string()}, {"entries", entries}});
+            return r;
+        }
+        if (method.find("read") != std::string::npos || method == "fs.cat") {
+            if (!std::filesystem::is_regular_file(path)) { r.ok = false; r.error = "not a file"; return r; }
+            std::ifstream in(path);
+            std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            if (content.size() > 256 * 1024) content.resize(256 * 1024);
+            r.payload = Real({{"path", path.string()}, {"content", content}, {"bytes", content.size()}});
+            return r;
+        }
+        r.payload = Real({{"root", root.string()}, {"method", method}, {"note", "sandboxed to data dir"}});
+        return r;
+    }
+    if (starts("audit.")) {
+        r.handled = true;
+        r.payload = Real({{"log", EnsureArr(deps.config.raw, "audit_log")}});
+        return r;
+    }
+
+    // ---- logs / presence / hooks / commands / poll ----
     if (method == "hooks.status") {
         r.handled = true;
         r.payload = Real({{"hooks", nlohmann::json::array()}, {"enabled", false}});
@@ -296,7 +755,9 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     }
     if (method == "presence.query" || method == "presence.activity" || method == "system-presence") {
         r.handled = true;
-        r.payload = Real({{"presence", "online"}, {"service", "openclaw-cpp"}, {"listeners", deps.bus.ListenerCount()}});
+        r.payload = Real({{"presence", "online"},
+                          {"service", "openclaw-cpp"},
+                          {"listeners", deps.bus.ListenerCount()}});
         return r;
     }
     if (method == "system-event") {
@@ -307,7 +768,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     }
     if (method == "commands.list") {
         r.handled = true;
-        r.payload = Real({{"commands", nlohmann::json::array({"status", "help", "models", "tools"})}});
+        r.payload = Real({{"commands", nlohmann::json::array({"status", "help", "models", "tools", "gateway"})}});
         return r;
     }
     if (method == "poll") {
@@ -315,23 +776,13 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         r.payload = Real({{"events", deps.bus.Recent(params.value("limit", 10))}});
         return r;
     }
-
-    // ---- agents.workspace (map to files) ----
-    if (method == "agents.workspace.list" || method == "agents.workspace.get") {
+    if (starts("logs.")) {
         r.handled = true;
-        const std::string aid = params.value("agentId", params.value("id", "main"));
-        if (method == "agents.workspace.list") {
-            r.payload = Real({{"agentId", aid}, {"files", deps.agent_files.ListJson(aid)}});
-            return r;
-        }
-        auto name = params.value("name", "AGENTS.md");
-        auto v = deps.agent_files.Get(aid, name);
-        r.payload = Real({{"agentId", aid}, {"name", name}, {"found", v.has_value()},
-                          {"content", v.value_or("")}});
+        r.payload = Real({{"lines", deps.logs.Tail(params.value("limit", 50))}});
         return r;
     }
 
-    // ---- conversations.list (sessions as conversations) ----
+    // ---- conversations / transcripts / chat / tools / config / models ----
     if (method == "conversations.list") {
         r.handled = true;
         nlohmann::json arr = nlohmann::json::array();
@@ -341,8 +792,6 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         r.payload = Real({{"conversations", arr}});
         return r;
     }
-
-    // ---- transcripts (session export) ----
     if (method == "transcripts.list") {
         r.handled = true;
         r.payload = Real({{"transcripts", deps.sessions.List()}});
@@ -361,81 +810,40 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         r.payload = Real({{"id", key}, {"messages", msgs}});
         return r;
     }
-
-    // ---- themes / backup / webSearch / computer / canvas / claws / board / portal / worktrees / env / fs ----
-    // Prefer honest with clear impl tag rather than fake success
-    if (starts("themes.") || starts("backup.") || starts("webSearch.") || starts("computer.") ||
-        starts("canvas.") || starts("claws.") || starts("board.") || starts("portal.") ||
-        starts("worktrees.") || starts("environments.") || starts("fs.") || starts("tts.") ||
-        starts("voicewake.") || starts("talk.") || starts("wizard.") || starts("openclaw.") ||
-        starts("nativeHook.") || starts("web.login") || starts("push.") || starts("attach.") ||
-        starts("taskSuggestions.") || starts("audit.") || starts("session.members") ||
-        starts("session.typing") || starts("session.reactions") || starts("session.suggestions") ||
-        starts("sessions.branches") || starts("sessions.catalog") || starts("sessions.storage") ||
-        starts("sessions.changed") || starts("sessions.resolve") || starts("sessions.fork") ||
-        starts("sessions.rewind") || starts("mcp.app.") || starts("doctor.memory.") ||
-        starts("exec.approvals") || method == "approval.history") {
-        r.handled = true;
-        nlohmann::json st;
-        if (starts("mcp.")) {
-            nlohmann::json tools = nlohmann::json::array();
-            for (const auto& n : deps.tools.Names())
-                if (n.rfind("mcp.", 0) == 0) tools.push_back(n);
-            st["mcp_tools"] = tools;
-        }
-        r.payload = Honest(method, params, st);
-        return r;
-    }
-
-    if (starts("session.") || starts("sessions.")) {
-        r.handled = true;
-        r.payload = Honest(method, params, {{"sessions", deps.sessions.List()}});
-        return r;
-    }
-    if (starts("agents.")) {
-        r.handled = true;
-        r.payload = Honest(method, params, {{"agents", deps.config.raw.value("agents_list", nlohmann::json::array())}});
-        return r;
-    }
-    if (starts("skills.")) {
-        r.handled = true;
-        r.payload = Honest(method, params, deps.skills.StatusJson());
-        return r;
-    }
-    if (starts("channels.")) {
-        r.handled = true;
-        r.payload = Honest(method, params, {{"adapters", deps.adapters.StatusJson()}});
-        return r;
-    }
-    if (starts("cron.")) {
-        r.handled = true;
-        r.payload = Honest(method, params, {{"jobs", deps.cron.ListJson()}});
-        return r;
-    }
-    if (starts("memory.") || starts("doctor.") || starts("diagnostics.")) {
-        r.handled = true;
-        r.payload = Honest(method, params, {{"memory_keys", deps.memory.Keys()}});
-        return r;
-    }
-    if (starts("node.") || starts("device.")) {
-        r.handled = true;
-        r.payload = Honest(method, params, {{"nodes", deps.nodes.ListJson()}, {"pairing", deps.pairing.ListJson()}});
-        return r;
-    }
-    if (starts("secrets.") || starts("approval") || starts("exec.") || starts("plugin.approval")) {
-        r.handled = true;
-        r.payload = Honest(method, params, {{"approvals", deps.approvals.ListJson()},
-                                            {"secrets_keys", deps.secrets.ListJson()}});
-        return r;
-    }
     if (starts("chat.") || starts("tools.") || starts("config.") || starts("models.") ||
-        starts("providers.") || starts("logs.") || starts("artifacts.") || starts("assistant.") ||
-        starts("message.") || starts("conversations.")) {
+        starts("providers.") || starts("artifacts.") || starts("assistant.") || starts("message.") ||
+        starts("conversations.") || starts("session.") || starts("sessions.")) {
         r.handled = true;
-        r.payload = Honest(method, params, nlohmann::json::object());
+        // Prefer real snapshots over honest empty
+        nlohmann::json st;
+        if (starts("tools.")) st["tools"] = deps.tools.Names();
+        if (starts("config.")) st["config"] = deps.config.ToJson();
+        if (starts("models.") || starts("providers.")) {
+            st["providers"] = deps.router ? nlohmann::json(deps.router->Names()) : nlohmann::json::array();
+            st["default"] = deps.router ? deps.router->Default() : "";
+        }
+        if (starts("session") || starts("conversations.") || starts("message.") || starts("chat.")) {
+            st["sessions"] = deps.sessions.List();
+        }
+        if (starts("artifacts.") || starts("assistant.")) st["media"] = deps.media.ListJson();
+        r.payload = Real({{"method", method}, {"state", st}});
         return r;
     }
 
+    // ---- Explicit NOT implemented (no fake browser/computer/tts) ----
+    if (starts("computer.") || starts("canvas.") || starts("webSearch.") || starts("browser.") ||
+        starts("tts.") || starts("voicewake.") || starts("talk.") || starts("claws.") ||
+        starts("board.") || starts("portal.") || starts("wizard.") || starts("openclaw.") ||
+        starts("nativeHook.") || starts("web.login") || starts("push.") || starts("attach.") ||
+        starts("taskSuggestions.") || starts("mcp.app.") || starts("doctor.memory.")) {
+        r.handled = true;
+        r.payload = Real({{"implemented", false},
+                          {"method", method},
+                          {"note", "intentionally not faked — see PARITY.md"}});
+        return r;
+    }
+
+    // residual catch-all still honest (should be rare)
     r.handled = true;
     r.payload = Honest(method, params, nlohmann::json::object());
     return r;

@@ -3,7 +3,7 @@
 Upstream OpenClaw supports **ACP agents** (external coding harnesses via ACP/acpx).
 See upstream docs: `docs/tools/acp-agents.md`.
 
-## openclaw-cpp status (0.9.0-dev)
+## openclaw-cpp status (1.0.0-dev)
 
 | Piece | Status |
 |-------|--------|
