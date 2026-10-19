@@ -27,6 +27,7 @@ Registry MakeDefaultChannels() {
     Registry r;
     r.Register({"cli", "Local CLI chat entry (openclaw-cpp chat)", true});
     r.Register({"http", "Gateway HTTP /v1/chat/completions + /tools/invoke", true});
+    r.Register({"webhook", "HTTP inbound POST /api/channels/webhook/inbound", true});
     r.Register({"websocket", "Gateway WebSocket control plane (partial RPC)", true});
     r.Register({"telegram", "Telegram Bot API (TODO)", false});
     r.Register({"discord", "Discord gateway (TODO)", false});

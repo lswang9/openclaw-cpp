@@ -1,13 +1,17 @@
 #pragma once
 
+#include "openclaw/approvals/store.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/agent/loop.hpp"
+#include "openclaw/channels/adapter.hpp"
 #include "openclaw/channels/registry.hpp"
 #include "openclaw/config/config.hpp"
 #include "openclaw/cron/scheduler.hpp"
+#include "openclaw/memory/store.hpp"
 #include "openclaw/plugins/registry.hpp"
-#include "openclaw/provider/provider.hpp"
 #include "openclaw/provider/deepseek.hpp"
+#include "openclaw/provider/provider.hpp"
+#include "openclaw/secrets/store.hpp"
 #include "openclaw/session/store.hpp"
 #include "openclaw/skills/loader.hpp"
 #include "openclaw/tools/registry.hpp"
@@ -26,14 +30,18 @@ struct ServerOptions {
 
 struct ServerDeps {
     provider::Provider& provider;
-    provider::DeepSeekProvider* deepseek = nullptr;  // for streaming when available
+    provider::DeepSeekProvider* deepseek = nullptr;
     tools::Registry& tools;
     session::Store& sessions;
     channels::Registry& channels;
+    channels::AdapterHub& adapters;
     skills::Library& skills;
     plugins::Registry& plugins;
     cron::Scheduler& cron;
     auth::PairingStore& pairing;
+    approvals::Store& approvals;
+    secrets::Store& secrets;
+    memory::Store& memory;
     config::Snapshot config;
     auth::AuthConfig auth;
 };
@@ -57,6 +65,7 @@ private:
     void HandleChatCompletions(int client_fd, const nlohmann::json& body, bool stream);
     nlohmann::json DispatchRpc(const nlohmann::json& msg);
     nlohmann::json Stub(const std::string& method, const nlohmann::json& params);
+    std::string DeliverInbound(const channels::InboundMessage& msg);
 
     ServerOptions opts_;
     ServerDeps deps_;

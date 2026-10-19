@@ -4,7 +4,7 @@
 
 | 仓库 | 角色 | 状态 |
 |------|------|------|
-| **[openclaw-cpp](https://github.com/lswang9/openclaw-cpp)** | 核心：CLI、agent loop、provider、session、内嵌 Gateway 初版 | 活跃（0.3.0-dev） |
+| **[openclaw-cpp](https://github.com/lswang9/openclaw-cpp)** | 核心：CLI、agent loop、provider、session、内嵌 Gateway 初版 | 活跃（0.4.0-dev） |
 | **[openclaw-cpp-gateway](https://github.com/lswang9/openclaw-cpp-gateway)** | Gateway 深挖（HTTP/WS 协议、通道多路、鉴权）— 可从核心迁出 | README 占位 |
 | **[openclaw-cpp-tools](https://github.com/lswang9/openclaw-cpp-tools)** | 工具包 / skills / 执行器扩展 | README 占位 |
 

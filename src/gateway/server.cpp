@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #include <algorithm>
 #include <stdexcept>
 #include <cctype>
@@ -20,7 +21,7 @@
 namespace openclaw::gateway {
 namespace {
 
-constexpr const char* kVersion = "0.3.0-dev";
+constexpr const char* kVersion = "0.4.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -319,6 +320,22 @@ void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bo
     send(HttpResponse(200, "OK", resp.dump()));
 }
 
+
+std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
+    auto messages = deps_.sessions.Load(msg.session_key);
+    std::string content = msg.text;
+    if (!msg.sender.empty()) {
+        content = "[" + msg.channel + "/" + msg.sender + "] " + msg.text;
+    }
+    messages.push_back(agent::Message{.role = "user", .content = content});
+    auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, {.max_turns = 8});
+    if (result.ok) {
+        deps_.sessions.Save(msg.session_key, result.messages);
+        return result.final_text;
+    }
+    return std::string("error: ") + result.error;
+}
+
 void Server::HandleHttp(int client_fd, const std::string& req) {
     std::istringstream first(req);
     std::string method, path, version;
@@ -349,6 +366,9 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             {"sessions", deps_.sessions.List()},
             {"channels", deps_.channels.ListJson()},
             {"skills", deps_.skills.StatusJson()},
+            {"adapters", deps_.adapters.StatusJson()},
+            {"approvals_pending", deps_.approvals.ListJson("pending")},
+            {"secrets_keys", deps_.secrets.ListJson()},
             {"plugins", deps_.plugins.ListJson()},
             {"methods_advertised", AdvertisedMethodCount()},
             {"methods_implemented", ImplementedMethods()},
@@ -407,6 +427,44 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         }
         return;
     }
+    
+    if (method == "GET" && path == "/v1/adapters") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"adapters", deps_.adapters.StatusJson()}}.dump(2)));
+        return;
+    }
+    if (method == "GET" && path == "/v1/approvals") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"approvals", deps_.approvals.ListJson()}}.dump(2)));
+        return;
+    }
+    // POST /api/channels/<id>/inbound
+    if (method == "POST" && path.rfind("/api/channels/", 0) == 0 && path.size() > 14 &&
+        path.find("/inbound") != std::string::npos) {
+        try {
+            auto rest = path.substr(std::string("/api/channels/").size());
+            auto slash = rest.find('/');
+            std::string chan_id = slash == std::string::npos ? rest : rest.substr(0, slash);
+            auto* adapter = deps_.adapters.Get(chan_id);
+            if (!adapter) {
+                send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "unknown channel adapter"}, {"id", chan_id}}.dump()));
+                return;
+            }
+            auto* wh = dynamic_cast<channels::WebhookAdapter*>(adapter);
+            if (!wh) {
+                send(HttpResponse(400, "Bad Request",
+                                  nlohmann::json{{"error", "adapter does not support HTTP inbound"},
+                                                 {"id", chan_id},
+                                                 {"status", adapter->Status()}}.dump()));
+                return;
+            }
+            auto body = nlohmann::json::parse(BodyOf(req));
+            auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
+            send(HttpResponse(200, "OK", wh->HandleInbound(body, deliver).dump(2)));
+        } catch (const std::exception& e) {
+            send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", e.what()}}.dump()));
+        }
+        return;
+    }
+
     send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "not found"}, {"path", path}}.dump()));
 }
 
@@ -428,7 +486,8 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     if (method == "health" || method == "status" || method == "gateway.status" || method == "system.info") {
         return ok({{"runtime", "running"}, {"version", kVersion}, {"align_target", kAlign},
                    {"tools", deps_.tools.Names()}, {"sessions", deps_.sessions.List()},
-                   {"skills", deps_.skills.StatusJson()}, {"auth", deps_.auth.require_auth}});
+                   {"skills", deps_.skills.StatusJson()}, {"adapters", deps_.adapters.StatusJson()},
+                   {"auth", deps_.auth.require_auth}});
     }
     if (method == "connect") {
         return ok({{"protocol", 1}, {"server", "openclaw-cpp"}, {"version", kVersion}});
@@ -437,7 +496,8 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         return ok({{"methods", AdvertisedMethods()}, {"implemented", ImplementedMethods()}});
     }
     if (method == "events.list") return ok({{"events", AdvertisedEvents()}});
-    if (method == "tools.list" || method == "tools.catalog") {
+
+    if (method == "tools.list" || method == "tools.catalog" || method == "tools.effective") {
         return ok({{"tools", deps_.tools.Names()}, {"openai", deps_.tools.OpenAiToolsArray()}});
     }
     if (method == "tools.invoke") {
@@ -449,6 +509,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             return ok({{"tool", name}, {"result", nlohmann::json::parse(result)}});
         } catch (const std::exception& e) { return err(e.what()); }
     }
+
     if (method == "sessions.list") return ok({{"sessions", deps_.sessions.List()}});
     if (method == "sessions.get" || method == "sessions.preview" || method == "chat.history") {
         const std::string key = params.value("key", params.value("id", params.value("sessionKey", "")));
@@ -462,24 +523,57 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         deps_.sessions.Save(key, {});
         return ok({{"key", key}, {"created", true}});
     }
-    if (method == "sessions.delete" || method == "sessions.reset") {
+    if (method == "sessions.delete") {
         const std::string key = params.value("key", params.value("id", ""));
         if (key.empty()) return err("missing session key");
-        if (method == "sessions.reset") { deps_.sessions.Save(key, {}); return ok({{"key", key}, {"reset", true}}); }
         return ok({{"key", key}, {"removed", deps_.sessions.Remove(key)}});
     }
-    if (method == "chat.send") {
-        const std::string text = params.value("message", params.value("text", ""));
-        const std::string session_key = params.value("sessionKey", params.value("session_id", "default"));
-        if (text.empty()) return err("missing message");
-        auto messages = deps_.sessions.Load(session_key);
-        messages.push_back(agent::Message{.role = "user", .content = text});
-        auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, {.max_turns = 8});
-        if (!result.ok) return err(result.error);
-        deps_.sessions.Save(session_key, result.messages);
-        return ok({{"sessionKey", session_key}, {"text", result.final_text}, {"turns", result.turns}});
+    if (method == "sessions.reset" || method == "sessions.compact") {
+        const std::string key = params.value("key", params.value("id", ""));
+        if (key.empty()) return err("missing session key");
+        auto msgs = deps_.sessions.Load(key);
+        if (method == "sessions.compact" && msgs.size() > 4) {
+            // keep system + last 3
+            std::vector<agent::Message> kept;
+            if (!msgs.empty() && msgs.front().role == "system") kept.push_back(msgs.front());
+            auto start = msgs.size() > 3 ? msgs.size() - 3 : 0;
+            for (size_t i = start; i < msgs.size(); ++i) kept.push_back(msgs[i]);
+            deps_.sessions.Save(key, kept);
+            return ok({{"key", key}, {"compacted", true}, {"messages", kept.size()}});
+        }
+        deps_.sessions.Save(key, {});
+        return ok({{"key", key}, {"reset", true}});
     }
-    if (method == "chat.abort") return ok({{"aborted", true}, {"note", "no active run to abort in single-threaded stub"}});
+    if (method == "sessions.patch") {
+        const std::string key = params.value("key", params.value("id", ""));
+        if (key.empty()) return err("missing session key");
+        if (params.contains("messages") && params["messages"].is_array()) {
+            std::vector<agent::Message> msgs;
+            for (const auto& m : params["messages"]) msgs.push_back(agent::Message::FromJson(m));
+            deps_.sessions.Save(key, msgs);
+        }
+        return ok({{"key", key}, {"patched", true}});
+    }
+    if (method == "sessions.subscribe") {
+        return ok({{"subscribed", true}, {"key", params.value("key", "")}, {"note", "event push not yet multiplexed"}});
+    }
+    if (method == "sessions.send" || method == "chat.send" || method == "chat.inject") {
+        const std::string text = params.value("message", params.value("text", ""));
+        const std::string session_key = params.value("sessionKey", params.value("session_id", params.value("key", "default")));
+        if (text.empty()) return err("missing message");
+        channels::InboundMessage im;
+        im.channel = "rpc";
+        im.sender = params.value("sender", "user");
+        im.text = text;
+        im.session_key = session_key;
+        auto reply = DeliverInbound(im);
+        if (reply.rfind("error:", 0) == 0) return err(reply.substr(6));
+        return ok({{"sessionKey", session_key}, {"text", reply}});
+    }
+    if (method == "chat.abort") {
+        return ok({{"aborted", true}, {"note", "no active run to abort in single-threaded stub"}});
+    }
+
     if (method == "config.get") return ok(deps_.config.ToJson());
     if (method == "config.schema") {
         return ok({{"type", "object"},
@@ -488,25 +582,108 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
                      {"agents", {{"type", "object"}}},
                      {"session_dir", {{"type", "string"}}}}}});
     }
-    if (method == "channels.status") return ok({{"channels", deps_.channels.ListJson()}});
+    if (method == "config.set" || method == "config.apply" || method == "config.patch") {
+        if (params.contains("gateway")) {
+            deps_.config.gateway_host = params["gateway"].value("host", deps_.config.gateway_host);
+            deps_.config.gateway_port = static_cast<std::uint16_t>(
+                params["gateway"].value("port", deps_.config.gateway_port));
+        }
+        if (params.contains("agents") && params["agents"].contains("defaults")) {
+            deps_.config.deepseek_model =
+                params["agents"]["defaults"].value("model", deps_.config.deepseek_model);
+        }
+        if (params.contains("session_dir")) {
+            deps_.config.session_dir = params.value("session_dir", deps_.config.session_dir);
+        }
+        deps_.config.raw.merge_patch(params);
+        config::Save(config::DefaultPath(), deps_.config);
+        return ok({{"saved", true}, {"config", deps_.config.ToJson()}});
+    }
+
+    if (method == "channels.status") {
+        return ok({{"channels", deps_.channels.ListJson()}, {"adapters", deps_.adapters.StatusJson()}});
+    }
+    if (method == "channels.start" || method == "channels.stop") {
+        const std::string cid = params.value("id", params.value("channel", ""));
+        auto* a = deps_.adapters.Get(cid);
+        if (!a) return err("unknown adapter: " + cid);
+        a->SetEnabled(method == "channels.start");
+        return ok({{"id", cid}, {"enabled", a->Enabled()}, {"status", a->Status()}});
+    }
     if (method == "channels.pairing.list" || method == "node.pair.list" || method == "device.pair.list") {
         return ok({{"pairing", deps_.pairing.ListJson()}});
     }
     if (method == "channels.pairing.approve") {
-        const std::string id = params.value("id", "");
-        return ok({{"approved", deps_.pairing.Approve(id)}, {"id", id}});
+        return ok({{"approved", deps_.pairing.Approve(params.value("id", ""))}});
     }
     if (method == "channels.pairing.dismiss") {
-        const std::string id = params.value("id", "");
-        return ok({{"dismissed", deps_.pairing.Dismiss(id)}, {"id", id}});
+        return ok({{"dismissed", deps_.pairing.Dismiss(params.value("id", ""))}});
     }
+
+    // agents (in-memory via config.raw["agents_list"])
     if (method == "agents.list") {
+        if (deps_.config.raw.contains("agents_list")) {
+            return ok({{"agents", deps_.config.raw["agents_list"]}});
+        }
         return ok({{"agents", nlohmann::json::array({{{"id", "main"}, {"model", deps_.config.deepseek_model}}})}});
     }
+    if (method == "agents.create") {
+        auto id = params.value("id", "agent-" + std::to_string(deps_.config.raw.value("agents_list", nlohmann::json::array()).size() + 1));
+        if (!deps_.config.raw.contains("agents_list")) deps_.config.raw["agents_list"] = nlohmann::json::array();
+        deps_.config.raw["agents_list"].push_back({{"id", id}, {"model", params.value("model", deps_.config.deepseek_model)}});
+        config::Save(config::DefaultPath(), deps_.config);
+        return ok({{"created", true}, {"id", id}});
+    }
+    if (method == "agents.update") {
+        auto id = params.value("id", "");
+        if (!deps_.config.raw.contains("agents_list")) return err("no agents");
+        for (auto& a : deps_.config.raw["agents_list"]) {
+            if (a.value("id", "") == id) {
+                if (params.contains("model")) a["model"] = params["model"];
+                config::Save(config::DefaultPath(), deps_.config);
+                return ok({{"updated", true}, {"agent", a}});
+            }
+        }
+        return err("agent not found");
+    }
+    if (method == "agents.delete") {
+        auto id = params.value("id", "");
+        if (!deps_.config.raw.contains("agents_list")) return err("no agents");
+        auto& arr = deps_.config.raw["agents_list"];
+        nlohmann::json next = nlohmann::json::array();
+        for (auto& a : arr) if (a.value("id", "") != id) next.push_back(a);
+        arr = next;
+        config::Save(config::DefaultPath(), deps_.config);
+        return ok({{"deleted", id}});
+    }
+
     if (method == "skills.status" || method == "skills.library.list") {
         return ok(deps_.skills.StatusJson());
     }
+    if (method == "skills.library.read" || method == "skills.detail") {
+        auto name = params.value("name", params.value("id", ""));
+        auto s = deps_.skills.Find(name);
+        if (!s) return err("skill not found: " + name);
+        return ok({{"name", s->name}, {"description", s->description}, {"path", s->path.string()},
+                   {"body", s->body.substr(0, 4000)}});
+    }
+    if (method == "skills.search") {
+        auto q = params.value("q", params.value("query", ""));
+        nlohmann::json hits = nlohmann::json::array();
+        for (const auto& s : deps_.skills.List()) {
+            if (q.empty() || s.name.find(q) != std::string::npos ||
+                s.description.find(q) != std::string::npos) {
+                hits.push_back({{"name", s.name}, {"description", s.description}});
+            }
+        }
+        return ok({{"hits", hits}});
+    }
     if (method == "plugins.list") return ok({{"plugins", deps_.plugins.ListJson()}});
+    if (method == "plugins.setEnabled") {
+        return ok({{"stub", true}, {"note", "plugin enable persists after plugin.json writer lands"},
+                   {"id", params.value("id", "")}, {"enabled", params.value("enabled", false)}});
+    }
+
     if (method == "cron.list" || method == "cron" || method == "cron.runs") {
         return ok({{"jobs", deps_.cron.ListJson()}});
     }
@@ -519,18 +696,82 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         deps_.cron.Add(j);
         return ok({{"added", true}, {"job", {{"id", j.id}, {"cron", j.cron_expr}}}});
     }
+    if (method == "cron.update") {
+        cron::Job j;
+        j.id = params.value("id", "");
+        j.cron_expr = params.value("cron", params.value("expr", "* * * * *"));
+        j.payload = params.value("payload", "");
+        j.enabled = params.value("enabled", true);
+        if (!deps_.cron.Update(j.id, j)) return err("cron job not found");
+        return ok({{"updated", true}, {"id", j.id}});
+    }
     if (method == "cron.remove") {
         return ok({{"removed", deps_.cron.Remove(params.value("id", ""))}});
     }
-    if (method == "memory.get") {
-        // via tools process-local is separate; report session dir hint
-        return ok(Stub(method, params));
-    }
-    if (method == "memory.status" || method == "memory.search") {
-        return ok({{"stub", true}, {"method", method}, {"note", "use CLI memory / memory_* tools"}});
+    if (method == "cron.run") {
+        auto fired = deps_.cron.Tick(std::chrono::system_clock::now());
+        return ok({{"fired", fired}, {"jobs", deps_.cron.ListJson()}});
     }
 
-    // Advertised but not implemented: structured stub (keeps clients progressing)
+    if (method == "memory.get") {
+        auto key = params.value("key", "");
+        auto v = deps_.memory.Get(key);
+        if (!v) return ok({{"found", false}, {"key", key}});
+        return ok({{"found", true}, {"key", key}, {"value", *v}});
+    }
+    if (method == "memory.status") {
+        return ok({{"keys", deps_.memory.Keys()}, {"count", deps_.memory.Keys().size()}});
+    }
+    if (method == "memory.search") {
+        auto q = params.value("q", params.value("query", ""));
+        nlohmann::json hits = nlohmann::json::array();
+        for (const auto& k : deps_.memory.Keys()) {
+            auto v = deps_.memory.Get(k);
+            if (!v) continue;
+            if (q.empty() || k.find(q) != std::string::npos || v->find(q) != std::string::npos) {
+                hits.push_back({{"key", k}, {"value", *v}});
+            }
+        }
+        return ok({{"hits", hits}});
+    }
+
+    // approvals
+    if (method == "approval.list" || method == "exec.approval.list" || method == "plugin.approval.list") {
+        return ok({{"approvals", deps_.approvals.ListJson(params.value("status", ""))}});
+    }
+    if (method == "approval.get") {
+        return ok(deps_.approvals.GetJson(params.value("id", "")));
+    }
+    if (method == "approval.resolve" || method == "exec.approval.resolve" || method == "plugin.approval.resolve") {
+        bool approve = params.value("approve", params.value("decision", "approve") == std::string("approve"));
+        return ok({{"resolved", deps_.approvals.Resolve(params.value("id", ""), approve)}});
+    }
+    if (method == "exec.approval.request" || method == "plugin.approval.request") {
+        std::string kind = method.find("plugin") != std::string::npos ? "plugin" : "exec";
+        auto id = deps_.approvals.Create(kind, params.value("summary", params.dump()));
+        return ok({{"id", id}, {"status", "pending"}});
+    }
+
+    // secrets (never return raw values in list)
+    if (method == "secrets.store.list" || method == "secrets.reload") {
+        return ok({{"keys", deps_.secrets.ListJson()}});
+    }
+    if (method == "secrets.store.set") {
+        auto key = params.value("key", "");
+        auto value = params.value("value", "");
+        if (key.empty()) return err("missing key");
+        deps_.secrets.Set(key, value);
+        return ok({{"set", true}, {"key", key}});
+    }
+    if (method == "secrets.store.delete") {
+        return ok({{"deleted", deps_.secrets.Delete(params.value("key", ""))}});
+    }
+
+    if (method == "mcp.app.listTools") {
+        return ok({{"tools", nlohmann::json::array()},
+                   {"note", "use embedded mcp::Client against an MCP server; gateway bridge TODO"}});
+    }
+
     const auto advertised = AdvertisedMethods();
     if (std::find(advertised.begin(), advertised.end(), method) != advertised.end()) {
         return ok(Stub(method, params));

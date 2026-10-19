@@ -1,6 +1,10 @@
 #include "openclaw/agent/loop.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/channels/registry.hpp"
+#include "openclaw/mcp/client.hpp"
+#include "openclaw/secrets/store.hpp"
+#include "openclaw/approvals/store.hpp"
+#include "openclaw/channels/adapter.hpp"
 #include "openclaw/config/config.hpp"
 #include "openclaw/cron/scheduler.hpp"
 #include "openclaw/gateway/methods.hpp"
@@ -27,7 +31,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.3.0-dev";
+constexpr const char* kVersion = "0.4.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -145,6 +149,60 @@ int CmdSelfTest() {
     if (channels::MakeDefaultChannels().List().size() < 3) { std::cerr << "FAIL channels\n"; ++failures; }
     else std::cerr << "PASS channels\n";
 
+    // webhook adapter
+    {
+        auto hub = channels::AdapterHub::MakeDefault();
+        auto* wh = dynamic_cast<channels::WebhookAdapter*>(hub.Get("webhook"));
+        if (!wh) { std::cerr << "FAIL webhook adapter\n"; ++failures; }
+        else {
+            auto out = wh->HandleInbound({{"text", "hi"}, {"sender", "t"}},
+                                         [](const channels::InboundMessage& m) { return std::string("got:") + m.text; });
+            if (!out.value("ok", false) || out.value("reply", "") != "got:hi") {
+                std::cerr << "FAIL webhook inbound " << out.dump() << "\n"; ++failures;
+            } else std::cerr << "PASS webhook inbound\n";
+        }
+        if (!hub.Get("telegram") || hub.Get("telegram")->Enabled()) {
+            std::cerr << "FAIL telegram stub\n"; ++failures;
+        } else std::cerr << "PASS im stubs\n";
+    }
+
+    // MCP mock client
+    {
+        std::string last_write;
+        std::string next_read;
+        mcp::Client client(
+            [&](const std::string& line) { next_read = mcp::Client::MockServerHandle(nlohmann::json::parse(line)).dump(); },
+            [&]() { return next_read; });
+        if (!client.Initialize()) { std::cerr << "FAIL mcp init\n"; ++failures; }
+        else {
+            auto tools = client.ListTools();
+            if (tools.empty() || tools[0].name != "mock_echo") {
+                std::cerr << "FAIL mcp tools\n"; ++failures;
+            } else {
+                auto call = client.CallTool("mock_echo", {{"x", 1}});
+                if (!call.contains("content")) { std::cerr << "FAIL mcp call\n"; ++failures; }
+                else std::cerr << "PASS mcp client\n";
+            }
+        }
+    }
+
+    // approvals + secrets
+    {
+        approvals::Store ap;
+        auto id = ap.Create("exec", "rm -rf /");
+        if (!ap.Resolve(id, false) || ap.List("rejected").size() != 1) {
+            std::cerr << "FAIL approvals\n"; ++failures;
+        } else std::cerr << "PASS approvals\n";
+        auto sp = std::filesystem::temp_directory_path() / "oc-sec-test.json";
+        secrets::Store sec(sp);
+        sec.Set("k", "v");
+        if (!sec.Get("k") || *sec.Get("k") != "v" || sec.ListJson().empty()) {
+            std::cerr << "FAIL secrets\n"; ++failures;
+        } else std::cerr << "PASS secrets\n";
+        std::filesystem::remove(sp);
+    }
+
+
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
     return 1;
@@ -195,14 +253,17 @@ int CmdGateway(int argc, char** argv, int argi) {
     std::string api_key = EnvOr("DEEPSEEK_API_KEY", "missing");
     auto tools = tools::MakeDefaultRegistry();
     auto channels = channels::MakeDefaultChannels();
+    auto adapters = channels::AdapterHub::MakeDefault();
     auto skills = LoadSkills();
     plugins::Registry plugins;
     plugins.Scan(RepoRoot() / "plugins");
     cron::Scheduler cron;
     auth::PairingStore pairing;
-    // demo pending pair
     pairing.Add({.id = "pair-demo", .channel = "cli", .code = "ABC123", .sender = "local"});
+    approvals::Store approvals;
     session::Store sessions(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
+    memory::Store memory(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
+    secrets::Store secrets(std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "secrets.json");
     auto cfg = config::LoadOrDefault(config::DefaultPath());
     cfg.gateway_host = opts.bind_host;
     cfg.gateway_port = opts.port;
@@ -214,10 +275,14 @@ int CmdGateway(int argc, char** argv, int argi) {
         .tools = tools,
         .sessions = sessions,
         .channels = channels,
+        .adapters = adapters,
         .skills = skills,
         .plugins = plugins,
         .cron = cron,
         .pairing = pairing,
+        .approvals = approvals,
+        .secrets = secrets,
+        .memory = memory,
         .config = cfg,
         .auth = auth::FromEnv(),
     };

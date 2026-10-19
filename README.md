@@ -1,45 +1,37 @@
 # openclaw-cpp
 
-OpenClaw 的 **C++ 全量重写**（非 Node 包装）。对齐目标：**OpenClaw 2026.10.5**。
+OpenClaw **C++ 全量重写**（非 Node 包装）。对齐：**OpenClaw 2026.10.5**。
 
-**当前：0.3.0-dev — 未宣称全量对齐。** 进度见 [PARITY.md](PARITY.md)，系列见 [SERIES.md](SERIES.md)。
+**0.4.0-dev — 未宣称全量对齐。** 见 [PARITY.md](PARITY.md) · [SERIES.md](SERIES.md)。
 
-## 亮点（0.3.0-dev）
+## 0.4.0-dev 摘要
 
-- Gateway 广告上游 **516** methods / **62** events；**36** 个已实现或半实现
-- 可选网关鉴权：`OPENCLAW_GATEWAY_TOKEN`（Bearer / `X-OpenClaw-Token`）
-- Skills：加载 `SKILL.md`（含 frontmatter）；示例 `skills/examples/hello-skill`
-- Streaming：`POST /v1/chat/completions` + `"stream": true` → SSE
-- Cron：5 字段表达式 + `openclaw-cpp cron-daemon`
-- Agent loop、session、tools、channels/config/plugins 骨架
+- Gateway：**516** methods 广告 / **72** 实现
+- **Channel adapters**：`webhook` HTTP 入站 → agent loop；telegram/discord/slack/feishu/whatsapp stubs
+- **MCP client** 骨架（stdio JSON-RPC + mock self-test）
+- **Approvals / secrets** stores + RPC
+- Auth、skills、streaming、cron eval（延续 0.3）
 
-## 构建（Conan）
+## 构建
 
 ```bash
 conan install . --output-folder=build --build=missing -s build_type=Release -s compiler.cppstd=20
-cmake --preset conan-release
-cmake --build --preset conan-release -j
+cmake --preset conan-release && cmake --build --preset conan-release -j
 ./build/build/Release/openclaw-cpp self-test
 ```
 
-## 常用命令
+## Webhook 入站示例
 
 ```bash
-./build/build/Release/openclaw-cpp status
-./build/build/Release/openclaw-cpp skills
-./build/build/Release/openclaw-cpp methods
 ./build/build/Release/openclaw-cpp gateway --port 18789
-# 鉴权示例：
-# export OPENCLAW_GATEWAY_TOKEN=secret
-# curl -H "Authorization: Bearer secret" http://127.0.0.1:18789/v1/status
+curl -sS -X POST http://127.0.0.1:18789/api/channels/webhook/inbound \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"hello","sender":"alice","session_key":"demo"}'
 ```
 
 | 变量 | 说明 |
 |------|------|
-| `DEEPSEEK_API_KEY` | chat / stream 需要 |
-| `OPENCLAW_GATEWAY_TOKEN` | 非空则启用 Gateway HTTP/WS 鉴权 |
-| `OPENCLAW_SKILLS_DIR` | 额外 skills 扫描根目录 |
-| `OPENCLAW_SESSION_DIR` | 会话/记忆目录 |
-| `OPENCLAW_CRON_DEMO_SECONDS` | cron-daemon 短跑演示秒数 |
-
-Sibling：`openclaw-cpp-gateway`、`openclaw-cpp-tools`（占位，实现仍在本仓）。
+| `DEEPSEEK_API_KEY` | chat / webhook→LLM |
+| `OPENCLAW_GATEWAY_TOKEN` | 启用鉴权 |
+| `OPENCLAW_SKILLS_DIR` | 额外 skills 根 |
+| `OPENCLAW_SESSION_DIR` | 会话与 memory |

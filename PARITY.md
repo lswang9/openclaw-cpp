@@ -1,36 +1,35 @@
 # OpenClaw 2026.10.5 → openclaw-cpp 对齐表
 
-目标：用 **C++20 + Conan** 全量重写官方 OpenClaw **2026.10.5** 行为（非 Node 包装）。
-**不宣称已完成全量对齐。** 当前版本：**0.3.0-dev**。
+目标：用 **C++20 + Conan** 全量重写官方 OpenClaw **2026.10.5**（非 Node 包装）。
+**不宣称全量对齐。** 当前：**0.4.0-dev**。
 
 | 上游模块 | C++ 状态 | 备注 |
 |----------|----------|------|
-| Gateway method catalog | **部分** | 广告 **516** 个上游方法名；**36** 个有真实/半真实实现；其余返回结构化 `stub` |
-| Gateway events catalog | **部分** | 广告 **62** 个上游事件名；目前主要发 `connect.challenge` |
-| Gateway HTTP | **部分** | `/health` `/v1/status|models|methods|channels|config|skills` `/v1/chat/completions` `/tools/invoke` |
-| Gateway WebSocket | **部分** | Upgrade + DispatchRpc；未实现方法 → structured stub |
-| Streaming chat | **部分** | `POST /v1/chat/completions` + `stream:true` → SSE（DeepSeek）；需 API key/余额 |
-| Auth | **部分** | `OPENCLAW_GATEWAY_TOKEN` → Bearer / `X-OpenClaw-Token`；`/health` 豁免 |
-| Pairing | **骨架** | in-memory PairingStore；`channels.pairing.*` / `node.pair.list` / `device.pair.list` |
-| Agent loop + tools | **部分** | tool_calls 循环；`echo` `time_now` `memory_*` |
-| Provider DeepSeek | **部分** | sync + stream；402/401/429 |
-| Session store | **部分** | JSON 文件；sessions.create/get/list/delete/reset/preview |
-| Skills | **部分** | 扫描 `*/SKILL.md` frontmatter；示例 `skills/examples/hello-skill` |
-| Plugins | **骨架** | 扫描 `plugins/*/plugin.json` |
-| Channels | **骨架** | registry（cli/http/ws 启用；IM 适配器 TODO） |
-| Config | **骨架** | JSON load/save；`config.get` / `config.schema` |
-| Memory | **骨架** | JSON KV + tools；`memory.*` RPC 多为 stub |
-| Cron | **部分** | 5 字段表达式匹配 + Tick 去重 + `cron-daemon`；`cron.add/remove/list` |
-| Agents | **骨架** | `agents.list` 返回 main |
-| Control UI / Nodes / MCP / Media / ACP | TODO | |
-| Secrets / Approvals / Daemon install | TODO | |
+| Gateway method catalog | **部分** | 广告 **516**；**实现 72**（含 sessions/chat/agents/skills/cron/config/approvals/secrets/channels.*）；其余 structured stub |
+| Gateway events | **部分** | 广告 62；主要 `connect.challenge` |
+| Gateway HTTP/WS | **部分** | 既有 REST + WS RPC；新增 `/api/channels/{id}/inbound`、`/v1/adapters`、`/v1/approvals` |
+| Streaming chat | **部分** | SSE `stream:true` |
+| Auth | **部分** | `OPENCLAW_GATEWAY_TOKEN` |
+| Pairing | **骨架** | in-memory + pairing RPCs |
+| Channel adapters | **部分** | **WebhookAdapter** 真入站→agent loop；telegram/discord/slack/feishu/whatsapp = StubAdapter+TODO |
+| Agent loop + tools | **部分** | tool_calls；echo/time_now/memory_* |
+| Provider DeepSeek | **部分** | sync+stream；402 等 |
+| Session | **部分** | create/get/list/delete/reset/compact/patch/send/subscribe |
+| Skills | **部分** | SKILL.md 扫描；list/read/detail/search |
+| Plugins | **骨架** | 目录扫描；setEnabled stub |
+| Agents | **部分** | list/create/update/delete（持久化到 config.raw） |
+| Config | **部分** | get/set/apply/patch/schema + 落盘 |
+| Memory | **部分** | get/status/search 真读 Store |
+| Cron | **部分** | add/update/remove/list/run + 表达式 Tick |
+| Approvals | **部分** | approval/exec/plugin.approval list/request/resolve |
+| Secrets | **部分** | secrets.store list/set/delete（仅列 key，不回显 value） |
+| MCP | **骨架** | `mcp::Client` stdio JSON-RPC + mock self-test；gateway `mcp.app.listTools` 占位 |
+| Control UI / Nodes / Media / ACP | TODO | |
 
 ## 里程碑
 
-1. ~~CLI → DeepSeek~~
-2. ~~Agent loop + Gateway HTTP/WS 初版~~
-3. ~~Channels/config/memory/cron 骨架~~
-4. **进行中 (0.3.0-dev)**：完整方法目录广告、auth、skills、streaming、cron eval
-5. 下一刀：真实 channel 适配器、更多 RPC 实装、secrets/approvals、Control UI 协议
+1. ~~第一刀 DeepSeek CLI~~ → ~~agent/gateway 0.2~~ → ~~0.3 catalog/auth/skills/stream/cron~~
+2. **0.4.0-dev（本切片）**：RPC 深化至 72、channel adapter 框架+webhook 入站、MCP client、approvals/secrets
+3. 下一刀：真实 IM 适配器、MCP↔tools 桥、事件推送、secrets 加密、更多 RPC 实装
 
-详见 [SERIES.md](SERIES.md)。
+Sibling 仓仍为占位；实现集中在本仓。
