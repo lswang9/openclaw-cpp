@@ -1,5 +1,7 @@
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/gateway/methods.hpp"
+#include "openclaw/logging/tail.hpp"
+#include "openclaw/context/assemble.hpp"
 #include "openclaw/config/validate.hpp"
 #include "openclaw/channels/outbound.hpp"
 #include <thread>
@@ -27,7 +29,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "0.5.0-dev";
+constexpr const char* kVersion = "0.6.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -337,6 +339,7 @@ void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bo
 
 
 void Server::Emit(const std::string& event, const nlohmann::json& payload) {
+    deps_.logs.Append("event", event);
     deps_.bus.Emit(event, payload);
     const auto frame_payload = nlohmann::json{{"type", "event"}, {"event", event}, {"payload", payload}}.dump();
     auto make_frame = [](const std::string& payload) {
@@ -368,9 +371,13 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     messages.push_back(agent::Message{.role = "user", .content = content});
     Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "user"}, {"text", msg.text},
                              {"channel", msg.channel}, {"sender", msg.sender}});
-    auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, {.max_turns = 8});
+    context::AssembleOptions aopts;
+    aopts.system_prompt = deps_.system_prompt;
+    auto assembled = context::Assemble(messages, aopts);
+    auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, assembled, {.max_turns = 8});
     if (result.ok) {
         deps_.sessions.Save(msg.session_key, result.messages);
+        deps_.logs.Append("info", "chat ok session=" + msg.session_key);
         Emit("chat", {{"sessionKey", msg.session_key}, {"text", result.final_text}, {"turns", result.turns}});
         Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "assistant"}, {"text", result.final_text}});
         return result.final_text;
@@ -558,9 +565,16 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     if (method == "sessions.get" || method == "sessions.preview" || method == "chat.history") {
         const std::string key = params.value("key", params.value("id", params.value("sessionKey", "")));
         if (key.empty()) return err("missing session key");
+        auto all = deps_.sessions.Load(key);
+        const std::size_t limit = params.value("limit", params.value("page_size", 50));
+        const std::size_t offset = params.value("offset", 0);
         nlohmann::json msgs = nlohmann::json::array();
-        for (const auto& m : deps_.sessions.Load(key)) msgs.push_back(m.ToJson());
-        return ok({{"key", key}, {"messages", msgs}});
+        for (std::size_t i = offset; i < all.size() && msgs.size() < limit; ++i) {
+            msgs.push_back(all[i].ToJson());
+        }
+        return ok({{"key", key}, {"messages", msgs}, {"total", all.size()},
+                   {"offset", offset}, {"limit", limit},
+                   {"has_more", offset + msgs.size() < all.size()}});
     }
     if (method == "sessions.create") {
         const std::string key = params.value("key", params.value("id", "session-" + std::to_string(deps_.sessions.List().size() + 1)));
@@ -576,14 +590,12 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         const std::string key = params.value("key", params.value("id", ""));
         if (key.empty()) return err("missing session key");
         auto msgs = deps_.sessions.Load(key);
-        if (method == "sessions.compact" && msgs.size() > 4) {
-            // keep system + last 3
-            std::vector<agent::Message> kept;
-            if (!msgs.empty() && msgs.front().role == "system") kept.push_back(msgs.front());
-            auto start = msgs.size() > 3 ? msgs.size() - 3 : 0;
-            for (size_t i = start; i < msgs.size(); ++i) kept.push_back(msgs[i]);
+        if (method == "sessions.compact") {
+            const std::size_t keep = params.value("keep_recent", 24);
+            auto kept = context::Compact(msgs, keep);
             deps_.sessions.Save(key, kept);
-            return ok({{"key", key}, {"compacted", true}, {"messages", kept.size()}});
+            deps_.logs.Append("info", "compacted session " + key);
+            return ok({{"key", key}, {"compacted", true}, {"before", msgs.size()}, {"messages", kept.size()}});
         }
         deps_.sessions.Save(key, {});
         return ok({{"key", key}, {"reset", true}});
@@ -599,9 +611,14 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         return ok({{"key", key}, {"patched", true}});
     }
     if (method == "sessions.subscribe" || method == "sessions.messages.subscribe") {
+        events::SubFilter filt;
+        const std::string key = params.value("key", params.value("sessionKey", ""));
+        if (!key.empty()) filt.session_key = key;
+        if (params.contains("event")) filt.event_name = params.value("event", "");
         return ok({{"subscribed", true},
-                   {"key", params.value("key", "")},
-                   {"recent", deps_.bus.Recent(16)},
+                   {"key", key},
+                   {"filter", {{"sessionKey", key}, {"event", params.value("event", "")}}},
+                   {"recent", deps_.bus.Recent(16, filt)},
                    {"listeners", deps_.bus.ListenerCount()}});
     }
     if (method == "sessions.send" || method == "chat.send" || method == "chat.inject") {
@@ -834,6 +851,41 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
 
 
+
+
+    // agents.files
+    if (method == "agents.files.list") {
+        const std::string aid = params.value("agentId", params.value("id", "main"));
+        return ok({{"agentId", aid}, {"files", deps_.agent_files.ListJson(aid)}});
+    }
+    if (method == "agents.files.get") {
+        const std::string aid = params.value("agentId", params.value("id", "main"));
+        const std::string name = params.value("name", params.value("path", ""));
+        auto v = deps_.agent_files.Get(aid, name);
+        if (!v) return err("file not found");
+        return ok({{"agentId", aid}, {"name", name}, {"content", *v}});
+    }
+    if (method == "agents.files.set") {
+        const std::string aid = params.value("agentId", params.value("id", "main"));
+        const std::string name = params.value("name", params.value("path", ""));
+        const std::string content = params.value("content", params.value("text", ""));
+        if (name.empty()) return err("missing name");
+        deps_.agent_files.Set(aid, name, content);
+        return ok({{"agentId", aid}, {"name", name}, {"saved", true}});
+    }
+
+    // device pairing deepen
+    if (method == "device.pair.approve") {
+        return ok({{"approved", deps_.pairing.Approve(params.value("id", ""))}});
+    }
+    if (method == "device.pair.reject" || method == "device.pair.remove") {
+        return ok({{"removed", deps_.pairing.Dismiss(params.value("id", ""))}});
+    }
+
+    if (method == "logs.tail") {
+        const std::size_t n = params.value("n", params.value("limit", 100));
+        return ok({{"lines", deps_.logs.Tail(n)}, {"size", deps_.logs.Size()}});
+    }
 
     // nodes
     if (method == "node.list") return ok({{"nodes", deps_.nodes.ListJson()}});

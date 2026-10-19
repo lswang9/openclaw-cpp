@@ -1,5 +1,6 @@
 #pragma once
 
+#include "openclaw/agent/files.hpp"
 #include "openclaw/approvals/store.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/agent/loop.hpp"
@@ -9,6 +10,7 @@
 #include "openclaw/config/config.hpp"
 #include "openclaw/cron/scheduler.hpp"
 #include "openclaw/events/bus.hpp"
+#include "openclaw/logging/tail.hpp"
 #include "openclaw/media/store.hpp"
 #include "openclaw/memory/store.hpp"
 #include "openclaw/nodes/registry.hpp"
@@ -51,8 +53,11 @@ struct ServerDeps {
     nodes::Registry& nodes;
     media::Store& media;
     events::Bus& bus;
+    agent::FileStore& agent_files;
+    logging::TailBuffer& logs;
     config::Snapshot config;
     auth::AuthConfig auth;
+    std::string system_prompt = "You are OpenClaw (C++ rewrite). Be concise and helpful.";
 };
 
 class Server {
@@ -81,8 +86,6 @@ private:
     ServerDeps deps_;
     std::atomic<bool> running_{false};
     int listen_fd_ = -1;
-
-    // WS fan-out: fds subscribed to events (best-effort; single-threaded accept loop).
     std::mutex ws_mu_;
     std::set<int> ws_clients_;
 };

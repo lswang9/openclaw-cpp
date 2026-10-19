@@ -23,6 +23,10 @@
 #include "openclaw/skills/loader.hpp"
 #include "openclaw/tools/registry.hpp"
 #include "openclaw/util.hpp"
+#include "openclaw/agent/files.hpp"
+#include "openclaw/logging/tail.hpp"
+#include "openclaw/context/assemble.hpp"
+#include "openclaw/mcp/stdio.hpp"
 
 #include <curl/curl.h>
 
@@ -37,7 +41,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.5.0-dev";
+constexpr const char* kVersion = "0.6.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -59,7 +63,7 @@ std::string ReadStdin() {
 void PrintUsage() {
     std::cerr
         << "openclaw-cpp " << kVersion << " — align OpenClaw 2026.10.5\n"
-        << "  chat [-s SESSION] <msg> | gateway [--port N] | cron-daemon | self-test\n"
+        << "  chat [-s SESSION] <msg> | gateway [--port N] | cron-daemon | mcp-mock-server | self-test\n"
         << "  status | tools | channels | config | methods | skills | memory | cron\n";
 }
 
@@ -276,6 +280,79 @@ int CmdSelfTest() {
         else std::cerr << "PASS config validate\n";
     }
 
+
+    // context assemble + compact
+    {
+        std::vector<agent::Message> hist;
+        hist.push_back({.role = "user", .content = "u1"});
+        hist.push_back({.role = "assistant", .content = "a1"});
+        hist.push_back({.role = "tool", .content = std::string(5000, 'x'), .tool_call_id = "t1"});
+        hist.push_back({.role = "assistant", .content = "a2"});
+        context::AssembleOptions o;
+        o.system_prompt = "sys";
+        o.keep_recent = 2;
+        o.max_tool_result_chars = 100;
+        auto assembled = context::Assemble(hist, o);
+        bool has_sys = !assembled.empty() && assembled.front().role == "system";
+        auto compacted = context::Compact(hist, 2);
+        if (!has_sys || compacted.size() > 3) {
+            std::cerr << "FAIL context assemble/compact\n"; ++failures;
+        } else std::cerr << "PASS context assemble/compact\n";
+    }
+
+    // event bus session filter
+    {
+        events::Bus bus;
+        int hits = 0;
+        events::SubFilter f; f.session_key = "s1";
+        bus.Subscribe([&](const std::string&, const nlohmann::json&) { ++hits; }, f);
+        bus.Emit("chat", {{"sessionKey", "s2"}});
+        bus.Emit("chat", {{"sessionKey", "s1"}});
+        if (hits != 1) { std::cerr << "FAIL bus filter hits=" << hits << "\n"; ++failures; }
+        else std::cerr << "PASS bus session filter\n";
+    }
+
+    // MCP stdio child (spawn this binary as mcp-mock-server)
+    {
+        const char* self = "/workspace/openclaw-cpp/build/build/Release/openclaw-cpp";
+        if (!std::filesystem::exists(self)) {
+            std::cerr << "SKIP mcp stdio (binary path)\n";
+        } else {
+            try {
+                auto cli = mcp::MakeStdioClient({self, "mcp-mock-server"});
+                if (!cli->Initialize()) { std::cerr << "FAIL mcp stdio init\n"; ++failures; }
+                else {
+                    auto tools = cli->ListTools();
+                    if (tools.empty()) { std::cerr << "FAIL mcp stdio list\n"; ++failures; }
+                    else {
+                        auto call = cli->CallTool(tools[0].name, {{"ping", 1}});
+                        if (!call.contains("content")) { std::cerr << "FAIL mcp stdio call\n"; ++failures; }
+                        else std::cerr << "PASS mcp stdio child\n";
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "FAIL mcp stdio " << e.what() << "\n"; ++failures;
+            }
+        }
+    }
+
+    // agents files
+    {
+        auto tmp = std::filesystem::temp_directory_path() / "oc-agent-files";
+        agent::FileStore fs(tmp);
+        fs.Set("main", "SOUL.md", "hello");
+        auto v = fs.Get("main", "SOUL.md");
+        if (!v || *v != "hello") { std::cerr << "FAIL agent files\n"; ++failures; }
+        else std::cerr << "PASS agent files\n";
+    }
+
+    // logs tail
+    {
+        logging::GlobalLog().Append("info", "self-test");
+        if (logging::GlobalLog().Tail(1).empty()) { std::cerr << "FAIL logs\n"; ++failures; }
+        else std::cerr << "PASS logs tail\n";
+    }
+
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
     return 1;
@@ -348,6 +425,24 @@ int CmdGateway(int argc, char** argv, int argi) {
     auto nodes = nodes::Registry::MakeDefault();
     media::Store media(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "media");
     events::Bus bus;
+    agent::FileStore agent_files(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "agents");
+    auto& logs = logging::GlobalLog();
+    logs.Append("info", "gateway starting");
+    // Optional real MCP stdio child: OPENCLAW_MCP_COMMAND="/path/to/server arg1"
+    if (const char* mcp_cmd = std::getenv("OPENCLAW_MCP_COMMAND"); mcp_cmd && *mcp_cmd) {
+        try {
+            std::vector<std::string> argv;
+            std::istringstream iss(mcp_cmd);
+            std::string tok;
+            while (iss >> tok) argv.push_back(tok);
+            auto stdio_cli = mcp::MakeStdioClient(argv);
+            auto n = mcp::RegisterMcpTools(tools, stdio_cli, "mcp.stdio.");
+            std::cerr << "[gateway] stdio mcp bridged " << n << " tools\n";
+            logs.Append("info", "stdio mcp tools=" + std::to_string(n));
+        } catch (const std::exception& e) {
+            std::cerr << "[gateway] stdio mcp failed: " << e.what() << "\n";
+        }
+    }
     auto cfg = config::LoadOrDefault(config::DefaultPath());
     cfg.gateway_host = opts.bind_host;
     cfg.gateway_port = opts.port;
@@ -370,6 +465,8 @@ int CmdGateway(int argc, char** argv, int argi) {
         .nodes = nodes,
         .media = media,
         .bus = bus,
+        .agent_files = agent_files,
+        .logs = logs,
         .config = cfg,
         .auth = auth::FromEnv(),
     };
@@ -418,6 +515,27 @@ int CmdStatus() {
         {"methods_implemented", openclaw::gateway::ImplementedMethods().size()},
         {"events_advertised", openclaw::gateway::AdvertisedEventCount()},
     }.dump(2) << '\n';
+    return 0;
+}
+
+
+int CmdMcpMockServer() {
+    // Line-delimited JSON-RPC MCP mock on stdio (for MakeStdioClient self-test).
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        try {
+            auto req = nlohmann::json::parse(line);
+            auto resp = openclaw::mcp::Client::MockServerHandle(req);
+            std::cout << resp.dump() << std::endl;
+            std::cout.flush();
+        } catch (const std::exception& e) {
+            std::cout << nlohmann::json{{"jsonrpc", "2.0"},
+                                        {"id", nullptr},
+                                        {"error", {{"message", e.what()}}}}.dump()
+                      << std::endl;
+        }
+    }
     return 0;
 }
 
@@ -476,6 +594,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (cmd == "cron-daemon") return CmdCronDaemon();
+        if (cmd == "mcp-mock-server") return CmdMcpMockServer();
         if (cmd == "gateway") return CmdGateway(argc, argv, 2);
         if (cmd == "chat") return CmdChat(argc, argv, 2);
         if (cmd == "-h" || cmd == "--help" || cmd == "help") { PrintUsage(); return 0; }
