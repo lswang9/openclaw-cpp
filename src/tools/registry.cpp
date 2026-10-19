@@ -1,5 +1,7 @@
 #include "openclaw/tools/registry.hpp"
 #include "openclaw/approvals/store.hpp"
+#include <curl/curl.h>
+#include <cctype>
 
 #include <chrono>
 #include <cstdlib>
@@ -156,6 +158,95 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
                                  {"stdout", "mock: executed (no real shell)"}}.dump();
         };
         r.Register(std::move(shell));
+    }
+
+
+    // Real HTTP GET via libcurl (SSRF-conscious: blocks localhost/private by default unless allow_private)
+    {
+        ToolSpec http;
+        http.name = "http_get";
+        http.description = "Fetch a public HTTP(S) URL and return status + body text (truncated).";
+        http.parameters = {
+            {"type", "object"},
+            {"properties",
+             {{"url", {{"type", "string"}}},
+              {"max_bytes", {{"type", "integer"}}},
+              {"allow_private", {{"type", "boolean"}}}}},
+            {"required", nlohmann::json::array({"url"})},
+        };
+        http.handler = [](const nlohmann::json& args) -> std::string {
+            const std::string url = args.value("url", "");
+            if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+                return nlohmann::json{{"error", "only http/https URLs allowed"}}.dump();
+            }
+            bool allow_private = args.value("allow_private", false);
+            auto lower = url;
+            for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (!allow_private) {
+                if (lower.find("localhost") != std::string::npos || lower.find("127.0.0.1") != std::string::npos ||
+                    lower.find("0.0.0.0") != std::string::npos || lower.find("::1") != std::string::npos ||
+                    lower.find("169.254.") != std::string::npos || lower.find("10.") != std::string::npos ||
+                    lower.find("192.168.") != std::string::npos) {
+                    return nlohmann::json{{"error", "private/localhost URLs blocked (set allow_private)"}}.dump();
+                }
+            }
+            size_t max_b = static_cast<size_t>(args.value("max_bytes", 65536));
+            if (max_b > 1 << 20) max_b = 1 << 20;
+            CURL* curl = curl_easy_init();
+            if (!curl) return nlohmann::json{{"error", "curl init failed"}}.dump();
+            std::string body;
+            auto write = [](char* p, size_t s, size_t n, void* u) -> size_t {
+                auto* o = static_cast<std::string*>(u);
+                o->append(p, s * n);
+                return s * n;
+            };
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +write);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+            curl_easy_setopt(curl, CURLOPT_USERAGENT, "openclaw-cpp-http_get/1.1");
+            CURLcode rc = curl_easy_perform(curl);
+            long http = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
+            curl_easy_cleanup(curl);
+            if (rc != CURLE_OK) {
+                return nlohmann::json{{"ok", false}, {"error", curl_easy_strerror(rc)}, {"url", url}}.dump();
+            }
+            bool truncated = body.size() > max_b;
+            if (truncated) body.resize(max_b);
+            return nlohmann::json{{"ok", true},
+                                  {"impl", "real"},
+                                  {"url", url},
+                                  {"http", http},
+                                  {"bytes", body.size()},
+                                  {"truncated", truncated},
+                                  {"body", body}}.dump();
+        };
+        r.Register(std::move(http));
+    }
+
+    // Browser: honest not-configured stub (no headless chrome bundled)
+    {
+        ToolSpec br;
+        br.name = "browser";
+        br.description = "Browser automation — not configured in openclaw-cpp (use http_get for simple fetch).";
+        br.parameters = {
+            {"type", "object"},
+            {"properties",
+             {{"action", {{"type", "string"}}},
+              {"url", {{"type", "string"}}}}},
+        };
+        br.handler = [](const nlohmann::json& args) {
+            return nlohmann::json{{"ok", false},
+                                  {"configured", false},
+                                  {"impl", "stub"},
+                                  {"error", "not configured"},
+                                  {"action", args.value("action", "")},
+                                  {"hint", "use tool http_get for URL fetch; headless browser not shipped"}}.dump();
+        };
+        r.Register(std::move(br));
     }
 
     return r;

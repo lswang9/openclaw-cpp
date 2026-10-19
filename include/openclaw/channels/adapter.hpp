@@ -24,6 +24,12 @@ public:
     // Optional start/stop for long-lived adapters (bots etc.)
     virtual void Start(DeliverFn deliver) { (void)deliver; }
     virtual void Stop() {}
+    // HTTP inbound (POST /api/channels/<id>/inbound)
+    virtual bool SupportsHttpInbound() const { return false; }
+    virtual nlohmann::json HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
+        (void)body; (void)deliver;
+        return {{"ok", false}, {"error", "inbound not supported"}};
+    }
 };
 
 // HTTP webhook inbound: Gateway POST /api/channels/{id}/inbound
@@ -35,8 +41,12 @@ public:
     bool Enabled() const override { return enabled_; }
     void SetEnabled(bool on) override { enabled_ = on; }
     nlohmann::json Status() const override;
-    // Handle one inbound JSON payload; returns reply text via deliver.
-    nlohmann::json HandleInbound(const nlohmann::json& body, const DeliverFn& deliver);
+    bool SupportsHttpInbound() const override { return true; }
+    nlohmann::json HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) override;
+    // Back-compat alias
+    nlohmann::json HandleInbound(const nlohmann::json& body, const DeliverFn& deliver) {
+        return HandleHttpInbound(body, deliver);
+    }
 
 private:
     std::string id_;

@@ -1,52 +1,41 @@
 # OpenClaw 2026.10.5 → openclaw-cpp 对齐表
 
-**不宣称全量对齐。** 当前：**1.0.0-dev**。
+**不宣称全量对齐。** 当前：**1.1.0-dev**。目标仍是随时间覆盖上游功能，诚实标注缺口。
 
-## 术语（强制区分）
+## 术语
 
 | 标签 | 含义 |
 |------|------|
-| **real** | 本地真实状态读写或实网副作用（`impl:"real"`）。 |
-| **honest** | 明确部分实现：`impl:"honest"` + note，不假装与上游等价。 |
-| **stub** | 占位 / 无 token 出站 `record_only` / 明确 `implemented:false`（不假装已实现）。 |
-| **catalog-only** | 广告表 516 中未进 `ImplementedMethods`。 |
-
-> **不要**用空 stub 膨胀计数。1.0 把原 honest 桶尽量改为带本地 state 的 **real**。
+| **real** | 本地真实状态或实网副作用（`impl:"real"`） |
+| **honest** | `impl:"honest"` 部分实现 |
+| **stub** | 占位 / `record_only` / `implemented:false` / `configured:false` — **不假装已实现** |
+| **catalog-only** | 广告 516 中未进 `ImplementedMethods` |
 
 ## 规模
 
 | 指标 | 值 |
 |------|-----|
 | Catalog | **516** |
-| `ImplementedMethods` | **237** |
-| ExtraDispatch `Real(...)` 路径 | ~多数前缀（users/plugins/sessions/agents/channels/cron/memory/themes/backup/fs/audit/media/…） |
-| ExtraDispatch `Honest(...)` | 极少 residual catch-all |
-| 故意不伪实现 | computer / canvas / webSearch / browser / tts / wizard / … → `implemented:false` |
+| `ImplementedMethods` | **266** |
+| 1.1 相对 1.0 | +TTS/voice、http_get、Feishu inbound、更多 controlUi/catalog/agent/… 本地 real |
 
-## 模块表
+## 模块
 
 | 上游模块 | 状态 | 备注 |
 |----------|------|------|
-| Gateway HTTP+WS | **real（部分）** | health/status/chat SSE、WS RPC、media upload/serve |
-| Daemon lifecycle | **real** | pidfile、`gateway start\|stop\|status`、SIGINT/SIGTERM 优雅停 |
-| Chat + agent loop | **real（部分）** | tools、loop guard、多 provider |
-| Sessions / transcripts | **real（部分）** | fork/rewind/resolve/catalog/storage/files/goal/groups/branches/meta |
-| Media pipeline | **real** | `POST/GET /v1/media`、`media.*` RPC、落盘按 id 取回 |
-| Tools / MCP | **real（部分）** | registry + mock/stdio bridge |
-| Plugins | **real（部分）** | `plugin.json` scan + Linux `.so` via [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md)；非 JS 宿主 |
-| Provider routing | **real** | list / setDefault |
-| Control UI | **real（骨架）** | sessions/tools/SSE（0.9） |
-| Secrets | **real（部分）** | AES-GCM iff passphrase |
-| Cron / persist / pairing / nodes | **real（部分）** | StateStore |
-| Channels outbound | **real \| stub** | token→live_http；否则 record_only |
-| ACP | **stub / gap** | 内存骨架；见 [docs/ACP-GAP.md](docs/ACP-GAP.md) |
-| Browser / computer / TTS / canvas | **stub** | `implemented:false`，不伪造 |
-| Full JS plugin host / OAuth IM / UI WS | TODO | |
+| Gateway / daemon / media / plugins `.so` | **real（部分）** | 见 1.0 |
+| TTS / talk / voicewake | **real \| stub** | `OPENCLAW_TTS_URL`(+API_KEY) → HTTP；否则 `record_only` |
+| Browser tool | **stub** | `browser` → `not configured`；**real** `http_get` curl 拉取 |
+| Feishu | **real（部分）** | outbound webhook URL；inbound challenge 校验 + 消息入队 agent |
+| Telegram / Discord outbound | **real \| stub** | env token → live_http |
+| computer / canvas / desktop / board | **stub** | `implemented:false` |
+| ACP | **stub / gap** | [docs/ACP-GAP.md](docs/ACP-GAP.md) |
+| CI | **real** | `.github/workflows/ci.yml` Conan + self-test (ubuntu) |
 
 ## 里程碑
 
-- ~~0.2–0.9~~ …
-- **1.0.0-dev**：honest→real 本地状态加深；daemon pidfile/start/stop；Plugin C SDK + sample `.so`；media 上传/按 id 服务；PARITY 三分法
-- 下一刀：更多核心 RPC 行为对齐；Control UI WS；ACP wire 或继续明确延后
+- ~~0.2–1.0~~ …
+- **1.1.0-dev**：catalog real 扩充；TTS HTTP/record；http_get + browser stub；Feishu inbound；GitHub Actions CI
+- 下一刀：继续把 catalog-only 变为 real 本地行为；更深 channel/IM；缩小 stub 面
 
-`ImplementedMethods=237` ≠ 上游 237 API 行为等价。看响应 `impl` 与本文档。
+`266` ≠ 上游 266 API 行为等价。看 `impl` 与本文。

@@ -17,3 +17,5 @@
 - **0.9.0-dev**: real local-state ExtraDispatch, Control UI sessions/SSE/tools, ACP skeleton+gap, live TG/Discord/Feishu curl when tokens
 
 - **1.0.0-dev**: real ExtraDispatch bulk, daemon pidfile start/stop, plugin C SDK+.so, media upload/serve
+
+- **1.1.0-dev**: TTS HTTP/record, http_get+browser stub, Feishu inbound, catalog real expand, GHA CI

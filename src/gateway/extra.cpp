@@ -232,7 +232,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     if (starts("update.")) {
         r.handled = true;
         r.payload = Real({{"status", "idle"},
-                          {"current", "1.0.0-dev"},
+                          {"current", "1.1.0-dev"},
                           {"align_target", "OpenClaw 2026.10.5"},
                           {"auto_update", false},
                           {"method", method}});
@@ -830,12 +830,170 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
-    // ---- Explicit NOT implemented (no fake browser/computer/tts) ----
-    if (starts("computer.") || starts("canvas.") || starts("webSearch.") || starts("browser.") ||
-        starts("tts.") || starts("voicewake.") || starts("talk.") || starts("claws.") ||
+    // ---- TTS / voice / talk (real local + optional HTTP) ----
+    if (starts("tts.") || starts("voicewake.") || starts("talk.")) {
+        r.handled = true;
+        if (!deps.tts) {
+            r.payload = Real({{"implemented", false}, {"error", "tts not wired"}});
+            return r;
+        }
+        auto& tts = *deps.tts;
+        if (method == "tts.status") { r.payload = Real(tts.Status()); return r; }
+        if (method == "tts.providers") { r.payload = Real({{"providers", tts.Providers()}}); return r; }
+        if (method == "tts.enable") { tts.SetEnabled(true); r.payload = Real(tts.Status()); return r; }
+        if (method == "tts.disable") { tts.SetEnabled(false); r.payload = Real(tts.Status()); return r; }
+        if (method == "tts.setProvider") {
+            tts.SetProvider(params.value("provider", params.value("id", "http")));
+            r.payload = Real(tts.Status());
+            return r;
+        }
+        if (method == "tts.setPersona" || method == "talk.voice.set" || method == "talk.voice.change") {
+            tts.SetPersona(params.value("persona", params.value("voice", params.value("id", "default"))));
+            r.payload = Real({{"persona", tts.Persona()}, {"status", tts.Status()}});
+            return r;
+        }
+        if (method == "tts.speak" || method == "tts.convert" || method == "talk.voice.complete") {
+            auto text = params.value("text", params.value("input", ""));
+            r.payload = Real(tts.Speak(text, params.value("voice", "")));
+            return r;
+        }
+        if (method == "tts.personas" || method == "talk.voice.get") {
+            r.payload = Real({{"persona", tts.Persona()},
+                              {"personas", nlohmann::json::array({"default", "alloy", "echo"})}});
+            return r;
+        }
+        if (starts("voicewake.")) {
+            auto& vw = EnsureObj(deps.config.raw, "voicewake");
+            if (method == "voicewake.get" || method == "voicewake.routing.get") {
+                r.payload = Real({{"enabled", vw.value("enabled", false)},
+                                  {"phrase", vw.value("phrase", "hey openclaw")},
+                                  {"routing", vw.value("routing", nlohmann::json::object())}});
+                return r;
+            }
+            if (method == "voicewake.set" || method == "voicewake.routing.set") {
+                if (params.contains("enabled")) vw["enabled"] = params["enabled"];
+                if (params.contains("phrase")) vw["phrase"] = params["phrase"];
+                if (params.contains("routing")) vw["routing"] = params["routing"];
+                PersistCfg(deps);
+                r.payload = Real({{"saved", true}, {"voicewake", vw}});
+                return r;
+            }
+            r.payload = Real({{"voicewake", vw}, {"method", method}});
+            return r;
+        }
+        r.payload = Real({{"tts", tts.Status()}, {"method", method}});
+        return r;
+    }
+
+    // ---- browser RPC: honest not-configured (tool browser also stub) ----
+    if (starts("browser.")) {
+        r.handled = true;
+        r.payload = Real({{"configured", false},
+                          {"implemented", false},
+                          {"method", method},
+                          {"hint", "use tools.invoke http_get for fetch"}});
+        return r;
+    }
+
+    // ---- controlUi / catalog / agent / projects / question / terminal (local) ----
+    if (starts("controlUi.")) {
+        r.handled = true;
+        auto& ui = EnsureObj(deps.config.raw, "control_ui");
+        if (method.find("sessionPreview") != std::string::npos) {
+            auto key = params.value("sessionKey", params.value("key", ""));
+            nlohmann::json msgs = nlohmann::json::array();
+            for (const auto& m : deps.sessions.Load(key)) {
+                msgs.push_back({{"role", m.role}, {"content", m.content.substr(0, 200)}});
+                if (msgs.size() >= 20) break;
+            }
+            r.payload = Real({{"sessionKey", key}, {"preview", msgs}});
+            return r;
+        }
+        if (method.find("github") != std::string::npos || method.find("linkPreview") != std::string::npos) {
+            r.payload = Real({{"ok", false}, {"note", "github preview not wired"}, {"method", method}});
+            return r;
+        }
+        r.payload = Real({{"control_ui", ui}, {"sessions", deps.sessions.List()}, {"method", method}});
+        return r;
+    }
+    if (starts("catalog.") || method == "catalog.browse") {
+        r.handled = true;
+        r.payload = Real({{"methods", ImplementedMethods().size()},
+                          {"advertised", AdvertisedMethodCount()},
+                          {"tools", deps.tools.Names()},
+                          {"method", method}});
+        return r;
+    }
+    if (starts("agent.") || method == "agent") {
+        r.handled = true;
+        auto& ag = EnsureObj(deps.config.raw, "agent_identity");
+        if (method == "agent.identity.get") {
+            r.payload = Real({{"identity", ag.value("name", "openclaw-cpp")}, {"raw", ag}});
+            return r;
+        }
+        if (method.find("identity") != std::string::npos && method.find("get") == std::string::npos) {
+            if (params.contains("name")) ag["name"] = params["name"];
+            PersistCfg(deps);
+            r.payload = Real({{"identity", ag}});
+            return r;
+        }
+        if (method == "agent.wait") {
+            r.payload = Real({{"ready", true}, {"waited_ms", 0}});
+            return r;
+        }
+        r.payload = Real({{"identity", ag}, {"method", method}});
+        return r;
+    }
+    if (starts("projects.") || starts("question.") || starts("terminal.") || starts("gateway.")) {
+        r.handled = true;
+        auto key = method.substr(0, method.find('.'));
+        auto& store = EnsureObj(deps.config.raw, (key + "_store").c_str());
+        if (method.find("list") != std::string::npos || method.find("get") != std::string::npos) {
+            r.payload = Real({{key, store}, {"method", method}});
+            return r;
+        }
+        if (method.find("set") != std::string::npos || method.find("put") != std::string::npos ||
+            method.find("create") != std::string::npos) {
+            store["last"] = params;
+            PersistCfg(deps);
+            r.payload = Real({{"saved", true}, {key, store}});
+            return r;
+        }
+        if (starts("gateway.") && (method.find("status") != std::string::npos || method.find("health") != std::string::npos)) {
+            r.payload = Real({{"runtime", "running"}, {"version", "1.1.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
+            return r;
+        }
+        r.payload = Real({{key, store}, {"method", method}});
+        return r;
+    }
+    if (starts("cron.scratch")) {
+        r.handled = true;
+        auto& sc = EnsureObj(deps.config.raw, "cron_scratch");
+        auto id = params.value("id", params.value("jobId", "default"));
+        if (method.find("set") != std::string::npos) {
+            sc[id] = params.value("value", params);
+            PersistCfg(deps);
+            r.payload = Real({{"id", id}, {"saved", true}});
+            return r;
+        }
+        r.payload = Real({{"id", id}, {"value", sc.value(id, nlohmann::json::object())}});
+        return r;
+    }
+    if (starts("webSearch.")) {
+        r.handled = true;
+        // Not a search engine — point at http_get
+        r.payload = Real({{"implemented", false},
+                          {"method", method},
+                          {"hint", "no bundled search index; use http_get tool for URLs"}});
+        return r;
+    }
+
+    // ---- Explicit NOT implemented (no fake computer/canvas/desktop) ----
+    if (starts("computer.") || starts("canvas.") || starts("claws.") ||
         starts("board.") || starts("portal.") || starts("wizard.") || starts("openclaw.") ||
         starts("nativeHook.") || starts("web.login") || starts("push.") || starts("attach.") ||
-        starts("taskSuggestions.") || starts("mcp.app.") || starts("doctor.memory.")) {
+        starts("taskSuggestions.") || starts("mcp.app.") || starts("doctor.memory.") ||
+        starts("desktop.") || starts("debugProxy.")) {
         r.handled = true;
         r.payload = Real({{"implemented", false},
                           {"method", method},

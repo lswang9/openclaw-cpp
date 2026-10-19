@@ -31,7 +31,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.0.0-dev";
+constexpr const char* kVersion = "1.1.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -572,8 +572,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                 send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "unknown channel adapter"}, {"id", chan_id}}.dump()));
                 return;
             }
-            auto* wh = dynamic_cast<channels::WebhookAdapter*>(adapter);
-            if (!wh) {
+            if (!adapter->SupportsHttpInbound()) {
                 send(HttpResponse(400, "Bad Request",
                                   nlohmann::json{{"error", "adapter does not support HTTP inbound"},
                                                  {"id", chan_id},
@@ -582,7 +581,13 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             }
             auto body = nlohmann::json::parse(BodyOf(req));
             auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
-            send(HttpResponse(200, "OK", wh->HandleInbound(body, deliver).dump(2)));
+            auto result = adapter->HandleHttpInbound(body, deliver);
+            // Feishu URL verification expects top-level {"challenge":"..."}
+            if (result.contains("challenge") && result.value("mode", "") == "url_verification") {
+                send(HttpResponse(200, "OK", nlohmann::json{{"challenge", result["challenge"]}}.dump()));
+                return;
+            }
+            send(HttpResponse(200, "OK", result.dump(2)));
         } catch (const std::exception& e) {
             send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", e.what()}}.dump()));
         }

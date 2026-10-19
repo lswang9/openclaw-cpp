@@ -1,5 +1,6 @@
 #include "openclaw/channels/adapter.hpp"
 #include "openclaw/channels/outbound.hpp"
+#include "openclaw/channels/feishu.hpp"
 
 namespace openclaw::channels {
 
@@ -13,7 +14,7 @@ nlohmann::json WebhookAdapter::Status() const {
             {"inbound_path", "/api/channels/" + id_ + "/inbound"}};
 }
 
-nlohmann::json WebhookAdapter::HandleInbound(const nlohmann::json& body, const DeliverFn& deliver) {
+nlohmann::json WebhookAdapter::HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
     if (!enabled_) {
         return {{"ok", false}, {"error", "adapter disabled"}};
     }
@@ -90,10 +91,7 @@ AdapterHub AdapterHub::MakeDefault() {
         "/api/v10/channels/{id}/messages"));
     hub.Add(std::make_unique<StubAdapter>(
         "slack", "TODO: Slack Events API + Socket Mode (OpenClaw channels/slack)"));
-    hub.Add(std::make_unique<OutboundRecordAdapter>(
-        "feishu",
-        "TODO: live Feishu/Lark API; outbound payloads recorded locally",
-        "/open-apis/im/v1/messages"));
+    hub.Add(std::make_unique<FeishuAdapter>());
     hub.Add(std::make_unique<StubAdapter>(
         "whatsapp", "TODO: WhatsApp Cloud API / Baileys-style bridge"));
     return hub;

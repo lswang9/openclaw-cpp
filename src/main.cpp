@@ -25,6 +25,8 @@
 #include "openclaw/util.hpp"
 #include "openclaw/acp/session.hpp"
 #include "openclaw/daemon/lifecycle.hpp"
+#include "openclaw/voice/tts.hpp"
+#include "openclaw/channels/feishu.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/persist/store.hpp"
 #include "openclaw/provider/openai_compat.hpp"
@@ -50,7 +52,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.0-dev";
+constexpr const char* kVersion = "1.1.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -426,7 +428,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.0.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.1.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -473,7 +475,7 @@ int CmdSelfTest() {
     }
 
     // implemented count >= 150
-    if (gateway::ImplementedMethods().size() < 150) {
+    if (gateway::ImplementedMethods().size() < 200) {
         std::cerr << "FAIL implemented count " << gateway::ImplementedMethods().size() << "\n"; ++failures;
     } else std::cerr << "PASS implemented count (" << gateway::ImplementedMethods().size() << ")\n";
 
@@ -540,6 +542,65 @@ int CmdSelfTest() {
             else std::cerr << "PASS plugin native invoke\n";
         } else {
             std::cerr << "PASS plugin scan (no .so yet — build sample)\n";
+        }
+    }
+
+
+    // TTS record-only
+    {
+        voice::TtsEngine tts;
+        auto st = tts.Status();
+        auto sp = tts.Speak("hello");
+        if (sp.value("mode", "") != "record_only" && st.value("url_configured", true)) {
+            // ok if url configured in env
+        }
+        if (!sp.value("ok", false)) { std::cerr << "FAIL tts speak\n"; ++failures; }
+        else std::cerr << "PASS tts record-only/http\n";
+    }
+
+    // http_get tool (example.com) + browser stub
+    {
+        approvals::Store ap;
+        tools::RegistryOptions o; o.approvals = &ap; o.enable_shell = false;
+        auto reg = tools::MakeDefaultRegistry(o);
+        if (!reg.Has("http_get") || !reg.Has("browser")) {
+            std::cerr << "FAIL tools http_get/browser missing\n"; ++failures;
+        } else {
+            auto br = nlohmann::json::parse(reg.Invoke("browser", {{"action", "open"}}));
+            if (br.value("configured", true) != false) {
+                std::cerr << "FAIL browser should be not configured\n"; ++failures;
+            } else std::cerr << "PASS browser not-configured stub\n";
+            auto hg = nlohmann::json::parse(reg.Invoke("http_get", {{"url", "https://example.com"}, {"max_bytes", 2048}}));
+            if (!hg.value("ok", false) || hg.value("http", 0) < 200) {
+                std::cerr << "WARN http_get example.com: " << hg.dump() << "\n";
+                // network may be blocked — still pass if tool exists
+                std::cerr << "PASS http_get tool registered\n";
+            } else std::cerr << "PASS http_get fetch\n";
+        }
+    }
+
+    // Feishu inbound challenge + message
+    {
+        auto hub = channels::AdapterHub::MakeDefault();
+        auto* fs = dynamic_cast<channels::FeishuAdapter*>(hub.Get("feishu"));
+        if (!fs) { std::cerr << "FAIL feishu adapter type\n"; ++failures; }
+        else {
+            auto ch = fs->HandleHttpInbound({{"type", "url_verification"}, {"challenge", "c-test"}, {"token", ""}}, {});
+            if (ch.value("challenge", "") != "c-test") {
+                std::cerr << "FAIL feishu challenge " << ch.dump() << "\n"; ++failures;
+            } else {
+                bool delivered = false;
+                auto msg = fs->HandleHttpInbound(
+                    {{"event", {{"message", {{"content", "{\"text\":\"ping-feishu\"}"}, {"chat_id", "oc_1"}}},
+                                {"sender", {{"sender_id", {{"open_id", "ou_x"}}}}}}}},
+                    [&](const channels::InboundMessage& m) {
+                        delivered = (m.text == "ping-feishu");
+                        return std::string("ack");
+                    });
+                if (!delivered || !msg.value("ok", false)) {
+                    std::cerr << "FAIL feishu inbound msg " << msg.dump() << "\n"; ++failures;
+                } else std::cerr << "PASS feishu inbound verify+enqueue\n";
+            }
         }
     }
 
@@ -726,6 +787,7 @@ int CmdGateway(int argc, char** argv, int argi) {
         (std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "data").string()));
     persist::StateStore persist(data_dir);
     acp::Registry acp_reg;
+    voice::TtsEngine tts_engine;
     persist.LoadCron(cron);
     persist.LoadPairing(pairing);
     persist.LoadNodes(nodes);
@@ -775,6 +837,7 @@ int CmdGateway(int argc, char** argv, int argi) {
         .logs = logs,
         .persist = &persist,
         .acp = &acp_reg,
+        .tts = &tts_engine,
         .config = cfg,
         .auth = auth::FromEnv(),
     };

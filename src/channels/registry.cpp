@@ -33,7 +33,7 @@ Registry MakeDefaultChannels() {
     r.Register({"discord", "Discord gateway (TODO)", false});
     r.Register({"slack", "Slack Events API (TODO)", false});
     r.Register({"whatsapp", "WhatsApp (TODO)", false});
-    r.Register({"feishu", "Feishu/Lark (TODO)", false});
+    r.Register({"feishu", "Feishu/Lark inbound+outbound", true});
     return r;
 }
 
