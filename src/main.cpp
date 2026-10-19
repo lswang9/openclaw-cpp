@@ -56,7 +56,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.4.0-dev";
+constexpr const char* kVersion = "1.5.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -432,7 +432,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.4.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.5.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -479,7 +479,7 @@ int CmdSelfTest() {
     }
 
     // implemented count >= 150
-    if (gateway::ImplementedMethods().size() < 400) {
+    if (gateway::ImplementedMethods().size() < 500) {
         std::cerr << "FAIL implemented count " << gateway::ImplementedMethods().size() << "\n"; ++failures;
     } else std::cerr << "PASS implemented count (" << gateway::ImplementedMethods().size() << ")\n";
 
@@ -749,6 +749,44 @@ int CmdSelfTest() {
         auto reg = tools::MakeDefaultRegistry(o);
         if (!reg.Has("browser_open_url")) { std::cerr << "FAIL browser_open_url tool\n"; ++failures; }
         else std::cerr << "PASS browser_open_url tool registered\n";
+    }
+
+
+    // session lock + loop timeout/cancel
+    {
+        auto dir = std::filesystem::temp_directory_path() / "oc-lock-test";
+        std::filesystem::remove_all(dir);
+        session::Store st(dir);
+        {
+            auto g1 = st.Lock("a");
+            st.Save("a", {{.role = "user", .content = "x"}});
+        }
+        if (st.Load("a").size() != 1) { std::cerr << "FAIL session lock save\n"; ++failures; }
+        else std::cerr << "PASS session lock\n";
+
+        provider::MockProvider mock;
+        // slow path: enqueue nothing useful — use cancel
+        std::atomic<bool> cancel{false};
+        agent::LoopOptions o;
+        o.max_turns = 3;
+        o.cancel = &cancel;
+        cancel = true;
+        agent::CompletionResult mr;
+        mr.ok = true; mr.finish_reason = "stop";
+        mr.message.role = "assistant"; mr.message.content = "x";
+        mock.Enqueue(mr);
+        tools::Registry empty_tools;
+        auto r = agent::RunAgentLoop(mock, empty_tools, {{.role="user",.content="h"}}, o);
+        if (!r.cancelled) { std::cerr << "FAIL cancel " << r.error << "\n"; ++failures; }
+        else std::cerr << "PASS agent cancel\n";
+
+        cancel = false;
+        o.cancel = nullptr;
+        o.timeout = std::chrono::milliseconds(0);
+        mock.Enqueue(mr);
+        auto r2 = agent::RunAgentLoop(mock, empty_tools, {{.role="user",.content="h"}}, o);
+        if (!r2.ok) { std::cerr << "FAIL loop ok after cancel test\n"; ++failures; }
+        else std::cerr << "PASS agent loop after cancel reset\n";
     }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }

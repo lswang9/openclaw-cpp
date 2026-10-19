@@ -84,6 +84,7 @@ public:
     void Run();
     void Stop();
     bool Running() const { return running_.load(); }
+    std::atomic<bool>& AgentCancelFlag() { return cancel_agents_; }
 
 private:
     bool HandleClient(int client_fd);
@@ -99,6 +100,7 @@ private:
     ServerOptions opts_;
     ServerDeps deps_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> cancel_agents_{false};
     int listen_fd_ = -1;
     std::mutex ws_mu_;
     std::set<int> ws_clients_;

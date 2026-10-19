@@ -31,7 +31,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.4.0-dev";
+constexpr const char* kVersion = "1.5.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -189,6 +189,9 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
         agent.value("identical_tool_warn_after", 2));
     o.identical_tool_break_after = static_cast<std::size_t>(
         agent.value("identical_tool_break_after", 4));
+    int timeout_ms = override_body.value(
+        "timeout_ms", agent.value("timeout_ms", raw.value("timeout_ms", 0)));
+    if (timeout_ms > 0) o.timeout = std::chrono::milliseconds(timeout_ms);
     if (o.max_turns == 0) o.max_turns = 1;
     return o;
 }
@@ -196,6 +199,7 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
 Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {}
 Server::~Server() { Stop(); if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; } }
 void Server::Stop() {
+    cancel_agents_.store(true);
     running_.store(false);
     if (listen_fd_ >= 0) shutdown(listen_fd_, SHUT_RDWR);
 }
@@ -220,6 +224,7 @@ void Server::Run() {
         close(listen_fd_); listen_fd_ = -1;
         throw std::runtime_error("listen() failed");
     }
+    cancel_agents_.store(false);
     running_.store(true);
     std::cerr << "[gateway] http+ws://" << opts_.bind_host << ':' << opts_.port
               << " align=" << kAlign << " ver=" << kVersion
@@ -339,6 +344,7 @@ void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bo
     }
 
     agent::LoopOptions lopts = MakeLoopOpts(deps_, body);
+    lopts.cancel = &cancel_agents_;
     auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, lopts);
     if (!session_id.empty() && result.ok) deps_.sessions.Save(session_id, result.messages);
     if (!result.ok) {
@@ -407,6 +413,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     aopts.system_prompt = deps_.system_prompt;
     auto assembled = context::Assemble(messages, aopts);
     agent::LoopOptions lopts = MakeLoopOpts(deps_);
+    lopts.cancel = &cancel_agents_;
     provider::Provider* prov = &deps_.provider;
     if (deps_.router) prov = deps_.router;
     auto result = agent::RunAgentLoop(*prov, deps_.tools, assembled, lopts);
@@ -514,6 +521,28 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         for (const auto& m : deps_.sessions.Load(id)) msgs.push_back(m.ToJson());
         send(HttpResponse(200, "OK",
             nlohmann::json{{"id", id}, {"messages", msgs}, {"impl", "real"}}.dump(2)));
+        return;
+    }
+    if (method == "POST" && path == "/v1/rpc") {
+        try {
+            auto body = nlohmann::json::parse(BodyOf(req));
+            auto reply = DispatchRpc(body);
+            send(HttpResponse(200, "OK", reply.dump(2)));
+        } catch (const std::exception& e) {
+            send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", e.what()}}.dump()));
+        }
+        return;
+    }
+    if (method == "POST" && path == "/v1/sessions") {
+        try {
+            auto body = nlohmann::json::parse(BodyOf(req));
+            const std::string key = body.value("key", body.value("id", body.value("session_id",
+                "session-" + std::to_string(deps_.sessions.List().size() + 1))));
+            deps_.sessions.Save(key, {});
+            send(HttpResponse(200, "OK", nlohmann::json{{"id", key}, {"created", true}, {"impl", "real"}}.dump(2)));
+        } catch (const std::exception& e) {
+            send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", e.what()}}.dump()));
+        }
         return;
     }
     if (method == "GET" && path == "/v1/sessions") {

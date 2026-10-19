@@ -47,11 +47,28 @@ LoopResult RunAgentLoop(provider::Provider& provider,
     std::string last_sig;
     std::size_t same_count = 0;
 
+    const auto deadline = opts.timeout.count() > 0
+                              ? std::chrono::steady_clock::now() + opts.timeout
+                              : std::chrono::steady_clock::time_point::max();
+
     for (std::size_t turn = 0; turn < opts.max_turns; ++turn) {
         ++out.turns;
         if (opts.verbose) {
             std::cerr << "[agent] turn " << out.turns << " messages=" << out.messages.size()
                       << '\n';
+        }
+
+        if (opts.cancel && opts.cancel->load()) {
+            out.ok = false;
+            out.cancelled = true;
+            out.error = "cancelled";
+            return out;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            out.ok = false;
+            out.timed_out = true;
+            out.error = "agent loop timeout (" + std::to_string(opts.timeout.count()) + "ms)";
+            return out;
         }
 
         if (!RateBucket::Global().TryAcquire(opts.rate_limit_per_minute)) {

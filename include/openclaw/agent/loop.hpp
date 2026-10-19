@@ -4,6 +4,7 @@
 #include "openclaw/provider/provider.hpp"
 #include "openclaw/tools/registry.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <deque>
@@ -19,15 +20,16 @@ struct LoopOptions {
     std::size_t identical_tool_warn_after = 2;
     std::size_t identical_tool_break_after = 4;
     std::string provider_route;
-    // 0 = unlimited. Counts Complete() calls across loops sharing the same RateBucket.
     std::size_t rate_limit_per_minute = 0;
+    // Wall-clock deadline for the whole loop (0 = no timeout).
+    std::chrono::milliseconds timeout{0};
+    // Optional cooperative cancel flag (e.g. gateway shutdown).
+    std::atomic<bool>* cancel = nullptr;
 };
 
-// Process-wide sliding window for gateway agent Completes.
 class RateBucket {
 public:
     static RateBucket& Global();
-    // Returns false if over limit (and does not record). limit 0 = always allow.
     bool TryAcquire(std::size_t limit_per_minute);
     std::size_t RecentCount() const;
 
@@ -43,6 +45,8 @@ struct LoopResult {
     std::vector<Message> messages;
     std::size_t turns = 0;
     std::vector<std::string> warnings;
+    bool cancelled = false;
+    bool timed_out = false;
 };
 
 LoopResult RunAgentLoop(provider::Provider& provider,

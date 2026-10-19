@@ -25,3 +25,5 @@
 - **1.3.0-dev**: catalog→549 real-prefix coverage, WA/iMessage inbound, log/otel export, Control UI invoke+export
 
 - **1.4.0-dev**: SimulationBackend real-sim, browser.open_url, mcp.app client bridge, honest PARITY
+
+- **1.5.0-dev**: loop timeout/cancel, session locks, HTTP /v1/rpc, integration-smoke, RELEASE.md

@@ -33,3 +33,6 @@ jobs:
 
       - name: Self-test
         run: ./build/build/Release/openclaw-cpp self-test
+
+      - name: Integration smoke (mock)
+        run: ./scripts/integration-smoke.sh

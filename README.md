@@ -1,17 +1,18 @@
 # openclaw-cpp
 
-OpenClaw **C++ rewrite** aiming at **OpenClaw 2026.10.5** feature coverage over time.
+C++ rewrite toward **OpenClaw 2026.10.5** features over time.
 
-**1.4.0-dev — not full parity.** Read [PARITY.md](PARITY.md) (sim vs real vs missing).
+**1.5.0-dev — not full parity.** [PARITY.md](PARITY.md) · [docs/RELEASE.md](docs/RELEASE.md)
 
-## 1.4 highlights
+## 1.5 highlights
 
-- **`real-sim`**: computer / canvas / desktop via `SimulationBackend` (placeholder PNG + action log)
-- **browser.open_url** / tool `browser_open_url`: curl + title (not Playwright)
-- **mcp.app.***: list/call tools + resources via `mcp::Client`
-- PARITY.md rewritten for brutal honesty
+- Agent loop: **timeout_ms**, **cancel** on gateway stop, **per-session locks**
+- `POST /v1/rpc`, `POST /v1/sessions`
+- `scripts/integration-smoke.sh` (mock provider, no live LLM)
+- Easy catalog gaps → local stores (board/portal/setup/…); still not upstream UI
 
 ```bash
 cmake --preset conan-release && cmake --build --preset conan-release -j
 ./build/build/Release/openclaw-cpp self-test
+./scripts/integration-smoke.sh
 ```

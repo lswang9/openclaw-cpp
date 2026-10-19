@@ -240,7 +240,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     if (starts("update.")) {
         r.handled = true;
         r.payload = Real({{"status", "idle"},
-                          {"current", "1.4.0-dev"},
+                          {"current", "1.5.0-dev"},
                           {"align_target", "OpenClaw 2026.10.5"},
                           {"auto_update", false},
                           {"method", method}});
@@ -1101,7 +1101,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         if (starts("gateway.") && (method.find("status") != std::string::npos || method.find("health") != std::string::npos)) {
-            r.payload = Real({{"runtime", "running"}, {"version", "1.4.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
+            r.payload = Real({{"runtime", "running"}, {"version", "1.5.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
             return r;
         }
         r.payload = Real({{key, store}, {"method", method}});
@@ -1414,6 +1414,16 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             }
             return r;
         }
+        if (method == "mcp.app.writeResource" || method == "mcp.app.formResource" ||
+            method == "mcp.app.subscribeResource" || method == "mcp.app.unsubscribeResource" ||
+            method == "mcp.app.openFile" || method == "mcp.app.modelContext" ||
+            method == "mcp.app.removeModelContext") {
+            auto& st = EnsureObj(deps.config.raw, "mcp_app");
+            st[method] = params;
+            PersistCfg(deps);
+            r.payload = Real({{"ok", true}, {"method", method}, {"note", "local mcp.app resource/context ack"}});
+            return r;
+        }
         // host-UI-ish methods: local ack + tool inventory (not a full MCP app host)
         if (method == "mcp.app.discover" || method == "mcp.app.view" || method == "mcp.app.launch" ||
             method == "mcp.app.settings" || method == "mcp.app.onboard" || method == "mcp.app.mention" ||
@@ -1435,15 +1445,91 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
-    if (starts("claws.") || starts("board.") || starts("portal.") || starts("wizard.") || starts("openclaw.") ||
-        starts("nativeHook.") || starts("web.login") || starts("attach.") ||
-        starts("taskSuggestions.") || starts("debugProxy.")) {
+    // ---- Easy catalog gaps: local boards/portals/setup/mentions (not upstream UI) ----
+    if (starts("board.") || starts("portal.") || starts("wizard.") || starts("openclaw.") ||
+        starts("mentions.") || starts("migrations.") || starts("usage.") || starts("ui.") ||
+        starts("storage.") || starts("progressCard.") || starts("plugin.approval") ||
+        starts("plugin.surface") || starts("taskSuggestions.") || starts("nativeHook.") ||
+        starts("web.login") || starts("attach.") || starts("claws.") || starts("debugProxy.")) {
         r.handled = true;
-        r.payload = Real({{"implemented", false},
-                          {"method", method},
-                          {"note", "intentionally not faked — see PARITY.md"}});
+        // Still missing production features — but give real local stores for API testing
+        if (starts("debugProxy.") || starts("claws.") || starts("nativeHook.") ||
+            starts("web.login") || starts("attach.")) {
+            r.payload = Real({{"implemented", false},
+                              {"method", method},
+                              {"note", "intentionally not faked — see PARITY.md"}});
+            return r;
+        }
+        auto store_key = method.substr(0, method.find('.'));
+        if (store_key.empty()) store_key = "misc";
+        auto& store = EnsureObj(deps.config.raw, (store_key + "_local").c_str());
+        if (starts("openclaw.approval") || starts("plugin.approval")) {
+            r.payload = Real({{"approvals", deps.approvals.ListJson()}, {"method", method}});
+            return r;
+        }
+        if (starts("openclaw.chat")) {
+            auto key = params.value("sessionKey", params.value("key", "main"));
+            nlohmann::json msgs = nlohmann::json::array();
+            for (const auto& m : deps.sessions.Load(key)) msgs.push_back(m.ToJson());
+            r.payload = Real({{"sessionKey", key}, {"messages", msgs}, {"method", method}});
+            return r;
+        }
+        if (starts("openclaw.setup") || starts("wizard.")) {
+            auto& setup = EnsureObj(deps.config.raw, "setup");
+            if (method.find("start") != std::string::npos || method.find("activate") != std::string::npos ||
+                method.find("prepare") != std::string::npos || method.find("auto") != std::string::npos) {
+                setup["last"] = method;
+                setup["params"] = params;
+                setup["status"] = "local-ack";
+                PersistCfg(deps);
+            }
+            r.payload = Real({{"setup", setup}, {"method", method},
+                              {"note", "local setup ack only — not OpenClaw installer"}});
+            return r;
+        }
+        if (starts("openclaw.changes") || starts("mentions.")) {
+            auto& arr = EnsureArr(store, "items");
+            if (method.find("list") != std::string::npos) {
+                r.payload = Real({{"items", arr}, {"method", method}});
+                return r;
+            }
+            if (method.find("dismiss") != std::string::npos) {
+                auto id = params.value("id", "");
+                nlohmann::json next = nlohmann::json::array();
+                for (auto& x : arr)
+                    if (x.value("id", "") != id) next.push_back(x);
+                arr = next;
+                PersistCfg(deps);
+                r.payload = Real({{"dismissed", id}, {"items", arr}});
+                return r;
+            }
+            if (method.find("changed") != std::string::npos || method.find("add") != std::string::npos) {
+                arr.push_back(params.empty() ? nlohmann::json{{"id", "item-" + std::to_string(arr.size())}} : params);
+                PersistCfg(deps);
+            }
+            r.payload = Real({{"items", arr}, {"method", method}});
+            return r;
+        }
+        if (starts("board.") || starts("portal.") || starts("progressCard.") || starts("ui.") ||
+            starts("storage.") || starts("usage.") || starts("migrations.") || starts("taskSuggestions.") ||
+            starts("plugin.surface")) {
+            if (method.find("put") != std::string::npos || method.find("update") != std::string::npos ||
+                method.find("action") != std::string::npos || method.find("grant") != std::string::npos ||
+                method.find("apply") != std::string::npos || method.find("plan") != std::string::npos) {
+                store["last"] = {{"method", method}, {"params", params}};
+                PersistCfg(deps);
+                r.payload = Real({{"saved", true}, {"store", store}, {"method", method},
+                                  {"note", "local store only — not production board/portal UI"}});
+                return r;
+            }
+            r.payload = Real({{"store", store}, {"method", method},
+                              {"note", "local store only — not production board/portal UI"}});
+            return r;
+        }
+        r.payload = Real({{"store", store}, {"method", method}});
         return r;
     }
+
 
 
     // residual catch-all still honest (should be rare)

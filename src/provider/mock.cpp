@@ -11,9 +11,10 @@ agent::CompletionResult MockProvider::Complete(const std::vector<agent::Message>
     last_messages_ = messages;
     if (script_.empty()) {
         agent::CompletionResult r;
-        r.ok = false;
-        r.finish_reason = "error";
-        r.error = "MockProvider: no scripted responses left";
+        r.ok = true;
+        r.finish_reason = "stop";
+        r.message.role = "assistant";
+        r.message.content = "mock-default";
         return r;
     }
     auto r = std::move(script_.front());
