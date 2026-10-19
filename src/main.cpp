@@ -23,6 +23,10 @@
 #include "openclaw/skills/loader.hpp"
 #include "openclaw/tools/registry.hpp"
 #include "openclaw/util.hpp"
+#include "openclaw/diagnostics/doctor.hpp"
+#include "openclaw/persist/store.hpp"
+#include "openclaw/provider/openai_compat.hpp"
+#include "openclaw/provider/router.hpp"
 #include "openclaw/agent/files.hpp"
 #include "openclaw/logging/tail.hpp"
 #include "openclaw/context/assemble.hpp"
@@ -41,7 +45,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.6.0-dev";
+constexpr const char* kVersion = "0.7.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -353,6 +357,79 @@ int CmdSelfTest() {
         else std::cerr << "PASS logs tail\n";
     }
 
+
+    // provider router
+    {
+        provider::Router r;
+        auto mock = std::make_shared<provider::MockProvider>();
+        agent::CompletionResult mr;
+        mr.ok = true; mr.finish_reason = "stop";
+        mr.message.role = "assistant"; mr.message.content = "routed";
+        mock->Enqueue(mr);
+        r.Add("mock", mock);
+        r.SetDefault("mock");
+        auto out = r.Complete({{.role = "user", .content = "hi"}}, nlohmann::json::array());
+        if (!out.ok || out.message.content != "routed") {
+            std::cerr << "FAIL router\n"; ++failures;
+        } else std::cerr << "PASS provider router\n";
+    }
+
+    // loop detection identical tools
+    {
+        provider::MockProvider mock;
+        tools::Registry reg = tools::MakeDefaultRegistry();
+        // two identical tool_calls turns then would break on 4th — feed 4 identical
+        for (int i = 0; i < 4; ++i) {
+            agent::CompletionResult first;
+            first.ok = true; first.finish_reason = "tool_calls";
+            first.message.role = "assistant";
+            agent::ToolCall tc; tc.id = "c" + std::to_string(i); tc.name = "echo";
+            tc.arguments_json = "{\"text\":\"same\"}";
+            first.tool_calls.push_back(tc);
+            first.message.tool_calls = nlohmann::json::array({
+                {{"id", tc.id}, {"type", "function"},
+                 {"function", {{"name", "echo"}, {"arguments", tc.arguments_json}}}},
+            });
+            mock.Enqueue(first);
+        }
+        auto result = agent::RunAgentLoop(mock, reg, {{.role = "user", .content = "x"}},
+                                          {.max_turns = 8, .identical_tool_warn_after = 2, .identical_tool_break_after = 3});
+        if (result.ok || result.error.find("loop detection") == std::string::npos) {
+            std::cerr << "FAIL loop detect ok=" << result.ok << " err=" << result.error << "\n";
+            ++failures;
+        } else if (result.warnings.empty()) {
+            std::cerr << "FAIL loop warn missing\n"; ++failures;
+        } else std::cerr << "PASS loop detection\n";
+    }
+
+    // persist round-trip
+    {
+        auto dir = std::filesystem::temp_directory_path() / "oc-persist-test";
+        std::filesystem::remove_all(dir);
+        persist::StateStore st(dir);
+        cron::Scheduler sch;
+        sch.Add({.id = "j1", .cron_expr = "0 * * * *", .payload = "p", .enabled = true});
+        st.SaveCron(sch);
+        cron::Scheduler sch2;
+        st.LoadCron(sch2);
+        if (sch2.List().size() != 1 || sch2.List()[0].id != "j1") {
+            std::cerr << "FAIL persist cron\n"; ++failures;
+        } else std::cerr << "PASS persist state\n";
+        std::filesystem::remove_all(dir);
+    }
+
+    // doctor
+    {
+        auto doc = diagnostics::RunDoctorJson({{"version", "0.7.0-dev"},
+                                              {"methods_implemented", 10},
+                                              {"providers", nlohmann::json::array({"mock"})},
+                                              {"deepseek_key_set", false},
+                                              {"memory_keys", 0},
+                                              {"cron_jobs", 0}});
+        if (!doc.contains("checks")) { std::cerr << "FAIL doctor\n"; ++failures; }
+        else std::cerr << "PASS doctor diagnostics\n";
+    }
+
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
     return 1;
@@ -407,10 +484,33 @@ int CmdGateway(int argc, char** argv, int argi) {
     tropts.enable_shell = true;
     tropts.shell_requires_approval = true;
     auto tools = tools::MakeDefaultRegistry(tropts);
-    // Bridge in-process mock MCP tools as mcp.* (replace with real client transport later).
     auto mcp_client = mcp::MakeMockClient();
     auto mcp_n = mcp::RegisterMcpTools(tools, mcp_client);
     std::cerr << "[gateway] bridged " << mcp_n << " mcp tools\n";
+
+    // Multi-provider router (DeepSeek + OpenAI-compat + mock)
+    provider::Router router;
+    const std::string ds_key = api_key;
+    const std::string ds_base = EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com");
+    const std::string ds_model = EnvOr("DEEPSEEK_MODEL", "deepseek-chat");
+    router.Add("deepseek", std::make_shared<provider::OpenAiCompatProvider>("deepseek", ds_key, ds_base, ds_model));
+    const std::string oai_key = EnvOr("OPENAI_API_KEY", ds_key);
+    const std::string oai_base = EnvOr("OPENAI_BASE_URL", "https://api.openai.com");
+    const std::string oai_model = EnvOr("OPENAI_MODEL", "gpt-4o-mini");
+    router.Add("openai", std::make_shared<provider::OpenAiCompatProvider>("openai", oai_key, oai_base, oai_model));
+    auto mock_prov = std::make_shared<provider::MockProvider>();
+    // seed a trivial stop response for mock route health
+    {
+        agent::CompletionResult mr;
+        mr.ok = true;
+        mr.finish_reason = "stop";
+        mr.message.role = "assistant";
+        mr.message.content = "mock-ok";
+        mock_prov->Enqueue(mr);
+    }
+    router.Add("mock", mock_prov);
+    router.SetDefault(EnvOr("OPENCLAW_DEFAULT_PROVIDER", "deepseek"));
+
     auto channels = channels::MakeDefaultChannels();
     auto adapters = channels::AdapterHub::MakeDefault();
     auto skills = LoadSkills();
@@ -418,7 +518,6 @@ int CmdGateway(int argc, char** argv, int argi) {
     plugins.Scan(RepoRoot() / "plugins");
     cron::Scheduler cron;
     auth::PairingStore pairing;
-    pairing.Add({.id = "pair-demo", .channel = "cli", .code = "ABC123", .sender = "local"});
     session::Store sessions(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
     memory::Store memory(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
     secrets::Store secrets(std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "secrets.json");
@@ -428,7 +527,17 @@ int CmdGateway(int argc, char** argv, int argi) {
     agent::FileStore agent_files(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "agents");
     auto& logs = logging::GlobalLog();
     logs.Append("info", "gateway starting");
-    // Optional real MCP stdio child: OPENCLAW_MCP_COMMAND="/path/to/server arg1"
+
+    const auto data_dir = std::filesystem::path(EnvOr("OPENCLAW_DATA_DIR",
+        (std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "data").string()));
+    persist::StateStore persist(data_dir);
+    persist.LoadCron(cron);
+    persist.LoadPairing(pairing);
+    persist.LoadNodes(nodes);
+    if (pairing.List().empty()) {
+        pairing.Add({.id = "pair-demo", .channel = "cli", .code = "ABC123", .sender = "local"});
+    }
+
     if (const char* mcp_cmd = std::getenv("OPENCLAW_MCP_COMMAND"); mcp_cmd && *mcp_cmd) {
         try {
             std::vector<std::string> argv;
@@ -438,7 +547,6 @@ int CmdGateway(int argc, char** argv, int argi) {
             auto stdio_cli = mcp::MakeStdioClient(argv);
             auto n = mcp::RegisterMcpTools(tools, stdio_cli, "mcp.stdio.");
             std::cerr << "[gateway] stdio mcp bridged " << n << " tools\n";
-            logs.Append("info", "stdio mcp tools=" + std::to_string(n));
         } catch (const std::exception& e) {
             std::cerr << "[gateway] stdio mcp failed: " << e.what() << "\n";
         }
@@ -446,10 +554,13 @@ int CmdGateway(int argc, char** argv, int argi) {
     auto cfg = config::LoadOrDefault(config::DefaultPath());
     cfg.gateway_host = opts.bind_host;
     cfg.gateway_port = opts.port;
-    provider::DeepSeekProvider deepseek(api_key, EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-                                        EnvOr("DEEPSEEK_MODEL", "deepseek-chat"));
+
+    // Keep DeepSeekProvider for streaming path
+    provider::DeepSeekProvider deepseek(ds_key, ds_base, ds_model);
+
     gateway::ServerDeps deps{
-        .provider = deepseek,
+        .provider = router,
+        .router = &router,
         .deepseek = &deepseek,
         .tools = tools,
         .sessions = sessions,
@@ -467,10 +578,12 @@ int CmdGateway(int argc, char** argv, int argi) {
         .bus = bus,
         .agent_files = agent_files,
         .logs = logs,
+        .persist = &persist,
         .config = cfg,
         .auth = auth::FromEnv(),
     };
-    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+
     gateway::Server server(opts, deps);
     try { server.Run(); }
     catch (const std::exception& e) {

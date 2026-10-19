@@ -14,9 +14,11 @@
 #include "openclaw/media/store.hpp"
 #include "openclaw/memory/store.hpp"
 #include "openclaw/nodes/registry.hpp"
+#include "openclaw/persist/store.hpp"
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/provider/deepseek.hpp"
 #include "openclaw/provider/provider.hpp"
+#include "openclaw/provider/router.hpp"
 #include "openclaw/secrets/store.hpp"
 #include "openclaw/session/store.hpp"
 #include "openclaw/skills/loader.hpp"
@@ -38,6 +40,7 @@ struct ServerOptions {
 
 struct ServerDeps {
     provider::Provider& provider;
+    provider::Router* router = nullptr;
     provider::DeepSeekProvider* deepseek = nullptr;
     tools::Registry& tools;
     session::Store& sessions;
@@ -55,6 +58,7 @@ struct ServerDeps {
     events::Bus& bus;
     agent::FileStore& agent_files;
     logging::TailBuffer& logs;
+    persist::StateStore* persist = nullptr;
     config::Snapshot config;
     auth::AuthConfig auth;
     std::string system_prompt = "You are OpenClaw (C++ rewrite). Be concise and helpful.";
@@ -81,6 +85,7 @@ private:
     nlohmann::json Stub(const std::string& method, const nlohmann::json& params);
     std::string DeliverInbound(const channels::InboundMessage& msg);
     void Emit(const std::string& event, const nlohmann::json& payload);
+    void PersistAll() const;
 
     ServerOptions opts_;
     ServerDeps deps_;

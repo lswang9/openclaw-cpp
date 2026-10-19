@@ -5,11 +5,13 @@ namespace openclaw::gateway {
 std::vector<std::string> ImplementedMethods() {
     return {
         "health", "status", "gateway.status", "system.info", "connect",
+        "diagnostics.stability", "doctor.memory.status",
         "methods.list", "events.list",
         "sessions.list", "sessions.get", "sessions.delete", "sessions.create",
         "sessions.reset", "sessions.preview", "sessions.patch", "sessions.send",
         "sessions.subscribe", "sessions.messages.subscribe", "sessions.compact",
-        "chat.send", "chat.history", "chat.abort", "chat.inject",
+        "sessions.abort", "sessions.usage",
+        "chat.send", "chat.history", "chat.abort", "chat.inject", "chat.startup",
         "tools.list", "tools.invoke", "tools.catalog", "tools.effective",
         "config.get", "config.set", "config.apply", "config.patch", "config.schema",
         "config.schema.lookup",
@@ -18,9 +20,11 @@ std::vector<std::string> ImplementedMethods() {
         "agents.list", "agents.create", "agents.update", "agents.delete",
         "agents.files.list", "agents.files.get", "agents.files.set",
         "skills.status", "skills.library.list", "skills.library.read", "skills.detail",
-        "skills.search", "plugins.list", "plugins.setEnabled",
+        "skills.search", "skills.bins", "skills.install",
+        "plugins.list", "plugins.setEnabled",
         "cron.add", "cron.update", "cron.remove", "cron.runs", "cron.list", "cron.run",
-        "memory.get", "memory.status", "memory.search",
+        "cron.get", "cron.history",
+        "memory.get", "memory.set", "memory.status", "memory.search",
         "approval.list", "approval.get", "approval.resolve",
         "exec.approval.list", "exec.approval.request", "exec.approval.resolve",
         "plugin.approval.list", "plugin.approval.request", "plugin.approval.resolve",
@@ -31,6 +35,7 @@ std::vector<std::string> ImplementedMethods() {
         "message.action", "conversations.send",
         "artifacts.list", "artifacts.get", "assistant.media.get",
         "logs.tail",
+        "models.list", "models.probe",
     };
 }
 

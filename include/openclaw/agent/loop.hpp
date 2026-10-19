@@ -13,6 +13,10 @@ namespace openclaw::agent {
 struct LoopOptions {
     std::size_t max_turns = 8;
     bool verbose = false;
+    // Soft-warn / break if the same tool+args repeats this many times consecutively.
+    std::size_t identical_tool_warn_after = 2;
+    std::size_t identical_tool_break_after = 4;
+    std::string provider_route;  // optional router route
 };
 
 struct LoopResult {
@@ -21,10 +25,9 @@ struct LoopResult {
     std::string error;
     std::vector<Message> messages;
     std::size_t turns = 0;
+    std::vector<std::string> warnings;
 };
 
-// Minimal OpenClaw-aligned agent loop:
-// messages → model → optional tool_calls → tool results → model … → stop
 LoopResult RunAgentLoop(provider::Provider& provider,
                         tools::Registry& registry,
                         std::vector<Message> messages,

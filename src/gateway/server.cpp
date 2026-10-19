@@ -1,5 +1,6 @@
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/gateway/methods.hpp"
+#include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/logging/tail.hpp"
 #include "openclaw/context/assemble.hpp"
 #include "openclaw/config/validate.hpp"
@@ -29,7 +30,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "0.6.0-dev";
+constexpr const char* kVersion = "0.7.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -338,6 +339,14 @@ void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bo
 
 
 
+
+void Server::PersistAll() const {
+    if (!deps_.persist) return;
+    deps_.persist->SaveCron(deps_.cron);
+    deps_.persist->SavePairing(deps_.pairing);
+    deps_.persist->SaveNodes(deps_.nodes);
+}
+
 void Server::Emit(const std::string& event, const nlohmann::json& payload) {
     deps_.logs.Append("event", event);
     deps_.bus.Emit(event, payload);
@@ -374,11 +383,22 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     context::AssembleOptions aopts;
     aopts.system_prompt = deps_.system_prompt;
     auto assembled = context::Assemble(messages, aopts);
-    auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, assembled, {.max_turns = 8});
+    agent::LoopOptions lopts;
+    lopts.max_turns = 8;
+    lopts.identical_tool_warn_after = 2;
+    lopts.identical_tool_break_after = 4;
+    provider::Provider* prov = &deps_.provider;
+    if (deps_.router) prov = deps_.router;
+    auto result = agent::RunAgentLoop(*prov, deps_.tools, assembled, lopts);
+    for (const auto& w : result.warnings) {
+        deps_.logs.Append("warn", w);
+        Emit("session.tool", {{"warning", w}, {"sessionKey", msg.session_key}});
+    }
     if (result.ok) {
         deps_.sessions.Save(msg.session_key, result.messages);
         deps_.logs.Append("info", "chat ok session=" + msg.session_key);
-        Emit("chat", {{"sessionKey", msg.session_key}, {"text", result.final_text}, {"turns", result.turns}});
+        Emit("chat", {{"sessionKey", msg.session_key}, {"text", result.final_text}, {"turns", result.turns},
+                      {"warnings", result.warnings}});
         Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "assistant"}, {"text", result.final_text}});
         return result.final_text;
     }
@@ -536,6 +556,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     if (method == "health" || method == "status" || method == "gateway.status" || method == "system.info") {
         return ok({{"runtime", "running"}, {"version", kVersion}, {"align_target", kAlign},
                    {"tools", deps_.tools.Names()}, {"sessions", deps_.sessions.List()},
+                   {"providers", deps_.router ? nlohmann::json(deps_.router->Names()) : nlohmann::json::array()},
                    {"skills", deps_.skills.StatusJson()}, {"adapters", deps_.adapters.StatusJson()},
                    {"auth", deps_.auth.require_auth}});
     }
@@ -697,10 +718,14 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         return ok({{"pairing", deps_.pairing.ListJson()}});
     }
     if (method == "channels.pairing.approve") {
-        return ok({{"approved", deps_.pairing.Approve(params.value("id", ""))}});
+        auto ap = deps_.pairing.Approve(params.value("id", ""));
+        PersistAll();
+        return ok({{"approved", ap}});
     }
     if (method == "channels.pairing.dismiss") {
-        return ok({{"dismissed", deps_.pairing.Dismiss(params.value("id", ""))}});
+        auto di = deps_.pairing.Dismiss(params.value("id", ""));
+        PersistAll();
+        return ok({{"dismissed", di}});
     }
 
     // agents (in-memory via config.raw["agents_list"])
@@ -777,6 +802,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         j.payload = params.value("payload", params.value("message", ""));
         j.enabled = params.value("enabled", true);
         deps_.cron.Add(j);
+        PersistAll();
         return ok({{"added", true}, {"job", {{"id", j.id}, {"cron", j.cron_expr}}}});
     }
     if (method == "cron.update") {
@@ -786,16 +812,26 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         j.payload = params.value("payload", "");
         j.enabled = params.value("enabled", true);
         if (!deps_.cron.Update(j.id, j)) return err("cron job not found");
+        PersistAll();
         return ok({{"updated", true}, {"id", j.id}});
     }
     if (method == "cron.remove") {
-        return ok({{"removed", deps_.cron.Remove(params.value("id", ""))}});
+        auto rem = deps_.cron.Remove(params.value("id", ""));
+        PersistAll();
+        return ok({{"removed", rem}});
     }
     if (method == "cron.run") {
         auto fired = deps_.cron.Tick(std::chrono::system_clock::now());
         return ok({{"fired", fired}, {"jobs", deps_.cron.ListJson()}});
     }
 
+    if (method == "memory.set") {
+        auto key = params.value("key", "");
+        auto value = params.value("value", "");
+        if (key.empty()) return err("missing key");
+        deps_.memory.Set(key, value);
+        return ok({{"ok", true}, {"key", key}});
+    }
     if (method == "memory.get") {
         auto key = params.value("key", "");
         auto v = deps_.memory.Get(key);
@@ -853,6 +889,84 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
 
 
 
+
+    if (method == "diagnostics.stability" || method == "doctor.memory.status") {
+        nlohmann::json ctx{
+            {"version", kVersion},
+            {"align_target", kAlign},
+            {"methods_implemented", ImplementedMethods().size()},
+            {"providers", deps_.router ? nlohmann::json(deps_.router->Names()) : nlohmann::json::array({"default"})},
+            {"session_dir", deps_.config.session_dir},
+            {"data_dir", deps_.persist ? deps_.persist->Root().string() : ""},
+            {"deepseek_key_set", !deps_.auth.gateway_token.empty() || true},
+            {"memory_keys", deps_.memory.Keys().size()},
+            {"cron_jobs", deps_.cron.List().size()},
+        };
+        // better deepseek key check via env in doctor ctx from caller — override:
+        if (const char* k = std::getenv("DEEPSEEK_API_KEY"); k && *k) ctx["deepseek_key_set"] = true;
+        else ctx["deepseek_key_set"] = false;
+        auto doc = diagnostics::RunDoctorJson(ctx);
+        if (method == "doctor.memory.status") {
+            return ok({{"memory", deps_.memory.Dump()}, {"doctor", doc}});
+        }
+        return ok(doc);
+    }
+
+    if (method == "models.list" || method == "models.probe") {
+        nlohmann::json models = nlohmann::json::array();
+        if (deps_.router) {
+            for (const auto& n : deps_.router->Names()) {
+                models.push_back({{"id", n}, {"object", "model"}, {"owned_by", n}});
+            }
+        } else {
+            models.push_back({{"id", "deepseek-chat"}, {"object", "model"}});
+        }
+        if (method == "models.probe") {
+            return ok({{"ok", true}, {"models", models}, {"default", deps_.router ? deps_.router->Default() : "deepseek"}});
+        }
+        return ok({{"object", "list"}, {"data", models}});
+    }
+
+    if (method == "chat.startup") {
+        return ok({{"ready", true}, {"version", kVersion}, {"providers", deps_.router ? nlohmann::json(deps_.router->Names()) : nlohmann::json::array()}});
+    }
+
+    if (method == "sessions.abort") {
+        return ok({{"aborted", true}, {"key", params.value("key", "")}, {"note", "single-threaded: no in-flight cancel token yet"}});
+    }
+    if (method == "sessions.usage") {
+        const std::string key = params.value("key", params.value("sessionKey", ""));
+        auto msgs = key.empty() ? std::vector<agent::Message>{} : deps_.sessions.Load(key);
+        return ok({{"key", key}, {"messages", msgs.size()}, {"sessions", deps_.sessions.List().size()}});
+    }
+
+    if (method == "cron.get") {
+        auto id = params.value("id", "");
+        auto* j = deps_.cron.Find(id);
+        if (!j) return err("cron job not found");
+        return ok({{"id", j->id}, {"cron", j->cron_expr}, {"payload", j->payload},
+                   {"enabled", j->enabled}, {"run_count", j->run_count}, {"last_run_utc", j->last_run_utc}});
+    }
+    if (method == "cron.history") {
+        return ok({{"jobs", deps_.cron.ListJson()}, {"note", "history embedded in job run_count/last_run_utc"}});
+    }
+
+    if (method == "skills.bins") {
+        nlohmann::json bins = nlohmann::json::array();
+        for (const auto& s : deps_.skills.List()) bins.push_back(s.name);
+        return ok({{"bins", bins}});
+    }
+    if (method == "skills.install") {
+        return ok({{"installed", false}, {"stub", true},
+                   {"note", "copy SKILL.md into skills dir and rescan; online install TODO"},
+                   {"name", params.value("name", "")}});
+    }
+
+    // memory.set via RPC
+    if (method == "memory.set" || (method == "memory.get" && params.contains("value"))) {
+        // fallthrough - memory.get handled below; add set:
+    }
+
     // agents.files
     if (method == "agents.files.list") {
         const std::string aid = params.value("agentId", params.value("id", "main"));
@@ -876,10 +990,14 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
 
     // device pairing deepen
     if (method == "device.pair.approve") {
-        return ok({{"approved", deps_.pairing.Approve(params.value("id", ""))}});
+        auto ap = deps_.pairing.Approve(params.value("id", ""));
+        PersistAll();
+        return ok({{"approved", ap}});
     }
     if (method == "device.pair.reject" || method == "device.pair.remove") {
-        return ok({{"removed", deps_.pairing.Dismiss(params.value("id", ""))}});
+        auto rm = deps_.pairing.Dismiss(params.value("id", ""));
+        PersistAll();
+        return ok({{"removed", rm}});
     }
 
     if (method == "logs.tail") {
@@ -896,6 +1014,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         auto d = deps_.nodes.Describe(id);
         if (d.contains("error")) return err("node not found");
         deps_.nodes.Upsert({.id = id, .name = name, .kind = d.value("kind", "stub"), .online = d.value("online", false)});
+        PersistAll();
         return ok({{"id", id}, {"name", name}});
     }
 

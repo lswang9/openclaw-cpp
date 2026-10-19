@@ -12,6 +12,9 @@ LoopResult RunAgentLoop(provider::Provider& provider,
     out.messages = std::move(messages);
     const auto tools = registry.OpenAiToolsArray();
 
+    std::string last_sig;
+    std::size_t same_count = 0;
+
     for (std::size_t turn = 0; turn < opts.max_turns; ++turn) {
         ++out.turns;
         if (opts.verbose) {
@@ -35,11 +38,32 @@ LoopResult RunAgentLoop(provider::Provider& provider,
         }
 
         for (const auto& tc : completion.tool_calls) {
+            const std::string sig = tc.name + "|" + tc.arguments_json;
+            if (sig == last_sig) {
+                ++same_count;
+            } else {
+                last_sig = sig;
+                same_count = 1;
+            }
+
+            if (same_count == opts.identical_tool_warn_after) {
+                const std::string w =
+                    "repeated identical tool call soft-warn: " + tc.name + " x" +
+                    std::to_string(same_count);
+                out.warnings.push_back(w);
+                if (opts.verbose) std::cerr << "[agent] " << w << '\n';
+            }
+            if (same_count >= opts.identical_tool_break_after) {
+                out.ok = false;
+                out.error = "loop detection: identical tool call repeated " +
+                            std::to_string(same_count) + " times (" + tc.name + ")";
+                out.final_text = completion.message.content;
+                return out;
+            }
+
             nlohmann::json args = nlohmann::json::object();
             try {
-                if (!tc.arguments_json.empty()) {
-                    args = nlohmann::json::parse(tc.arguments_json);
-                }
+                if (!tc.arguments_json.empty()) args = nlohmann::json::parse(tc.arguments_json);
             } catch (const std::exception& e) {
                 args = {{"_parse_error", e.what()}, {"_raw", tc.arguments_json}};
             }
