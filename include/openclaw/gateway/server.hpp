@@ -3,6 +3,9 @@
 #include "openclaw/agent/files.hpp"
 #include "openclaw/acp/session.hpp"
 #include "openclaw/voice/tts.hpp"
+#include "openclaw/sim/backend.hpp"
+#include "openclaw/mcp/client.hpp"
+#include <memory>
 #include "openclaw/approvals/store.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/agent/loop.hpp"
@@ -63,6 +66,8 @@ struct ServerDeps {
     persist::StateStore* persist = nullptr;
     acp::Registry* acp = nullptr;
     voice::TtsEngine* tts = nullptr;
+    sim::SimulationBackend* sim = nullptr;
+    std::shared_ptr<mcp::Client> mcp_client;
     config::Snapshot config;
     auth::AuthConfig auth;
     std::string system_prompt = "You are OpenClaw (C++ rewrite). Be concise and helpful.";

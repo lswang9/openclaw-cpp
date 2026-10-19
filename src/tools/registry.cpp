@@ -239,15 +239,73 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
               {"url", {{"type", "string"}}}}},
         };
         br.handler = [](const nlohmann::json& args) {
+            auto action = args.value("action", "");
+            if (action == "open_url" || action == "open") {
+                return nlohmann::json{{"ok", false},
+                                      {"error", "use tool browser_open_url"},
+                                      {"hint", "browser_open_url for curl+title; no Playwright"}}.dump();
+            }
             return nlohmann::json{{"ok", false},
                                   {"configured", false},
                                   {"impl", "stub"},
-                                  {"error", "not configured"},
-                                  {"action", args.value("action", "")},
-                                  {"hint", "use tool http_get for URL fetch; headless browser not shipped"}}.dump();
+                                  {"error", "full browser not configured"},
+                                  {"action", action},
+                                  {"hint", "use browser_open_url or http_get; no Playwright/Chromium"}}.dump();
         };
         r.Register(std::move(br));
     }
+
+    {
+        ToolSpec bo;
+        bo.name = "browser_open_url";
+        bo.description = "Lightweight URL open: curl fetch, extract <title>, store page text (not Playwright).";
+        bo.parameters = {
+            {"type", "object"},
+            {"properties", {{"url", {{"type", "string"}}}}},
+            {"required", nlohmann::json::array({"url"})},
+        };
+        // Actual sim is on gateway; tool does its own curl for agent use without ServerDeps
+        bo.handler = [](const nlohmann::json& args) -> std::string {
+            const std::string url = args.value("url", "");
+            if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+                return nlohmann::json{{"error", "only http/https"}}.dump();
+            }
+            CURL* curl = curl_easy_init();
+            if (!curl) return nlohmann::json{{"error", "curl init"}}.dump();
+            std::string body;
+            auto write = [](char* p, size_t s, size_t n, void* u) -> size_t {
+                static_cast<std::string*>(u)->append(p, s * n); return s * n;
+            };
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +write);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+            curl_easy_setopt(curl, CURLOPT_USERAGENT, "openclaw-cpp-browser_open_url/1.4");
+            CURLcode rc = curl_easy_perform(curl);
+            long http = 0;
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
+            curl_easy_cleanup(curl);
+            if (rc != CURLE_OK) return nlohmann::json{{"ok", false}, {"error", curl_easy_strerror(rc)}}.dump();
+            std::string title;
+            auto p1 = body.find("<title");
+            if (p1 != std::string::npos) {
+                p1 = body.find('>', p1);
+                auto p2 = body.find("</title>", p1);
+                if (p1 != std::string::npos && p2 != std::string::npos) title = body.substr(p1 + 1, p2 - p1 - 1);
+            }
+            if (body.size() > 32768) body.resize(32768);
+            return nlohmann::json{{"ok", true},
+                                  {"mode", "lightweight"},
+                                  {"url", url},
+                                  {"title", title},
+                                  {"http", http},
+                                  {"text_bytes", body.size()},
+                                  {"text_prefix", body.substr(0, 500)}}.dump();
+        };
+        r.Register(std::move(bo));
+    }
+
 
     return r;
 }

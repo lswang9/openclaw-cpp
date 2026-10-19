@@ -23,6 +23,13 @@ nlohmann::json Real(nlohmann::json payload) {
     return payload;
 }
 
+nlohmann::json RealSim(nlohmann::json payload) {
+    payload["impl"] = "real-sim";
+    payload["simulation"] = true;
+    if (!payload.contains("mode")) payload["mode"] = "simulation";
+    return payload;
+}
+
 nlohmann::json Honest(const std::string& method, const nlohmann::json& params,
                       const nlohmann::json& state) {
     return {{"ok", true},
@@ -233,7 +240,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     if (starts("update.")) {
         r.handled = true;
         r.payload = Real({{"status", "idle"},
-                          {"current", "1.3.0-dev"},
+                          {"current", "1.4.0-dev"},
                           {"align_target", "OpenClaw 2026.10.5"},
                           {"auto_update", false},
                           {"method", method}});
@@ -1008,13 +1015,24 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
-    // ---- browser RPC: honest not-configured (tool browser also stub) ----
-    if (starts("browser.")) {
+    // ---- browser lightweight (curl+title via SimulationBackend) ----
+    if (starts("browser.") || method == "browser.open_url") {
         r.handled = true;
-        r.payload = Real({{"configured", false},
-                          {"implemented", false},
-                          {"method", method},
-                          {"hint", "use tools.invoke http_get for fetch"}});
+        if (!deps.sim) {
+            r.payload = Real({{"configured", false}, {"error", "sim not wired"}});
+            return r;
+        }
+        if (method == "browser.status" || method == "browser.") {
+            r.payload = Real(deps.sim->BrowserStatus());
+            return r;
+        }
+        if (method.find("open") != std::string::npos) {
+            auto url = params.value("url", params.value("href", ""));
+            r.payload = Real(deps.sim->BrowserOpenUrl(url));
+            return r;
+        }
+        r.payload = Real({{"status", deps.sim->BrowserStatus()}, {"method", method},
+                          {"hint", "browser.open_url | tool browser_open_url"}});
         return r;
     }
 
@@ -1083,7 +1101,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         if (starts("gateway.") && (method.find("status") != std::string::npos || method.find("health") != std::string::npos)) {
-            r.payload = Real({{"runtime", "running"}, {"version", "1.3.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
+            r.payload = Real({{"runtime", "running"}, {"version", "1.4.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
             return r;
         }
         r.payload = Real({{key, store}, {"method", method}});
@@ -1300,17 +1318,133 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     }
 
     // ---- Explicit NOT implemented (no fake computer/canvas/desktop) ----
-    if (starts("computer.") || starts("canvas.") || starts("claws.") ||
-        starts("board.") || starts("portal.") || starts("wizard.") || starts("openclaw.") ||
+    // ---- computer / canvas / desktop SIMULATION (real-sim) ----
+    if (starts("computer.") || starts("canvas.") || starts("desktop.")) {
+        r.handled = true;
+        if (!deps.sim) {
+            r.payload = RealSim({{"error", "sim backend not wired"}, {"method", method}});
+            return r;
+        }
+        auto& sim = *deps.sim;
+        if (method == "computer.status") { r.payload = RealSim(sim.ComputerStatus()); return r; }
+        if (method == "computer.invoke") { r.payload = RealSim(sim.ComputerInvoke(params)); return r; }
+        if (method.find("screenshot") != std::string::npos) {
+            r.payload = RealSim(sim.Screenshot(params));
+            return r;
+        }
+        if (starts("canvas.")) {
+            if (method.find("preview") != std::string::npos) {
+                r.payload = RealSim(sim.CanvasPreview(params));
+                return r;
+            }
+            if (method.find("view") != std::string::npos || method.find("get") != std::string::npos) {
+                r.payload = RealSim(sim.CanvasView(params));
+                return r;
+            }
+            if (method.find("put") != std::string::npos || method.find("update") != std::string::npos) {
+                r.payload = RealSim(sim.CanvasPut(params));
+                return r;
+            }
+            r.payload = RealSim(sim.CanvasView(params));
+            return r;
+        }
+        if (starts("desktop.")) {
+            if (method.find("launch") != std::string::npos) {
+                r.payload = RealSim(sim.DesktopLaunch(params));
+                return r;
+            }
+            if (method.find("observe") != std::string::npos) {
+                r.payload = RealSim(sim.DesktopObserve(params));
+                return r;
+            }
+            if (method.find("release") != std::string::npos) {
+                r.payload = RealSim(sim.DesktopRelease(params));
+                return r;
+            }
+            r.payload = RealSim({{"desktop", sim.Status()}, {"method", method}});
+            return r;
+        }
+        r.payload = RealSim(sim.ComputerInvoke(params.contains("action") ? params : nlohmann::json{{"action", "noop"}, {"method", method}}));
+        return r;
+    }
+
+    // ---- mcp.app.* bridge to mcp::Client ----
+    if (starts("mcp.app.")) {
+        r.handled = true;
+        auto cli = deps.mcp_client;
+        if (method == "mcp.app.listTools") {
+            nlohmann::json tools = nlohmann::json::array();
+            if (cli) {
+                for (const auto& t : cli->ListTools())
+                    tools.push_back({{"name", t.name}, {"description", t.description}});
+            }
+            // also surface bridged registry tools
+            for (const auto& n : deps.tools.Names())
+                if (n.rfind("mcp.", 0) == 0) tools.push_back({{"name", n}, {"bridged", true}});
+            r.payload = Real({{"tools", tools}, {"client", cli ? true : false}});
+            return r;
+        }
+        if (method == "mcp.app.callTool") {
+            if (!cli) { r.ok = false; r.error = "mcp client not attached"; return r; }
+            auto name = params.value("name", params.value("tool", ""));
+            auto args = params.contains("arguments") ? params["arguments"] : params.value("args", nlohmann::json::object());
+            try {
+                r.payload = Real(cli->CallTool(name, args));
+            } catch (const std::exception& e) {
+                r.ok = false; r.error = e.what();
+            }
+            return r;
+        }
+        if (method == "mcp.app.listResources") {
+            if (!cli) { r.payload = Real({{"resources", nlohmann::json::array()}, {"client", false}}); return r; }
+            r.payload = Real(cli->ListResources());
+            return r;
+        }
+        if (method == "mcp.app.listResourceTemplates") {
+            if (!cli) { r.payload = Real({{"resourceTemplates", nlohmann::json::array()}}); return r; }
+            r.payload = Real(cli->ListResourceTemplates());
+            return r;
+        }
+        if (method == "mcp.app.readResource") {
+            if (!cli) { r.ok = false; r.error = "mcp client not attached"; return r; }
+            try {
+                r.payload = Real(cli->ReadResource(params.value("uri", "")));
+            } catch (const std::exception& e) {
+                r.ok = false; r.error = e.what();
+            }
+            return r;
+        }
+        // host-UI-ish methods: local ack + tool inventory (not a full MCP app host)
+        if (method == "mcp.app.discover" || method == "mcp.app.view" || method == "mcp.app.launch" ||
+            method == "mcp.app.settings" || method == "mcp.app.onboard" || method == "mcp.app.mention" ||
+            method == "mcp.app.updateModelContext") {
+            auto& st = EnsureObj(deps.config.raw, "mcp_app");
+            st["last_method"] = method;
+            st["last_params"] = params;
+            PersistCfg(deps);
+            nlohmann::json tools = nlohmann::json::array();
+            if (cli) for (const auto& t : cli->ListTools()) tools.push_back(t.name);
+            r.payload = Real({{"ok", true},
+                              {"method", method},
+                              {"state", st},
+                              {"tools", tools},
+                              {"note", "MCP app host UI surface is local-ack only; tools/resources go through mcp.app.list*/call*/read*"}});
+            return r;
+        }
+        r.payload = Real({{"method", method}, {"client", cli ? true : false}});
+        return r;
+    }
+
+    if (starts("claws.") || starts("board.") || starts("portal.") || starts("wizard.") || starts("openclaw.") ||
         starts("nativeHook.") || starts("web.login") || starts("attach.") ||
-        starts("taskSuggestions.") || starts("mcp.app.") ||
-        starts("desktop.") || starts("debugProxy.")) {
+        starts("taskSuggestions.") || starts("debugProxy.")) {
         r.handled = true;
         r.payload = Real({{"implemented", false},
                           {"method", method},
                           {"note", "intentionally not faked — see PARITY.md"}});
         return r;
     }
+
 
     // residual catch-all still honest (should be rare)
     r.handled = true;

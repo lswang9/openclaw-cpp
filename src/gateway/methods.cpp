@@ -553,6 +553,23 @@ std::vector<std::string> ImplementedMethods() {
         "last-heartbeat",
         "doctor.memory.dedupeDreamDiary",
         "doctor.memory.resetDreamDiary",
+        "computer.invoke",
+        "computer.screenshot",
+        "canvas.document.preview",
+        "canvas.document.put",
+        "desktop.observe",
+        "desktop.launch",
+        "desktop.release",
+        "browser.open_url",
+        "mcp.app.view",
+        "mcp.app.listResourceTemplates",
+        "mcp.app.readResource",
+        "mcp.app.updateModelContext",
+        "mcp.app.onboard",
+        "mcp.app.discover",
+        "mcp.app.launch",
+        "mcp.app.settings",
+        "mcp.app.mention",
     };
 }
 

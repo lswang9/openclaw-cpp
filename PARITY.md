@@ -1,43 +1,49 @@
-# OpenClaw 2026.10.5 → openclaw-cpp 对齐表
+# OpenClaw 2026.10.5 → openclaw-cpp — brutally honest parity
 
-**不宣称全量对齐。** 当前：**1.3.0-dev**。
+**Current: 1.4.0-dev. This is NOT full OpenClaw 2026.10.5 parity.**
 
-## 术语
+OpenClaw upstream is a large Node/TS product (ACP agents, real browser/computer use, rich Control UI, JS plugins, production IM stacks). openclaw-cpp is a **C++20 rewrite** that implements a growing **API surface** with local state, optional HTTP, and **explicit simulation** where real OS/browser automation is out of scope.
 
-| 标签 | 含义 |
-|------|------|
-| **real** | 本地真实状态或实网副作用（`impl:"real"`） |
-| **honest** | `impl:"honest"` 残余 catch-all |
-| **stub** | `implemented:false` / not-configured / record_only — 不假装 |
-| **catalog-only** | 广告表中仍未列入 `ImplementedMethods` 的少数项（board/computer/canvas/…） |
+## Impl tags (read these in RPC responses)
 
-## 规模
+| `impl` | Meaning |
+|--------|---------|
+| **`real`** | Touches real local state and/or real network (curl IM/TTS/http_get when env set). Still may be a **subset** of upstream behavior. |
+| **`real-sim`** | Deterministic **SimulationBackend**. Records mouse/keyboard/canvas/desktop actions; screenshot is a **placeholder 1×1 PNG**. Useful for API/catalog testing — **not** production computer-use. |
+| **`honest`** | Partial; returns visible state + note. Rare residual. |
+| **`stub` / `implemented:false`** | Intentionally missing or not faked (board host UI, Playwright browser, etc.). |
 
-| 指标 | 值 |
-|------|-----|
-| Catalog（广告） | **516**（`AdvertisedMethodCount`） |
-| `ImplementedMethods` | **549**（含既有前缀桶可服务的上游名 + 本地扩展） |
-| 仍明确 stub | computer / canvas / desktop / board / portal / wizard / openclaw.* / mcp.app.* / browser 等 |
+## Scale
 
-> 549 多数走已有 **real** 前缀处理器（skills/users/sessions/node/…），不是空 stub 膨胀。
+| Metric | Value |
+|--------|--------|
+| Catalog advertised | **516** |
+| `ImplementedMethods` | **566** |
+| Production-grade vs upstream | **Low–medium** on chat/gateway/tools; **sim/lightweight** on computer/canvas/desktop/browser |
 
-## 1.3 增量
+Many of the 566 names are served by **prefix buckets** (skills/users/sessions/…). That expands surface coverage; it does **not** mean each name matches OpenClaw 2026.10.5 semantics.
 
-| 项 | 状态 |
-|----|------|
-| WhatsApp / iMessage inbound | **real（部分）** — `SimpleInboundAdapter`；`WHATSAPP_VERIFY_TOKEN` / `IMESSAGE_VERIFY_TOKEN` |
-| logs.export / otel.export | **real（cheap）** — JSONL under data/exports；`OTEL_EXPORTER_OTLP_ENDPOINT` 仅标记 best-effort（无完整 OTLP protobuf） |
-| Control UI | sessions/tools、**tool invoke**、**session export**（`GET /v1/sessions/:id/export`） |
-| Catalog 覆盖 | 大批量 skills/users/sessions/… 纳入 ImplementedMethods |
+## Hard gaps (1.4 focus)
 
-## CI
+| Area | Status | Honest note |
+|------|--------|-------------|
+| **computer / canvas / desktop** | **`real-sim`** | `SimulationBackend`: event log, placeholder PNG, canvas JSON doc, desktop launch flags. **No** real display, accessibility tree, or process control. |
+| **browser** | **lightweight `real` + stub** | `browser.open_url` / tool `browser_open_url`: curl + `<title>` regex + stored text. **`browser` tool** still refuses full automation (no Playwright/Chromium). |
+| **mcp.app.*** | **`real` (partial)** | Bridged to in-proc/`mcp::Client`: listTools/callTool/listResources/readResource. Host-UI methods (`view`/`launch`/`settings`/…) are **local ack** only — not an MCP App host. |
+| **board / portal / wizard / openclaw.*** | **`implemented:false`** | Not faked. |
+| **ACP wire / acpx** | **skeleton / gap** | See [docs/ACP-GAP.md](docs/ACP-GAP.md). |
+| **IM** | **partial `real`** | Feishu/Slack/Discord/WA/iMessage inbound webhooks; TG/Discord/Feishu outbound when tokens set. No full Socket Mode / Baileys / multi-tenant prod. |
+| **Plugins** | **partial `real`** | Linux `.so` C ABI sample — **not** JS plugin host. |
+| **TTS** | **partial `real`** | HTTP if `OPENCLAW_TTS_URL`; else record_only. |
+| **Control UI** | **skeleton `real`** | Embedded HTML: chat SSE, tools invoke, session export — not upstream Control UI. |
+| **CI** | **docs only** | [docs/ci-github-actions.yml](docs/ci-github-actions.yml); `.github/workflows` not pushed (token lacks `workflow` scope). |
 
-YAML 仅 [docs/ci-github-actions.yml](docs/ci-github-actions.yml)。**不**推 `.github/workflows`（token 无 `workflow` scope）。
+## What “align OpenClaw 2026.10.5” means here
 
-## 里程碑
+- **Goal:** grow toward the **same feature checklist** over time.
+- **Today:** a Conan/C++ gateway with chat/tools/sessions/channels/MCP bridge and a **catalog-compatible RPC list**, with **honest** `impl` labels.
+- **Do not** treat `ImplementedMethods` count as % feature parity.
 
-- ~~0.2–1.2~~ …
-- **1.3.0-dev**：catalog real 覆盖大幅上升；WA/iMessage inbound；log/otel 文件导出；Control UI invoke+export
-- 下一刀：真正 OTLP、outbound WhatsApp、继续削 stub 面
+## Milestone
 
-`549` ≠ 上游行为逐 API 等价。看 `impl`。
+- **1.4.0-dev**: SimulationBackend (`real-sim`); lightweight `browser.open_url`; `mcp.app.*` client bridge; this PARITY rewrite.

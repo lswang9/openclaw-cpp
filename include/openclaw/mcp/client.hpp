@@ -25,6 +25,9 @@ public:
     bool Initialize();
     std::vector<ToolInfo> ListTools();
     nlohmann::json CallTool(const std::string& name, const nlohmann::json& arguments);
+    nlohmann::json ListResources();
+    nlohmann::json ListResourceTemplates();
+    nlohmann::json ReadResource(const std::string& uri);
 
     // In-process mock server loop for self-test (handles one request from a queue).
     static nlohmann::json MockServerHandle(const nlohmann::json& req);

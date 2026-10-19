@@ -26,6 +26,7 @@
 #include "openclaw/acp/session.hpp"
 #include "openclaw/daemon/lifecycle.hpp"
 #include "openclaw/voice/tts.hpp"
+#include "openclaw/sim/backend.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
@@ -55,7 +56,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.3.0-dev";
+constexpr const char* kVersion = "1.4.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -431,7 +432,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.3.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.4.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -569,10 +570,10 @@ int CmdSelfTest() {
         if (!reg.Has("http_get") || !reg.Has("browser")) {
             std::cerr << "FAIL tools http_get/browser missing\n"; ++failures;
         } else {
-            auto br = nlohmann::json::parse(reg.Invoke("browser", {{"action", "open"}}));
+            auto br = nlohmann::json::parse(reg.Invoke("browser", {{"action", "playwright"}}));
             if (br.value("configured", true) != false) {
-                std::cerr << "FAIL browser should be not configured\n"; ++failures;
-            } else std::cerr << "PASS browser not-configured stub\n";
+                std::cerr << "FAIL browser full automation should be not configured\n"; ++failures;
+            } else std::cerr << "PASS browser full-automation stub\n";
             auto hg = nlohmann::json::parse(reg.Invoke("http_get", {{"url", "https://example.com"}, {"max_bytes", 2048}}));
             if (!hg.value("ok", false) || hg.value("http", 0) < 200) {
                 std::cerr << "WARN http_get example.com: " << hg.dump() << "\n";
@@ -711,6 +712,43 @@ int CmdSelfTest() {
         auto n = gateway::ImplementedMethods().size();
         if (n < 500) { std::cerr << "FAIL implemented too small " << n << "\n"; ++failures; }
         else std::cerr << "PASS implemented growth (" << n << ")\n";
+    }
+
+
+    // simulation backend
+    {
+        sim::SimulationBackend sim(std::filesystem::temp_directory_path() / "oc-sim");
+        auto shot = sim.Screenshot({});
+        auto inv = sim.ComputerInvoke({{"action", "mouse_click"}, {"x", 1}, {"y", 2}});
+        auto cv = sim.CanvasPut({{"title", "t1"}, {"widgets", nlohmann::json::array()}});
+        auto dl = sim.DesktopLaunch({{"app", "sim"}});
+        if (!shot.contains("path") || inv.value("action", "") != "mouse_click" ||
+            !cv.value("saved", false) || !dl["desktop"].value("running", false)) {
+            std::cerr << "FAIL sim backend\n"; ++failures;
+        } else std::cerr << "PASS simulation backend\n";
+        auto br = sim.BrowserOpenUrl("https://example.com");
+        if (!br.value("ok", false)) std::cerr << "WARN browser.open_url " << br.dump() << "\n";
+        else std::cerr << "PASS browser.open_url lightweight\n";
+    }
+
+    // mcp.app bridge via client
+    {
+        auto cli = mcp::MakeMockClient();
+        auto tools = cli->ListTools();
+        auto call = cli->CallTool("mock_echo", {{"x", 1}});
+        auto res = cli->ListResources();
+        if (tools.empty() || !res.contains("resources")) {
+            std::cerr << "FAIL mcp app bridge pieces\n"; ++failures;
+        } else std::cerr << "PASS mcp client list/call/resources\n";
+    }
+
+    // browser_open_url tool
+    {
+        approvals::Store ap;
+        tools::RegistryOptions o; o.approvals = &ap; o.enable_shell = false;
+        auto reg = tools::MakeDefaultRegistry(o);
+        if (!reg.Has("browser_open_url")) { std::cerr << "FAIL browser_open_url tool\n"; ++failures; }
+        else std::cerr << "PASS browser_open_url tool registered\n";
     }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
@@ -897,6 +935,7 @@ int CmdGateway(int argc, char** argv, int argi) {
     persist::StateStore persist(data_dir);
     acp::Registry acp_reg;
     voice::TtsEngine tts_engine;
+    sim::SimulationBackend sim_backend(data_dir);
     persist.LoadCron(cron);
     persist.LoadPairing(pairing);
     persist.LoadNodes(nodes);
@@ -947,6 +986,8 @@ int CmdGateway(int argc, char** argv, int argi) {
         .persist = &persist,
         .acp = &acp_reg,
         .tts = &tts_engine,
+        .sim = &sim_backend,
+        .mcp_client = mcp_client,
         .config = cfg,
         .auth = auth::FromEnv(),
     };

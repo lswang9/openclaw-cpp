@@ -45,6 +45,20 @@ nlohmann::json Client::CallTool(const std::string& name, const nlohmann::json& a
     return Request("tools/call", {{"name", name}, {"arguments", arguments}});
 }
 
+nlohmann::json Client::ListResources() {
+    try { return Request("resources/list"); }
+    catch (...) { return {{"resources", nlohmann::json::array()}, {"error", "resources/list unavailable"}}; }
+}
+
+nlohmann::json Client::ListResourceTemplates() {
+    try { return Request("resources/templates/list"); }
+    catch (...) { return {{"resourceTemplates", nlohmann::json::array()}}; }
+}
+
+nlohmann::json Client::ReadResource(const std::string& uri) {
+    return Request("resources/read", {{"uri", uri}});
+}
+
 nlohmann::json Client::MockServerHandle(const nlohmann::json& req) {
     const std::string method = req.value("method", "");
     const auto id = req.contains("id") ? req["id"] : nlohmann::json();
@@ -69,6 +83,20 @@ nlohmann::json Client::MockServerHandle(const nlohmann::json& req) {
                                     {{"type", "text"},
                                      {"text", nlohmann::json{{"echo", params}}.dump()}},
                                 })}});
+    }
+    if (method == "resources/list") {
+        return ok({{"resources", nlohmann::json::array({
+            {{"uri", "mock://echo"}, {"name", "echo"}, {"mimeType", "text/plain"}}
+        })}});
+    }
+    if (method == "resources/templates/list") {
+        return ok({{"resourceTemplates", nlohmann::json::array()}});
+    }
+    if (method == "resources/read") {
+        const auto params = req.value("params", nlohmann::json::object());
+        return ok({{"contents", nlohmann::json::array({
+            {{"uri", params.value("uri", "")}, {"mimeType", "text/plain"}, {"text", "mock-resource"}}
+        })}});
     }
     return nlohmann::json{{"jsonrpc", "2.0"},
                           {"id", id},

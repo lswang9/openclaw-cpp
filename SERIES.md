@@ -23,3 +23,5 @@
 - **1.2.0-dev**: Slack/Discord inbound, session export/import, backup restore, max_turns+rate_limit
 
 - **1.3.0-dev**: catalog→549 real-prefix coverage, WA/iMessage inbound, log/otel export, Control UI invoke+export
+
+- **1.4.0-dev**: SimulationBackend real-sim, browser.open_url, mcp.app client bridge, honest PARITY

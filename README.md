@@ -1,18 +1,17 @@
 # openclaw-cpp
 
-OpenClaw **C++ 全量重写** · 对齐 **OpenClaw 2026.10.5**。
+OpenClaw **C++ rewrite** aiming at **OpenClaw 2026.10.5** feature coverage over time.
 
-**1.3.0-dev — 未宣称全量对齐。** [PARITY.md](PARITY.md)
+**1.4.0-dev — not full parity.** Read [PARITY.md](PARITY.md) (sim vs real vs missing).
 
-## 1.3 摘要
+## 1.4 highlights
 
-- **549** implemented methods（前缀桶 real 本地行为；board/computer 等仍 stub）
-- WhatsApp / iMessage HTTP inbound（与 Feishu/Slack 同模式）
-- `logs.export` / `otel.export` → data/exports JSONL（可选 OTEL endpoint 标记）
-- Control UI：tools **Invoke**、session **Export**
+- **`real-sim`**: computer / canvas / desktop via `SimulationBackend` (placeholder PNG + action log)
+- **browser.open_url** / tool `browser_open_url`: curl + title (not Playwright)
+- **mcp.app.***: list/call tools + resources via `mcp::Client`
+- PARITY.md rewritten for brutal honesty
 
 ```bash
 cmake --preset conan-release && cmake --build --preset conan-release -j
 ./build/build/Release/openclaw-cpp self-test
-./build/build/Release/openclaw-cpp gateway --port 18789
 ```
