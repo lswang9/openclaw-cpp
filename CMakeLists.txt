@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 0.4.0 LANGUAGES CXX)
+project(openclaw-cpp VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,16 +21,22 @@ set(OPENCLAW_SOURCES
   src/gateway/methods.cpp
   src/gateway/catalog_generated.cpp
   src/config/config.cpp
+  src/config/validate.cpp
   src/channels/registry.cpp
   src/channels/adapter.cpp
+  src/channels/outbound.cpp
   src/memory/store.cpp
   src/cron/scheduler.cpp
   src/auth/gateway_auth.cpp
   src/skills/loader.cpp
   src/plugins/registry.cpp
   src/mcp/client.cpp
+  src/mcp/bridge.cpp
   src/approvals/store.cpp
   src/secrets/store.cpp
+  src/events/bus.cpp
+  src/nodes/registry.cpp
+  src/media/store.cpp
 )
 
 add_executable(openclaw-cpp ${OPENCLAW_SOURCES})

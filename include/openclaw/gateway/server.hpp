@@ -4,10 +4,14 @@
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/agent/loop.hpp"
 #include "openclaw/channels/adapter.hpp"
+#include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/registry.hpp"
 #include "openclaw/config/config.hpp"
 #include "openclaw/cron/scheduler.hpp"
+#include "openclaw/events/bus.hpp"
+#include "openclaw/media/store.hpp"
 #include "openclaw/memory/store.hpp"
+#include "openclaw/nodes/registry.hpp"
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/provider/deepseek.hpp"
 #include "openclaw/provider/provider.hpp"
@@ -18,6 +22,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <set>
 #include <string>
 
 namespace openclaw::gateway {
@@ -42,6 +48,9 @@ struct ServerDeps {
     approvals::Store& approvals;
     secrets::Store& secrets;
     memory::Store& memory;
+    nodes::Registry& nodes;
+    media::Store& media;
+    events::Bus& bus;
     config::Snapshot config;
     auth::AuthConfig auth;
 };
@@ -59,18 +68,23 @@ public:
     bool Running() const { return running_.load(); }
 
 private:
-    void HandleClient(int client_fd);
+    bool HandleClient(int client_fd);
     void HandleHttp(int client_fd, const std::string& req);
     void HandleWebSocket(int client_fd, const std::string& req);
     void HandleChatCompletions(int client_fd, const nlohmann::json& body, bool stream);
     nlohmann::json DispatchRpc(const nlohmann::json& msg);
     nlohmann::json Stub(const std::string& method, const nlohmann::json& params);
     std::string DeliverInbound(const channels::InboundMessage& msg);
+    void Emit(const std::string& event, const nlohmann::json& payload);
 
     ServerOptions opts_;
     ServerDeps deps_;
     std::atomic<bool> running_{false};
     int listen_fd_ = -1;
+
+    // WS fan-out: fds subscribed to events (best-effort; single-threaded accept loop).
+    std::mutex ws_mu_;
+    std::set<int> ws_clients_;
 };
 
 }  // namespace openclaw::gateway

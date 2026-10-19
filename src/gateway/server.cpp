@@ -1,5 +1,8 @@
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/gateway/methods.hpp"
+#include "openclaw/config/validate.hpp"
+#include "openclaw/channels/outbound.hpp"
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -19,9 +22,12 @@
 #include <vector>
 
 namespace openclaw::gateway {
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 namespace {
 
-constexpr const char* kVersion = "0.4.0-dev";
+constexpr const char* kVersion = "0.5.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -198,23 +204,25 @@ void Server::Run() {
         socklen_t plen = sizeof(peer);
         int client = accept(listen_fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
         if (client < 0) { if (!running_.load()) break; continue; }
-        try { HandleClient(client); } catch (const std::exception& e) {
+        bool should_close = true;
+        try { should_close = HandleClient(client); } catch (const std::exception& e) {
             if (opts_.verbose) std::cerr << "[gateway] " << e.what() << '\n';
+            should_close = true;
         }
-        close(client);
+        if (should_close) close(client);
     }
     if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
     running_.store(false);
 }
 
-void Server::HandleClient(int client_fd) {
+bool Server::HandleClient(int client_fd) {
     std::string req;
     char buf[8192];
     while (req.find("\r\n\r\n") == std::string::npos) {
         ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
-        if (n <= 0) return;
+        if (n <= 0) return true;
         req.append(buf, static_cast<size_t>(n));
-        if (req.size() > 1 << 20) return;
+        if (req.size() > 1 << 20) return true;
     }
     const auto cl = HeaderValue(req, "Content-Length");
     if (!cl.empty()) {
@@ -229,11 +237,17 @@ void Server::HandleClient(int client_fd) {
     auto upgrade = HeaderValue(req, "Upgrade");
     for (char& c : upgrade) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (upgrade.find("websocket") != std::string::npos) {
-        HandleWebSocket(client_fd, req);
-        return;
+        std::thread([this, client_fd, req]() {
+            try { HandleWebSocket(client_fd, req); } catch (...) {}
+            { std::lock_guard lock(ws_mu_); ws_clients_.erase(client_fd); }
+            close(client_fd);
+        }).detach();
+        return false;  // thread owns fd
     }
     HandleHttp(client_fd, req);
+    return true;
 }
+
 
 nlohmann::json Server::Stub(const std::string& method, const nlohmann::json& params) {
     return {
@@ -321,6 +335,30 @@ void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bo
 }
 
 
+
+void Server::Emit(const std::string& event, const nlohmann::json& payload) {
+    deps_.bus.Emit(event, payload);
+    const auto frame_payload = nlohmann::json{{"type", "event"}, {"event", event}, {"payload", payload}}.dump();
+    auto make_frame = [](const std::string& payload) {
+        std::string frame;
+        frame.push_back(static_cast<char>(0x81));
+        const auto len = payload.size();
+        if (len < 126) frame.push_back(static_cast<char>(len));
+        else {
+            frame.push_back(126);
+            frame.push_back(static_cast<char>((len >> 8) & 0xff));
+            frame.push_back(static_cast<char>(len & 0xff));
+        }
+        frame += payload;
+        return frame;
+    };
+    const auto frame = make_frame(frame_payload);
+    std::lock_guard lock(ws_mu_);
+    for (int fd : ws_clients_) {
+        (void)::send(fd, frame.data(), frame.size(), MSG_NOSIGNAL);
+    }
+}
+
 std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     auto messages = deps_.sessions.Load(msg.session_key);
     std::string content = msg.text;
@@ -328,11 +366,16 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
         content = "[" + msg.channel + "/" + msg.sender + "] " + msg.text;
     }
     messages.push_back(agent::Message{.role = "user", .content = content});
+    Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "user"}, {"text", msg.text},
+                             {"channel", msg.channel}, {"sender", msg.sender}});
     auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, {.max_turns = 8});
     if (result.ok) {
         deps_.sessions.Save(msg.session_key, result.messages);
+        Emit("chat", {{"sessionKey", msg.session_key}, {"text", result.final_text}, {"turns", result.turns}});
+        Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "assistant"}, {"text", result.final_text}});
         return result.final_text;
     }
+    Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "error"}, {"text", result.error}});
     return std::string("error: ") + result.error;
 }
 
@@ -506,6 +549,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         auto args = params.contains("args") ? params["args"] : params.value("arguments", nlohmann::json::object());
         try {
             auto result = deps_.tools.Invoke(name, args);
+            Emit("session.tool", {{"tool", name}, {"args", args}, {"result", nlohmann::json::parse(result)}});
             return ok({{"tool", name}, {"result", nlohmann::json::parse(result)}});
         } catch (const std::exception& e) { return err(e.what()); }
     }
@@ -554,8 +598,11 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         }
         return ok({{"key", key}, {"patched", true}});
     }
-    if (method == "sessions.subscribe") {
-        return ok({{"subscribed", true}, {"key", params.value("key", "")}, {"note", "event push not yet multiplexed"}});
+    if (method == "sessions.subscribe" || method == "sessions.messages.subscribe") {
+        return ok({{"subscribed", true},
+                   {"key", params.value("key", "")},
+                   {"recent", deps_.bus.Recent(16)},
+                   {"listeners", deps_.bus.ListenerCount()}});
     }
     if (method == "sessions.send" || method == "chat.send" || method == "chat.inject") {
         const std::string text = params.value("message", params.value("text", ""));
@@ -576,11 +623,29 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
 
     if (method == "config.get") return ok(deps_.config.ToJson());
     if (method == "config.schema") {
-        return ok({{"type", "object"},
-                   {"properties",
-                    {{"gateway", {{"type", "object"}}},
-                     {"agents", {{"type", "object"}}},
-                     {"session_dir", {{"type", "string"}}}}}});
+        auto schema = nlohmann::json{
+            {"type", "object"},
+            {"properties",
+             {{"gateway",
+               {{"type", "object"},
+                {"properties",
+                 {{"host", {{"type", "string"}}},
+                  {"port", {{"type", "integer"}, {"minimum", 1}, {"maximum", 65535}}}}}}},
+              {"agents",
+               {{"type", "object"},
+                {"properties",
+                 {{"defaults",
+                   {{"type", "object"},
+                    {"properties", {{"model", {{"type", "string"}}}}}}}}}}},
+              {"session_dir", {{"type", "string"}}}}},
+            {"validation", config::ValidateLightJson(deps_.config)},
+        };
+        return ok(schema);
+    }
+    if (method == "config.schema.lookup") {
+        const std::string path = params.value("path", params.value("key", ""));
+        auto v = config::ValidateLightJson(deps_.config);
+        return ok({{"path", path}, {"validation", v}, {"config", deps_.config.ToJson()}});
     }
     if (method == "config.set" || method == "config.apply" || method == "config.patch") {
         if (params.contains("gateway")) {
@@ -597,7 +662,8 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         }
         deps_.config.raw.merge_patch(params);
         config::Save(config::DefaultPath(), deps_.config);
-        return ok({{"saved", true}, {"config", deps_.config.ToJson()}});
+        return ok({{"saved", true}, {"config", deps_.config.ToJson()},
+                   {"validation", config::ValidateLightJson(deps_.config)}});
     }
 
     if (method == "channels.status") {
@@ -767,9 +833,59 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         return ok({{"deleted", deps_.secrets.Delete(params.value("key", ""))}});
     }
 
+
+
+    // nodes
+    if (method == "node.list") return ok({{"nodes", deps_.nodes.ListJson()}});
+    if (method == "node.describe") return ok(deps_.nodes.Describe(params.value("id", params.value("nodeId", ""))));
+    if (method == "node.rename") {
+        auto id = params.value("id", "");
+        auto name = params.value("name", "");
+        auto d = deps_.nodes.Describe(id);
+        if (d.contains("error")) return err("node not found");
+        deps_.nodes.Upsert({.id = id, .name = name, .kind = d.value("kind", "stub"), .online = d.value("online", false)});
+        return ok({{"id", id}, {"name", name}});
+    }
+
+    // media / artifacts
+    if (method == "artifacts.list" || method == "assistant.media.get") {
+        if (method == "assistant.media.get") return ok(deps_.media.GetJson(params.value("id", "")));
+        return ok({{"artifacts", deps_.media.ListJson()}});
+    }
+    if (method == "artifacts.get") return ok(deps_.media.GetJson(params.value("id", "")));
+    // upload via params.base64 or params.text
+    if (method == "message.action" && params.value("action", "") == "media.upload") {
+        std::string data = params.value("text", params.value("data", ""));
+        auto asset = deps_.media.Put(params.value("filename", "upload.bin"),
+                                     params.value("content_type", "application/octet-stream"), data);
+        Emit("session.message", {{"media_id", asset.id}, {"filename", asset.filename}});
+        return ok({{"id", asset.id}, {"filename", asset.filename}, {"bytes", asset.bytes}});
+    }
+
+    // channel outbound (telegram/feishu record)
+    if (method == "message.action" || method == "conversations.send") {
+        const std::string channel = params.value("channel", params.value("to_channel", ""));
+        const std::string text = params.value("text", params.value("message", ""));
+        const std::string chat_id = params.value("chat_id", params.value("to", ""));
+        if (channel.empty() || text.empty()) {
+            // fall through if not an outbound send shape
+        } else {
+            auto* adapter = deps_.adapters.Get(channel);
+            auto* out = dynamic_cast<channels::OutboundRecordAdapter*>(adapter);
+            if (!out) return err("channel does not support outbound record: " + channel);
+            out->SetEnabled(true);
+            auto res = out->SendText(chat_id, text, params);
+            Emit("chat", {{"outbound", true}, {"channel", channel}, {"chat_id", chat_id}});
+            return ok(res);
+        }
+    }
+
     if (method == "mcp.app.listTools") {
-        return ok({{"tools", nlohmann::json::array()},
-                   {"note", "use embedded mcp::Client against an MCP server; gateway bridge TODO"}});
+        nlohmann::json tools = nlohmann::json::array();
+        for (const auto& n : deps_.tools.Names()) {
+            if (n.rfind("mcp.", 0) == 0) tools.push_back(n);
+        }
+        return ok({{"tools", tools}, {"note", "mcp.* tools bridged into registry when MCP client attached"}});
     }
 
     const auto advertised = AdvertisedMethods();
@@ -799,6 +915,8 @@ void Server::HandleWebSocket(int client_fd, const std::string& req) {
        << "Sec-WebSocket-Accept: " << WsAccept(key) << "\r\n\r\n";
     const auto hs_s = hs.str();
     (void)::send(client_fd, hs_s.data(), hs_s.size(), 0);
+    { std::lock_guard lock(ws_mu_); ws_clients_.insert(client_fd); }
+
 
     auto hello = nlohmann::json{
         {"type", "event"}, {"event", "connect.challenge"},

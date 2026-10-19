@@ -1,4 +1,5 @@
 #include "openclaw/channels/adapter.hpp"
+#include "openclaw/channels/outbound.hpp"
 
 namespace openclaw::channels {
 
@@ -79,14 +80,18 @@ nlohmann::json AdapterHub::StatusJson() const {
 AdapterHub AdapterHub::MakeDefault() {
     AdapterHub hub;
     hub.Add(std::make_unique<WebhookAdapter>("webhook"));
-    hub.Add(std::make_unique<StubAdapter>(
-        "telegram", "TODO: Telegram Bot API long-poll / webhook (OpenClaw channels/telegram)"));
+    hub.Add(std::make_unique<OutboundRecordAdapter>(
+        "telegram",
+        "TODO: live Telegram Bot API; outbound payloads recorded locally",
+        "/bot<token>/sendMessage"));
     hub.Add(std::make_unique<StubAdapter>(
         "discord", "TODO: Discord Gateway websocket (OpenClaw channels/discord)"));
     hub.Add(std::make_unique<StubAdapter>(
         "slack", "TODO: Slack Events API + Socket Mode (OpenClaw channels/slack)"));
-    hub.Add(std::make_unique<StubAdapter>(
-        "feishu", "TODO: Feishu/Lark event subscription (OpenClaw channels/feishu)"));
+    hub.Add(std::make_unique<OutboundRecordAdapter>(
+        "feishu",
+        "TODO: live Feishu/Lark API; outbound payloads recorded locally",
+        "/open-apis/im/v1/messages"));
     hub.Add(std::make_unique<StubAdapter>(
         "whatsapp", "TODO: WhatsApp Cloud API / Baileys-style bridge"));
     return hub;

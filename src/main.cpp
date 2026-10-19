@@ -2,6 +2,12 @@
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/channels/registry.hpp"
 #include "openclaw/mcp/client.hpp"
+#include "openclaw/config/validate.hpp"
+#include "openclaw/channels/outbound.hpp"
+#include "openclaw/media/store.hpp"
+#include "openclaw/nodes/registry.hpp"
+#include "openclaw/events/bus.hpp"
+#include "openclaw/mcp/bridge.hpp"
 #include "openclaw/secrets/store.hpp"
 #include "openclaw/approvals/store.hpp"
 #include "openclaw/channels/adapter.hpp"
@@ -31,7 +37,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.4.0-dev";
+constexpr const char* kVersion = "0.5.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -203,6 +209,73 @@ int CmdSelfTest() {
     }
 
 
+
+    // MCP bridge into tools
+    {
+        approvals::Store ap;
+        tools::RegistryOptions o; o.approvals = &ap;
+        auto reg = tools::MakeDefaultRegistry(o);
+        auto cli = mcp::MakeMockClient();
+        auto n = mcp::RegisterMcpTools(reg, cli);
+        if (n < 1 || !reg.Has("mcp.mock_echo")) { std::cerr << "FAIL mcp bridge\n"; ++failures; }
+        else {
+            auto out = reg.Invoke("mcp.mock_echo", {{"hi", true}});
+            if (out.find("content") == std::string::npos && out.find("echo") == std::string::npos) {
+                std::cerr << "FAIL mcp bridge invoke " << out << "\n"; ++failures;
+            } else std::cerr << "PASS mcp bridge\n";
+        }
+    }
+
+    // shell approval gate
+    {
+        approvals::Store ap;
+        tools::RegistryOptions o; o.approvals = &ap; o.shell_requires_approval = true;
+        auto reg = tools::MakeDefaultRegistry(o);
+        auto pending = nlohmann::json::parse(reg.Invoke("shell", {{"command", "echo hi"}}));
+        if (!pending.value("needs_approval", false)) { std::cerr << "FAIL shell gate\n"; ++failures; }
+        else {
+            auto id = pending.value("approval_id", "");
+            ap.Resolve(id, true);
+            auto done = nlohmann::json::parse(reg.Invoke("shell", {{"command", "echo hi"}, {"approval_id", id}}));
+            if (!done.value("ok", false) || !done.value("mocked", false)) {
+                std::cerr << "FAIL shell approved " << done.dump() << "\n"; ++failures;
+            } else std::cerr << "PASS shell approval\n";
+        }
+    }
+
+    // event bus
+    {
+        events::Bus bus;
+        int hits = 0;
+        bus.Subscribe([&](const std::string& ev, const nlohmann::json&) { if (ev == "chat") ++hits; });
+        bus.Emit("chat", {{"x", 1}});
+        if (hits != 1 || bus.Recent(1).empty()) { std::cerr << "FAIL event bus\n"; ++failures; }
+        else std::cerr << "PASS event bus\n";
+    }
+
+    // outbound telegram/feishu
+    {
+        auto hub = channels::AdapterHub::MakeDefault();
+        auto* tg = dynamic_cast<channels::OutboundRecordAdapter*>(hub.Get("telegram"));
+        auto* fs = dynamic_cast<channels::OutboundRecordAdapter*>(hub.Get("feishu"));
+        if (!tg || !fs) { std::cerr << "FAIL outbound adapters\n"; ++failures; }
+        else {
+            tg->SetEnabled(true);
+            auto r = tg->SendText("123", "hello-tg");
+            if (!r.value("recorded", false) || tg->OutboundLog().empty()) {
+                std::cerr << "FAIL telegram outbound\n"; ++failures;
+            } else std::cerr << "PASS telegram/feishu outbound record\n";
+        }
+    }
+
+    // config validate
+    {
+        auto cfg = config::LoadOrDefault(config::DefaultPath());
+        auto v = config::ValidateLightJson(cfg);
+        if (!v.value("ok", false)) { std::cerr << "FAIL config validate " << v.dump() << "\n"; ++failures; }
+        else std::cerr << "PASS config validate\n";
+    }
+
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
     return 1;
@@ -251,7 +324,16 @@ int CmdGateway(int argc, char** argv, int argi) {
         else if (a == "--verbose" || a == "-v") opts.verbose = true;
     }
     std::string api_key = EnvOr("DEEPSEEK_API_KEY", "missing");
-    auto tools = tools::MakeDefaultRegistry();
+    approvals::Store approvals;
+    tools::RegistryOptions tropts;
+    tropts.approvals = &approvals;
+    tropts.enable_shell = true;
+    tropts.shell_requires_approval = true;
+    auto tools = tools::MakeDefaultRegistry(tropts);
+    // Bridge in-process mock MCP tools as mcp.* (replace with real client transport later).
+    auto mcp_client = mcp::MakeMockClient();
+    auto mcp_n = mcp::RegisterMcpTools(tools, mcp_client);
+    std::cerr << "[gateway] bridged " << mcp_n << " mcp tools\n";
     auto channels = channels::MakeDefaultChannels();
     auto adapters = channels::AdapterHub::MakeDefault();
     auto skills = LoadSkills();
@@ -260,10 +342,12 @@ int CmdGateway(int argc, char** argv, int argi) {
     cron::Scheduler cron;
     auth::PairingStore pairing;
     pairing.Add({.id = "pair-demo", .channel = "cli", .code = "ABC123", .sender = "local"});
-    approvals::Store approvals;
     session::Store sessions(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
     memory::Store memory(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
     secrets::Store secrets(std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "secrets.json");
+    auto nodes = nodes::Registry::MakeDefault();
+    media::Store media(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "media");
+    events::Bus bus;
     auto cfg = config::LoadOrDefault(config::DefaultPath());
     cfg.gateway_host = opts.bind_host;
     cfg.gateway_port = opts.port;
@@ -283,6 +367,9 @@ int CmdGateway(int argc, char** argv, int argi) {
         .approvals = approvals,
         .secrets = secrets,
         .memory = memory,
+        .nodes = nodes,
+        .media = media,
+        .bus = bus,
         .config = cfg,
         .auth = auth::FromEnv(),
     };
@@ -343,7 +430,11 @@ int main(int argc, char** argv) {
         if (cmd == "self-test") return CmdSelfTest();
         if (cmd == "status") return CmdStatus();
         if (cmd == "tools") {
-            for (auto& n : openclaw::tools::MakeDefaultRegistry().Names()) std::cout << n << '\n';
+            openclaw::approvals::Store ap;
+            openclaw::tools::RegistryOptions o; o.approvals = &ap;
+            auto reg = openclaw::tools::MakeDefaultRegistry(o);
+            openclaw::mcp::RegisterMcpTools(reg, openclaw::mcp::MakeMockClient());
+            for (auto& n : reg.Names()) std::cout << n << '\n';
             return 0;
         }
         if (cmd == "channels") {
