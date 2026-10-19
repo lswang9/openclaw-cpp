@@ -1,7 +1,7 @@
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/gateway/methods.hpp"
+
 #include <nlohmann/json.hpp>
-#include <stdexcept>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -9,6 +9,8 @@
 #include <unistd.h>
 
 #include <array>
+#include <algorithm>
+#include <stdexcept>
 #include <cctype>
 #include <cstring>
 #include <iostream>
@@ -18,119 +20,68 @@
 namespace openclaw::gateway {
 namespace {
 
-constexpr const char* kVersion = "0.2.0-dev";
+constexpr const char* kVersion = "0.3.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
-                         const std::string& content_type = "application/json") {
+                         const std::string& content_type = "application/json",
+                         const std::string& extra_headers = "") {
     std::ostringstream oss;
     oss << "HTTP/1.1 " << code << ' ' << status << "\r\n"
         << "Content-Type: " << content_type << "\r\n"
         << "Content-Length: " << body.size() << "\r\n"
         << "Connection: close\r\n"
         << "Access-Control-Allow-Origin: *\r\n"
-        << "\r\n"
+        << extra_headers << "\r\n"
         << body;
     return oss.str();
 }
 
-bool StartsWith(const std::string& s, const std::string& p) {
-    return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
-}
-
 std::string HeaderValue(const std::string& req, const std::string& name) {
-    const std::string key = name + ":";
-    auto pos = req.find(key);
-    if (pos == std::string::npos) {
-        // case-insensitive light search
-        std::string lower = req;
-        for (char& c : lower) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        std::string lkey = key;
-        for (char& c : lkey) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        pos = lower.find(lkey);
-        if (pos == std::string::npos) {
-            return {};
-        }
-    }
+    std::string lower_req = req, lkey = name + ":";
+    for (char& c : lower_req) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : lkey) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    auto pos = lower_req.find(lkey);
+    if (pos == std::string::npos) return {};
     auto start = req.find(':', pos) + 1;
-    while (start < req.size() && (req[start] == ' ' || req[start] == '\t')) {
-        ++start;
-    }
+    while (start < req.size() && (req[start] == ' ' || req[start] == '\t')) ++start;
     auto end = req.find("\r\n", start);
-    if (end == std::string::npos) {
-        return req.substr(start);
-    }
-    return req.substr(start, end - start);
+    return end == std::string::npos ? req.substr(start) : req.substr(start, end - start);
 }
 
 std::string BodyOf(const std::string& req) {
     auto pos = req.find("\r\n\r\n");
-    if (pos == std::string::npos) {
-        return {};
-    }
-    return req.substr(pos + 4);
+    return pos == std::string::npos ? std::string{} : req.substr(pos + 4);
 }
 
-// Minimal WebSocket accept key (RFC6455) — SHA1+base64 of key+GUID.
-// We implement a tiny SHA1 to avoid new deps.
 namespace sha1 {
 using u32 = uint32_t;
 using u8 = uint8_t;
-
 inline u32 rol(u32 v, int n) { return (v << n) | (v >> (32 - n)); }
-
 std::array<u8, 20> hash(const std::string& data) {
     u32 h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
     std::vector<u8> msg(data.begin(), data.end());
     const uint64_t bit_len = static_cast<uint64_t>(msg.size()) * 8;
     msg.push_back(0x80);
-    while ((msg.size() % 64) != 56) {
-        msg.push_back(0);
-    }
-    for (int i = 7; i >= 0; --i) {
-        msg.push_back(static_cast<u8>((bit_len >> (i * 8)) & 0xff));
-    }
+    while ((msg.size() % 64) != 56) msg.push_back(0);
+    for (int i = 7; i >= 0; --i) msg.push_back(static_cast<u8>((bit_len >> (i * 8)) & 0xff));
     for (size_t chunk = 0; chunk < msg.size(); chunk += 64) {
         u32 w[80];
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < 16; ++i)
             w[i] = (msg[chunk + i * 4] << 24) | (msg[chunk + i * 4 + 1] << 16) |
                    (msg[chunk + i * 4 + 2] << 8) | msg[chunk + i * 4 + 3];
-        }
-        for (int i = 16; i < 80; ++i) {
-            w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-        }
+        for (int i = 16; i < 80; ++i) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
         u32 a = h0, b = h1, c = h2, d = h3, e = h4;
         for (int i = 0; i < 80; ++i) {
             u32 f, k;
-            if (i < 20) {
-                f = (b & c) | ((~b) & d);
-                k = 0x5A827999;
-            } else if (i < 40) {
-                f = b ^ c ^ d;
-                k = 0x6ED9EBA1;
-            } else if (i < 60) {
-                f = (b & c) | (b & d) | (c & d);
-                k = 0x8F1BBCDC;
-            } else {
-                f = b ^ c ^ d;
-                k = 0xCA62C1D6;
-            }
+            if (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
             u32 temp = rol(a, 5) + f + e + k + w[i];
-            e = d;
-            d = c;
-            c = rol(b, 30);
-            b = a;
-            a = temp;
+            e = d; d = c; c = rol(b, 30); b = a; a = temp;
         }
-        h0 += a;
-        h1 += b;
-        h2 += c;
-        h3 += d;
-        h4 += e;
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
     }
     std::array<u8, 20> out{};
     u32 hs[5] = {h0, h1, h2, h3, h4};
@@ -145,178 +96,113 @@ std::array<u8, 20> hash(const std::string& data) {
 }  // namespace sha1
 
 std::string Base64(const std::array<uint8_t, 20>& in) {
-    static const char* T =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
     int val = 0, valb = -6;
     for (uint8_t c : in) {
         val = (val << 8) + c;
         valb += 8;
-        while (valb >= 0) {
-            out.push_back(T[(val >> valb) & 0x3F]);
-            valb -= 6;
-        }
+        while (valb >= 0) { out.push_back(T[(val >> valb) & 0x3F]); valb -= 6; }
     }
-    if (valb > -6) {
-        out.push_back(T[((val << 8) >> (valb + 8)) & 0x3F]);
-    }
-    while (out.size() % 4) {
-        out.push_back('=');
-    }
+    if (valb > -6) out.push_back(T[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
     return out;
 }
 
 std::string WsAccept(const std::string& key) {
-    const auto dig = sha1::hash(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    return Base64(dig);
+    return Base64(sha1::hash(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
 }
 
 std::string WsFrameText(const std::string& payload) {
     std::string frame;
-    frame.push_back(static_cast<char>(0x81));  // FIN + text
+    frame.push_back(static_cast<char>(0x81));
     const auto len = payload.size();
-    if (len < 126) {
-        frame.push_back(static_cast<char>(len));
-    } else if (len <= 0xffff) {
+    if (len < 126) frame.push_back(static_cast<char>(len));
+    else if (len <= 0xffff) {
         frame.push_back(126);
         frame.push_back(static_cast<char>((len >> 8) & 0xff));
         frame.push_back(static_cast<char>(len & 0xff));
     } else {
         frame.push_back(127);
-        for (int i = 7; i >= 0; --i) {
-            frame.push_back(static_cast<char>((len >> (i * 8)) & 0xff));
-        }
+        for (int i = 7; i >= 0; --i) frame.push_back(static_cast<char>((len >> (i * 8)) & 0xff));
     }
     frame += payload;
     return frame;
 }
 
 bool ParseWsClientFrame(const std::string& buf, std::string& out_payload) {
-    if (buf.size() < 2) {
-        return false;
-    }
-    const auto b0 = static_cast<uint8_t>(buf[0]);
+    if (buf.size() < 2) return false;
     const auto b1 = static_cast<uint8_t>(buf[1]);
     const bool masked = (b1 & 0x80) != 0;
     uint64_t len = b1 & 0x7f;
     size_t off = 2;
     if (len == 126) {
-        if (buf.size() < 4) {
-            return false;
-        }
+        if (buf.size() < 4) return false;
         len = (static_cast<uint8_t>(buf[2]) << 8) | static_cast<uint8_t>(buf[3]);
         off = 4;
-    } else if (len == 127) {
-        return false;  // oversized for stub
-    }
-    uint8_t mask[4] = {0, 0, 0, 0};
+    } else if (len == 127) return false;
+    uint8_t mask[4] = {};
     if (masked) {
-        if (buf.size() < off + 4) {
-            return false;
-        }
-        for (int i = 0; i < 4; ++i) {
-            mask[i] = static_cast<uint8_t>(buf[off + i]);
-        }
+        if (buf.size() < off + 4) return false;
+        for (int i = 0; i < 4; ++i) mask[i] = static_cast<uint8_t>(buf[off + i]);
         off += 4;
     }
-    if (buf.size() < off + len) {
-        return false;
-    }
+    if (buf.size() < off + len) return false;
     out_payload.resize(static_cast<size_t>(len));
     for (uint64_t i = 0; i < len; ++i) {
         auto c = static_cast<uint8_t>(buf[off + static_cast<size_t>(i)]);
-        if (masked) {
-            c ^= mask[i % 4];
-        }
+        if (masked) c ^= mask[i % 4];
         out_payload[static_cast<size_t>(i)] = static_cast<char>(c);
     }
-    (void)b0;
     return true;
 }
 
 }  // namespace
 
-Server::Server(ServerOptions opts, provider::Provider& provider, tools::Registry& registry,
-               session::Store& sessions, channels::Registry& channels, config::Snapshot config)
-    : opts_(std::move(opts)),
-      provider_(provider),
-      registry_(registry),
-      sessions_(sessions),
-      channels_(channels),
-      config_(std::move(config)) {}
-
-Server::~Server() {
-    Stop();
-    if (listen_fd_ >= 0) {
-        close(listen_fd_);
-        listen_fd_ = -1;
-    }
-}
-
+Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {}
+Server::~Server() { Stop(); if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; } }
 void Server::Stop() {
     running_.store(false);
-    if (listen_fd_ >= 0) {
-        // unblock accept
-        shutdown(listen_fd_, SHUT_RDWR);
-    }
+    if (listen_fd_ >= 0) shutdown(listen_fd_, SHUT_RDWR);
 }
 
 void Server::Run() {
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) {
-        throw std::runtime_error("socket() failed");
-    }
+    if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
     int yes = 1;
     setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(opts_.port);
     if (inet_pton(AF_INET, opts_.bind_host.c_str(), &addr.sin_addr) != 1) {
-        close(listen_fd_);
-        listen_fd_ = -1;
-        throw std::runtime_error("invalid bind host: " + opts_.bind_host);
+        close(listen_fd_); listen_fd_ = -1;
+        throw std::runtime_error("invalid bind host");
     }
     if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close(listen_fd_);
-        listen_fd_ = -1;
-        throw std::runtime_error("bind() failed on " + opts_.bind_host + ":" +
-                                 std::to_string(opts_.port));
+        close(listen_fd_); listen_fd_ = -1;
+        throw std::runtime_error("bind() failed");
     }
     if (listen(listen_fd_, 64) < 0) {
-        close(listen_fd_);
-        listen_fd_ = -1;
+        close(listen_fd_); listen_fd_ = -1;
         throw std::runtime_error("listen() failed");
     }
-
     running_.store(true);
-    std::cerr << "[gateway] listening on http://" << opts_.bind_host << ':' << opts_.port
-              << " (ws upgrade enabled) align=" << kAlign << " ver=" << kVersion << '\n';
-
+    std::cerr << "[gateway] http+ws://" << opts_.bind_host << ':' << opts_.port
+              << " align=" << kAlign << " ver=" << kVersion
+              << " methods=" << AdvertisedMethodCount()
+              << " implemented=" << ImplementedMethods().size()
+              << " auth=" << (deps_.auth.require_auth ? "on" : "off") << '\n';
     while (running_.load()) {
         sockaddr_in peer{};
         socklen_t plen = sizeof(peer);
-        const int client = accept(listen_fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
-        if (client < 0) {
-            if (!running_.load()) {
-                break;
-            }
-            continue;
-        }
-        try {
-            HandleClient(client);
-        } catch (const std::exception& e) {
-            if (opts_.verbose) {
-                std::cerr << "[gateway] client error: " << e.what() << '\n';
-            }
+        int client = accept(listen_fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
+        if (client < 0) { if (!running_.load()) break; continue; }
+        try { HandleClient(client); } catch (const std::exception& e) {
+            if (opts_.verbose) std::cerr << "[gateway] " << e.what() << '\n';
         }
         close(client);
     }
-
-    if (listen_fd_ >= 0) {
-        close(listen_fd_);
-        listen_fd_ = -1;
-    }
+    if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
     running_.store(false);
 }
 
@@ -324,345 +210,376 @@ void Server::HandleClient(int client_fd) {
     std::string req;
     char buf[8192];
     while (req.find("\r\n\r\n") == std::string::npos) {
-        const ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            return;
-        }
+        ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+        if (n <= 0) return;
         req.append(buf, static_cast<size_t>(n));
-        if (req.size() > 1 << 20) {
-            return;
-        }
+        if (req.size() > 1 << 20) return;
     }
-    // If Content-Length, read remaining body
-    const auto cl_hdr = HeaderValue(req, "Content-Length");
-    if (!cl_hdr.empty()) {
-        const size_t want = static_cast<size_t>(std::stoul(cl_hdr));
+    const auto cl = HeaderValue(req, "Content-Length");
+    if (!cl.empty()) {
+        size_t want = static_cast<size_t>(std::stoul(cl));
         auto body_pos = req.find("\r\n\r\n") + 4;
         while (req.size() < body_pos + want) {
-            const ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
-            if (n <= 0) {
-                break;
-            }
+            ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
             req.append(buf, static_cast<size_t>(n));
         }
     }
-
-    const auto upgrade = HeaderValue(req, "Upgrade");
-    std::string up_lower = upgrade;
-    for (char& c : up_lower) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    if (up_lower.find("websocket") != std::string::npos) {
+    auto upgrade = HeaderValue(req, "Upgrade");
+    for (char& c : upgrade) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (upgrade.find("websocket") != std::string::npos) {
         HandleWebSocket(client_fd, req);
         return;
     }
     HandleHttp(client_fd, req);
 }
 
+nlohmann::json Server::Stub(const std::string& method, const nlohmann::json& params) {
+    return {
+        {"stub", true},
+        {"method", method},
+        {"params", params},
+        {"align_target", kAlign},
+        {"note", "structured placeholder — not yet fully implemented in openclaw-cpp"},
+    };
+}
+
+void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bool stream) {
+    auto send = [&](const std::string& resp) { (void)::send(client_fd, resp.data(), resp.size(), 0); };
+    std::vector<agent::Message> messages;
+    if (body.contains("messages") && body["messages"].is_array()) {
+        for (const auto& m : body["messages"]) messages.push_back(agent::Message::FromJson(m));
+    }
+    if (messages.empty()) {
+        send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", "messages required"}}.dump()));
+        return;
+    }
+    const std::string session_id = body.value("session_id", "");
+    if (!session_id.empty()) {
+        auto prior = deps_.sessions.Load(session_id);
+        prior.insert(prior.end(), messages.begin(), messages.end());
+        messages = std::move(prior);
+    }
+
+    if (stream && deps_.deepseek) {
+        // SSE headers
+        {
+            std::ostringstream oss;
+            oss << "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                << "Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+            const auto hs = oss.str();
+            (void)::send(client_fd, hs.data(), hs.size(), 0);
+        }
+        auto result = deps_.deepseek->CompleteStream(
+            messages, deps_.tools.OpenAiToolsArray(),
+            [&](std::string_view delta) {
+                nlohmann::json chunk{
+                    {"id", "chatcmpl-openclaw-cpp"},
+                    {"object", "chat.completion.chunk"},
+                    {"choices", nlohmann::json::array({
+                         {{"index", 0}, {"delta", {{"content", std::string(delta)}}}, {"finish_reason", nullptr}},
+                     })},
+                };
+                const std::string line = "data: " + chunk.dump() + "\n\n";
+                (void)::send(client_fd, line.data(), line.size(), 0);
+            });
+        if (!result.ok) {
+            const std::string line = "data: " + nlohmann::json{{"error", result.error}}.dump() + "\n\n";
+            (void)::send(client_fd, line.data(), line.size(), 0);
+        }
+        const std::string done = "data: [DONE]\n\n";
+        (void)::send(client_fd, done.data(), done.size(), 0);
+        if (!session_id.empty() && result.ok) {
+            messages.push_back(result.message);
+            deps_.sessions.Save(session_id, messages);
+        }
+        return;
+    }
+
+    agent::LoopOptions lopts;
+    lopts.max_turns = body.value("max_turns", 8);
+    auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, lopts);
+    if (!session_id.empty() && result.ok) deps_.sessions.Save(session_id, result.messages);
+    if (!result.ok) {
+        int code = (result.error.find("402") != std::string::npos) ? 402 : 502;
+        send(HttpResponse(code, code == 402 ? "Payment Required" : "Bad Gateway",
+                          nlohmann::json{{"error", {{"message", result.error}, {"type", "api_error"}}}}.dump()));
+        return;
+    }
+    nlohmann::json resp{
+        {"id", "chatcmpl-openclaw-cpp"},
+        {"object", "chat.completion"},
+        {"model", body.value("model", "deepseek-chat")},
+        {"choices", nlohmann::json::array({
+             {{"index", 0}, {"finish_reason", "stop"},
+              {"message", {{"role", "assistant"}, {"content", result.final_text}}}},
+         })},
+        {"usage", {{"turns", result.turns}}},
+    };
+    send(HttpResponse(200, "OK", resp.dump()));
+}
+
 void Server::HandleHttp(int client_fd, const std::string& req) {
     std::istringstream first(req);
     std::string method, path, version;
     first >> method >> path >> version;
+    auto send = [&](const std::string& resp) { (void)::send(client_fd, resp.data(), resp.size(), 0); };
 
-    if (opts_.verbose) {
-        std::cerr << "[gateway] " << method << ' ' << path << '\n';
+    // Auth (health exempt)
+    const bool public_ok = (path == "/health" || path == "/healthz");
+    if (!public_ok) {
+        auto deny = auth::CheckHttpAuth(deps_.auth, HeaderValue(req, "Authorization"),
+                                        HeaderValue(req, "X-OpenClaw-Token"));
+        if (deny) {
+            send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", *deny}}.dump()));
+            return;
+        }
     }
-
-    auto send = [&](const std::string& resp) {
-        (void)::send(client_fd, resp.data(), resp.size(), 0);
-    };
 
     if (method == "GET" && (path == "/health" || path == "/healthz")) {
         send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"service", "openclaw-cpp-gateway"}}.dump()));
         return;
     }
-
     if (method == "GET" && (path == "/" || path == "/v1/status")) {
-        nlohmann::json j{
-            {"service", "openclaw-cpp"},
-            {"version", kVersion},
-            {"align_target", kAlign},
-            {"gateway",
-             {{"bind", opts_.bind_host},
-              {"port", opts_.port},
-              {"http", true},
-              {"websocket", true}}},
-            {"tools", registry_.Names()},
-            {"sessions", sessions_.List()},
-            {"channels", channels_.ListJson()},
-            {"methods", AdvertisedMethods()},
-            {"events", AdvertisedEvents()},
-        };
-        send(HttpResponse(200, "OK", j.dump(2)));
+        send(HttpResponse(200, "OK", nlohmann::json{
+            {"service", "openclaw-cpp"}, {"version", kVersion}, {"align_target", kAlign},
+            {"gateway", {{"bind", opts_.bind_host}, {"port", opts_.port}, {"http", true}, {"websocket", true},
+                         {"auth", deps_.auth.require_auth}}},
+            {"tools", deps_.tools.Names()},
+            {"sessions", deps_.sessions.List()},
+            {"channels", deps_.channels.ListJson()},
+            {"skills", deps_.skills.StatusJson()},
+            {"plugins", deps_.plugins.ListJson()},
+            {"methods_advertised", AdvertisedMethodCount()},
+            {"methods_implemented", ImplementedMethods()},
+            {"events_advertised", AdvertisedEventCount()},
+        }.dump(2)));
         return;
     }
-
     if (method == "GET" && path == "/v1/models") {
-        nlohmann::json j{
+        send(HttpResponse(200, "OK", nlohmann::json{
             {"object", "list"},
-            {"data",
-             nlohmann::json::array({
-                 {{"id", "deepseek-chat"}, {"object", "model"}, {"owned_by", "deepseek"}},
-             })},
-        };
-        send(HttpResponse(200, "OK", j.dump()));
+            {"data", nlohmann::json::array({{{"id", "deepseek-chat"}, {"object", "model"}, {"owned_by", "deepseek"}}})},
+        }.dump()));
         return;
     }
-
+    if (method == "GET" && path == "/v1/methods") {
+        send(HttpResponse(200, "OK", nlohmann::json{
+            {"methods", AdvertisedMethods()},
+            {"implemented", ImplementedMethods()},
+            {"events", AdvertisedEvents()},
+            {"counts", {{"advertised", AdvertisedMethodCount()}, {"implemented", ImplementedMethods().size()},
+                        {"events", AdvertisedEventCount()}}},
+        }.dump()));
+        return;
+    }
+    if (method == "GET" && path == "/v1/channels") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"channels", deps_.channels.ListJson()}}.dump(2)));
+        return;
+    }
+    if (method == "GET" && path == "/v1/config") {
+        send(HttpResponse(200, "OK", deps_.config.ToJson().dump(2)));
+        return;
+    }
+    if (method == "GET" && path == "/v1/skills") {
+        send(HttpResponse(200, "OK", deps_.skills.StatusJson().dump(2)));
+        return;
+    }
     if (method == "POST" && path == "/tools/invoke") {
         try {
-            const auto body = nlohmann::json::parse(BodyOf(req));
-            const std::string name = body.value("tool", body.value("name", ""));
-            nlohmann::json args = body.contains("args") ? body["args"] : body.value("arguments", nlohmann::json::object());
-            if (name.empty()) {
-                send(HttpResponse(400, "Bad Request",
-                                  nlohmann::json{{"error", "missing tool name"}}.dump()));
-                return;
-            }
-            const auto result = registry_.Invoke(name, args);
-            send(HttpResponse(200, "OK",
-                              nlohmann::json{{"ok", true}, {"tool", name}, {"result", nlohmann::json::parse(result)}}.dump()));
+            auto body = nlohmann::json::parse(BodyOf(req));
+            std::string name = body.value("tool", body.value("name", ""));
+            auto args = body.contains("args") ? body["args"] : body.value("arguments", nlohmann::json::object());
+            auto result = deps_.tools.Invoke(name, args);
+            send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"tool", name}, {"result", nlohmann::json::parse(result)}}.dump()));
         } catch (const std::exception& e) {
             send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", e.what()}}.dump()));
         }
         return;
     }
-
     if (method == "POST" && path == "/v1/chat/completions") {
         try {
-            const auto body = nlohmann::json::parse(BodyOf(req));
-            std::vector<agent::Message> messages;
-            if (body.contains("messages") && body["messages"].is_array()) {
-                for (const auto& m : body["messages"]) {
-                    messages.push_back(agent::Message::FromJson(m));
-                }
-            }
-            if (messages.empty()) {
-                send(HttpResponse(400, "Bad Request",
-                                  nlohmann::json{{"error", "messages required"}}.dump()));
-                return;
-            }
-
-            const std::string session_id = body.value("session_id", "");
-            if (!session_id.empty()) {
-                auto prior = sessions_.Load(session_id);
-                prior.insert(prior.end(), messages.begin(), messages.end());
-                messages = std::move(prior);
-            }
-
-            agent::LoopOptions lopts;
-            lopts.max_turns = body.value("max_turns", 8);
-            auto result = agent::RunAgentLoop(provider_, registry_, messages, lopts);
-
-            if (!session_id.empty() && result.ok) {
-                sessions_.Save(session_id, result.messages);
-            }
-
-            if (!result.ok) {
-                const int code = (result.error.find("402") != std::string::npos) ? 402 : 502;
-                send(HttpResponse(code, code == 402 ? "Payment Required" : "Bad Gateway",
-                                  nlohmann::json{{"error", {{"message", result.error}, {"type", "api_error"}}}}.dump()));
-                return;
-            }
-
-            nlohmann::json resp{
-                {"id", "chatcmpl-openclaw-cpp"},
-                {"object", "chat.completion"},
-                {"model", body.value("model", "deepseek-chat")},
-                {"choices",
-                 nlohmann::json::array({
-                     {{"index", 0},
-                      {"finish_reason", "stop"},
-                      {"message", {{"role", "assistant"}, {"content", result.final_text}}}},
-                 })},
-                {"usage", {{"turns", result.turns}}},
-            };
-            send(HttpResponse(200, "OK", resp.dump()));
+            auto body = nlohmann::json::parse(BodyOf(req));
+            bool stream = body.value("stream", false);
+            HandleChatCompletions(client_fd, body, stream);
         } catch (const std::exception& e) {
             send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", e.what()}}.dump()));
         }
         return;
     }
-
-    if (method == "GET" && path == "/v1/methods") {
-        send(HttpResponse(200, "OK", nlohmann::json{{"methods", AdvertisedMethods()}, {"events", AdvertisedEvents()}}.dump(2)));
-        return;
-    }
-
-    if (method == "GET" && path == "/v1/channels") {
-        send(HttpResponse(200, "OK", nlohmann::json{{"channels", channels_.ListJson()}}.dump(2)));
-        return;
-    }
-
-    if (method == "GET" && path == "/v1/config") {
-        send(HttpResponse(200, "OK", config_.ToJson().dump(2)));
-        return;
-    }
-
-    send(HttpResponse(404, "Not Found",
-                      nlohmann::json{{"error", "not found"}, {"path", path}}.dump()));
+    send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "not found"}, {"path", path}}.dump()));
 }
-
-void Server::HandleWebSocket(int client_fd, const std::string& req) {
-    const auto key = HeaderValue(req, "Sec-WebSocket-Key");
-    if (key.empty()) {
-        const auto resp = HttpResponse(400, "Bad Request",
-                                       nlohmann::json{{"error", "missing Sec-WebSocket-Key"}}.dump());
-        (void)::send(client_fd, resp.data(), resp.size(), 0);
-        return;
-    }
-    const std::string accept = WsAccept(key);
-    std::ostringstream hs;
-    hs << "HTTP/1.1 101 Switching Protocols\r\n"
-       << "Upgrade: websocket\r\n"
-       << "Connection: Upgrade\r\n"
-       << "Sec-WebSocket-Accept: " << accept << "\r\n"
-       << "\r\n";
-    const auto hs_s = hs.str();
-    (void)::send(client_fd, hs_s.data(), hs_s.size(), 0);
-
-    // Hello event (OpenClaw-ish greeting; full protocol TBD)
-    const auto hello = nlohmann::json{
-        {"type", "event"},
-        {"event", "connect.challenge"},
-        {"payload",
-         {{"service", "openclaw-cpp"},
-          {"version", kVersion},
-          {"align_target", kAlign},
-          {"note", "WS control protocol subset — expanding toward OpenClaw Gateway RPC"}}},
-    }.dump();
-    {
-        const auto frame = WsFrameText(hello);
-        (void)::send(client_fd, frame.data(), frame.size(), 0);
-    }
-
-    char buf[8192];
-    while (running_.load()) {
-        const ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            break;
-        }
-        std::string raw(buf, static_cast<size_t>(n));
-        // opcode close?
-        if (!raw.empty() && (static_cast<uint8_t>(raw[0]) & 0x0f) == 0x8) {
-            break;
-        }
-        std::string payload;
-        if (!ParseWsClientFrame(raw, payload)) {
-            continue;
-        }
-        nlohmann::json reply;
-        try {
-            const auto msg = nlohmann::json::parse(payload);
-            reply = DispatchRpc(msg);
-        } catch (...) {
-            reply = {{"type", "res"}, {"ok", false}, {"error", "invalid JSON"}, {"echo", payload}};
-        }
-        const auto frame = WsFrameText(reply.dump());
-        if (::send(client_fd, frame.data(), frame.size(), 0) <= 0) {
-            break;
-        }
-    }
-}
-
 
 nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     const std::string method = msg.value("method", msg.value("type", ""));
     const auto params = msg.contains("params") ? msg["params"] : nlohmann::json::object();
     const auto id = msg.contains("id") ? msg["id"] : nlohmann::json();
-
     auto ok = [&](nlohmann::json payload) {
         nlohmann::json r{{"type", "res"}, {"ok", true}, {"payload", std::move(payload)}};
-        if (!id.is_null()) {
-            r["id"] = id;
-        }
+        if (!id.is_null()) r["id"] = id;
         return r;
     };
     auto err = [&](const std::string& e) {
         nlohmann::json r{{"type", "res"}, {"ok", false}, {"error", e}};
-        if (!id.is_null()) {
-            r["id"] = id;
-        }
+        if (!id.is_null()) r["id"] = id;
         return r;
     };
 
-    if (method == "health" || method == "status" || method == "gateway.status") {
-        return ok({
-            {"runtime", "running"},
-            {"version", kVersion},
-            {"align_target", kAlign},
-            {"tools", registry_.Names()},
-            {"sessions", sessions_.List()},
-            {"channels", channels_.ListJson()},
-        });
+    if (method == "health" || method == "status" || method == "gateway.status" || method == "system.info") {
+        return ok({{"runtime", "running"}, {"version", kVersion}, {"align_target", kAlign},
+                   {"tools", deps_.tools.Names()}, {"sessions", deps_.sessions.List()},
+                   {"skills", deps_.skills.StatusJson()}, {"auth", deps_.auth.require_auth}});
+    }
+    if (method == "connect") {
+        return ok({{"protocol", 1}, {"server", "openclaw-cpp"}, {"version", kVersion}});
     }
     if (method == "methods.list") {
-        return ok({{"methods", AdvertisedMethods()}});
+        return ok({{"methods", AdvertisedMethods()}, {"implemented", ImplementedMethods()}});
     }
-    if (method == "events.list") {
-        return ok({{"events", AdvertisedEvents()}});
-    }
-    if (method == "tools.list") {
-        return ok({{"tools", registry_.Names()}});
+    if (method == "events.list") return ok({{"events", AdvertisedEvents()}});
+    if (method == "tools.list" || method == "tools.catalog") {
+        return ok({{"tools", deps_.tools.Names()}, {"openai", deps_.tools.OpenAiToolsArray()}});
     }
     if (method == "tools.invoke") {
         const std::string name = params.value("tool", params.value("name", ""));
-        if (name.empty()) {
-            return err("missing tool name");
-        }
-        const auto args = params.contains("args") ? params["args"] : params.value("arguments", nlohmann::json::object());
+        if (name.empty()) return err("missing tool name");
+        auto args = params.contains("args") ? params["args"] : params.value("arguments", nlohmann::json::object());
         try {
-            const auto result = registry_.Invoke(name, args);
+            auto result = deps_.tools.Invoke(name, args);
             return ok({{"tool", name}, {"result", nlohmann::json::parse(result)}});
-        } catch (const std::exception& e) {
-            return err(e.what());
-        }
+        } catch (const std::exception& e) { return err(e.what()); }
     }
-    if (method == "sessions.list") {
-        return ok({{"sessions", sessions_.List()}});
-    }
-    if (method == "sessions.get") {
-        const std::string key = params.value("key", params.value("id", ""));
-        if (key.empty()) {
-            return err("missing session key");
-        }
+    if (method == "sessions.list") return ok({{"sessions", deps_.sessions.List()}});
+    if (method == "sessions.get" || method == "sessions.preview" || method == "chat.history") {
+        const std::string key = params.value("key", params.value("id", params.value("sessionKey", "")));
+        if (key.empty()) return err("missing session key");
         nlohmann::json msgs = nlohmann::json::array();
-        for (const auto& m : sessions_.Load(key)) {
-            msgs.push_back(m.ToJson());
-        }
+        for (const auto& m : deps_.sessions.Load(key)) msgs.push_back(m.ToJson());
         return ok({{"key", key}, {"messages", msgs}});
     }
-    if (method == "sessions.delete") {
+    if (method == "sessions.create") {
+        const std::string key = params.value("key", params.value("id", "session-" + std::to_string(deps_.sessions.List().size() + 1)));
+        deps_.sessions.Save(key, {});
+        return ok({{"key", key}, {"created", true}});
+    }
+    if (method == "sessions.delete" || method == "sessions.reset") {
         const std::string key = params.value("key", params.value("id", ""));
-        if (key.empty()) {
-            return err("missing session key");
-        }
-        const bool removed = sessions_.Remove(key);
-        return ok({{"key", key}, {"removed", removed}});
-    }
-    if (method == "config.get") {
-        return ok(config_.ToJson());
-    }
-    if (method == "channels.status") {
-        return ok({{"channels", channels_.ListJson()}});
+        if (key.empty()) return err("missing session key");
+        if (method == "sessions.reset") { deps_.sessions.Save(key, {}); return ok({{"key", key}, {"reset", true}}); }
+        return ok({{"key", key}, {"removed", deps_.sessions.Remove(key)}});
     }
     if (method == "chat.send") {
         const std::string text = params.value("message", params.value("text", ""));
         const std::string session_key = params.value("sessionKey", params.value("session_id", "default"));
-        if (text.empty()) {
-            return err("missing message");
-        }
-        std::vector<agent::Message> messages = sessions_.Load(session_key);
+        if (text.empty()) return err("missing message");
+        auto messages = deps_.sessions.Load(session_key);
         messages.push_back(agent::Message{.role = "user", .content = text});
-        auto result = agent::RunAgentLoop(provider_, registry_, messages, {.max_turns = 8});
-        if (!result.ok) {
-            return err(result.error);
-        }
-        sessions_.Save(session_key, result.messages);
+        auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, {.max_turns = 8});
+        if (!result.ok) return err(result.error);
+        deps_.sessions.Save(session_key, result.messages);
         return ok({{"sessionKey", session_key}, {"text", result.final_text}, {"turns", result.turns}});
     }
+    if (method == "chat.abort") return ok({{"aborted", true}, {"note", "no active run to abort in single-threaded stub"}});
+    if (method == "config.get") return ok(deps_.config.ToJson());
+    if (method == "config.schema") {
+        return ok({{"type", "object"},
+                   {"properties",
+                    {{"gateway", {{"type", "object"}}},
+                     {"agents", {{"type", "object"}}},
+                     {"session_dir", {{"type", "string"}}}}}});
+    }
+    if (method == "channels.status") return ok({{"channels", deps_.channels.ListJson()}});
+    if (method == "channels.pairing.list" || method == "node.pair.list" || method == "device.pair.list") {
+        return ok({{"pairing", deps_.pairing.ListJson()}});
+    }
+    if (method == "channels.pairing.approve") {
+        const std::string id = params.value("id", "");
+        return ok({{"approved", deps_.pairing.Approve(id)}, {"id", id}});
+    }
+    if (method == "channels.pairing.dismiss") {
+        const std::string id = params.value("id", "");
+        return ok({{"dismissed", deps_.pairing.Dismiss(id)}, {"id", id}});
+    }
+    if (method == "agents.list") {
+        return ok({{"agents", nlohmann::json::array({{{"id", "main"}, {"model", deps_.config.deepseek_model}}})}});
+    }
+    if (method == "skills.status" || method == "skills.library.list") {
+        return ok(deps_.skills.StatusJson());
+    }
+    if (method == "plugins.list") return ok({{"plugins", deps_.plugins.ListJson()}});
+    if (method == "cron.list" || method == "cron" || method == "cron.runs") {
+        return ok({{"jobs", deps_.cron.ListJson()}});
+    }
+    if (method == "cron.add") {
+        cron::Job j;
+        j.id = params.value("id", "job-" + std::to_string(deps_.cron.List().size() + 1));
+        j.cron_expr = params.value("cron", params.value("expr", "*/1 * * * *"));
+        j.payload = params.value("payload", params.value("message", ""));
+        j.enabled = params.value("enabled", true);
+        deps_.cron.Add(j);
+        return ok({{"added", true}, {"job", {{"id", j.id}, {"cron", j.cron_expr}}}});
+    }
+    if (method == "cron.remove") {
+        return ok({{"removed", deps_.cron.Remove(params.value("id", ""))}});
+    }
+    if (method == "memory.get") {
+        // via tools process-local is separate; report session dir hint
+        return ok(Stub(method, params));
+    }
+    if (method == "memory.status" || method == "memory.search") {
+        return ok({{"stub", true}, {"method", method}, {"note", "use CLI memory / memory_* tools"}});
+    }
 
-    return err("method not implemented yet: " + method);
+    // Advertised but not implemented: structured stub (keeps clients progressing)
+    const auto advertised = AdvertisedMethods();
+    if (std::find(advertised.begin(), advertised.end(), method) != advertised.end()) {
+        return ok(Stub(method, params));
+    }
+    return err("unknown method: " + method);
+}
+
+void Server::HandleWebSocket(int client_fd, const std::string& req) {
+    // Optional auth on WS via header
+    auto deny = auth::CheckHttpAuth(deps_.auth, HeaderValue(req, "Authorization"),
+                                    HeaderValue(req, "X-OpenClaw-Token"));
+    if (deny) {
+        auto resp = HttpResponse(401, "Unauthorized", nlohmann::json{{"error", *deny}}.dump());
+        (void)::send(client_fd, resp.data(), resp.size(), 0);
+        return;
+    }
+    const auto key = HeaderValue(req, "Sec-WebSocket-Key");
+    if (key.empty()) {
+        auto resp = HttpResponse(400, "Bad Request", nlohmann::json{{"error", "missing Sec-WebSocket-Key"}}.dump());
+        (void)::send(client_fd, resp.data(), resp.size(), 0);
+        return;
+    }
+    std::ostringstream hs;
+    hs << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+       << "Sec-WebSocket-Accept: " << WsAccept(key) << "\r\n\r\n";
+    const auto hs_s = hs.str();
+    (void)::send(client_fd, hs_s.data(), hs_s.size(), 0);
+
+    auto hello = nlohmann::json{
+        {"type", "event"}, {"event", "connect.challenge"},
+        {"payload", {{"service", "openclaw-cpp"}, {"version", kVersion}, {"align_target", kAlign},
+                     {"methods", AdvertisedMethodCount()}, {"implemented", ImplementedMethods().size()}}},
+    }.dump();
+    { auto frame = WsFrameText(hello); (void)::send(client_fd, frame.data(), frame.size(), 0); }
+
+    char buf[8192];
+    while (running_.load()) {
+        ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        std::string raw(buf, static_cast<size_t>(n));
+        if (!raw.empty() && (static_cast<uint8_t>(raw[0]) & 0x0f) == 0x8) break;
+        std::string payload;
+        if (!ParseWsClientFrame(raw, payload)) continue;
+        nlohmann::json reply;
+        try { reply = DispatchRpc(nlohmann::json::parse(payload)); }
+        catch (...) { reply = {{"type", "res"}, {"ok", false}, {"error", "invalid JSON"}}; }
+        auto frame = WsFrameText(reply.dump());
+        if (::send(client_fd, frame.data(), frame.size(), 0) <= 0) break;
+    }
 }
 
 }  // namespace openclaw::gateway

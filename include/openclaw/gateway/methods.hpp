@@ -1,17 +1,19 @@
 #pragma once
-
 #include <nlohmann/json.hpp>
-
+#include <cstddef>
 #include <string>
 #include <vector>
 
 namespace openclaw::gateway {
 
-// Subset of OpenClaw Gateway advertised methods we intend to implement.
+// Full upstream-advertised catalogs (OpenClaw Gateway).
 std::vector<std::string> AdvertisedMethods();
 nlohmann::json AdvertisedMethodsJson();
-
-// Events we currently emit / plan (from upstream GATEWAY_EVENTS).
 std::vector<std::string> AdvertisedEvents();
+std::size_t AdvertisedMethodCount();
+std::size_t AdvertisedEventCount();
+
+// Methods we implement with real or structured stub responses.
+std::vector<std::string> ImplementedMethods();
 
 }  // namespace openclaw::gateway

@@ -2,42 +2,44 @@
 
 namespace openclaw::gateway {
 
-std::vector<std::string> AdvertisedMethods() {
+std::vector<std::string> ImplementedMethods() {
     return {
-        // health / meta
         "health",
         "status",
         "gateway.status",
         "methods.list",
         "events.list",
-        // sessions (partial)
         "sessions.list",
         "sessions.get",
         "sessions.delete",
-        // chat (partial)
+        "sessions.create",
+        "sessions.reset",
+        "sessions.preview",
         "chat.send",
-        // tools
+        "chat.history",
+        "chat.abort",
         "tools.list",
         "tools.invoke",
-        // config
+        "tools.catalog",
         "config.get",
-        // channels
+        "config.schema",
         "channels.status",
-    };
-}
-
-nlohmann::json AdvertisedMethodsJson() {
-    return AdvertisedMethods();
-}
-
-std::vector<std::string> AdvertisedEvents() {
-    return {
-        "connect.challenge",
-        "health",
-        "tick",
-        "session.message",
-        "sessions.changed",
-        "shutdown",
+        "channels.pairing.list",
+        "agents.list",
+        "skills.status",
+        "skills.library.list",
+        "plugins.list",
+        "cron.add",
+        "cron.remove",
+        "cron.runs",
+        "cron.list",
+        "memory.get",
+        "memory.status",
+        "memory.search",
+        "system.info",
+        "connect",
+        "node.pair.list",
+        "device.pair.list",
     };
 }
 

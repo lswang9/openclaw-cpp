@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 0.2.0 LANGUAGES CXX)
+project(openclaw-cpp VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,17 +18,23 @@ set(OPENCLAW_SOURCES
   src/session/store.cpp
   src/gateway/server.cpp
   src/gateway/methods.cpp
+  src/gateway/catalog_generated.cpp
   src/config/config.cpp
   src/channels/registry.cpp
   src/memory/store.cpp
   src/cron/scheduler.cpp
+  src/auth/gateway_auth.cpp
+  src/skills/loader.cpp
+  src/plugins/registry.cpp
 )
 
 add_executable(openclaw-cpp ${OPENCLAW_SOURCES})
 target_include_directories(openclaw-cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(openclaw-cpp PRIVATE nlohmann_json::nlohmann_json CURL::libcurl)
+# pthread for cron daemon
+find_package(Threads REQUIRED)
+target_link_libraries(openclaw-cpp PRIVATE Threads::Threads)
 
 install(TARGETS openclaw-cpp RUNTIME DESTINATION bin)
-
 enable_testing()
 add_test(NAME self_test COMMAND openclaw-cpp self-test)
