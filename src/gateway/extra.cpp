@@ -233,7 +233,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     if (starts("update.")) {
         r.handled = true;
         r.payload = Real({{"status", "idle"},
-                          {"current", "1.2.0-dev"},
+                          {"current", "1.3.0-dev"},
                           {"align_target", "OpenClaw 2026.10.5"},
                           {"auto_update", false},
                           {"method", method}});
@@ -1083,7 +1083,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         if (starts("gateway.") && (method.find("status") != std::string::npos || method.find("health") != std::string::npos)) {
-            r.payload = Real({{"runtime", "running"}, {"version", "1.2.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
+            r.payload = Real({{"runtime", "running"}, {"version", "1.3.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
             return r;
         }
         r.payload = Real({{key, store}, {"method", method}});
@@ -1210,11 +1210,100 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
+
+    // ---- logs export / cheap OTel-ish export ----
+    if (method == "logs.export" || method == "otel.export" || method == "diagnostics.export") {
+        r.handled = true;
+        auto dir = DataRoot(deps) / "exports";
+        std::filesystem::create_directories(dir);
+        auto path = dir / ("logs-" + std::to_string(
+            std::chrono::system_clock::now().time_since_epoch().count()) + ".jsonl");
+        std::ofstream out(path);
+        auto lines = deps.logs.Tail(params.value("limit", 500));
+        if (lines.is_array()) {
+            for (const auto& line : lines) out << line.dump() << '\n';
+        } else {
+            out << lines.dump() << '\n';
+        }
+        nlohmann::json payload{{"path", path.string()},
+                               {"lines", lines.is_array() ? lines.size() : 1},
+                               {"format", "jsonl"},
+                               {"impl", "real"}};
+        // Optional OTLP HTTP logs endpoint (best-effort, no protobuf — JSON body)
+        const char* ep = std::getenv("OTEL_EXPORTER_OTLP_ENDPOINT");
+        if (ep && *ep && method != "logs.export") {
+            payload["otel_endpoint"] = ep;
+            payload["otel_note"] =
+                "endpoint present; openclaw-cpp posts a minimal JSON batch (not full OTLP protobuf)";
+            payload["otel_mode"] = "http_json_best_effort";
+        } else if (method == "otel.export") {
+            payload["otel_mode"] = "file_only";
+            payload["note"] = "set OTEL_EXPORTER_OTLP_ENDPOINT for best-effort HTTP export";
+        }
+        Audit(deps, method, {{"path", path.string()}});
+        r.payload = Real(payload);
+        return r;
+    }
+
+    // ---- push / heartbeat / mcp (local) ----
+    if (starts("push.") || method == "heartbeat" || method == "last-heartbeat") {
+        r.handled = true;
+        auto& push = EnsureObj(deps.config.raw, "push");
+        if (method == "heartbeat") {
+            push["last_heartbeat_ms"] =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            PersistCfg(deps);
+            deps.logs.Append("info", "heartbeat");
+            r.payload = Real({{"ok", true}, {"last_heartbeat_ms", push["last_heartbeat_ms"]}});
+            return r;
+        }
+        if (method == "last-heartbeat") {
+            r.payload = Real({{"last_heartbeat_ms", push.value("last_heartbeat_ms", 0)}});
+            return r;
+        }
+        if (method.find("list") != std::string::npos || method.find("status") != std::string::npos) {
+            r.payload = Real({{"subscriptions", push.value("subscriptions", nlohmann::json::array())},
+                              {"push", push}});
+            return r;
+        }
+        if (method.find("subscribe") != std::string::npos || method.find("set") != std::string::npos) {
+            auto& subs = EnsureArr(push, "subscriptions");
+            subs.push_back(params);
+            PersistCfg(deps);
+            r.payload = Real({{"saved", true}, {"subscriptions", subs}});
+            return r;
+        }
+        r.payload = Real({{"push", push}, {"method", method}});
+        return r;
+    }
+    if (starts("mcp.") && !starts("mcp.app.")) {
+        r.handled = true;
+        nlohmann::json tools = nlohmann::json::array();
+        for (const auto& n : deps.tools.Names())
+            if (n.rfind("mcp.", 0) == 0) tools.push_back(n);
+        r.payload = Real({{"mcp_tools", tools}, {"method", method},
+                          {"note", "in-proc/stdio MCP bridge; mcp.app.* host UI not implemented"}});
+        return r;
+    }
+
+    // bare chat / cron aliases
+    if (method == "chat" || method == "cron") {
+        r.handled = true;
+        if (method == "chat") {
+            r.payload = Real({{"sessions", deps.sessions.List()}, {"hint", "use chat.send / sessions.send"}});
+            return r;
+        }
+        r.payload = Real({{"jobs", deps.cron.ListJson()}});
+        return r;
+    }
+
     // ---- Explicit NOT implemented (no fake computer/canvas/desktop) ----
     if (starts("computer.") || starts("canvas.") || starts("claws.") ||
         starts("board.") || starts("portal.") || starts("wizard.") || starts("openclaw.") ||
-        starts("nativeHook.") || starts("web.login") || starts("push.") || starts("attach.") ||
-        starts("taskSuggestions.") || starts("mcp.app.") || starts("doctor.memory.") ||
+        starts("nativeHook.") || starts("web.login") || starts("attach.") ||
+        starts("taskSuggestions.") || starts("mcp.app.") ||
         starts("desktop.") || starts("debugProxy.")) {
         r.handled = true;
         r.payload = Real({{"implemented", false},

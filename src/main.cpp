@@ -29,6 +29,7 @@
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
+#include "openclaw/channels/simple_inbound.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/persist/store.hpp"
 #include "openclaw/provider/openai_compat.hpp"
@@ -54,7 +55,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.2.0-dev";
+constexpr const char* kVersion = "1.3.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -430,7 +431,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.2.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.3.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -477,7 +478,7 @@ int CmdSelfTest() {
     }
 
     // implemented count >= 150
-    if (gateway::ImplementedMethods().size() < 250) {
+    if (gateway::ImplementedMethods().size() < 400) {
         std::cerr << "FAIL implemented count " << gateway::ImplementedMethods().size() << "\n"; ++failures;
     } else std::cerr << "PASS implemented count (" << gateway::ImplementedMethods().size() << ")\n";
 
@@ -679,6 +680,37 @@ int CmdSelfTest() {
                 std::cerr << "FAIL slack/discord inbound\n"; ++failures;
             } else std::cerr << "PASS slack/discord inbound\n";
         }
+    }
+
+
+    // whatsapp / imessage inbound
+    {
+        auto hub = channels::AdapterHub::MakeDefault();
+        auto* wa = dynamic_cast<channels::SimpleInboundAdapter*>(hub.Get("whatsapp"));
+        auto* im = dynamic_cast<channels::SimpleInboundAdapter*>(hub.Get("imessage"));
+        if (!wa || !im) { std::cerr << "FAIL wa/imessage adapters\n"; ++failures; }
+        else {
+            auto ch = wa->HandleHttpInbound({{"hub.challenge", "m-ch"}, {"hub.verify_token", ""}}, {});
+            bool ok = false;
+            nlohmann::json wa_body = nlohmann::json::parse(R"({
+              "entry":[{"changes":[{"value":{"messages":[{"from":"1","text":{"body":"wa-hi"}}]}}]}]
+            })");
+            wa->HandleHttpInbound(wa_body,
+                [&](const channels::InboundMessage& m){ ok = m.text=="wa-hi"; return std::string("r"); });
+            bool ok2 = false;
+            im->HandleHttpInbound({{"text", "im-hi"}, {"sender", "me"}},
+                [&](const channels::InboundMessage& m){ ok2 = m.text=="im-hi"; return std::string("r"); });
+            if (ch.value("challenge","")!="m-ch" || !ok || !ok2) {
+                std::cerr << "FAIL wa/imessage inbound\n"; ++failures;
+            } else std::cerr << "PASS whatsapp/imessage inbound\n";
+        }
+    }
+
+    // implemented growth
+    {
+        auto n = gateway::ImplementedMethods().size();
+        if (n < 500) { std::cerr << "FAIL implemented too small " << n << "\n"; ++failures; }
+        else std::cerr << "PASS implemented growth (" << n << ")\n";
     }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }

@@ -6,7 +6,7 @@
 <title>openclaw-cpp Control</title>
 <style>
   :root { font-family: ui-sans-serif, system-ui, sans-serif; color: #e8eaed; background: #0f1115; }
-  body { max-width: 960px; margin: 1.5rem auto; padding: 0 1rem; }
+  body { max-width: 980px; margin: 1.5rem auto; padding: 0 1rem; }
   h1 { font-size: 1.2rem; } h2 { font-size: 1rem; margin: 0 0 .75rem; color: #93c5fd; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
   @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
@@ -19,18 +19,19 @@
   button.secondary { background: #374151; }
   button:disabled { opacity: .5; }
   pre, .list { white-space: pre-wrap; word-break: break-word; background: #0f1115; padding: .65rem; border-radius: 8px;
-    border: 1px solid #2a2f3a; max-height: 220px; overflow: auto; font-size: .82rem; margin: 0; }
+    border: 1px solid #2a2f3a; max-height: 240px; overflow: auto; font-size: .82rem; margin: 0; }
   .ok { color: #34d399; } .bad { color: #f87171; } .muted { color: #9ca3af; font-size: .85rem; }
   .chip { display: inline-block; background: #111827; border: 1px solid #374151; border-radius: 999px; padding: .15rem .55rem; margin: .15rem; font-size: .8rem; cursor: pointer; }
-  .chip:hover { border-color: #60a5fa; }
+  .chip:hover, .chip.active { border-color: #60a5fa; }
 </style>
 </head>
 <body>
-  <h1>openclaw-cpp Control <span class="muted">0.9 · align 2026.10.5</span></h1>
+  <h1>openclaw-cpp Control <span class="muted">1.3 · align 2026.10.5</span></h1>
   <div class="card">
     <button class="secondary" id="btnHealth">Health</button>
     <button class="secondary" id="btnStatus">Status</button>
-    <button class="secondary" id="btnRefresh">Refresh sessions/tools</button>
+    <button class="secondary" id="btnRefresh">Refresh</button>
+    <button class="secondary" id="btnExport">Export session</button>
     <span id="badge" class="muted">—</span>
     <pre id="meta" class="muted" style="margin-top:.75rem">Ready.</pre>
   </div>
@@ -43,6 +44,15 @@
       <h2>Tools</h2>
       <div id="tools" class="list muted">Loading…</div>
     </div>
+  </div>
+  <div class="card">
+    <h2>Tool invoke</h2>
+    <label class="muted">Tool name</label>
+    <input id="toolName" placeholder="echo"/>
+    <label class="muted">Args JSON</label>
+    <textarea id="toolArgs" placeholder='{"text":"hi"}'></textarea>
+    <button id="btnInvoke">Invoke</button>
+    <pre id="toolOut"></pre>
   </div>
   <div class="card">
     <h2>Chat</h2>
@@ -70,31 +80,43 @@ async function get(path) {
   let j; try { j = JSON.parse(t); } catch { j = t; }
   return {ok:r.ok, status:r.status, body:j};
 }
+async function post(path, body) {
+  const r = await fetch(path, {method:'POST', headers: headers(), body: JSON.stringify(body)});
+  const t = await r.text();
+  let j; try { j = JSON.parse(t); } catch { j = t; }
+  return {ok:r.ok, status:r.status, body:j};
+}
 function setBadge(ok, text) {
   const b = document.getElementById('badge');
   b.textContent = text;
   b.className = ok ? 'ok' : 'bad';
 }
+function selectTool(name) {
+  document.getElementById('toolName').value = name;
+  document.querySelectorAll('#tools .chip').forEach(c => {
+    c.classList.toggle('active', c.textContent === name);
+  });
+}
 async function refreshLists() {
   const st = await get('/v1/status');
   const sessions = st.body.sessions || [];
-  const tools = st.body.tools || [];
+  let tools = st.body.tools || [];
   document.getElementById('sessions').innerHTML = sessions.length
     ? sessions.map(s => `<span class="chip" data-s="${s}">${s}</span>`).join('')
-    : '<span class="muted">(none)</span>';
-  document.getElementById('tools').innerHTML = tools.length
-    ? tools.map(t => `<span class="chip">${t}</span>`).join('')
     : '<span class="muted">(none)</span>';
   document.querySelectorAll('#sessions .chip').forEach(el => {
     el.onclick = () => { document.getElementById('session').value = el.dataset.s; };
   });
   const toolsAlt = await get('/v1/tools');
   if (toolsAlt.ok && toolsAlt.body.tools) {
-    document.getElementById('tools').innerHTML = toolsAlt.body.tools.map(t => {
-      const name = typeof t === 'string' ? t : (t.name || JSON.stringify(t));
-      return `<span class="chip">${name}</span>`;
-    }).join('');
+    tools = toolsAlt.body.tools.map(t => typeof t === 'string' ? t : (t.name || ''));
   }
+  document.getElementById('tools').innerHTML = tools.length
+    ? tools.map(t => `<span class="chip" data-t="${t}">${t}</span>`).join('')
+    : '<span class="muted">(none)</span>';
+  document.querySelectorAll('#tools .chip').forEach(el => {
+    el.onclick = () => selectTool(el.dataset.t);
+  });
 }
 document.getElementById('btnHealth').onclick = async () => {
   const r = await get('/health');
@@ -107,6 +129,56 @@ document.getElementById('btnStatus').onclick = async () => {
   setBadge(r.ok, r.ok ? 'status ok' : 'status fail');
 };
 document.getElementById('btnRefresh').onclick = refreshLists;
+document.getElementById('btnExport').onclick = async () => {
+  const session = document.getElementById('session').value.trim() || 'ui-demo';
+  // Prefer HTTP sessions list detail; fall back to chat history via completions not needed —
+  // use /v1/sessions and fetch via tools/rpc-less: GET won't export body — use POST tools? 
+  // Export via chat.history shape: call a small JSON-RPC over WS not available — use fetch to a new endpoint if any.
+  // Use status + dedicated export: POST /tools/invoke won't work. Use GET /v1/sessions then
+  // POST message to a synthetic path: we added sessions.export RPC only on WS.
+  // Soft approach: open /v1/sessions and also try POST /v1/chat with history from local.
+  const r = await post('/tools/invoke', {
+    tool: 'echo',
+    args: { text: 'use WS sessions.export — fetching /v1/sessions metadata' }
+  });
+  const list = await get('/v1/sessions');
+  const hit = (list.body.sessions || []).find(s => (s.id || s) === session);
+  // Try OpenAI-style: no. Provide download of whatever we can from a new HTTP route if server has it.
+  // Fallback: fetch session via chat completions history is not exposed; use export endpoint.
+  const ex = await fetch('/v1/sessions/' + encodeURIComponent(session) + '/export', {headers: headers(false)});
+  if (ex.ok) {
+    const text = await ex.text();
+    const blob = new Blob([text], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = session + '.json';
+    a.click();
+    setBadge(true, 'exported ' + session);
+    document.getElementById('meta').textContent = text.slice(0, 2000);
+    return;
+  }
+  document.getElementById('meta').textContent = JSON.stringify({
+    note: 'GET /v1/sessions/:id/export missing or failed',
+    http: ex.status,
+    sessions: list.body,
+    echo: r.body
+  }, null, 2);
+  setBadge(false, 'export failed');
+};
+document.getElementById('btnInvoke').onclick = async () => {
+  const name = document.getElementById('toolName').value.trim();
+  const raw = document.getElementById('toolArgs').value.trim() || '{}';
+  const out = document.getElementById('toolOut');
+  try {
+    const args = JSON.parse(raw);
+    const r = await post('/tools/invoke', {tool: name, args});
+    out.textContent = JSON.stringify(r.body, null, 2);
+    setBadge(r.ok, r.ok ? 'tool ok' : 'tool fail');
+  } catch (e) {
+    out.textContent = String(e);
+    setBadge(false, 'bad args');
+  }
+};
 document.getElementById('btnSend').onclick = async () => {
   const msg = document.getElementById('msg').value.trim();
   const session = document.getElementById('session').value.trim() || 'ui-demo';
@@ -146,7 +218,6 @@ document.getElementById('btnSend').onclick = async () => {
             const j = JSON.parse(data);
             const delta = j.choices?.[0]?.delta?.content;
             if (delta) out.textContent += delta;
-            if (j.error) out.textContent += '\n' + JSON.stringify(j.error);
           } catch {}
         }
       }

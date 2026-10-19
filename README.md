@@ -2,20 +2,17 @@
 
 OpenClaw **C++ 全量重写** · 对齐 **OpenClaw 2026.10.5**。
 
-**1.2.0-dev — 未宣称全量对齐。** [PARITY.md](PARITY.md) · [docs/ci-github-actions.yml](docs/ci-github-actions.yml)
+**1.3.0-dev — 未宣称全量对齐。** [PARITY.md](PARITY.md)
 
-## 1.2 摘要
+## 1.3 摘要
 
-- **285** implemented methods
-- **Slack / Discord inbound** webhooks（challenge / Interactions ping + 消息 → agent）
-- **sessions.export / import**；**backup.restore**（含会话正文）
-- **max_turns** + **rate_limit_per_minute** 经 config → agent loop
-- CI YAML 仅在 `docs/`（不推 `.github/workflows`）
+- **549** implemented methods（前缀桶 real 本地行为；board/computer 等仍 stub）
+- WhatsApp / iMessage HTTP inbound（与 Feishu/Slack 同模式）
+- `logs.export` / `otel.export` → data/exports JSONL（可选 OTEL endpoint 标记）
+- Control UI：tools **Invoke**、session **Export**
 
 ```bash
-conan install . --output-folder=build --build=missing -s build_type=Release -s compiler.cppstd=20
 cmake --preset conan-release && cmake --build --preset conan-release -j
 ./build/build/Release/openclaw-cpp self-test
+./build/build/Release/openclaw-cpp gateway --port 18789
 ```
-
-Env extras: `SLACK_VERIFY_TOKEN`, `DISCORD_VERIFY_TOKEN`, `FEISHU_VERIFY_TOKEN`, agent limits in config `raw.agent`.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.2.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,7 @@ set(OPENCLAW_SOURCES
   src/channels/feishu.cpp
   src/channels/slack.cpp
   src/channels/discord.cpp
+  src/channels/simple_inbound.cpp
   src/daemon/lifecycle.cpp
   src/provider/deepseek.cpp
   src/provider/mock.cpp

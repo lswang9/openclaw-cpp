@@ -31,7 +31,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.2.0-dev";
+constexpr const char* kVersion = "1.3.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -502,6 +502,18 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& n : deps_.tools.Names()) arr.push_back({{"name", n}});
         send(HttpResponse(200, "OK", nlohmann::json{{"tools", arr}, {"openai", deps_.tools.OpenAiToolsArray()}}.dump(2)));
+        return;
+    }
+    if (method == "GET" && path.rfind("/v1/sessions/", 0) == 0 && path.size() > 13 &&
+        path.find("/export") != std::string::npos) {
+        // /v1/sessions/<id>/export
+        auto rest = path.substr(std::string("/v1/sessions/").size());
+        auto slash = rest.find('/');
+        std::string id = slash == std::string::npos ? rest : rest.substr(0, slash);
+        nlohmann::json msgs = nlohmann::json::array();
+        for (const auto& m : deps_.sessions.Load(id)) msgs.push_back(m.ToJson());
+        send(HttpResponse(200, "OK",
+            nlohmann::json{{"id", id}, {"messages", msgs}, {"impl", "real"}}.dump(2)));
         return;
     }
     if (method == "GET" && path == "/v1/sessions") {
