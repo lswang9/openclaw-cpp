@@ -4,7 +4,7 @@ from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 
 class OpenclawCppConan(ConanFile):
     name = "openclaw-cpp"
-    version = "0.1.0"
+    version = "0.2.0"
     package_type = "application"
     settings = "os", "compiler", "build_type", "arch"
     generators = "CMakeDeps", "CMakeToolchain"
@@ -12,6 +12,9 @@ class OpenclawCppConan(ConanFile):
     def requirements(self):
         self.requires("nlohmann_json/3.11.3")
         self.requires("libcurl/8.10.1")
+
+    def configure(self):
+        self.settings.compiler.cppstd = "20"
 
     def layout(self):
         cmake_layout(self)

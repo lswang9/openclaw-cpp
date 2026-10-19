@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 0.1.0 LANGUAGES CXX)
+project(openclaw-cpp VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,8 +9,25 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
 
-add_executable(openclaw-cpp src/main.cpp)
+set(OPENCLAW_SOURCES
+  src/main.cpp
+  src/agent/loop.cpp
+  src/provider/deepseek.cpp
+  src/provider/mock.cpp
+  src/tools/registry.cpp
+  src/session/store.cpp
+  src/gateway/server.cpp
+)
+
+add_executable(openclaw-cpp ${OPENCLAW_SOURCES})
 target_include_directories(openclaw-cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(openclaw-cpp PRIVATE nlohmann_json::nlohmann_json CURL::libcurl)
 
+if(UNIX AND NOT APPLE)
+  # nothing extra; sockets in libc
+endif()
+
 install(TARGETS openclaw-cpp RUNTIME DESTINATION bin)
+
+enable_testing()
+add_test(NAME self_test COMMAND openclaw-cpp self-test)

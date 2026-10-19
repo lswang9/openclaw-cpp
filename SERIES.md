@@ -1,15 +1,15 @@
-# openclaw-cpp 系列规划
+# openclaw-cpp 系列
 
-一套仓库、分阶段落地；对齐官方 OpenClaw **2026.10.5**。
+对齐官方 OpenClaw **2026.10.5** 的 C++ 全量重写系列。
 
 | 仓库 | 角色 | 状态 |
 |------|------|------|
-| **openclaw-cpp**（本仓） | 核心：CLI / 会话入口 / LLM 往返 | 第一刀：DeepSeek chat completions |
-| openclaw-cpp-gateway | Gateway：通道接入、路由、鉴权 | 规划中 |
-| openclaw-cpp-tools | Tools：工具协议、执行器、与 agent 集成 | 规划中 |
+| **[openclaw-cpp](https://github.com/lswang9/openclaw-cpp)** | 核心：CLI、agent loop、provider、session、内嵌 Gateway 初版 | 活跃（0.2.0-dev） |
+| **[openclaw-cpp-gateway](https://github.com/lswang9/openclaw-cpp-gateway)** | Gateway 深挖（HTTP/WS 协议、通道多路、鉴权）— 可从核心迁出 | README 占位 |
+| **[openclaw-cpp-tools](https://github.com/lswang9/openclaw-cpp-tools)** | 工具包 / skills / 执行器扩展 | README 占位 |
 
 原则：
 
-1. 先核心、后外围；本仓不依赖尚未开源的 sibling。
-2. 共用 C++20 + Conan；接口在稳定后再抽公共库。
-3. 行为对齐 2026.10.5，不是 Node 包装层。
+1. 先在核心仓做出可运行垂直切片，再拆 sibling，避免空转。
+2. 共用 C++20 + Conan；稳定接口后再抽 `openclaw-cpp-common`。
+3. 行为对齐 2026.10.5，不是 Node 包装层。详见 [PARITY.md](PARITY.md)。

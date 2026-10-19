@@ -1,5 +1,5 @@
 # openclaw::session
 
-占位目录。对齐目标：官方 OpenClaw **2026.10.5** 同名能力模块。
+对齐目标：官方 OpenClaw **2026.10.5** 的 `session` 子系统。
 
-当前仓库（第一刀）仅实现 CLI → DeepSeek chat completions 往返；本目录代码尚未落地。
+状态：见仓库根目录 [PARITY.md](../../../PARITY.md)。本目录含可编译实现（持续扩展）。
