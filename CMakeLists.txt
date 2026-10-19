@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 0.7.0 LANGUAGES CXX)
+project(openclaw-cpp VERSION 0.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
 set(OPENCLAW_SOURCES
@@ -23,6 +24,7 @@ set(OPENCLAW_SOURCES
   src/gateway/server.cpp
   src/gateway/methods.cpp
   src/gateway/catalog_generated.cpp
+  src/gateway/extra.cpp
   src/config/config.cpp
   src/config/validate.cpp
   src/channels/registry.cpp
@@ -48,9 +50,18 @@ set(OPENCLAW_SOURCES
 )
 
 add_executable(openclaw-cpp ${OPENCLAW_SOURCES})
-target_include_directories(openclaw-cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(openclaw-cpp PRIVATE nlohmann_json::nlohmann_json CURL::libcurl Threads::Threads)
+target_include_directories(openclaw-cpp PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/gateway)
+target_link_libraries(openclaw-cpp PRIVATE
+  nlohmann_json::nlohmann_json
+  CURL::libcurl
+  OpenSSL::SSL
+  OpenSSL::Crypto
+  Threads::Threads)
 
 install(TARGETS openclaw-cpp RUNTIME DESTINATION bin)
+# ship control UI source for reference
+install(FILES web/control.html DESTINATION share/openclaw-cpp OPTIONAL)
 enable_testing()
 add_test(NAME self_test COMMAND openclaw-cpp self-test)

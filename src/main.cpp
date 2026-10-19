@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -45,7 +46,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.7.0-dev";
+constexpr const char* kVersion = "0.8.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -420,7 +421,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "0.7.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "0.8.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -429,6 +430,47 @@ int CmdSelfTest() {
         if (!doc.contains("checks")) { std::cerr << "FAIL doctor\n"; ++failures; }
         else std::cerr << "PASS doctor diagnostics\n";
     }
+
+
+    // secrets encryption
+    {
+        auto sp = std::filesystem::temp_directory_path() / "oc-sec-enc.json";
+        std::filesystem::remove(sp);
+        secrets::Store sec(sp, "test-passphrase");
+        sec.Set("api", "super-secret");
+        auto v = sec.Get("api");
+        // file must not contain plaintext
+        std::string file = (std::ifstream(sp) >> std::noskipws, std::string{std::istreambuf_iterator<char>(std::ifstream(sp).rdbuf()), {}});
+        // re-read properly
+        {
+            std::ifstream in(sp); std::string s((std::istreambuf_iterator<char>(in)), {});
+            file = s;
+        }
+        if (!v || *v != "super-secret" || file.find("super-secret") != std::string::npos || !sec.Encrypted()) {
+            std::cerr << "FAIL secrets encrypt\n"; ++failures;
+        } else std::cerr << "PASS secrets encrypt\n";
+        std::filesystem::remove(sp);
+    }
+
+    // providers hot-switch (router)
+    {
+        provider::Router r;
+        auto m1 = std::make_shared<provider::MockProvider>();
+        auto m2 = std::make_shared<provider::MockProvider>();
+        agent::CompletionResult a; a.ok=true; a.finish_reason="stop"; a.message.role="assistant"; a.message.content="p1";
+        agent::CompletionResult b; b.ok=true; b.finish_reason="stop"; b.message.role="assistant"; b.message.content="p2";
+        m1->Enqueue(a); m2->Enqueue(b);
+        r.Add("p1", m1); r.Add("p2", m2); r.SetDefault("p1");
+        r.SetDefault("p2");
+        auto out = r.Complete({{.role="user",.content="x"}}, nlohmann::json::array());
+        if (!out.ok || out.message.content != "p2") { std::cerr << "FAIL provider switch\n"; ++failures; }
+        else std::cerr << "PASS provider hot-switch\n";
+    }
+
+    // implemented count >= 150
+    if (gateway::ImplementedMethods().size() < 150) {
+        std::cerr << "FAIL implemented count " << gateway::ImplementedMethods().size() << "\n"; ++failures;
+    } else std::cerr << "PASS implemented count (" << gateway::ImplementedMethods().size() << ")\n";
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
@@ -520,7 +562,8 @@ int CmdGateway(int argc, char** argv, int argi) {
     auth::PairingStore pairing;
     session::Store sessions(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
     memory::Store memory(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
-    secrets::Store secrets(std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "secrets.json");
+    secrets::Store secrets(std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "secrets.json",
+                             EnvOr("OPENCLAW_SECRETS_PASSPHRASE", ""));
     auto nodes = nodes::Registry::MakeDefault();
     media::Store media(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "media");
     events::Bus bus;

@@ -1,5 +1,6 @@
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/gateway/methods.hpp"
+#include "openclaw/gateway/extra.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/logging/tail.hpp"
 #include "openclaw/context/assemble.hpp"
@@ -30,7 +31,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "0.7.0-dev";
+constexpr const char* kVersion = "0.8.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -427,7 +428,14 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"service", "openclaw-cpp-gateway"}}.dump()));
         return;
     }
-    if (method == "GET" && (path == "/" || path == "/v1/status")) {
+    if (method == "GET" && (path == "/" || path == "/control" || path == "/ui")) {
+        static const std::string kUi =
+#include "control_ui_html.inc"
+        ;
+        send(HttpResponse(200, "OK", kUi, "text/html; charset=utf-8"));
+        return;
+    }
+    if (method == "GET" && path == "/v1/status") {
         send(HttpResponse(200, "OK", nlohmann::json{
             {"service", "openclaw-cpp"}, {"version", kVersion}, {"align_target", kAlign},
             {"gateway", {{"bind", opts_.bind_host}, {"port", opts_.port}, {"http", true}, {"websocket", true},
@@ -1059,12 +1067,20 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         return ok({{"tools", tools}, {"note", "mcp.* tools bridged into registry when MCP client attached"}});
     }
 
+    {
+        auto extra = TryExtraDispatch(deps_, method, params);
+        if (extra.handled) {
+            if (!extra.ok) return err(extra.error);
+            return ok(extra.payload);
+        }
+    }
     const auto advertised = AdvertisedMethods();
     if (std::find(advertised.begin(), advertised.end(), method) != advertised.end()) {
         return ok(Stub(method, params));
     }
     return err("unknown method: " + method);
 }
+
 
 void Server::HandleWebSocket(int client_fd, const std::string& req) {
     // Optional auth on WS via header
