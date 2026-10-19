@@ -7,7 +7,6 @@
 
 namespace openclaw::channels {
 
-// Records outbound webhook payloads (no real network). For telegram/feishu stubs.
 class OutboundRecordAdapter : public Adapter {
 public:
     OutboundRecordAdapter(std::string id, std::string todo_note, std::string webhook_path);
@@ -16,7 +15,10 @@ public:
     void SetEnabled(bool on) override { enabled_ = on; }
     nlohmann::json Status() const override;
 
-    // "Send" — records payload; optionally would HTTP POST when OPENCLAW_CHANNEL_HTTP_SEND=1 later.
+    // Send text. If env token present, POST via libcurl; always records payload.
+    // Telegram: TELEGRAM_BOT_TOKEN → https://api.telegram.org/bot<token>/sendMessage
+    // Discord:  DISCORD_BOT_TOKEN + channel id → Discord API
+    // Feishu:   FEISHU_APP_ID/SECRET deferred — record only unless FEISHU_WEBHOOK_URL set
     nlohmann::json SendText(const std::string& chat_id, const std::string& text,
                             const nlohmann::json& extra = {});
     nlohmann::json OutboundLog() const;
@@ -28,6 +30,8 @@ private:
     std::string webhook_path_;
     bool enabled_ = false;
     std::vector<nlohmann::json> sent_;
+    nlohmann::json HttpPostJson(const std::string& url, const nlohmann::json& body,
+                                const std::vector<std::string>& headers) const;
 };
 
 }  // namespace openclaw::channels

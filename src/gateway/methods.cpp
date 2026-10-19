@@ -4,6 +4,7 @@ namespace openclaw::gateway {
 
 std::vector<std::string> ImplementedMethods() {
     return {
+        "acp.status", "acp.sessions.list", "acp.sessions.create", "acp.sessions.prompt",
         "health",
         "status",
         "gateway.status",

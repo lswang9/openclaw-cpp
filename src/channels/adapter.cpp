@@ -84,8 +84,10 @@ AdapterHub AdapterHub::MakeDefault() {
         "telegram",
         "TODO: live Telegram Bot API; outbound payloads recorded locally",
         "/bot<token>/sendMessage"));
-    hub.Add(std::make_unique<StubAdapter>(
-        "discord", "TODO: Discord Gateway websocket (OpenClaw channels/discord)"));
+    hub.Add(std::make_unique<OutboundRecordAdapter>(
+        "discord",
+        "Outbound via DISCORD_BOT_TOKEN; inbound Gateway WS TODO",
+        "/api/v10/channels/{id}/messages"));
     hub.Add(std::make_unique<StubAdapter>(
         "slack", "TODO: Slack Events API + Socket Mode (OpenClaw channels/slack)"));
     hub.Add(std::make_unique<OutboundRecordAdapter>(

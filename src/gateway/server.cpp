@@ -31,7 +31,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "0.8.0-dev";
+constexpr const char* kVersion = "0.9.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -477,6 +477,20 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
     }
     if (method == "GET" && path == "/v1/config") {
         send(HttpResponse(200, "OK", deps_.config.ToJson().dump(2)));
+        return;
+    }
+    if (method == "GET" && path == "/v1/tools") {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& n : deps_.tools.Names()) arr.push_back({{"name", n}});
+        send(HttpResponse(200, "OK", nlohmann::json{{"tools", arr}, {"openai", deps_.tools.OpenAiToolsArray()}}.dump(2)));
+        return;
+    }
+    if (method == "GET" && path == "/v1/sessions") {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& id : deps_.sessions.List()) {
+            arr.push_back({{"id", id}, {"messages", deps_.sessions.Load(id).size()}});
+        }
+        send(HttpResponse(200, "OK", nlohmann::json{{"sessions", arr}}.dump(2)));
         return;
     }
     if (method == "GET" && path == "/v1/skills") {

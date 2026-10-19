@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openclaw/agent/files.hpp"
+#include "openclaw/acp/session.hpp"
 #include "openclaw/approvals/store.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/agent/loop.hpp"
@@ -59,6 +60,7 @@ struct ServerDeps {
     agent::FileStore& agent_files;
     logging::TailBuffer& logs;
     persist::StateStore* persist = nullptr;
+    acp::Registry* acp = nullptr;
     config::Snapshot config;
     auth::AuthConfig auth;
     std::string system_prompt = "You are OpenClaw (C++ rewrite). Be concise and helpful.";

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 0.8.0 LANGUAGES CXX)
+project(openclaw-cpp VERSION 0.9.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,6 +15,7 @@ set(OPENCLAW_SOURCES
   src/main.cpp
   src/agent/loop.cpp
   src/agent/files.cpp
+  src/acp/session.cpp
   src/provider/deepseek.cpp
   src/provider/mock.cpp
   src/provider/openai_compat.cpp

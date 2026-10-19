@@ -13,3 +13,5 @@
 1. 先在核心仓做出可运行垂直切片，再拆 sibling，避免空转。
 2. 共用 C++20 + Conan；稳定接口后再抽 `openclaw-cpp-common`。
 3. 行为对齐 2026.10.5，不是 Node 包装层。详见 [PARITY.md](PARITY.md)。
+
+- **0.9.0-dev**: real local-state ExtraDispatch, Control UI sessions/SSE/tools, ACP skeleton+gap, live TG/Discord/Feishu curl when tokens

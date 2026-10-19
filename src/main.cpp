@@ -23,6 +23,7 @@
 #include "openclaw/skills/loader.hpp"
 #include "openclaw/tools/registry.hpp"
 #include "openclaw/util.hpp"
+#include "openclaw/acp/session.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/persist/store.hpp"
 #include "openclaw/provider/openai_compat.hpp"
@@ -46,7 +47,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.8.0-dev";
+constexpr const char* kVersion = "0.9.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -421,7 +422,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "0.8.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "0.9.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -471,6 +472,32 @@ int CmdSelfTest() {
     if (gateway::ImplementedMethods().size() < 150) {
         std::cerr << "FAIL implemented count " << gateway::ImplementedMethods().size() << "\n"; ++failures;
     } else std::cerr << "PASS implemented count (" << gateway::ImplementedMethods().size() << ")\n";
+
+
+    // ACP skeleton
+    {
+        acp::Registry acp;
+        auto id = acp.Create("codex");
+        acp.AppendPrompt(id, "hi");
+        auto st = acp.StatusJson();
+        if (!st.value("skeleton", false) || acp.ListJson().empty()) {
+            std::cerr << "FAIL acp skeleton\n"; ++failures;
+        } else std::cerr << "PASS acp skeleton\n";
+    }
+
+    // outbound record without tokens (graceful)
+    {
+        auto hub = channels::AdapterHub::MakeDefault();
+        auto* tg = dynamic_cast<channels::OutboundRecordAdapter*>(hub.Get("telegram"));
+        auto* dc = dynamic_cast<channels::OutboundRecordAdapter*>(hub.Get("discord"));
+        if (!tg || !dc) { std::cerr << "FAIL outbound adapters\n"; ++failures; }
+        else {
+            auto r = tg->SendText("1", "no-token-test");
+            if (!r.value("recorded", false) || r.value("mode", "") != "record_only") {
+                std::cerr << "FAIL telegram no-token " << r.dump() << "\n"; ++failures;
+            } else std::cerr << "PASS telegram/discord outbound graceful\n";
+        }
+    }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
@@ -574,6 +601,7 @@ int CmdGateway(int argc, char** argv, int argi) {
     const auto data_dir = std::filesystem::path(EnvOr("OPENCLAW_DATA_DIR",
         (std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "data").string()));
     persist::StateStore persist(data_dir);
+    acp::Registry acp_reg;
     persist.LoadCron(cron);
     persist.LoadPairing(pairing);
     persist.LoadNodes(nodes);
@@ -622,6 +650,7 @@ int CmdGateway(int argc, char** argv, int argi) {
         .agent_files = agent_files,
         .logs = logs,
         .persist = &persist,
+        .acp = &acp_reg,
         .config = cfg,
         .auth = auth::FromEnv(),
     };
