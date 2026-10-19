@@ -1,4 +1,5 @@
 #include "openclaw/gateway/server.hpp"
+#include "openclaw/gateway/methods.hpp"
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -236,11 +237,13 @@ bool ParseWsClientFrame(const std::string& buf, std::string& out_payload) {
 }  // namespace
 
 Server::Server(ServerOptions opts, provider::Provider& provider, tools::Registry& registry,
-               session::Store& sessions)
+               session::Store& sessions, channels::Registry& channels, config::Snapshot config)
     : opts_(std::move(opts)),
       provider_(provider),
       registry_(registry),
-      sessions_(sessions) {}
+      sessions_(sessions),
+      channels_(channels),
+      config_(std::move(config)) {}
 
 Server::~Server() {
     Stop();
@@ -386,6 +389,9 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
               {"websocket", true}}},
             {"tools", registry_.Names()},
             {"sessions", sessions_.List()},
+            {"channels", channels_.ListJson()},
+            {"methods", AdvertisedMethods()},
+            {"events", AdvertisedEvents()},
         };
         send(HttpResponse(200, "OK", j.dump(2)));
         return;
@@ -478,6 +484,21 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         return;
     }
 
+    if (method == "GET" && path == "/v1/methods") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"methods", AdvertisedMethods()}, {"events", AdvertisedEvents()}}.dump(2)));
+        return;
+    }
+
+    if (method == "GET" && path == "/v1/channels") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"channels", channels_.ListJson()}}.dump(2)));
+        return;
+    }
+
+    if (method == "GET" && path == "/v1/config") {
+        send(HttpResponse(200, "OK", config_.ToJson().dump(2)));
+        return;
+    }
+
     send(HttpResponse(404, "Not Found",
                       nlohmann::json{{"error", "not found"}, {"path", path}}.dump()));
 }
@@ -533,22 +554,7 @@ void Server::HandleWebSocket(int client_fd, const std::string& req) {
         nlohmann::json reply;
         try {
             const auto msg = nlohmann::json::parse(payload);
-            const std::string method = msg.value("method", msg.value("type", ""));
-            if (method == "status" || method == "gateway.status") {
-                reply = {{"type", "res"},
-                         {"ok", true},
-                         {"payload",
-                          {{"runtime", "running"},
-                           {"tools", registry_.Names()},
-                           {"sessions", sessions_.List()}}}};
-            } else if (method == "tools.list") {
-                reply = {{"type", "res"}, {"ok", true}, {"payload", {{"tools", registry_.Names()}}}};
-            } else {
-                reply = {{"type", "res"},
-                         {"ok", false},
-                         {"error", "method not implemented yet: " + method},
-                         {"echo", msg}};
-            }
+            reply = DispatchRpc(msg);
         } catch (...) {
             reply = {{"type", "res"}, {"ok", false}, {"error", "invalid JSON"}, {"echo", payload}};
         }
@@ -557,6 +563,106 @@ void Server::HandleWebSocket(int client_fd, const std::string& req) {
             break;
         }
     }
+}
+
+
+nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
+    const std::string method = msg.value("method", msg.value("type", ""));
+    const auto params = msg.contains("params") ? msg["params"] : nlohmann::json::object();
+    const auto id = msg.contains("id") ? msg["id"] : nlohmann::json();
+
+    auto ok = [&](nlohmann::json payload) {
+        nlohmann::json r{{"type", "res"}, {"ok", true}, {"payload", std::move(payload)}};
+        if (!id.is_null()) {
+            r["id"] = id;
+        }
+        return r;
+    };
+    auto err = [&](const std::string& e) {
+        nlohmann::json r{{"type", "res"}, {"ok", false}, {"error", e}};
+        if (!id.is_null()) {
+            r["id"] = id;
+        }
+        return r;
+    };
+
+    if (method == "health" || method == "status" || method == "gateway.status") {
+        return ok({
+            {"runtime", "running"},
+            {"version", kVersion},
+            {"align_target", kAlign},
+            {"tools", registry_.Names()},
+            {"sessions", sessions_.List()},
+            {"channels", channels_.ListJson()},
+        });
+    }
+    if (method == "methods.list") {
+        return ok({{"methods", AdvertisedMethods()}});
+    }
+    if (method == "events.list") {
+        return ok({{"events", AdvertisedEvents()}});
+    }
+    if (method == "tools.list") {
+        return ok({{"tools", registry_.Names()}});
+    }
+    if (method == "tools.invoke") {
+        const std::string name = params.value("tool", params.value("name", ""));
+        if (name.empty()) {
+            return err("missing tool name");
+        }
+        const auto args = params.contains("args") ? params["args"] : params.value("arguments", nlohmann::json::object());
+        try {
+            const auto result = registry_.Invoke(name, args);
+            return ok({{"tool", name}, {"result", nlohmann::json::parse(result)}});
+        } catch (const std::exception& e) {
+            return err(e.what());
+        }
+    }
+    if (method == "sessions.list") {
+        return ok({{"sessions", sessions_.List()}});
+    }
+    if (method == "sessions.get") {
+        const std::string key = params.value("key", params.value("id", ""));
+        if (key.empty()) {
+            return err("missing session key");
+        }
+        nlohmann::json msgs = nlohmann::json::array();
+        for (const auto& m : sessions_.Load(key)) {
+            msgs.push_back(m.ToJson());
+        }
+        return ok({{"key", key}, {"messages", msgs}});
+    }
+    if (method == "sessions.delete") {
+        const std::string key = params.value("key", params.value("id", ""));
+        if (key.empty()) {
+            return err("missing session key");
+        }
+        const bool removed = sessions_.Remove(key);
+        return ok({{"key", key}, {"removed", removed}});
+    }
+    if (method == "config.get") {
+        return ok(config_.ToJson());
+    }
+    if (method == "channels.status") {
+        return ok({{"channels", channels_.ListJson()}});
+    }
+    if (method == "chat.send") {
+        const std::string text = params.value("message", params.value("text", ""));
+        const std::string session_key = params.value("sessionKey", params.value("session_id", "default"));
+        if (text.empty()) {
+            return err("missing message");
+        }
+        std::vector<agent::Message> messages = sessions_.Load(session_key);
+        messages.push_back(agent::Message{.role = "user", .content = text});
+        auto result = agent::RunAgentLoop(provider_, registry_, messages, {.max_turns = 8});
+        if (!result.ok) {
+            return err(result.error);
+        }
+        sessions_.Save(session_key, result.messages);
+        return ok({{"sessionKey", session_key}, {"text", result.final_text}, {"turns", result.turns}});
+    }
+
+    return err("method not implemented yet: " + method);
 }
 
 }  // namespace openclaw::gateway

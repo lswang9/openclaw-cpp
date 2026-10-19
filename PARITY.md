@@ -10,15 +10,15 @@
 | Tools registry | **部分** | `echo`, `time_now`；`/tools/invoke` |
 | Session store | **部分** | JSON 文件；session_id 挂到 chat API |
 | Gateway HTTP | **部分** | `/health` `/v1/status` `/v1/models` `/v1/chat/completions` `/tools/invoke` |
-| Gateway WebSocket | **骨架** | Upgrade + hello + status/tools.list；完整 RPC 待补 |
-| Channels (WhatsApp/Telegram/…) | TODO | 对接 gateway 入站 |
+| Gateway WebSocket | **部分** | Upgrade + hello + DispatchRpc（health/sessions/tools/config/chat.send/…） |
+| Channels (WhatsApp/Telegram/…) | **骨架** | registry + `/v1/channels`；真实适配器 TODO |
 | Memory / context-engine | TODO | |
 | Plugins / skills | TODO | sibling: openclaw-cpp-tools |
 | MCP | TODO | |
 | Cron / hooks / daemon | TODO | |
 | Nodes / companion apps | TODO | |
 | Control UI | TODO | |
-| Config / secrets | TODO | |
+| Config / secrets | **骨架** | JSON config load/save；secrets TODO |
 | Pairing / approvals | TODO | |
 | Media / image / canvas | TODO | |
 | ACP / alternate runtimes | TODO | |

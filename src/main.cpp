@@ -6,6 +6,9 @@
 #include "openclaw/session/store.hpp"
 #include "openclaw/tools/registry.hpp"
 #include "openclaw/util.hpp"
+#include "openclaw/channels/registry.hpp"
+#include "openclaw/config/config.hpp"
+#include "openclaw/gateway/methods.hpp"
 
 #include <curl/curl.h>
 
@@ -46,6 +49,9 @@ void PrintUsage() {
         << "  openclaw-cpp chat [-s SESSION] <message...>\n"
         << "  openclaw-cpp gateway [--port N] [--host ADDR]\n"
         << "  openclaw-cpp tools\n"
+        << "  openclaw-cpp channels\n"
+        << "  openclaw-cpp config\n"
+        << "  openclaw-cpp methods\n"
         << "  openclaw-cpp status\n"
         << "  openclaw-cpp self-test\n"
         << "  openclaw-cpp <message...>          # shorthand for chat\n";
@@ -130,6 +136,23 @@ int CmdSelfTest() {
         ++failures;
     } else {
         std::cerr << "PASS tools registry\n";
+    }
+
+    // 5) channels + methods catalog
+    {
+        auto ch = channels::MakeDefaultChannels();
+        if (ch.List().size() < 3) {
+            std::cerr << "FAIL channels registry\n";
+            ++failures;
+        } else {
+            std::cerr << "PASS channels registry\n";
+        }
+        if (gateway::AdvertisedMethods().empty()) {
+            std::cerr << "FAIL methods catalog\n";
+            ++failures;
+        } else {
+            std::cerr << "PASS methods catalog (" << gateway::AdvertisedMethods().size() << ")\n";
+        }
     }
 
     if (failures == 0) {
@@ -228,12 +251,16 @@ int CmdGateway(int argc, char** argv, int argi) {
         std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
 
     auto registry = tools::MakeDefaultRegistry();
+    auto channels = channels::MakeDefaultChannels();
     session::Store store(sess_root);
+    auto cfg = config::LoadOrDefault(config::DefaultPath());
+    cfg.gateway_host = opts.bind_host;
+    cfg.gateway_port = opts.port;
     provider::DeepSeekProvider provider(api_key.empty() ? std::string("missing") : api_key, base,
                                         model);
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    gateway::Server server(opts, provider, registry, store);
+    gateway::Server server(opts, provider, registry, store, channels, cfg);
     try {
         server.Run();
     } catch (const std::exception& e) {
@@ -251,8 +278,8 @@ int CmdStatus() {
                      {"version", "0.2.0-dev"},
                      {"align_target", "OpenClaw 2026.10.5"},
                      {"modules",
-                      nlohmann::json::array(
-                          {"agent", "gateway", "tools", "session", "provider/deepseek"})},
+                      nlohmann::json::array({"agent", "gateway", "tools", "session",
+                                                 "provider/deepseek", "channels", "config"})},
                      {"todo", "channels, memory, plugins, mcp, cron, nodes, control-ui, ..."},
                  }
                      .dump(2)
@@ -265,6 +292,29 @@ int CmdTools() {
     for (const auto& n : registry.Names()) {
         std::cout << n << '\n';
     }
+    return 0;
+}
+
+
+int CmdChannels() {
+    auto ch = openclaw::channels::MakeDefaultChannels();
+    std::cout << ch.ListJson().dump(2) << '\n';
+    return 0;
+}
+
+int CmdConfig() {
+    auto cfg = openclaw::config::LoadOrDefault(openclaw::config::DefaultPath());
+    std::cout << cfg.ToJson().dump(2) << '\n';
+    return 0;
+}
+
+int CmdMethods() {
+    std::cout << nlohmann::json{
+                     {"methods", openclaw::gateway::AdvertisedMethods()},
+                     {"events", openclaw::gateway::AdvertisedEvents()},
+                 }
+                     .dump(2)
+              << '\n';
     return 0;
 }
 
@@ -285,6 +335,15 @@ int main(int argc, char** argv) {
         }
         if (cmd == "tools") {
             return CmdTools();
+        }
+        if (cmd == "methods") {
+            return CmdMethods();
+        }
+        if (cmd == "config") {
+            return CmdConfig();
+        }
+        if (cmd == "channels") {
+            return CmdChannels();
         }
         if (cmd == "gateway") {
             return CmdGateway(argc, argv, 2);

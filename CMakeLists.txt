@@ -17,15 +17,14 @@ set(OPENCLAW_SOURCES
   src/tools/registry.cpp
   src/session/store.cpp
   src/gateway/server.cpp
+  src/gateway/methods.cpp
+  src/config/config.cpp
+  src/channels/registry.cpp
 )
 
 add_executable(openclaw-cpp ${OPENCLAW_SOURCES})
 target_include_directories(openclaw-cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(openclaw-cpp PRIVATE nlohmann_json::nlohmann_json CURL::libcurl)
-
-if(UNIX AND NOT APPLE)
-  # nothing extra; sockets in libc
-endif()
 
 install(TARGETS openclaw-cpp RUNTIME DESTINATION bin)
 
