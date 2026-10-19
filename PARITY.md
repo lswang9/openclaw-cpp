@@ -30,7 +30,7 @@
 | Telegram / Discord outbound | **real \| stub** | env token → live_http |
 | computer / canvas / desktop / board | **stub** | `implemented:false` |
 | ACP | **stub / gap** | [docs/ACP-GAP.md](docs/ACP-GAP.md) |
-| CI | **real** | `.github/workflows/ci.yml` Conan + self-test (ubuntu) |
+| CI | **ready** | Workflow YAML in [docs/ci-github-actions.yml](docs/ci-github-actions.yml); installing under `.github/workflows/` needs a GitHub token with `workflow` scope (OAuth push rejected without it) |
 
 ## 里程碑
 

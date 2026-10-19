@@ -10,7 +10,7 @@ OpenClaw **C++ 全量重写** · 对齐 **OpenClaw 2026.10.5**。
 - **TTS**：`OPENCLAW_TTS_URL` / `OPENCLAW_TTS_API_KEY` → HTTP；否则 record-only
 - **Tools**：`http_get`（curl）；`browser` 明确 not configured
 - **Feishu**：inbound URL verification + message → agent；outbound via `FEISHU_WEBHOOK_URL`
-- **CI**：GitHub Actions Conan build + `self-test`
+- **CI**：workflow at `docs/ci-github-actions.yml` (enable as `.github/workflows/ci.yml` with `workflow` scope)
 
 ```bash
 conan install . --output-folder=build --build=missing -s build_type=Release -s compiler.cppstd=20
