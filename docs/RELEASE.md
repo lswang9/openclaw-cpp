@@ -10,7 +10,7 @@
 
 ## Cutting a non-dev tag (later)
 
-Dev line uses `X.Y.Z-dev` (e.g. `1.5.0-dev`). For a tagged release:
+Dev line uses `X.Y.Z-dev` (e.g. `1.5.1-dev`). For a tagged release:
 
 ```bash
 # 1. Bump to X.Y.Z (drop -dev) in CMakeLists.txt, conanfile.py, kVersion constants, PARITY/README

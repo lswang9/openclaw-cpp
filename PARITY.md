@@ -1,46 +1,30 @@
-# OpenClaw 2026.10.5 → openclaw-cpp — honest parity
+# OpenClaw 2026.10.5 → openclaw-cpp
 
-**Current: 1.5.0-dev. NOT full OpenClaw 2026.10.5 parity.**
+**Version: 1.5.1-dev · 未宣称与上游全量对齐。**
 
-## Impl tags
+## 执行摘要（今晚可用什么）
 
-| `impl` | Meaning |
-|--------|---------|
-| **`real`** | Local state and/or real HTTP when env configured. Subset of upstream. |
-| **`real-sim`** | `SimulationBackend` — placeholder PNG, action log. **Not** production computer-use. |
-| **`honest`** | Rare partial catch-all. |
-| **`implemented:false`** | Intentionally missing (debugProxy, claws, nativeHook, web.login, attach, …). |
+| 层级 | 内容 |
+|------|------|
+| **今天可当真用（`impl:real`，仍是子集）** | Gateway HTTP+WS；mock/DeepSeek/OpenAI-compat 路由；agent loop（tools、max_turns、timeout、cancel、session 锁）；sessions/CRUD/export；tools（含 `http_get` / `browser_open_url`）；MCP mock/stdio bridge + `mcp.app` list/call/resources；cron/persist/pairing；Control UI 骨架；IM **webhook 入站**（Feishu/Slack/Discord/WA/iMessage）与 **有 token 时的出站**；AES secrets（有 passphrase 时）；`scripts/integration-smoke.sh`（mock，无活 LLM） |
+| **仿真 / 轻量（勿当生产自动化）** | `impl:real-sim` computer/canvas/desktop（占位 PNG + 事件日志）；browser = curl+`<title>`，**无** Playwright |
+| **本地占位 store（API 面可测，不是上游 UI）** | board / portal / wizard / openclaw.setup / mentions / … |
+| **明确缺失** | ACP 完整 wire/acpx；JS 插件宿主；真实 OS/桌面/无障碍树；完整 Socket Mode/Baileys；board 真 UI；`.github/workflows` 直接推送（见 docs CI） |
 
-## Scale
+## Impl 标签
 
-| Metric | Value |
-|--------|--------|
-| Catalog advertised | **516** |
-| `ImplementedMethods` | **~640** (prefix buckets + local stores for board/portal/setup/…) |
-| Count ≠ parity | Many names share handlers; semantics ≠ upstream |
+| `impl` | 含义 |
+|--------|------|
+| **real** | 本地状态和/或真实 HTTP（视 env） |
+| **real-sim** | `SimulationBackend`，非生产 computer-use |
+| **honest** | 少见的部分实现 |
+| **implemented:false** | 故意不伪造（debugProxy / claws / nativeHook / web.login / attach 等） |
 
-## 1.5 hardening
+## 规模（计数 ≠ 对齐度）
 
-| Item | Status |
-|------|--------|
-| Agent loop timeout | **`real`** — `timeout_ms` / `agent.timeout_ms` → `LoopOptions.timeout` |
-| Cooperative cancel | **`real`** — gateway `Stop()` sets cancel flag checked each turn |
-| Session locks | **`real`** — per-id `recursive_mutex` on Load/Save/Append/Remove |
-| HTTP JSON-RPC | **`real`** — `POST /v1/rpc`; `POST /v1/sessions` |
-| Integration smoke | **`scripts/integration-smoke.sh`** — mock provider, no live LLM |
-| Release docs | **`docs/RELEASE.md`** — how to cut a non-dev tag |
+| 指标 | 约值 |
+|------|------|
+| Catalog 广告 | 516 |
+| `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
-## Still hard / missing vs upstream
-
-| Area | Honest status |
-|------|----------------|
-| computer/canvas/desktop | **real-sim only** |
-| browser | lightweight curl+title; no Playwright |
-| mcp.app host UI | list/call/resources **real**; host chrome local-ack |
-| board/portal/wizard/openclaw.setup | **local JSON stores** for API testing — **not** production UIs |
-| ACP wire / JS plugins / full IM | gap / partial (see prior docs) |
-| CI under `.github/workflows` | docs YAML only (token scope) |
-
-## Release
-
-See [docs/RELEASE.md](docs/RELEASE.md). Do not claim full 2026.10.5 parity in tags unless this file says so.
+详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。

@@ -240,7 +240,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
     if (starts("update.")) {
         r.handled = true;
         r.payload = Real({{"status", "idle"},
-                          {"current", "1.5.0-dev"},
+                          {"current", "1.5.1-dev"},
                           {"align_target", "OpenClaw 2026.10.5"},
                           {"auto_update", false},
                           {"method", method}});
@@ -1101,7 +1101,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         if (starts("gateway.") && (method.find("status") != std::string::npos || method.find("health") != std::string::npos)) {
-            r.payload = Real({{"runtime", "running"}, {"version", "1.5.0-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
+            r.payload = Real({{"runtime", "running"}, {"version", "1.5.1-dev"}, {"align_target", "OpenClaw 2026.10.5"}});
             return r;
         }
         r.payload = Real({{key, store}, {"method", method}});
@@ -1462,7 +1462,8 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         }
         auto store_key = method.substr(0, method.find('.'));
         if (store_key.empty()) store_key = "misc";
-        auto& store = EnsureObj(deps.config.raw, (store_key + "_local").c_str());
+        const std::string store_name = store_key + "_local";
+        auto& store = EnsureObj(deps.config.raw, store_name.c_str());
         if (starts("openclaw.approval") || starts("plugin.approval")) {
             r.payload = Real({{"approvals", deps.approvals.ListJson()}, {"method", method}});
             return r;

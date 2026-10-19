@@ -56,7 +56,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.5.0-dev";
+constexpr const char* kVersion = "1.5.1-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -432,7 +432,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.5.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.5.1-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
