@@ -3,6 +3,7 @@
 #include "openclaw/agent/loop.hpp"
 #include "openclaw/agent/types.hpp"
 #include "openclaw/provider/provider.hpp"
+#include "openclaw/mcp/client.hpp"
 #include "openclaw/tools/registry.hpp"
 
 #include <nlohmann/json.hpp>
@@ -21,10 +22,21 @@ namespace openclaw::acp {
 //
 // Implemented: initialize, session/new|list|prompt|cancel|close|resume, ping.
 // Multimodal: text + image_base64 / image_url (+ optional file) on session/prompt.
-// Not implemented: auth/*, session MCP, acpx adapters, audio/video.
+// Session MCP: session/mcp/add|list|remove (mock/stdio); tools merged on prompt.
+// Not implemented: auth/*, acpx adapters, audio/video.
 // Channel bindings: see acp::Registry BindChannel / HandleChannelInbound.
 
 constexpr int kAcpProtocolVersion = 2;
+
+struct SessionMcpAttachment {
+    std::string id;          // local attachment id (mcp_1, ...)
+    std::string name;        // display / server name
+    std::string transport;   // mock | stdio
+    std::string prefix;      // tool name prefix, default mcp.
+    std::vector<std::string> argv;  // stdio argv
+    std::shared_ptr<mcp::Client> client;
+    std::vector<std::string> tool_names;  // registered local names (prefix+remote)
+};
 
 struct WireSession {
     std::string id;
@@ -33,6 +45,7 @@ struct WireSession {
     std::vector<nlohmann::json> messages;  // ACP wire log {role, text, messageId}
     std::vector<agent::Message> history;   // agent-loop conversation
     std::shared_ptr<std::atomic<bool>> cancel = std::make_shared<std::atomic<bool>>(false);
+    std::vector<SessionMcpAttachment> mcp_servers;
 };
 
 struct LoopBackend {
@@ -45,7 +58,7 @@ struct LoopBackend {
 class AgentEndpoint {
 public:
     explicit AgentEndpoint(std::string agent_name = "openclaw-cpp",
-                           std::string agent_version = "1.8.0-dev");
+                           std::string agent_version = "1.19.0-dev");
 
     // Inject provider/tools (e.g. mock for tests, DeepSeek when configured).
     // If unset, EnsureDefaultBackend() installs MockProvider + empty tools.
@@ -61,6 +74,11 @@ public:
 
     nlohmann::json NewSession(const nlohmann::json& params);
     nlohmann::json Prompt(const std::string& session_id, const nlohmann::json& prompt_blocks);
+
+    // Attach MCP server tools to a wire session (merged into agent tools on prompt).
+    nlohmann::json AddSessionMcp(const std::string& session_id, const nlohmann::json& spec);
+    nlohmann::json ListSessionMcp(const std::string& session_id) const;
+    nlohmann::json RemoveSessionMcp(const std::string& session_id, const std::string& mcp_id);
 
 private:
     mutable std::mutex mu_;
@@ -94,6 +112,11 @@ private:
                        nlohmann::json data = nullptr);
     void Notify(const std::string& method, nlohmann::json params);
     WireSession* Find(const std::string& id);
+    const WireSession* FindConst(const std::string& id) const;
+    void AttachMcpServersFromParams(WireSession& session, const nlohmann::json& mcp_servers);
+    nlohmann::json AddSessionMcpTo(WireSession& session, const nlohmann::json& spec);
+    std::shared_ptr<tools::Registry> BuildTurnTools(const WireSession& session) const;
+    int mcp_seq_ = 1;
     static std::string PromptText(const nlohmann::json& prompt_blocks);
     static PromptParsed ParsePrompt(const nlohmann::json& prompt_blocks);
 };

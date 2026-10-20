@@ -181,6 +181,56 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             r.payload = Real(deps.acp->Bindings().StatusJson());
             return r;
         }
+        if (method == "acp.session.mcp.add" || method == "acp.sessions.mcp.add") {
+            auto sid = params.value("sessionId", params.value("session_id", params.value("id", "")));
+            if (sid.rfind("acp-", 0) == 0) {
+                auto gj = deps.acp->GetJson(sid);
+                if (gj.contains("prompts") && gj["prompts"].is_array()) {
+                    for (const auto& p : gj["prompts"]) {
+                        if (p.is_string()) {
+                            auto s = p.get<std::string>();
+                            if (s.rfind("wire:", 0) == 0) { sid = s.substr(5); break; }
+                        }
+                    }
+                }
+            }
+            nlohmann::json spec = params.contains("server") ? params["server"] : params;
+            r.payload = Real(deps.acp->Endpoint().AddSessionMcp(sid, spec));
+            return r;
+        }
+        if (method == "acp.session.mcp.list" || method == "acp.sessions.mcp.list") {
+            auto sid = params.value("sessionId", params.value("session_id", params.value("id", "")));
+            if (sid.rfind("acp-", 0) == 0) {
+                auto gj = deps.acp->GetJson(sid);
+                if (gj.contains("prompts") && gj["prompts"].is_array()) {
+                    for (const auto& p : gj["prompts"]) {
+                        if (p.is_string()) {
+                            auto s = p.get<std::string>();
+                            if (s.rfind("wire:", 0) == 0) { sid = s.substr(5); break; }
+                        }
+                    }
+                }
+            }
+            r.payload = Real(deps.acp->Endpoint().ListSessionMcp(sid));
+            return r;
+        }
+        if (method == "acp.session.mcp.remove" || method == "acp.sessions.mcp.remove") {
+            auto sid = params.value("sessionId", params.value("session_id", params.value("id", "")));
+            auto mid = params.value("mcpId", params.value("mcp_id", params.value("name", "")));
+            if (sid.rfind("acp-", 0) == 0) {
+                auto gj = deps.acp->GetJson(sid);
+                if (gj.contains("prompts") && gj["prompts"].is_array()) {
+                    for (const auto& p : gj["prompts"]) {
+                        if (p.is_string()) {
+                            auto s = p.get<std::string>();
+                            if (s.rfind("wire:", 0) == 0) { sid = s.substr(5); break; }
+                        }
+                    }
+                }
+            }
+            r.payload = Real(deps.acp->Endpoint().RemoveSessionMcp(sid, mid));
+            return r;
+        }
         if (method == "acp.wire" || method == "acp.rpc") {
             nlohmann::json req = params.contains("request") ? params["request"] : params;
             if (!req.contains("method") && params.contains("acpMethod")) {

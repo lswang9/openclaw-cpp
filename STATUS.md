@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.18.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.19.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 构建
 
@@ -66,7 +66,7 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 3. **IM**：webhook 入站较完整；**WhatsApp Cloud API**（verify/feed/send，**非 Baileys**）；Slack Socket / Discord Gateway / Feishu 长连接（`FORCE_MOCK` / `.feed`）。见 `docs/WA-CLOUD.md` 等。
 4. **MCP App**：可 list/call tools、resources；宿主 UI 类 RPC 多为本地 ack。
-5. **ACP**：`session/prompt`→AgentLoop（默认 mock）；`session/cancel`；`acp-stdio`；**通道绑定** `acp.bind` / auto-bind（Slack/Feishu/Discord/WhatsApp→prompt+outbound）。支持 **多模态 prompt**（text+image_base64/url）；**无** acpx/音视频。见 `docs/ACP-GAP.md`。
+5. **ACP**：`session/prompt`→AgentLoop（默认 mock）；`session/cancel`；`acp-stdio`；**通道绑定** `acp.bind` / auto-bind（Slack/Feishu/Discord/WhatsApp→prompt+outbound）。支持 **多模态 prompt**（text+image_base64/url）；**session MCP**（`acp.session.mcp.*` / `session/mcp/*`，prompt 合并工具）；**无** acpx/音视频。见 `docs/ACP-GAP.md`。
 6. **JS 插件**：Node stdio 桥（`plugins/js_bridge`）可加载 `plugins/sample_js` 并注册 `js.*` 工具；`OPENCLAW_JS_FORCE_MOCK=1` 走内存 mock。**不是**上游完整 JS 插件 API。见 `docs/JS-PLUGIN-HOST.md`。
 7. **对齐数字**：ImplementedMethods 很多 ≠ 与 OpenClaw 2026.10.5 行为一一等价。
 

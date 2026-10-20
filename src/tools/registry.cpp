@@ -52,6 +52,18 @@ std::vector<std::string> Registry::Names() const {
     return names;
 }
 
+std::size_t Registry::MergeFrom(const Registry& other) {
+    std::size_t n = 0;
+    for (const auto& name : other.Names()) {
+        if (Has(name)) continue;
+        if (const auto* spec = other.Get(name)) {
+            Register(*spec);
+            ++n;
+        }
+    }
+    return n;
+}
+
 Registry MakeDefaultRegistry(RegistryOptions opts) {
     Registry r;
 

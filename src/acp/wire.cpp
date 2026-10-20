@@ -1,4 +1,6 @@
 #include "openclaw/acp/wire.hpp"
+#include "openclaw/mcp/bridge.hpp"
+#include "openclaw/mcp/stdio.hpp"
 #include "openclaw/provider/mock.hpp"
 #include "openclaw/util.hpp"
 
@@ -237,7 +239,7 @@ nlohmann::json AgentEndpoint::StatusJson() const {
             {"sessions", sessions_.size()},
             {"capabilities", AgentCapabilities()},
             {"gap_doc", "docs/ACP-GAP.md"},
-            {"note", "session/prompt → RunAgentLoop; multimodal text+image(+file); channel bind; not acpx"}};
+            {"session_mcp", true},{"note", "session/prompt → RunAgentLoop; multimodal; session MCP; channel bind; not acpx"}};
 }
 
 nlohmann::json AgentEndpoint::ListSessionsJson() const {
@@ -249,24 +251,173 @@ nlohmann::json AgentEndpoint::ListSessionsJson() const {
                        {"status", s.status},
                        {"messages", s.messages.size()},
                        {"history", s.history.size()},
+                       {"mcp_servers", s.mcp_servers.size()},
                        {"cancel_requested", s.cancel && s.cancel->load()}});
     }
     return arr;
 }
 
-nlohmann::json AgentEndpoint::NewSession(const nlohmann::json& params) {
+const WireSession* AgentEndpoint::FindConst(const std::string& id) const {
+    for (const auto& s : sessions_) {
+        if (s.id == id) return &s;
+    }
+    return nullptr;
+}
+
+void AgentEndpoint::AttachMcpServersFromParams(WireSession& session, const nlohmann::json& mcp_servers) {
+    // Caller must hold mu_. Specs use mock/stdio; failures are skipped (logged via empty tool list).
+    if (!mcp_servers.is_array()) return;
+    for (const auto& spec : mcp_servers) {
+        if (!spec.is_object()) continue;
+        auto one = AddSessionMcpTo(session, spec);
+        (void)one;
+    }
+}
+
+nlohmann::json AgentEndpoint::AddSessionMcpTo(WireSession& s, const nlohmann::json& spec) {
+    SessionMcpAttachment att;
+    att.id = "mcp_" + std::to_string(mcp_seq_++);
+    att.name = spec.value("name", spec.value("id", "mcp"));
+    att.transport = spec.value("transport", "");
+    if (att.transport.empty()) {
+        if (spec.contains("command") || spec.contains("argv") || spec.contains("args"))
+            att.transport = "stdio";
+        else
+            att.transport = "mock";
+    }
+    att.prefix = spec.value("prefix", "mcp.");
+    if (!att.prefix.empty() && att.prefix.back() != '.') att.prefix.push_back('.');
+
+    if (att.transport == "mock" || att.transport == "in-process" || att.transport == "force_mock") {
+        att.client = mcp::MakeMockClient();
+    } else if (att.transport == "stdio") {
+        std::vector<std::string> argv;
+        if (spec.contains("argv") && spec["argv"].is_array()) {
+            for (const auto& a : spec["argv"]) {
+                if (a.is_string()) argv.push_back(a.get<std::string>());
+            }
+        } else if (spec.contains("args") && spec["args"].is_array()) {
+            if (spec.contains("command") && spec["command"].is_string())
+                argv.push_back(spec["command"].get<std::string>());
+            for (const auto& a : spec["args"]) {
+                if (a.is_string()) argv.push_back(a.get<std::string>());
+            }
+        } else if (spec.contains("command") && spec["command"].is_string()) {
+            argv.push_back(spec["command"].get<std::string>());
+        }
+        att.argv = argv;
+        if (argv.empty()) {
+            return {{"ok", false}, {"error", "stdio MCP requires command/argv"}, {"sessionId", s.id}};
+        }
+        try {
+            att.client = mcp::MakeStdioClient(argv);
+        } catch (const std::exception& e) {
+            return {{"ok", false}, {"error", e.what()}, {"transport", "stdio"}};
+        }
+    } else {
+        return {{"ok", false},
+                {"error", "unsupported transport (use mock|stdio)"},
+                {"transport", att.transport}};
+    }
+
+    if (!att.client) return {{"ok", false}, {"error", "failed to create MCP client"}};
+
+    tools::Registry probe;
+    auto n = mcp::RegisterMcpTools(probe, att.client, att.prefix);
+    att.tool_names = probe.Names();
+
+    s.mcp_servers.push_back(std::move(att));
+    const auto& back = s.mcp_servers.back();
+    return {{"ok", true},
+            {"impl", "real"},
+            {"sessionId", s.id},
+            {"mcp",
+             {{"id", back.id},
+              {"name", back.name},
+              {"transport", back.transport},
+              {"prefix", back.prefix},
+              {"tools", back.tool_names},
+              {"tool_count", n}}},
+            {"mcp_servers", s.mcp_servers.size()}};
+}
+
+std::shared_ptr<tools::Registry> AgentEndpoint::BuildTurnTools(const WireSession& session) const {
+    auto merged = std::make_shared<tools::Registry>();
+    if (backend_.tools) merged->MergeFrom(*backend_.tools);
+    for (const auto& att : session.mcp_servers) {
+        if (!att.client) continue;
+        mcp::RegisterMcpTools(*merged, att.client, att.prefix);
+    }
+    return merged;
+}
+
+nlohmann::json AgentEndpoint::AddSessionMcp(const std::string& session_id, const nlohmann::json& spec) {
     std::lock_guard lock(mu_);
-    WireSession s;
-    s.id = "sess_" + std::to_string(sess_seq_++);
-    s.cwd = params.value("cwd", ".");
-    s.status = "idle";
-    sessions_.push_back(std::move(s));
-    Notify("session/update",
-           {{"sessionId", sessions_.back().id},
-            {"update", {{"sessionUpdate", "state_update"}, {"state", "idle"}}}});
-    return {{"sessionId", sessions_.back().id},
+    auto* s = Find(session_id);
+    if (!s) return {{"ok", false}, {"error", "session not found"}, {"sessionId", session_id}};
+    return AddSessionMcpTo(*s, spec);
+}
+
+nlohmann::json AgentEndpoint::ListSessionMcp(const std::string& session_id) const {
+    std::lock_guard lock(mu_);
+    auto* s = FindConst(session_id);
+    if (!s) return {{"ok", false}, {"error", "session not found"}, {"sessionId", session_id}};
+    nlohmann::json arr = nlohmann::json::array();
+    for (const auto& a : s->mcp_servers) {
+        arr.push_back({{"id", a.id},
+                       {"name", a.name},
+                       {"transport", a.transport},
+                       {"prefix", a.prefix},
+                       {"tools", a.tool_names},
+                       {"argv", a.argv}});
+    }
+    return {{"ok", true}, {"impl", "real"}, {"sessionId", session_id}, {"mcp_servers", arr}};
+}
+
+nlohmann::json AgentEndpoint::RemoveSessionMcp(const std::string& session_id, const std::string& mcp_id) {
+    std::lock_guard lock(mu_);
+    auto* s = Find(session_id);
+    if (!s) return {{"ok", false}, {"error", "session not found"}, {"sessionId", session_id}};
+    for (auto it = s->mcp_servers.begin(); it != s->mcp_servers.end(); ++it) {
+        if (it->id == mcp_id || it->name == mcp_id) {
+            s->mcp_servers.erase(it);
+            return {{"ok", true},
+                    {"impl", "real"},
+                    {"removed", mcp_id},
+                    {"sessionId", session_id},
+                    {"mcp_servers", s->mcp_servers.size()}};
+        }
+    }
+    return {{"ok", false}, {"error", "mcp attachment not found"}, {"id", mcp_id}};
+}
+
+nlohmann::json AgentEndpoint::NewSession(const nlohmann::json& params) {
+    std::string sid;
+    {
+        std::lock_guard lock(mu_);
+        WireSession s;
+        s.id = "sess_" + std::to_string(sess_seq_++);
+        s.cwd = params.value("cwd", ".");
+        s.status = "idle";
+        sessions_.push_back(std::move(s));
+        sid = sessions_.back().id;
+        Notify("session/update",
+               {{"sessionId", sid},
+                {"update", {{"sessionUpdate", "state_update"}, {"state", "idle"}}}});
+    }
+    nlohmann::json attached = nlohmann::json::array();
+    if (params.contains("mcpServers") && params["mcpServers"].is_array()) {
+        for (const auto& spec : params["mcpServers"]) {
+            if (!spec.is_object()) continue;
+            attached.push_back(AddSessionMcp(sid, spec));
+        }
+    }
+    return {{"sessionId", sid},
             {"availableCommands", nlohmann::json::array()},
-            {"_meta", {{"openclawCpp", {{"impl", "real"}, {"agent_loop", true}}}}}};
+            {"mcpAttached", attached},
+            {"_meta",
+             {{"openclawCpp",
+               {{"impl", "real"}, {"agent_loop", true}, {"session_mcp", true}}}}}};
 }
 
 nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, WireSession& session,
@@ -306,7 +457,13 @@ nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, 
     // Snapshot for loop outside lock
     auto history = session.history;
     auto provider = backend_.provider;
-    auto tools = backend_.tools;
+    auto tools = BuildTurnTools(session);
+    const std::size_t mcp_tool_count = [&]() {
+        std::size_t n = 0;
+        for (const auto& a : session.mcp_servers) n += a.tool_names.size();
+        return n;
+    }();
+    const std::size_t mcp_server_count = session.mcp_servers.size();
     auto opts = backend_.opts;
     opts.cancel = cancel.get();
     const std::string provider_name = backend_.provider_name;
@@ -396,6 +553,9 @@ nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, 
                 {"images", parsed.images},
                 {"files", parsed.files},
                 {"multimodal", parsed.images > 0 || parsed.files > 0},
+                {"mcp_servers", mcp_server_count},
+                {"mcp_tools", mcp_tool_count},
+                {"tools_merged", tools ? tools->Names().size() : 0},
                 {"note", "RunAgentLoop result surfaced as session/update agent_message"}}}}}};
 }
 
@@ -457,10 +617,65 @@ nlohmann::json AgentEndpoint::Handle(const nlohmann::json& request) {
         s.cwd = params.value("cwd", ".");
         s.status = "idle";
         sessions_.push_back(std::move(s));
+        auto sid = sessions_.back().id;
         Notify("session/update",
-               {{"sessionId", sessions_.back().id},
+               {{"sessionId", sid},
                 {"update", {{"sessionUpdate", "state_update"}, {"state", "idle"}}}});
-        return Ok(id, {{"sessionId", sessions_.back().id}, {"availableCommands", nlohmann::json::array()}});
+        nlohmann::json attached = nlohmann::json::array();
+        if (params.contains("mcpServers") && params["mcpServers"].is_array()) {
+            auto* live = Find(sid);
+            if (live) {
+                for (const auto& spec : params["mcpServers"]) {
+                    if (!spec.is_object()) continue;
+                    attached.push_back(AddSessionMcpTo(*live, spec));
+                }
+            }
+        }
+        return Ok(id, {{"sessionId", sid},
+                       {"availableCommands", nlohmann::json::array()},
+                       {"mcpAttached", attached}});
+    }
+
+    if (method == "session/mcp/add" || method == "session/mcp.add") {
+        auto sid = params.value("sessionId", "");
+        auto* s = Find(sid);
+        if (!s) return Err(id, -32001, "Session not found", {{"sessionId", sid}});
+        auto out = AddSessionMcpTo(*s, params.contains("server") ? params["server"] : params);
+        if (!out.value("ok", false))
+            return Err(id, -32000, out.value("error", "mcp add failed"), out);
+        return Ok(id, out);
+    }
+
+    if (method == "session/mcp/list" || method == "session/mcp.list") {
+        auto sid = params.value("sessionId", "");
+        auto* s = Find(sid);
+        if (!s) return Err(id, -32001, "Session not found", {{"sessionId", sid}});
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& a : s->mcp_servers) {
+            arr.push_back({{"id", a.id},
+                           {"name", a.name},
+                           {"transport", a.transport},
+                           {"prefix", a.prefix},
+                           {"tools", a.tool_names}});
+        }
+        return Ok(id, {{"sessionId", sid}, {"mcp_servers", arr}, {"impl", "real"}});
+    }
+
+    if (method == "session/mcp/remove" || method == "session/mcp.remove") {
+        auto sid = params.value("sessionId", "");
+        auto mid = params.value("mcpId", params.value("id", params.value("name", "")));
+        auto* s = Find(sid);
+        if (!s) return Err(id, -32001, "Session not found", {{"sessionId", sid}});
+        for (auto it = s->mcp_servers.begin(); it != s->mcp_servers.end(); ++it) {
+            if (it->id == mid || it->name == mid) {
+                s->mcp_servers.erase(it);
+                return Ok(id, {{"ok", true},
+                               {"removed", mid},
+                               {"sessionId", sid},
+                               {"mcp_servers", s->mcp_servers.size()}});
+            }
+        }
+        return Err(id, -32001, "MCP attachment not found", {{"mcpId", mid}});
     }
 
     if (method == "session/list") {
@@ -549,7 +764,7 @@ bool Client::Initialize(const nlohmann::json& client_info) {
     nlohmann::json info = client_info.empty()
                               ? nlohmann::json{{"name", "openclaw-cpp"},
                                                {"title", "openclaw-cpp ACP client"},
-                                               {"version", "1.8.0-dev"}}
+                                               {"version", "1.19.0-dev"}}
                               : client_info;
     auto resp = Request("initialize",
                         {{"protocolVersion", kAcpProtocolVersion},

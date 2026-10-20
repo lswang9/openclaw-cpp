@@ -68,7 +68,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.18.0-dev";
+constexpr const char* kVersion = "1.19.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -570,6 +570,55 @@ int CmdSelfTest() {
                         std::cerr << "PASS acp multimodal image prompt\n";
                 }
 
+
+                // Session MCP: attach mock server, merge tools, drive tool_call via scripted mock
+                {
+                    auto mock = std::make_shared<provider::MockProvider>();
+                    agent::CompletionResult tc;
+                    tc.ok = true;
+                    tc.finish_reason = "tool_calls";
+                    tc.tool_calls.push_back({"call_mcp1", "mcp.mock_echo", "{\"ping\":1}"});
+                    mock->Enqueue(std::move(tc));
+                    agent::CompletionResult done;
+                    done.ok = true;
+                    done.finish_reason = "stop";
+                    done.message.role = "assistant";
+                    done.message.content = "mcp-tool-done";
+                    mock->Enqueue(std::move(done));
+                    acp::LoopBackend b;
+                    b.provider = mock;
+                    b.tools = std::make_shared<tools::Registry>();
+                    b.opts.max_turns = 4;
+                    b.provider_name = "mock";
+                    agent->SetLoopBackend(std::move(b));
+                    (void)agent->DrainNotifications();
+                    auto add = agent->AddSessionMcp(sid, {{"name", "mock-mcp"}, {"transport", "mock"}});
+                    auto listed = agent->ListSessionMcp(sid);
+                    bool tools_ok = add.value("ok", false) &&
+                                    add.contains("mcp") &&
+                                    add["mcp"].value("tool_count", 0) >= 1 &&
+                                    listed.value("ok", false) &&
+                                    !listed["mcp_servers"].empty();
+                    auto prompt = agent->Prompt(sid, nlohmann::json::array({
+                        {{"type", "text"}, {"text", "call mcp"}}
+                    }));
+                    auto meta = prompt.value("_meta", nlohmann::json::object())
+                                    .value("openclawCpp", nlohmann::json::object());
+                    std::string reply = prompt.value("text", "");
+                    bool ran = meta.value("mcp_tools", 0) >= 1 &&
+                               meta.value("ok", false) &&
+                               (reply == "mcp-tool-done" || reply.find("mcp-tool") != std::string::npos);
+                    auto mid = add.value("mcp", nlohmann::json::object()).value("id", "");
+                    auto rem = agent->RemoveSessionMcp(sid, mid);
+                    if (!tools_ok || !ran || !rem.value("ok", false)) {
+                        std::cerr << "FAIL acp session mcp add=" << add.dump()
+                                  << " list=" << listed.dump()
+                                  << " prompt=" << prompt.dump()
+                                  << " rem=" << rem.dump() << "\n";
+                        ++failures;
+                    } else
+                        std::cerr << "PASS acp session MCP tools on prompt\n";
+                }
 
                 // cancel path: delay before loop; cancel on AgentEndpoint from another thread
                 setenv("OPENCLAW_ACP_TURN_DELAY_MS", "300", 1);

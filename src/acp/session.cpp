@@ -103,6 +103,7 @@ nlohmann::json Registry::StatusJson() const {
     st["bindings"] = bindings_.StatusJson();
     st["channel_bound"] = true;
     st["auto_bind"] = AutoBindEnabled();
+    st["session_mcp"] = true;
     return st;
 }
 
@@ -118,7 +119,7 @@ nlohmann::json Registry::AgentsListJson() const {
          {"protocolVersion", kAcpProtocolVersion},
          {"transport", nlohmann::json::array({"in-process", "stdio", "channel-bound"})},
          {"impl", "real"},
-         {"note", "session/prompt → AgentLoop; channel bindings for Slack/Feishu/Discord"}},
+         {"note", "session/prompt → AgentLoop; channel bindings; session MCP tools"}},
     });
 }
 

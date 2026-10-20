@@ -31,6 +31,8 @@ public:
     nlohmann::json OpenAiToolsArray() const;
     std::vector<std::string> Names() const;
     const ToolSpec* Get(const std::string& name) const;
+    // Copy all tool specs (handlers) from another registry; skips duplicate names.
+    std::size_t MergeFrom(const Registry& other);
 
 private:
     std::unordered_map<std::string, ToolSpec> tools_;
