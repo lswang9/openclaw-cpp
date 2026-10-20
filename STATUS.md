@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.5.1-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.6.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 构建
 
@@ -61,7 +61,7 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 ## 已知限制（务必读）
 
 1. **computer/canvas/desktop**：仿真（`real-sim`），截图是占位 PNG，不会真控鼠标键盘。
-2. **browser**：仅 `browser.open_url` / `browser_open_url`（curl + 标题），无 Chromium/Playwright。
+2. **browser**：优先 **CDP**（已运行的 Chrome `--remote-debugging-port`，见 [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md)）；不可用时回退 **curl-session**（cookie/重定向/链接表单）。**不是** Playwright。可用 `OPENCLAW_BROWSER_CDP_MOCK=1` 自测。
 3. **IM**：webhook 入站较完整；出站需对应 env token，否则只本地记录。
 4. **MCP App**：可 list/call tools、resources；宿主 UI 类 RPC 多为本地 ack。
 5. **ACP / JS 插件**：骨架或缺口，见 `docs/ACP-GAP.md`、`docs/PLUGIN-SDK.md`。
@@ -77,4 +77,5 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [SERIES.md](SERIES.md) | 版本里程碑 |
 | [docs/ACP-GAP.md](docs/ACP-GAP.md) | ACP 缺口 |
 | [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md) | 原生插件 ABI |
+| [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |

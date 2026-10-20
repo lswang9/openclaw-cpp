@@ -4,7 +4,7 @@ from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 
 class OpenclawCppConan(ConanFile):
     name = "openclaw-cpp"
-    version = "1.5.1"
+    version = "1.6.0"
     package_type = "application"
     settings = "os", "compiler", "build_type", "arch"
     generators = "CMakeDeps", "CMakeToolchain"

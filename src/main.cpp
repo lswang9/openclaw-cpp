@@ -27,6 +27,8 @@
 #include "openclaw/daemon/lifecycle.hpp"
 #include "openclaw/voice/tts.hpp"
 #include "openclaw/sim/backend.hpp"
+#include "openclaw/browser/engine.hpp"
+#include "openclaw/browser/cdp_client.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
@@ -44,6 +46,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -56,7 +59,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.5.1-dev";
+constexpr const char* kVersion = "1.6.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -432,7 +435,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.5.1-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.6.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -562,7 +565,7 @@ int CmdSelfTest() {
         else std::cerr << "PASS tts record-only/http\n";
     }
 
-    // http_get tool (example.com) + browser stub
+    // http_get tool (example.com) + browser actions
     {
         approvals::Store ap;
         tools::RegistryOptions o; o.approvals = &ap; o.enable_shell = false;
@@ -571,9 +574,13 @@ int CmdSelfTest() {
             std::cerr << "FAIL tools http_get/browser missing\n"; ++failures;
         } else {
             auto br = nlohmann::json::parse(reg.Invoke("browser", {{"action", "playwright"}}));
-            if (br.value("configured", true) != false) {
-                std::cerr << "FAIL browser full automation should be not configured\n"; ++failures;
-            } else std::cerr << "PASS browser full-automation stub\n";
+            if (br.value("ok", true) != false || br.value("error", "") != "unknown action") {
+                std::cerr << "FAIL browser unknown action " << br.dump() << "\n"; ++failures;
+            } else std::cerr << "PASS browser action surface\n";
+            auto st = nlohmann::json::parse(reg.Invoke("browser", {{"action", "status"}}));
+            if (!st.contains("engine") && !st.contains("fallback")) {
+                std::cerr << "FAIL browser status " << st.dump() << "\n"; ++failures;
+            } else std::cerr << "PASS browser status tool\n";
             auto hg = nlohmann::json::parse(reg.Invoke("http_get", {{"url", "https://example.com"}, {"max_bytes", 2048}}));
             if (!hg.value("ok", false) || hg.value("http", 0) < 200) {
                 std::cerr << "WARN http_get example.com: " << hg.dump() << "\n";
@@ -728,7 +735,44 @@ int CmdSelfTest() {
         } else std::cerr << "PASS simulation backend\n";
         auto br = sim.BrowserOpenUrl("https://example.com");
         if (!br.value("ok", false)) std::cerr << "WARN browser.open_url " << br.dump() << "\n";
-        else std::cerr << "PASS browser.open_url lightweight\n";
+        else std::cerr << "PASS browser.open_url curl-or-cdp\n";
+    }
+
+    // CDP mock + WS framing (no live Chromium required)
+    {
+        auto frame = browser::WsClientMaskFrame("hello");
+        size_t consumed = 0;
+        std::string payload;
+        uint8_t opcode = 0;
+        std::string server_frame;
+        server_frame.push_back(static_cast<char>(0x81));
+        server_frame.push_back(5);
+        server_frame += "hello";
+        if (!browser::WsParseServerFrame(server_frame, consumed, payload, opcode) ||
+            payload != "hello" || opcode != 0x1 || frame.size() < 6) {
+            std::cerr << "FAIL ws framing\n"; ++failures;
+        } else std::cerr << "PASS ws framing\n";
+
+        setenv("OPENCLAW_BROWSER_CDP_MOCK", "1", 1);
+        browser::CdpClient cdp(browser::CdpConfig{.mock = true});
+        auto conn = cdp.Connect();
+        auto nav = cdp.Navigate("https://example.com");
+        auto ev = cdp.Evaluate("document.title");
+        auto shotp = cdp.ScreenshotPng();
+        auto tu = cdp.TitleAndUrl();
+        if (!conn.value("ok", false) || !nav.value("ok", false) ||
+            ev.value("value", "") != "Example Domain" || !shotp.value("ok", false) ||
+            !tu.value("ok", false)) {
+            std::cerr << "FAIL cdp mock " << nav.dump() << " " << ev.dump() << "\n"; ++failures;
+        } else std::cerr << "PASS cdp mock navigate/eval/screenshot\n";
+
+        browser::Engine eng(std::filesystem::temp_directory_path() / "oc-browser-eng");
+        auto open = eng.OpenUrl("https://example.com");
+        auto eval = eng.Evaluate("document.title");
+        if (!open.value("ok", false) || eval.value("value", "") != std::string("Example Domain")) {
+            std::cerr << "FAIL browser engine mock " << open.dump() << "\n"; ++failures;
+        } else std::cerr << "PASS browser engine (cdp-mock)\n";
+        unsetenv("OPENCLAW_BROWSER_CDP_MOCK");
     }
 
     // mcp.app bridge via client
@@ -747,8 +791,10 @@ int CmdSelfTest() {
         approvals::Store ap;
         tools::RegistryOptions o; o.approvals = &ap; o.enable_shell = false;
         auto reg = tools::MakeDefaultRegistry(o);
-        if (!reg.Has("browser_open_url")) { std::cerr << "FAIL browser_open_url tool\n"; ++failures; }
-        else std::cerr << "PASS browser_open_url tool registered\n";
+        if (!reg.Has("browser_open_url") || !reg.Has("browser") ||
+            !reg.Has("browser_evaluate") || !reg.Has("browser_screenshot")) {
+            std::cerr << "FAIL browser tools\n"; ++failures;
+        } else std::cerr << "PASS browser tools registered\n";
     }
 
 

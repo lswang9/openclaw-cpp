@@ -1,20 +1,14 @@
 #include "openclaw/sim/backend.hpp"
 
-#include <curl/curl.h>
 #include <chrono>
 #include <fstream>
-#include <regex>
+#include <memory>
 
 namespace openclaw::sim {
-namespace {
-size_t WriteCb(char* p, size_t s, size_t n, void* u) {
-    static_cast<std::string*>(u)->append(p, s * n);
-    return s * n;
-}
-}  // namespace
 
 SimulationBackend::SimulationBackend(std::filesystem::path data_dir)
-    : root_(std::move(data_dir) / "sim") {
+    : root_(std::move(data_dir) / "sim"),
+      browser_(std::make_unique<browser::Engine>(root_ / "browser")) {
     std::filesystem::create_directories(root_);
 }
 
@@ -27,7 +21,6 @@ void SimulationBackend::Record(const std::string& kind, const nlohmann::json& de
 }
 
 std::string SimulationBackend::MinimalPngBytes() {
-    // 1x1 transparent PNG
     static const unsigned char k[] = {
         0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
         0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4,
@@ -38,12 +31,13 @@ std::string SimulationBackend::MinimalPngBytes() {
 }
 
 nlohmann::json SimulationBackend::Status() const {
+    auto br = browser_ ? browser_->Status() : nlohmann::json::object();
     return {{"mode", "simulation"},
             {"backend", "SimulationBackend"},
             {"events", events_.size()},
             {"desktop", desktop_},
             {"canvas_title", canvas_.value("title", "")},
-            {"last_url", last_url_},
+            {"browser", br},
             {"note", "NOT production OS/desktop automation — deterministic local sim"}};
 }
 
@@ -146,64 +140,36 @@ nlohmann::json SimulationBackend::DesktopRelease(const nlohmann::json& params) {
     return {{"mode", "simulation"}, {"desktop", desktop_}, {"released", true}};
 }
 
-nlohmann::json SimulationBackend::HttpGet(const std::string& url) const {
-    CURL* curl = curl_easy_init();
-    if (!curl) return {{"ok", false}, {"error", "curl init"}};
-    std::string body;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "openclaw-cpp-browser.open_url/1.4");
-    CURLcode rc = curl_easy_perform(curl);
-    long http = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http);
-    curl_easy_cleanup(curl);
-    if (rc != CURLE_OK) return {{"ok", false}, {"error", curl_easy_strerror(rc)}};
-    if (body.size() > 512 * 1024) body.resize(512 * 1024);
-    return {{"ok", true}, {"http", http}, {"body", body}};
-}
+browser::Engine& SimulationBackend::Browser() { return *browser_; }
+const browser::Engine& SimulationBackend::Browser() const { return *browser_; }
 
 nlohmann::json SimulationBackend::BrowserOpenUrl(const std::string& url) {
-    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
-        return {{"ok", false}, {"error", "only http/https"}, {"mode", "lightweight"}};
-    }
-    auto got = HttpGet(url);
-    if (!got.value("ok", false)) {
-        Record("browser.open_url_fail", {{"url", url}, {"error", got}});
-        return got;
-    }
-    std::string body = got.value("body", "");
-    std::string title;
-    std::smatch m;
-    static const std::regex re("<title[^>]*>([^<]*)</title>", std::regex::icase);
-    if (std::regex_search(body, m, re)) title = m[1].str();
-    // strip scripts roughly for text store
-    std::string text = body;
-    if (text.size() > 32 * 1024) text.resize(32 * 1024);
-    last_url_ = url;
-    last_title_ = title;
-    last_page_text_ = text;
-    Record("browser.open_url", {{"url", url}, {"title", title}, {"http", got.value("http", 0)}});
-    return {{"ok", true},
-            {"mode", "lightweight"},
-            {"impl_note", "curl fetch + title regex — not Playwright/Chromium"},
-            {"url", url},
-            {"title", title},
-            {"http", got.value("http", 0)},
-            {"text_bytes", text.size()}};
+    auto r = browser_->OpenUrl(url);
+    Record("browser.open_url", {{"url", url}, {"ok", r.value("ok", false)},
+                                {"engine", r.value("engine", "")}, {"title", r.value("title", "")}});
+    return r;
+}
+
+nlohmann::json SimulationBackend::BrowserNavigate(const std::string& url) {
+    auto r = browser_->Navigate(url);
+    Record("browser.navigate", {{"url", url}, {"ok", r.value("ok", false)}});
+    return r;
+}
+
+nlohmann::json SimulationBackend::BrowserEvaluate(const std::string& expression) {
+    auto r = browser_->Evaluate(expression);
+    Record("browser.evaluate", {{"expression", expression.substr(0, 120)}, {"ok", r.value("ok", false)}});
+    return r;
+}
+
+nlohmann::json SimulationBackend::BrowserScreenshot(const nlohmann::json& params) {
+    auto r = browser_->Screenshot(params);
+    Record("browser.screenshot", {{"ok", r.value("ok", false)}, {"path", r.value("path", "")}});
+    return r;
 }
 
 nlohmann::json SimulationBackend::BrowserStatus() const {
-    return {{"configured", true},
-            {"mode", "lightweight"},
-            {"engine", "curl+title"},
-            {"last_url", last_url_},
-            {"last_title", last_title_},
-            {"last_text_bytes", last_page_text_.size()},
-            {"note", "no headless browser; use browser.open_url / http_get"}};
+    return browser_->Status();
 }
 
 }  // namespace openclaw::sim

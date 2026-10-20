@@ -29,3 +29,5 @@
 - **1.5.0-dev**: loop timeout/cancel, session locks, HTTP /v1/rpc, integration-smoke, RELEASE.md
 
 - **1.5.1-dev**: docs STATUS.md (zh), PARITY executive summary, EnsureObj store_key lifetime fix
+
+- **1.6.0-dev**: browser CDP client (navigate/evaluate/screenshot) + curl-session fallback; BROWSER-CDP.md; fix ImplementedSet begin/end double-temporary UB (computer/browser RPC segfault)

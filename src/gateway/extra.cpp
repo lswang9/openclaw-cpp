@@ -9,13 +9,21 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <cstdio>
+#include <iostream>
+#include <unordered_set>
 
 namespace openclaw::gateway {
 namespace {
 
-const std::set<std::string>& ImplementedSet() {
-    static const std::set<std::string> s(ImplementedMethods().begin(), ImplementedMethods().end());
-    return s;
+const std::unordered_set<std::string>& ImplementedSet() {
+    // IMPORTANT: do not call ImplementedMethods().begin()/end() as two temporaries —
+    // that is UB (iterators from different vectors) and segfaulted browser/computer RPC.
+    static const auto* s = [] {
+        const auto methods = ImplementedMethods();
+        return new std::unordered_set<std::string>(methods.begin(), methods.end());
+    }();
+    return *s;
 }
 
 nlohmann::json Real(nlohmann::json payload) {
@@ -1015,24 +1023,55 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
-    // ---- browser lightweight (curl+title via SimulationBackend) ----
+    // ---- browser: CDP (real) or curl-session fallback (real-sim) ----
     if (starts("browser.") || method == "browser.open_url") {
         r.handled = true;
         if (!deps.sim) {
-            r.payload = Real({{"configured", false}, {"error", "sim not wired"}});
+            r.payload = Real({{"configured", false}, {"error", "sim/browser not wired"}});
             return r;
         }
+        auto tag = [](nlohmann::json payload) {
+            const std::string eng = payload.value("engine", "");
+            const std::string impl = payload.value("impl", "");
+            if (impl == "real" || eng == "cdp") return Real(std::move(payload));
+            if (eng == "cdp-mock" || impl == "real-sim" || eng == "curl-session")
+                return RealSim(std::move(payload));
+            if (impl == "missing") return payload;
+            return RealSim(std::move(payload));
+        };
         if (method == "browser.status" || method == "browser.") {
-            r.payload = Real(deps.sim->BrowserStatus());
+            r.payload = tag(deps.sim->BrowserStatus());
             return r;
         }
-        if (method.find("open") != std::string::npos) {
+        if (method == "browser.navigate" || method == "browser.open" ||
+            method == "browser.open_url" || method.find("open") != std::string::npos) {
             auto url = params.value("url", params.value("href", ""));
-            r.payload = Real(deps.sim->BrowserOpenUrl(url));
+            r.payload = tag(deps.sim->BrowserNavigate(url));
             return r;
         }
-        r.payload = Real({{"status", deps.sim->BrowserStatus()}, {"method", method},
-                          {"hint", "browser.open_url | tool browser_open_url"}});
+        if (method == "browser.evaluate" || method.find("eval") != std::string::npos) {
+            auto expr = params.value("expression", params.value("js", params.value("code", "")));
+            r.payload = tag(deps.sim->BrowserEvaluate(expr));
+            return r;
+        }
+        if (method == "browser.screenshot" || method.find("screenshot") != std::string::npos ||
+            method.find("capture") != std::string::npos) {
+            r.payload = tag(deps.sim->BrowserScreenshot(params));
+            return r;
+        }
+        if (method == "browser.title" || method == "browser.url") {
+            r.payload = tag(deps.sim->Browser().TitleAndUrl());
+            return r;
+        }
+        if (method == "browser.session" || method == "browser.state") {
+            r.payload = tag(deps.sim->Browser().SessionState());
+            return r;
+        }
+        r.payload = tag({{"status", deps.sim->BrowserStatus()},
+                         {"method", method},
+                         {"hint",
+                          "browser.navigate|evaluate|screenshot|status|open_url — CDP via "
+                          "OPENCLAW_BROWSER_CDP_URL or curl fallback"}});
         return r;
     }
 
