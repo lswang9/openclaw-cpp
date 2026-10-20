@@ -19,13 +19,25 @@ nlohmann::json AgentCapabilities() {
              {{"prompt", {{"image", true}, {"file", true}}},
               {"_meta",
                {{"openclawCpp",
-                 {{"note", "subset — AgentLoop on prompt; text+image(+file) parts; no session MCP / acpx"}}}}}}}};
+                 {{"sessionMcp", true},
+                  {"auth", true},
+                  {"note",
+                   "subset — AgentLoop; multimodal; session MCP; token/passphrase auth; no acpx"}}}}}}}};
 }
 
 int TurnDelayMs() {
     const char* v = std::getenv("OPENCLAW_ACP_TURN_DELAY_MS");
     if (!v || !*v) return 0;
     return std::atoi(v);
+}
+
+bool EnvTruthyLocal(const char* k, bool default_val = false) {
+    const char* v = std::getenv(k);
+    if (!v || !*v) return default_val;
+    const std::string s(v);
+    if (s == "0" || s == "false" || s == "no") return false;
+    if (s == "1" || s == "true" || s == "yes") return true;
+    return default_val;
 }
 
 }  // namespace
@@ -50,6 +62,152 @@ void AgentEndpoint::EnsureDefaultBackend() {
     backend_ = LoopBackend{mock, tools, opts, pname.empty() ? "mock" : pname};
     backend_ready_ = true;
     // Note: non-mock providers can be injected via SetLoopBackend from CLI/gateway later.
+}
+
+bool AgentEndpoint::EnvAuthRequired() {
+    return EnvTruthyLocal("OPENCLAW_ACP_AUTH_REQUIRED", false);
+}
+
+std::string AgentEndpoint::EnvToken() {
+    const char* a = std::getenv("OPENCLAW_ACP_TOKEN");
+    if (a && *a) return a;
+    const char* b = std::getenv("OPENCLAW_ACP_AUTH_TOKEN");
+    if (b && *b) return b;
+    return {};
+}
+
+std::string AgentEndpoint::EnvPassphrase() {
+    const char* p = std::getenv("OPENCLAW_ACP_PASSPHRASE");
+    if (p && *p) return p;
+    return {};
+}
+
+bool AgentEndpoint::CredentialsConfigured() const {
+    return !EnvToken().empty() || !EnvPassphrase().empty();
+}
+
+bool AgentEndpoint::AuthRequired() const {
+    // Required when explicitly forced, or when a token/passphrase is configured.
+    return EnvAuthRequired() || CredentialsConfigured();
+}
+
+bool AgentEndpoint::Authenticated() const {
+    std::lock_guard lock(mu_);
+    if (!AuthRequired()) return true;
+    return authenticated_;
+}
+
+bool AgentEndpoint::CheckCredential(const std::string& token, const std::string& passphrase) const {
+    const auto expect_tok = EnvToken();
+    const auto expect_pp = EnvPassphrase();
+    if (!expect_tok.empty() && !token.empty() && token == expect_tok) return true;
+    if (!expect_pp.empty() && !passphrase.empty() && passphrase == expect_pp) return true;
+    return false;
+}
+
+nlohmann::json AgentEndpoint::AuthMethodsJson() const {
+    nlohmann::json arr = nlohmann::json::array();
+    if (!EnvToken().empty() || EnvAuthRequired()) {
+        arr.push_back({{"id", "token"},
+                       {"name", "Bearer / ACP token"},
+                       {"description", "OPENCLAW_ACP_TOKEN — pass as authToken / token / Bearer"}});
+    }
+    if (!EnvPassphrase().empty() || EnvAuthRequired()) {
+        arr.push_back({{"id", "passphrase"},
+                       {"name", "Passphrase"},
+                       {"description", "OPENCLAW_ACP_PASSPHRASE"}});
+    }
+    return arr;
+}
+
+bool AgentEndpoint::AllowMethodWithoutAuth(const std::string& method) const {
+    if (method == "initialize" || method == "ping") return true;
+    if (method == "auth/login" || method == "auth/authenticate" || method == "authenticate" ||
+        method == "auth/status" || method == "auth/logout")
+        return true;
+    return false;
+}
+
+nlohmann::json AgentEndpoint::AuthStatusJson() const {
+    std::lock_guard lock(mu_);
+    const bool req = AuthRequired();
+    return {{"impl", "real"},
+            {"auth_required", req},
+            {"authenticated", !req || authenticated_},
+            {"auth_method", auth_method_},
+            {"token_configured", !EnvToken().empty()},
+            {"passphrase_configured", !EnvPassphrase().empty()},
+            {"force_required_env", EnvAuthRequired()},
+            {"authMethods", AuthMethodsJson()},
+            {"note", "minimal ACP auth gate — not OAuth/device-code"}};
+}
+
+nlohmann::json AgentEndpoint::Login(const nlohmann::json& params) {
+    std::lock_guard lock(mu_);
+    std::string token;
+    std::string passphrase;
+    if (params.contains("token") && params["token"].is_string()) token = params["token"].get<std::string>();
+    if (params.contains("authToken") && params["authToken"].is_string())
+        token = params["authToken"].get<std::string>();
+    if (params.contains("bearer") && params["bearer"].is_string()) token = params["bearer"].get<std::string>();
+    if (params.contains("passphrase") && params["passphrase"].is_string())
+        passphrase = params["passphrase"].get<std::string>();
+    if (params.contains("password") && params["password"].is_string())
+        passphrase = params["password"].get<std::string>();
+    if (params.contains("auth") && params["auth"].is_object()) {
+        auto& a = params["auth"];
+        if (a.contains("token") && a["token"].is_string()) token = a["token"].get<std::string>();
+        if (a.contains("passphrase") && a["passphrase"].is_string())
+            passphrase = a["passphrase"].get<std::string>();
+    }
+    auto method = params.value("method", params.value("type", ""));
+    if (method == "token" && token.empty() && params.contains("value") && params["value"].is_string())
+        token = params["value"].get<std::string>();
+    if (method == "passphrase" && passphrase.empty() && params.contains("value") &&
+        params["value"].is_string())
+        passphrase = params["value"].get<std::string>();
+
+    if (!AuthRequired()) {
+        authenticated_ = true;
+        auth_method_ = "none";
+        return {{"ok", true}, {"authenticated", true}, {"auth_required", false}, {"impl", "real"}};
+    }
+    if (!CredentialsConfigured()) {
+        authenticated_ = false;
+        auth_method_.clear();
+        return {{"ok", false},
+                {"authenticated", false},
+                {"auth_required", true},
+                {"error", "auth required but no OPENCLAW_ACP_TOKEN/PASSPHRASE configured (fail-closed)"},
+                {"impl", "real"}};
+    }
+    if (!CheckCredential(token, passphrase)) {
+        authenticated_ = false;
+        auth_method_.clear();
+        return {{"ok", false},
+                {"authenticated", false},
+                {"auth_required", true},
+                {"error", "invalid token or passphrase"},
+                {"impl", "real"}};
+    }
+    authenticated_ = true;
+    if (!token.empty() && CheckCredential(token, "")) auth_method_ = "token";
+    else auth_method_ = "passphrase";
+    return {{"ok", true},
+            {"authenticated", true},
+            {"auth_required", true},
+            {"auth_method", auth_method_},
+            {"impl", "real"}};
+}
+
+bool AgentEndpoint::TryAuthenticateParams(const nlohmann::json& params) {
+    if (!AuthRequired()) return true;
+    {
+        std::lock_guard lock(mu_);
+        if (authenticated_) return true;
+    }
+    auto r = Login(params);
+    return r.value("ok", false) && r.value("authenticated", false);
 }
 
 nlohmann::json AgentEndpoint::Ok(const nlohmann::json& id, nlohmann::json result) {
@@ -239,7 +397,7 @@ nlohmann::json AgentEndpoint::StatusJson() const {
             {"sessions", sessions_.size()},
             {"capabilities", AgentCapabilities()},
             {"gap_doc", "docs/ACP-GAP.md"},
-            {"session_mcp", true},{"note", "session/prompt → RunAgentLoop; multimodal; session MCP; channel bind; not acpx"}};
+            {"session_mcp", true},{"auth_required", AuthRequired()},{"authenticated", !AuthRequired() || authenticated_},{"note", "session/prompt → RunAgentLoop; multimodal; session MCP; auth gate; channel bind; not acpx"}};
 }
 
 nlohmann::json AgentEndpoint::ListSessionsJson() const {
@@ -392,6 +550,11 @@ nlohmann::json AgentEndpoint::RemoveSessionMcp(const std::string& session_id, co
 }
 
 nlohmann::json AgentEndpoint::NewSession(const nlohmann::json& params) {
+    if (AuthRequired() && !Authenticated()) {
+        return {{"error", "unauthorized"},
+                {"auth_required", true},
+                {"hint", "auth/login first"}};
+    }
     std::string sid;
     {
         std::lock_guard lock(mu_);
@@ -561,6 +724,12 @@ nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, 
 
 nlohmann::json AgentEndpoint::Prompt(const std::string& session_id,
                                      const nlohmann::json& prompt_blocks) {
+    if (AuthRequired() && !Authenticated()) {
+        return {{"error", "unauthorized"},
+                {"auth_required", true},
+                {"sessionId", session_id},
+                {"hint", "auth/login first"}};
+    }
     std::unique_lock lock(mu_);
     EnsureDefaultBackend();
     auto* s = Find(session_id);
@@ -593,22 +762,67 @@ nlohmann::json AgentEndpoint::Handle(const nlohmann::json& request) {
         client_protocol_ = selected;
         client_info_ = params.value("info", nlohmann::json::object());
         EnsureDefaultBackend();
+        // Optional credentials on initialize
+        bool authed_now = false;
+        if (AuthRequired()) {
+            lock.unlock();
+            auto login = Login(params);
+            lock.lock();
+            authed_now = login.value("ok", false) && login.value("authenticated", false);
+        } else {
+            authenticated_ = true;
+            auth_method_ = "none";
+            authed_now = true;
+        }
         return Ok(id, {{"protocolVersion", selected},
                        {"capabilities", AgentCapabilities()},
                        {"info",
                         {{"name", name_},
                          {"title", "openclaw-cpp ACP agent"},
                          {"version", version_}}},
-                       {"authMethods", nlohmann::json::array()},
+                       {"authMethods", AuthMethodsJson()},
                        {"_meta",
                         {{"openclawCpp",
-                          {{"agent_loop", true}, {"provider", backend_.provider_name}}}}}});
+                          {{"agent_loop", true},
+                           {"provider", backend_.provider_name},
+                           {"auth_required", AuthRequired()},
+                           {"authenticated", authed_now}}}}}});
     }
 
     if (method == "ping") return Ok(id, nlohmann::json::object());
 
+    if (method == "auth/login" || method == "auth/authenticate" || method == "authenticate") {
+        lock.unlock();
+        auto login = Login(params);
+        lock.lock();
+        if (!login.value("ok", false))
+            return Err(id, -32004, login.value("error", "authentication failed"), login);
+        return Ok(id, login);
+    }
+
+    if (method == "auth/status") {
+        lock.unlock();
+        auto st = AuthStatusJson();
+        lock.lock();
+        return Ok(id, st);
+    }
+
+    if (method == "auth/logout") {
+        authenticated_ = false;
+        auth_method_.clear();
+        return Ok(id, {{"ok", true}, {"authenticated", false}, {"impl", "real"}});
+    }
+
     if (!initialized_ && method.rfind("session/", 0) == 0) {
         return Err(id, -32002, "Server not initialized");
+    }
+
+    if (AuthRequired() && !authenticated_ && !AllowMethodWithoutAuth(method)) {
+        return Err(id, -32004, "Unauthorized: ACP auth required",
+                   {{"auth_required", true},
+                    {"authenticated", false},
+                    {"authMethods", AuthMethodsJson()},
+                    {"hint", "call auth/login with token or passphrase, or pass authToken on initialize"}});
     }
 
     if (method == "session/new") {
@@ -764,7 +978,7 @@ bool Client::Initialize(const nlohmann::json& client_info) {
     nlohmann::json info = client_info.empty()
                               ? nlohmann::json{{"name", "openclaw-cpp"},
                                                {"title", "openclaw-cpp ACP client"},
-                                               {"version", "1.19.0-dev"}}
+                                               {"version", "1.21.0-dev"}}
                               : client_info;
     auto resp = Request("initialize",
                         {{"protocolVersion", kAcpProtocolVersion},

@@ -69,7 +69,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.20.0-dev";
+constexpr const char* kVersion = "1.21.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -677,7 +677,100 @@ int CmdSelfTest() {
             std::cerr << "FAIL acp agents list\n"; ++failures;
         } else std::cerr << "PASS acp agents.list\n";
 
-        // Channel-bound ACP (mock inbound, no live Slack)
+        
+        // ACP auth gate (fail-closed + success; mock provider only)
+        {
+            unsetenv("OPENCLAW_ACP_TOKEN");
+            unsetenv("OPENCLAW_ACP_AUTH_TOKEN");
+            unsetenv("OPENCLAW_ACP_PASSPHRASE");
+            unsetenv("OPENCLAW_ACP_AUTH_REQUIRED");
+            setenv("OPENCLAW_ACP_TOKEN", "test-acp-secret", 1);
+            setenv("OPENCLAW_ACP_AUTH_REQUIRED", "1", 1);
+            acp::AgentEndpoint ep("openclaw-cpp", "1.21.0-dev");
+            acp::LoopBackend b;
+            b.provider = std::make_shared<provider::MockProvider>();
+            b.tools = std::make_shared<tools::Registry>();
+            b.opts.max_turns = 2;
+            b.provider_name = "mock";
+            ep.SetLoopBackend(std::move(b));
+            auto init = ep.Handle({{"jsonrpc", "2.0"},
+                                   {"id", 1},
+                                   {"method", "initialize"},
+                                   {"params",
+                                    {{"protocolVersion", 2},
+                                     {"capabilities", nlohmann::json::object()},
+                                     {"info", {{"name", "t"}, {"version", "0"}}}}}});
+            auto meta = init.value("result", nlohmann::json::object())
+                            .value("_meta", nlohmann::json::object())
+                            .value("openclawCpp", nlohmann::json::object());
+            bool req = meta.value("auth_required", false);
+            bool not_authed = !meta.value("authenticated", true);
+            auto denied = ep.Handle({{"jsonrpc", "2.0"},
+                                     {"id", 2},
+                                     {"method", "session/new"},
+                                     {"params", {{"cwd", "/tmp"}}}});
+            bool fail_closed = denied.contains("error") &&
+                               denied["error"].value("code", 0) == -32004;
+            auto bad = ep.Handle({{"jsonrpc", "2.0"},
+                                  {"id", 3},
+                                  {"method", "auth/login"},
+                                  {"params", {{"token", "wrong"}}}});
+            bool bad_login = bad.contains("error");
+            auto good = ep.Handle({{"jsonrpc", "2.0"},
+                                   {"id", 4},
+                                   {"method", "auth/login"},
+                                   {"params", {{"token", "test-acp-secret"}}}});
+            bool ok_login = good.contains("result") && good["result"].value("authenticated", false);
+            auto ns = ep.Handle({{"jsonrpc", "2.0"},
+                                 {"id", 5},
+                                 {"method", "session/new"},
+                                 {"params", {{"cwd", "/tmp"}}}});
+            auto sid = ns.value("result", nlohmann::json::object()).value("sessionId", "");
+            auto prompt = ep.Handle(
+                {{"jsonrpc", "2.0"},
+                 {"id", 6},
+                 {"method", "session/prompt"},
+                 {"params",
+                  {{"sessionId", sid},
+                   {"prompt", nlohmann::json::array({{{"type", "text"}, {"text", "hi"}}})}}}});
+            bool prompt_ok = prompt.contains("result") && !sid.empty();
+            // passphrase path
+            unsetenv("OPENCLAW_ACP_TOKEN");
+            setenv("OPENCLAW_ACP_PASSPHRASE", "phrase-1", 1);
+            acp::AgentEndpoint ep2;
+            ep2.SetLoopBackend({std::make_shared<provider::MockProvider>(),
+                                std::make_shared<tools::Registry>(), agent::LoopOptions{}, "mock"});
+            (void)ep2.Handle({{"jsonrpc", "2.0"},
+                              {"id", 1},
+                              {"method", "initialize"},
+                              {"params", {{"protocolVersion", 2}, {"capabilities", nlohmann::json::object()},
+                                          {"info", {{"name", "t"}, {"version", "0"}}},
+                                          {"passphrase", "phrase-1"}}}});
+            auto st = ep2.AuthStatusJson();
+            bool pp_ok = st.value("authenticated", false) && st.value("auth_required", false);
+            // AUTH_REQUIRED with no credentials → fail-closed login
+            unsetenv("OPENCLAW_ACP_PASSPHRASE");
+            unsetenv("OPENCLAW_ACP_TOKEN");
+            setenv("OPENCLAW_ACP_AUTH_REQUIRED", "1", 1);
+            acp::AgentEndpoint ep3;
+            auto no_cred = ep3.Login({{"token", "anything"}});
+            bool no_cred_fail = !no_cred.value("ok", true);
+            unsetenv("OPENCLAW_ACP_TOKEN");
+            unsetenv("OPENCLAW_ACP_AUTH_TOKEN");
+            unsetenv("OPENCLAW_ACP_PASSPHRASE");
+            unsetenv("OPENCLAW_ACP_AUTH_REQUIRED");
+            if (!req || !not_authed || !fail_closed || !bad_login || !ok_login || !prompt_ok ||
+                !pp_ok || !no_cred_fail) {
+                std::cerr << "FAIL acp auth gate init=" << init.dump()
+                          << " denied=" << denied.dump() << " good=" << good.dump()
+                          << " prompt=" << prompt.dump() << " st=" << st.dump()
+                          << " no_cred=" << no_cred.dump() << "\n";
+                ++failures;
+            } else
+                std::cerr << "PASS acp auth gate fail-closed+login\n";
+        }
+
+// Channel-bound ACP (mock inbound, no live Slack)
         {
             setenv("OPENCLAW_ACP_AUTO_BIND", "1", 1);
             setenv("OPENCLAW_DEFAULT_PROVIDER", "mock", 1);

@@ -23,7 +23,8 @@ namespace openclaw::acp {
 // Implemented: initialize, session/new|list|prompt|cancel|close|resume, ping.
 // Multimodal: text + image_base64 / image_url (+ optional file) on session/prompt.
 // Session MCP: session/mcp/add|list|remove (mock/stdio); tools merged on prompt.
-// Not implemented: auth/*, acpx adapters, audio/video.
+// Auth: auth/login|authenticate; initialize may carry token; gate session/* when required.
+// Not implemented: OAuth/device-code full flow, acpx adapters, audio/video.
 // Channel bindings: see acp::Registry BindChannel / HandleChannelInbound.
 
 constexpr int kAcpProtocolVersion = 2;
@@ -58,7 +59,7 @@ struct LoopBackend {
 class AgentEndpoint {
 public:
     explicit AgentEndpoint(std::string agent_name = "openclaw-cpp",
-                           std::string agent_version = "1.19.0-dev");
+                           std::string agent_version = "1.21.0-dev");
 
     // Inject provider/tools (e.g. mock for tests, DeepSeek when configured).
     // If unset, EnsureDefaultBackend() installs MockProvider + empty tools.
@@ -71,6 +72,13 @@ public:
     nlohmann::json StatusJson() const;
     nlohmann::json ListSessionsJson() const;
     bool Initialized() const { return initialized_; }
+    bool Authenticated() const;
+    bool AuthRequired() const;
+    nlohmann::json AuthStatusJson() const;
+    // Login with token or passphrase (also used from initialize params).
+    nlohmann::json Login(const nlohmann::json& params);
+    // Accept token from gateway RPC params without full JSON-RPC login.
+    bool TryAuthenticateParams(const nlohmann::json& params);
 
     nlohmann::json NewSession(const nlohmann::json& params);
     nlohmann::json Prompt(const std::string& session_id, const nlohmann::json& prompt_blocks);
@@ -85,6 +93,8 @@ private:
     std::string name_;
     std::string version_;
     bool initialized_ = false;
+    bool authenticated_ = false;
+    std::string auth_method_;  // token | passphrase | initialize
     int client_protocol_ = 0;
     nlohmann::json client_info_ = nlohmann::json::object();
     std::vector<WireSession> sessions_;
@@ -95,6 +105,13 @@ private:
     bool backend_ready_ = false;
 
     void EnsureDefaultBackend();
+    static bool EnvAuthRequired();
+    static std::string EnvToken();
+    static std::string EnvPassphrase();
+    bool CredentialsConfigured() const;
+    bool CheckCredential(const std::string& token, const std::string& passphrase) const;
+    nlohmann::json AuthMethodsJson() const;
+    bool AllowMethodWithoutAuth(const std::string& method) const;
     struct PromptParsed {
         std::string text;
         nlohmann::json openai_parts = nlohmann::json::array();  // provider wire

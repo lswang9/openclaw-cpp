@@ -124,6 +124,38 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             r.payload = Real({{"implemented", false}, {"skeleton", false}, {"error", "acp not wired"}});
             return r;
         }
+        if (method == "acp.auth.login" || method == "acp.auth" || method == "acp.authenticate") {
+            r.payload = Real(deps.acp->Endpoint().Login(params));
+            return r;
+        }
+        if (method == "acp.auth.status") {
+            r.payload = Real(deps.acp->Endpoint().AuthStatusJson());
+            return r;
+        }
+        if (method == "acp.auth.logout") {
+            auto resp = deps.acp->WireHandle(
+                {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "auth/logout"}, {"params", nlohmann::json::object()}});
+            r.payload = Real({{"response", resp}, {"impl", "real"}});
+            return r;
+        }
+        // Fail-closed: session/prompt/bind/wire/mcp require auth when configured
+        const bool acp_auth_exempt =
+            method == "acp.status" || method == "acp.agents.list" || method == "acp.auth.status" ||
+            method == "acp.auth.login" || method == "acp.auth" || method == "acp.authenticate" ||
+            method == "acp.auth.logout" || method == "acp.bindings.list" || method == "acp.bindings";
+        if (!acp_auth_exempt && deps.acp->Endpoint().AuthRequired()) {
+            if (!deps.acp->Endpoint().TryAuthenticateParams(params)) {
+                r.ok = false;
+                r.error = "unauthorized";
+                r.payload = Real({{"ok", false},
+                                  {"error", "unauthorized"},
+                                  {"auth_required", true},
+                                  {"authenticated", false},
+                                  {"hint", "pass token/authToken matching OPENCLAW_ACP_TOKEN or call acp.auth.login"},
+                                  {"auth", deps.acp->Endpoint().AuthStatusJson()}});
+                return r;
+            }
+        }
         if (method == "acp.status") { r.payload = Real(deps.acp->StatusJson()); return r; }
         if (method == "acp.agents.list") {
             r.payload = Real({{"agents", deps.acp->AgentsListJson()}});

@@ -104,6 +104,8 @@ nlohmann::json Registry::StatusJson() const {
     st["channel_bound"] = true;
     st["auto_bind"] = AutoBindEnabled();
     st["session_mcp"] = true;
+    st["auth_required"] = endpoint_->AuthRequired();
+    st["authenticated"] = endpoint_->Authenticated();
     return st;
 }
 

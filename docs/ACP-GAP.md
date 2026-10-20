@@ -3,7 +3,7 @@
 Upstream OpenClaw supports **ACP agents** (external coding harnesses via ACP/acpx).
 Canonical protocol: [Agent Client Protocol](https://agentclientprotocol.com/) (JSON-RPC, typically stdio).
 
-## openclaw-cpp status (**1.19.0-dev**)
+## openclaw-cpp status (**1.21.0-dev**)
 
 | Piece | Status | `impl` |
 |-------|--------|--------|
@@ -17,7 +17,8 @@ Canonical protocol: [Agent Client Protocol](https://agentclientprotocol.com/) (J
 | Channel-bound ACP sessions | **present** — `acp.bind` / auto-bind on slack/feishu/discord inbound → `session/prompt` + outbound | **real** |
 | Multimodal prompt (text + image_base64/image_url + optional file) | **present** — mock echoes `mock-saw-image:N`; OpenAI-compat maps vision `content` array | **real** (mock) / **honest** (live vision depends on model) |
 | **session MCP** (`session/mcp/add|list|remove`, gateway `acp.session.mcp.*`) | **present** — mock/stdio attach; tools merged into AgentLoop registry on prompt | **real** (mock) / **honest** (stdio) |
-| auth/* | **not implemented** | **missing** |
+| **auth/*** minimal | **present** — `auth/login` / `authenticate`; token (`OPENCLAW_ACP_TOKEN`) or passphrase; `OPENCLAW_ACP_AUTH_REQUIRED`; initialize may carry creds; gateway `acp.auth.*` | **real** (local gate) |
+| OAuth / device-code / acpx identity | **not implemented** | **missing** |
 
 ### Env
 
@@ -31,7 +32,14 @@ Canonical protocol: [Agent Client Protocol](https://agentclientprotocol.com/) (J
 ### Honest limits
 
 Prompt runs the **same** C++ agent loop as chat, but the default provider is **mock** so CI/self-test need no API keys.
-Channel bindings + multimodal image parts + **session MCP tool attach** are a **subset**. Still **not** full OpenClaw ACP hosting (no acpx spawn, no audio/video, limited file).
+Channel bindings + multimodal + session MCP + **minimal auth gate** are a **subset**. Still **not** full OpenClaw ACP hosting (no acpx spawn, no OAuth/device-code, no audio/video).
+
+### Auth
+
+- Wire: `auth/login`, `auth/authenticate`, `authenticate`, `auth/status`, `auth/logout`.
+- Gateway: `acp.auth.login` / `acp.auth.status` / `acp.auth.logout`.
+- When token/passphrase set or `OPENCLAW_ACP_AUTH_REQUIRED=1`, `session/*` (and gateway session/prompt/bind/wire) reject until login.
+
 
 ### Session MCP
 
