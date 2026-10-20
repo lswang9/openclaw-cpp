@@ -1398,9 +1398,32 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         };
         auto& sim = *deps.sim;
         if (method == "computer.status") { r.payload = tag_computer(sim.ComputerStatus()); return r; }
+        if (method == "computer.click" || method == "computer.mouse_click") {
+            nlohmann::json p = params;
+            p["action"] = "click";
+            r.payload = tag_computer(sim.ComputerInvoke(p));
+            return r;
+        }
+        if (method == "computer.type" || method == "computer.keyboard") {
+            nlohmann::json p = params;
+            p["action"] = "type";
+            r.payload = tag_computer(sim.ComputerInvoke(p));
+            return r;
+        }
+        if (method == "computer.move" || method == "computer.mouse_move") {
+            nlohmann::json p = params;
+            p["action"] = "move";
+            r.payload = tag_computer(sim.ComputerInvoke(p));
+            return r;
+        }
+        if (method == "computer.key") {
+            nlohmann::json p = params;
+            p["action"] = "key";
+            r.payload = tag_computer(sim.ComputerInvoke(p));
+            return r;
+        }
         if (method == "computer.invoke") {
             auto inv = sim.ComputerInvoke(params);
-            // screenshot action may be live; mouse/key stay real-sim
             r.payload = tag_computer(std::move(inv));
             return r;
         }

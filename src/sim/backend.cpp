@@ -1,5 +1,6 @@
 #include "openclaw/sim/backend.hpp"
 #include "openclaw/sim/capture.hpp"
+#include "openclaw/sim/input.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -58,18 +59,21 @@ nlohmann::json SimulationBackend::EventLog(std::size_t limit) const {
 
 nlohmann::json SimulationBackend::ComputerStatus() {
     auto cap = ProbeCaptureEnv();
-    const bool live = cap.has_display && !cap.force_sim && !cap.tools_available.empty();
-    return {{"mode", live ? "hybrid" : "simulation"},
+    auto in = ProbeInputEnv();
+    const bool shot_live = cap.has_display && !cap.force_sim && !cap.tools_available.empty();
+    const bool input_live = in.has_display && !in.force_sim && !in.tools_available.empty();
+    return {{"mode", (shot_live || input_live) ? "hybrid" : "simulation"},
             {"online", true},
-            {"impl", live ? "real" : "real-sim"},
-            {"capabilities", nlohmann::json::array({"screenshot", "mouse", "keyboard", "invoke"})},
-            {"screenshot_live", live},
+            {"impl", (shot_live || input_live) ? "real" : "real-sim"},
+            {"capabilities", nlohmann::json::array({"screenshot", "mouse", "keyboard", "invoke", "click", "type", "move"})},
+            {"screenshot_live", shot_live},
+            {"input_live", input_live},
             {"display", cap.display},
             {"wayland", cap.wayland},
-            {"tools_available", cap.tools_available},
+            {"capture_tools", cap.tools_available},
+            {"input_tools", in.tools_available},
             {"events", events_.size()},
-            {"note", live ? "screenshot can be live; click/type remain real-sim"
-                          : "no capture path — screenshot placeholder; click/type real-sim"}};
+            {"note", "live paths need DISPLAY + ffmpeg/scrot and/or xdotool; FORCE_SIM envs disable"}};
 }
 
 nlohmann::json SimulationBackend::Screenshot(const nlohmann::json& params) {
@@ -85,23 +89,38 @@ nlohmann::json SimulationBackend::Screenshot(const nlohmann::json& params) {
 
 nlohmann::json SimulationBackend::ComputerInvoke(const nlohmann::json& params) {
     auto action = params.value("action", params.value("op", "noop"));
-    nlohmann::json result{{"mode", "simulation"}, {"action", action}, {"ok", true}, {"impl", "real-sim"}};
+    nlohmann::json result;
     if (action == "screenshot" || action == "capture") {
-        result.merge_patch(Screenshot(params));
+        result = Screenshot(params);
+        result["action"] = action;
     } else if (action == "mouse_move" || action == "move") {
-        Record("mouse_move", params);
-        result["x"] = params.value("x", 0);
-        result["y"] = params.value("y", 0);
+        int x = params.value("x", 0);
+        int y = params.value("y", 0);
+        result = InputMouseMove(x, y);
+        Record("mouse_move", result);
     } else if (action == "mouse_click" || action == "click") {
-        Record("mouse_click", params);
-        result["button"] = params.value("button", "left");
-    } else if (action == "key" || action == "type" || action == "keyboard") {
-        Record("keyboard", params);
-        result["text"] = params.value("text", params.value("keys", ""));
+        auto button = params.value("button", "left");
+        int x = params.value("x", -1);
+        int y = params.value("y", -1);
+        result = InputMouseClick(button, x, y);
+        Record("mouse_click", result);
+    } else if (action == "type" || action == "keyboard") {
+        auto text = params.value("text", params.value("keys", ""));
+        result = InputTypeText(text);
+        Record("keyboard", result);
+    } else if (action == "key") {
+        auto keys = params.value("keys", params.value("text", params.value("key", "")));
+        result = InputKey(keys);
+        Record("keyboard", result);
     } else {
         Record("invoke", params);
-        result["echo"] = params;
+        result = {{"ok", true},
+                  {"impl", "real-sim"},
+                  {"mode", "simulation"},
+                  {"action", action},
+                  {"echo", params}};
     }
+    if (!result.contains("action")) result["action"] = action;
     return result;
 }
 

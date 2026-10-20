@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.9.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.10.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 构建
 
@@ -60,7 +60,7 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ## 已知限制（务必读）
 
-1. **computer/desktop**：有 `DISPLAY`/`WAYLAND` 且存在 scrot/import/ffmpeg/grim 时，**截图可为 `impl:real`**；否则占位 PNG（`real-sim`）。鼠标/键盘/canvas 仍为仿真。可用 `OPENCLAW_SCREENSHOT_FORCE_SIM=1` 强制占位。
+1. **computer/desktop**：有 display 时 **截图**（ffmpeg/scrot…）与 **click/type/move**（xdotool）可为 `impl:real`；否则 `real-sim`。canvas 仍仿真。`OPENCLAW_COMPUTER_FORCE_SIM=1` / `OPENCLAW_INPUT_FORCE_SIM=1` 强制仿真。见 `docs/COMPUTER-CAPTURE.md`。
 2. **browser**：优先 **CDP**（已运行的 Chrome `--remote-debugging-port`，见 [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md)）；不可用时回退 **curl-session**（cookie/重定向/链接表单）。**不是** Playwright。可用 `OPENCLAW_BROWSER_CDP_MOCK=1` 自测。
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 3. **IM**：webhook 入站较完整；出站需对应 env token，否则只本地记录。

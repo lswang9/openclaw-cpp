@@ -29,6 +29,7 @@
 #include "openclaw/voice/tts.hpp"
 #include "openclaw/sim/backend.hpp"
 #include "openclaw/sim/capture.hpp"
+#include "openclaw/sim/input.hpp"
 #include "openclaw/browser/engine.hpp"
 #include "openclaw/browser/cdp_client.hpp"
 #include "openclaw/channels/feishu.hpp"
@@ -61,7 +62,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.9.0-dev";
+constexpr const char* kVersion = "1.10.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -437,7 +438,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.9.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.10.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -826,6 +827,37 @@ int CmdSelfTest() {
             std::cerr << "FAIL sim backend " << shot.dump() << "\n"; ++failures;
         } else std::cerr << "PASS simulation backend (force-sim screenshot)\n";
         unsetenv("OPENCLAW_SCREENSHOT_FORCE_SIM");
+
+        // Input force-sim (no display required)
+        setenv("OPENCLAW_INPUT_FORCE_SIM", "1", 1);
+        {
+            sim::SimulationBackend sim_in(std::filesystem::temp_directory_path() / "oc-sim-in");
+            auto click = sim_in.ComputerInvoke({{"action", "click"}, {"x", 10}, {"y", 20}, {"button", "left"}});
+            auto type = sim_in.ComputerInvoke({{"action", "type"}, {"text", "hi"}});
+            auto move = sim_in.ComputerInvoke({{"action", "move"}, {"x", 1}, {"y", 2}});
+            if (click.value("impl", "") != "real-sim" || type.value("impl", "") != "real-sim" ||
+                move.value("impl", "") != "real-sim") {
+                std::cerr << "FAIL input force-sim " << click.dump() << "\n"; ++failures;
+            } else std::cerr << "PASS computer click/type force-sim\n";
+        }
+        unsetenv("OPENCLAW_INPUT_FORCE_SIM");
+
+        // Live input when DISPLAY + xdotool (optional)
+        {
+            auto inenv = sim::ProbeInputEnv();
+            if (inenv.has_display && !inenv.tools_available.empty() && !inenv.force_sim) {
+                sim::SimulationBackend live_in(std::filesystem::temp_directory_path() / "oc-sim-in-live");
+                auto mv = live_in.ComputerInvoke({{"action", "move"}, {"x", 120}, {"y", 140}});
+                auto cl = live_in.ComputerInvoke({{"action", "click"}, {"x", 120}, {"y", 140}});
+                if (mv.value("impl", "") == "real" && cl.value("impl", "") == "real") {
+                    std::cerr << "PASS computer move/click live (" << mv.value("engine", "") << ")\n";
+                } else {
+                    std::cerr << "WARN computer input live fallback " << mv.dump() << " " << cl.dump() << "\n";
+                }
+            } else {
+                std::cerr << "PASS computer input no-display probe\n";
+            }
+        }
 
         // Live path when DISPLAY + capture tool exist (optional; do not fail CI headless)
         auto env = sim::ProbeCaptureEnv();

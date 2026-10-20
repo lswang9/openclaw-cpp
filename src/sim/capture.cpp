@@ -76,7 +76,7 @@ nlohmann::json Placeholder(const std::filesystem::path& out_path, const std::str
 
 CaptureEnv ProbeCaptureEnv() {
     CaptureEnv e;
-    e.force_sim = EnvTruthy("OPENCLAW_SCREENSHOT_FORCE_SIM");
+    e.force_sim = EnvTruthy("OPENCLAW_SCREENSHOT_FORCE_SIM") || EnvTruthy("OPENCLAW_COMPUTER_FORCE_SIM");
     if (const char* d = std::getenv("DISPLAY"); d && *d) {
         e.display = d;
         e.has_display = true;

@@ -1,22 +1,33 @@
-# Computer screenshot capture (1.9)
+# Computer capture + input (1.10)
 
-## Behavior
+## Screenshot
 
 | Condition | `impl` | Engine examples |
 |-----------|--------|-----------------|
-| `OPENCLAW_SCREENSHOT_FORCE_SIM=1` | `real-sim` | placeholder 1×1 PNG |
+| `OPENCLAW_SCREENSHOT_FORCE_SIM=1` or `OPENCLAW_COMPUTER_FORCE_SIM=1` | `real-sim` | placeholder 1×1 PNG |
 | No `DISPLAY` / `WAYLAND_DISPLAY` | `real-sim` | placeholder |
-| Display set + tool works | **`real`** | `ffmpeg-x11grab`, `scrot`, `import`, `gnome-screenshot`, `grim` |
-| Display set but all tools fail | `real-sim` | placeholder + `attempts` |
+| Display + tool works | **`real`** | `ffmpeg-x11grab`, `scrot`, `import`, `gnome-screenshot`, `grim` |
 
-Mouse/keyboard/canvas remain **`real-sim`** (no OS input injection).
+Tools tried (order): scrot → import → gnome-screenshot → grim → ffmpeg x11grab.
 
-## Tools tried (in order)
+## Input (click / type / move / key)
 
-1. `scrot`
-2. ImageMagick `import -window root`
-3. `gnome-screenshot -f`
-4. `grim` (if Wayland)
-5. `ffmpeg -f x11grab` (X11)
+| Condition | `impl` | Engine |
+|-----------|--------|--------|
+| `OPENCLAW_INPUT_FORCE_SIM=1` or `OPENCLAW_COMPUTER_FORCE_SIM=1` | `real-sim` | event-log only |
+| No display / no tool | `real-sim` | event-log |
+| Display + **xdotool** (or ydotool) | **`real`** | `xdotool` / `ydotool` |
 
-Install tip (Debian/Ubuntu): `scrot` or `ffmpeg` (often already present).
+Gateway methods: `computer.click`, `computer.type`, `computer.move`, `computer.key`, plus `computer.invoke` actions.
+
+Canvas / desktop launch remain **`real-sim`**.
+
+## Env
+
+| Variable | Effect |
+|----------|--------|
+| `OPENCLAW_COMPUTER_FORCE_SIM` | Force sim for **both** screenshot and input |
+| `OPENCLAW_SCREENSHOT_FORCE_SIM` | Screenshot placeholder only |
+| `OPENCLAW_INPUT_FORCE_SIM` | Input event-log only |
+
+Install tip: `xdotool` (X11), `ffmpeg` for screenshots.
