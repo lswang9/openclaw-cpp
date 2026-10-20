@@ -19,6 +19,7 @@
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/plugins/js_host.hpp"
 #include "openclaw/board/store.hpp"
+#include "openclaw/canvas/store.hpp"
 #include "openclaw/provider/deepseek.hpp"
 #include "openclaw/provider/mock.hpp"
 #include "openclaw/session/store.hpp"
@@ -68,7 +69,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.19.0-dev";
+constexpr const char* kVersion = "1.20.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -984,6 +985,57 @@ int CmdSelfTest() {
             std::cerr << "PASS board store CRUD+persist\n";
     }
 
+    // canvas disk store + sim bridge
+    try {
+        auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
+        std::filesystem::remove_all(dir);
+        canvas::Store store(dir);
+        nlohmann::json widgets = nlohmann::json::array();
+        widgets.push_back({{"type", "text"}, {"text", "w"}});
+        auto created = store.Create({{"title", "t1"}, {"html", "<p>hi</p>"}, {"widgets", widgets}});
+        nlohmann::json cdoc = created.contains("document") && created["document"].is_object()
+                                  ? created["document"]
+                                  : nlohmann::json::object();
+        auto id = cdoc.value("id", "");
+        auto patched = store.Patch(id, {{"html", "<p>hi2</p>"}, {"title", "t2"}});
+        auto got = store.Get(id);
+        auto listed = store.List();
+        auto ev = store.Events(10, id);
+        (void)ev;
+        store.RecordEvent("test.ping", {{"x", 1}}, id);
+        canvas::Store store2(dir);
+        auto got2 = store2.Get(id);
+        sim::SimulationBackend sim(dir / "simroot");
+        auto put = sim.CanvasPut({{"title", "from-sim"}, {"html", "<b>sim</b>"}});
+        auto view = sim.CanvasView({});
+        nlohmann::json pdoc = patched.contains("document") && patched["document"].is_object()
+                                  ? patched["document"]
+                                  : nlohmann::json::object();
+        nlohmann::json gdoc = got.contains("document") && got["document"].is_object()
+                                  ? got["document"]
+                                  : nlohmann::json::object();
+        const auto docs = listed.contains("docs") && listed["docs"].is_array()
+                              ? listed["docs"]
+                              : nlohmann::json::array();
+        bool ok = created.value("ok", false) && !id.empty() &&
+                  pdoc.value("html", "") == "<p>hi2</p>" &&
+                  gdoc.value("title", "") == "t2" &&
+                  docs.size() >= 1 &&
+                  got2.value("ok", false) &&
+                  put.value("persisted", false) &&
+                  view.value("impl", "") == "real";
+        if (!ok) {
+            std::cerr << "FAIL canvas store created=" << created.dump()
+                      << " patch=" << patched.dump() << " put=" << put.dump()
+                      << " view=" << view.dump() << "\n";
+            ++failures;
+        } else
+            std::cerr << "PASS canvas store CRUD+persist+events\n";
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL canvas store exception: " << e.what() << "\n";
+        ++failures;
+    }
+
     // Feishu long-connection — offline recorded frames (no network)
     {
         setenv("FEISHU_WS_FORCE_MOCK", "1", 1);
@@ -1495,6 +1547,7 @@ int CmdGateway(int argc, char** argv, int argi) {
     auto nodes = nodes::Registry::MakeDefault();
     media::Store media(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "media");
     board::Store board_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "board.json");
+    canvas::Store canvas_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "canvas");
     events::Bus bus;
     agent::FileStore agent_files(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "agents");
     auto& logs = logging::GlobalLog();
@@ -1559,6 +1612,7 @@ int CmdGateway(int argc, char** argv, int argi) {
         .sim = &sim_backend,
         .js_host = &js_host,
         .board = &board_store,
+        .canvas = &canvas_store,
         .mcp_client = mcp_client,
         .config = cfg,
         .auth = auth::FromEnv(),

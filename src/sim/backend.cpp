@@ -10,7 +10,8 @@ namespace openclaw::sim {
 
 SimulationBackend::SimulationBackend(std::filesystem::path data_dir)
     : root_(std::move(data_dir) / "sim"),
-      browser_(std::make_unique<browser::Engine>(root_ / "browser")) {
+      browser_(std::make_unique<browser::Engine>(root_ / "browser")),
+      canvas_(std::make_unique<canvas::Store>(root_ / "canvas")) {
     std::filesystem::create_directories(root_);
 }
 
@@ -39,7 +40,7 @@ nlohmann::json SimulationBackend::Status() const {
             {"backend", "SimulationBackend"},
             {"events", events_.size()},
             {"desktop", desktop_},
-            {"canvas_title", canvas_.value("title", "")},
+            {"canvas", canvas_ ? canvas_->Status() : nlohmann::json::object()},
             {"browser", br},
             {"screenshot",
              {{"has_display", cap.has_display},
@@ -47,7 +48,7 @@ nlohmann::json SimulationBackend::Status() const {
               {"wayland", cap.wayland},
               {"force_sim", cap.force_sim},
               {"tools_available", cap.tools_available}}},
-            {"note", "screenshot may be live (impl:real); mouse/keyboard/canvas still real-sim"}};
+            {"note", "screenshot may be live; canvas disk-backed local store (not A2UI); input may be real-sim"}};
 }
 
 nlohmann::json SimulationBackend::EventLog(std::size_t limit) const {
@@ -125,26 +126,47 @@ nlohmann::json SimulationBackend::ComputerInvoke(const nlohmann::json& params) {
 }
 
 nlohmann::json SimulationBackend::CanvasView(const nlohmann::json& params) {
-    (void)params;
-    Record("canvas.view", nlohmann::json::object());
-    return {{"mode", "simulation"}, {"document", canvas_}};
+    std::string id;
+    if (params.contains("id") && params["id"].is_string()) id = params["id"].get<std::string>();
+    else if (params.contains("canvas_id") && params["canvas_id"].is_string())
+        id = params["canvas_id"].get<std::string>();
+    Record("canvas.view", {{"id", id}});
+    if (!id.empty()) {
+        auto g = canvas_->Get(id);
+        nlohmann::json doc = nlohmann::json::object();
+        if (g.contains("document") && g["document"].is_object()) doc = g["document"];
+        return {{"mode", "local"},
+                {"impl", "real"},
+                {"document", doc},
+                {"ok", g.value("ok", false)},
+                {"persisted", true}};
+    }
+    return canvas_->ActiveView();
 }
 
 nlohmann::json SimulationBackend::CanvasPreview(const nlohmann::json& params) {
     (void)params;
     Record("canvas.preview", nlohmann::json::object());
-    return {{"mode", "simulation"},
-            {"preview", {{"title", canvas_.value("title", "")},
-                         {"widget_count", canvas_.value("widgets", nlohmann::json::array()).size()}}},
-            {"note", "text preview only — no raster compositor"}};
+    return canvas_->ActivePreview();
 }
 
 nlohmann::json SimulationBackend::CanvasPut(const nlohmann::json& params) {
-    if (params.contains("title")) canvas_["title"] = params["title"];
-    if (params.contains("widgets")) canvas_["widgets"] = params["widgets"];
-    if (params.contains("document") && params["document"].is_object()) canvas_ = params["document"];
     Record("canvas.put", params);
-    return {{"mode", "simulation"}, {"document", canvas_}, {"saved", true}};
+    std::string id;
+    if (params.contains("id") && params["id"].is_string()) id = params["id"].get<std::string>();
+    else if (params.contains("canvas_id") && params["canvas_id"].is_string())
+        id = params["canvas_id"].get<std::string>();
+    if (!id.empty()) {
+        auto p = canvas_->Put(id, params);
+        nlohmann::json doc = nlohmann::json::object();
+        if (p.contains("document") && p["document"].is_object()) doc = p["document"];
+        return {{"mode", "local"},
+                {"impl", "real"},
+                {"document", doc},
+                {"saved", p.value("ok", false)},
+                {"persisted", true}};
+    }
+    return canvas_->ActivePut(params);
 }
 
 nlohmann::json SimulationBackend::DesktopLaunch(const nlohmann::json& params) {

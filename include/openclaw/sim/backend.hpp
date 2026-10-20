@@ -1,5 +1,6 @@
 #pragma once
 #include "openclaw/browser/engine.hpp"
+#include "openclaw/canvas/store.hpp"
 
 #include <nlohmann/json.hpp>
 #include <filesystem>
@@ -23,6 +24,8 @@ public:
     nlohmann::json CanvasView(const nlohmann::json& params = {});
     nlohmann::json CanvasPreview(const nlohmann::json& params = {});
     nlohmann::json CanvasPut(const nlohmann::json& params);
+    canvas::Store& Canvas() { return *canvas_; }
+    const canvas::Store& Canvas() const { return *canvas_; }
 
     nlohmann::json DesktopLaunch(const nlohmann::json& params);
     nlohmann::json DesktopObserve(const nlohmann::json& params = {});
@@ -39,7 +42,7 @@ public:
 private:
     std::filesystem::path root_;
     std::vector<nlohmann::json> events_;
-    nlohmann::json canvas_ = {{"title", "sim-canvas"}, {"widgets", nlohmann::json::array()}};
+    std::unique_ptr<canvas::Store> canvas_;
     nlohmann::json desktop_ = {{"running", false}, {"app", ""}};
     int seq_ = 1;
     std::unique_ptr<browser::Engine> browser_;

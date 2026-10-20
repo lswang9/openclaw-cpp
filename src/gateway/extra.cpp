@@ -1715,19 +1715,68 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         if (starts("canvas.")) {
-            if (method.find("preview") != std::string::npos) {
-                r.payload = RealSim(sim.CanvasPreview(params));
+            auto* store = deps.canvas ? deps.canvas : (deps.sim ? &deps.sim->Canvas() : nullptr);
+            auto tag_canvas = [](nlohmann::json payload) {
+                if (payload.value("impl", "") == "real") return Real(std::move(payload));
+                return RealSim(std::move(payload));
+            };
+            if (!store && !deps.sim) {
+                r.payload = RealSim({{"error", "canvas not wired"}, {"method", method}});
                 return r;
             }
-            if (method.find("view") != std::string::npos || method.find("get") != std::string::npos) {
-                r.payload = RealSim(sim.CanvasView(params));
+            if (method == "canvas.status") {
+                r.payload = Real(store ? store->Status() : nlohmann::json{{"error", "no store"}});
+                return r;
+            }
+            if (method == "canvas.list" || method == "canvas.docs.list") {
+                r.payload = Real(store->List());
+                return r;
+            }
+            if (method == "canvas.create" || method == "canvas.docs.create") {
+                r.payload = Real(store->Create(params));
+                return r;
+            }
+            if (method == "canvas.get" || method == "canvas.docs.get" ||
+                method == "canvas.document.get") {
+                r.payload = Real(store->Get(params.value("id", params.value("canvas_id", ""))));
+                return r;
+            }
+            if (method == "canvas.patch" || method == "canvas.docs.patch" ||
+                method == "canvas.document.patch") {
+                r.payload = Real(store->Patch(params.value("id", params.value("canvas_id", "")),
+                                              params.contains("patch") ? params["patch"] : params));
+                return r;
+            }
+            if (method == "canvas.delete" || method == "canvas.docs.delete" ||
+                method == "canvas.remove") {
+                r.payload = Real(store->Remove(params.value("id", params.value("canvas_id", ""))));
+                return r;
+            }
+            if (method == "canvas.events" || method == "canvas.events.list" ||
+                method == "canvas.event.log") {
+                r.payload = Real(store->Events(params.value("limit", 50),
+                                               params.value("id", params.value("canvas_id", ""))));
+                return r;
+            }
+            if (method == "canvas.event" || method == "canvas.events.append") {
+                r.payload = Real(store->RecordEvent(params.value("kind", "ui"),
+                                                    params.value("detail", nlohmann::json::object()),
+                                                    params.value("id", params.value("canvas_id", ""))));
+                return r;
+            }
+            if (method.find("preview") != std::string::npos) {
+                r.payload = tag_canvas(sim.CanvasPreview(params));
+                return r;
+            }
+            if (method.find("view") != std::string::npos) {
+                r.payload = tag_canvas(sim.CanvasView(params));
                 return r;
             }
             if (method.find("put") != std::string::npos || method.find("update") != std::string::npos) {
-                r.payload = RealSim(sim.CanvasPut(params));
+                r.payload = tag_canvas(sim.CanvasPut(params));
                 return r;
             }
-            r.payload = RealSim(sim.CanvasView(params));
+            r.payload = tag_canvas(sim.CanvasView(params));
             return r;
         }
         if (starts("desktop.")) {

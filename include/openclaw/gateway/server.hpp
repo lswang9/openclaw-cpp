@@ -23,6 +23,7 @@
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/plugins/js_host.hpp"
 #include "openclaw/board/store.hpp"
+#include "openclaw/canvas/store.hpp"
 #include "openclaw/provider/deepseek.hpp"
 #include "openclaw/provider/provider.hpp"
 #include "openclaw/provider/router.hpp"
@@ -71,6 +72,7 @@ struct ServerDeps {
     sim::SimulationBackend* sim = nullptr;
     plugins::JsHost* js_host = nullptr;
     board::Store* board = nullptr;
+    canvas::Store* canvas = nullptr;
     std::shared_ptr<mcp::Client> mcp_client;
     config::Snapshot config;
     auth::AuthConfig auth;
