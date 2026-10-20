@@ -1,0 +1,7 @@
+{
+  "name": "sample_js",
+  "enabled": true,
+  "js": "index.js",
+  "abi": 0,
+  "note": "Loaded via Node JSON-RPC bridge (plugins/js_bridge), not full OpenClaw JS API"
+}

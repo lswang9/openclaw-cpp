@@ -14,6 +14,7 @@ struct Plugin {
     bool enabled = false;
     std::filesystem::path path;
     std::string native_lib;  // basename of .so if any
+    std::string js_entry;    // e.g. index.js for Node bridge
     bool native_loaded = false;
     int abi = 0;
 };

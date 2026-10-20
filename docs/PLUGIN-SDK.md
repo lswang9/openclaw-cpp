@@ -22,3 +22,8 @@ Gateway `plugins.Scan` + `LoadNatives()` (`dlopen`). RPC: `plugins.invoke` with 
 ## Gap vs OpenClaw 2026.10.5
 
 Upstream plugins are primarily **JS/TS** with a rich host API. This C ABI is a **Linux-native** subset for tools/extensions — not JS plugin parity.
+
+
+## JS plugins
+
+See [JS-PLUGIN-HOST.md](JS-PLUGIN-HOST.md) — Node stdio bridge + `plugins/sample_js`. Not full upstream JS API.

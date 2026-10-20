@@ -30,6 +30,8 @@
 
 - **1.5.1-dev**: docs STATUS.md (zh), PARITY executive summary, EnsureObj store_key lifetime fix
 
+- **1.12.0-dev**: JS plugin host (Node stdio bridge + sample_js); FORCE_MOCK; docs/JS-PLUGIN-HOST.md
+
 - **1.11.0-dev**: Slack Socket Mode (WSS envelopes + mock feed); SLACK_APP_TOKEN; docs/SLACK-SOCKET.md
 
 - **1.10.0-dev**: computer.click/type/move via xdotool (impl:real); FORCE_SIM envs; COMPUTER-CAPTURE.md

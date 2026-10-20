@@ -17,6 +17,7 @@
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/memory/store.hpp"
 #include "openclaw/plugins/registry.hpp"
+#include "openclaw/plugins/js_host.hpp"
 #include "openclaw/provider/deepseek.hpp"
 #include "openclaw/provider/mock.hpp"
 #include "openclaw/session/store.hpp"
@@ -63,7 +64,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.11.0-dev";
+constexpr const char* kVersion = "1.12.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -439,7 +440,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.11.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.12.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -828,6 +829,47 @@ int CmdSelfTest() {
     }
 
 
+
+    // JS plugin host (Node bridge or FORCE_MOCK)
+    {
+        setenv("OPENCLAW_JS_FORCE_MOCK", "1", 1);
+        plugins::JsHost mock_host;
+        mock_host.Start(std::filesystem::temp_directory_path());  // mock path ok
+        auto st = mock_host.Status();
+        auto echo = mock_host.CallTool("js.sample_echo", {{"text", "ci"}});
+        unsetenv("OPENCLAW_JS_FORCE_MOCK");
+        if (!st.value("mock", false) || echo.value("content", "") != "js-echo:ci") {
+            std::cerr << "FAIL js host mock " << echo.dump() << "\n";
+            ++failures;
+        } else
+            std::cerr << "PASS js plugin host mock\n";
+    }
+    {
+        // Live Node bridge when node + host.mjs exist (no network)
+        plugins::JsHost live;
+        const auto root = RepoRoot() / "plugins";
+        const auto bridge = root / "js_bridge" / "host.mjs";
+        if (std::filesystem::exists(bridge)) {
+            unsetenv("OPENCLAW_JS_FORCE_MOCK");
+            live.Start(root, bridge);
+            auto echo = live.CallTool("js.sample_echo", {{"text", "node"}});
+            auto add = live.CallTool("js.sample_add", {{"a", 2}, {"b", 40}});
+            tools::Registry tr;
+            auto n = live.RegisterTools(tr);
+            live.Stop();
+            const bool echo_ok = echo.value("content", "") == "js-echo:node";
+            const bool add_ok = add.value("sum", 0.0) == 42.0 || add.value("content", "") == "42";
+            if (!echo_ok || !add_ok || n < 2) {
+                std::cerr << "FAIL js host node " << echo.dump() << " " << add.dump()
+                          << " n=" << n << "\n";
+                ++failures;
+            } else
+                std::cerr << "PASS js plugin host node bridge\n";
+        } else {
+            std::cerr << "PASS js plugin host skip-no-bridge\n";
+        }
+    }
+
     // whatsapp / imessage inbound
     {
         auto hub = channels::AdapterHub::MakeDefault();
@@ -1184,6 +1226,11 @@ int CmdGateway(int argc, char** argv, int argi) {
     auto skills = LoadSkills();
     plugins::Registry plugins;
     plugins.Scan(RepoRoot() / "plugins");
+    plugins::JsHost js_host;
+    // Auto-start JS bridge (Node) or mock when FORCE_MOCK / no node
+    js_host.Start(RepoRoot() / "plugins");
+    const auto js_tools_n = js_host.RegisterTools(tools);
+    (void)js_tools_n;
     {
         int pn = plugins.LoadNatives();
         if (pn) std::cerr << "[gateway] native plugins loaded: " << pn << "\n";
@@ -1258,6 +1305,7 @@ int CmdGateway(int argc, char** argv, int argi) {
         .acp = &acp_reg,
         .tts = &tts_engine,
         .sim = &sim_backend,
+        .js_host = &js_host,
         .mcp_client = mcp_client,
         .config = cfg,
         .auth = auth::FromEnv(),

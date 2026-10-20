@@ -30,6 +30,7 @@ void Registry::Scan(const fs::path& root) {
                 p.name = j.value("name", p.name);
                 p.enabled = j.value("enabled", false);
                 p.native_lib = j.value("native", "");
+                p.js_entry = j.value("js", j.value("main", ""));
                 p.abi = j.value("abi", 0);
             } catch (...) {
             }
@@ -54,6 +55,7 @@ bool Registry::SetEnabled(const std::string& id, bool enabled) {
         j["name"] = p.name;
         j["enabled"] = enabled;
         if (!p.native_lib.empty()) j["native"] = p.native_lib;
+        if (!p.js_entry.empty()) j["js"] = p.js_entry;
         if (p.abi) j["abi"] = p.abi;
         std::ofstream out(manifest);
         out << j.dump(2) << '\n';
@@ -136,6 +138,7 @@ nlohmann::json Registry::ListJson() const {
                        {"enabled", p.enabled},
                        {"path", p.path.string()},
                        {"native", p.native_lib},
+                       {"js", p.js_entry},
                        {"native_loaded", p.native_loaded},
                        {"abi", p.abi}});
     }

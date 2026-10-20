@@ -21,6 +21,7 @@
 #include "openclaw/nodes/registry.hpp"
 #include "openclaw/persist/store.hpp"
 #include "openclaw/plugins/registry.hpp"
+#include "openclaw/plugins/js_host.hpp"
 #include "openclaw/provider/deepseek.hpp"
 #include "openclaw/provider/provider.hpp"
 #include "openclaw/provider/router.hpp"
@@ -67,6 +68,7 @@ struct ServerDeps {
     acp::Registry* acp = nullptr;
     voice::TtsEngine* tts = nullptr;
     sim::SimulationBackend* sim = nullptr;
+    plugins::JsHost* js_host = nullptr;
     std::shared_ptr<mcp::Client> mcp_client;
     config::Snapshot config;
     auth::AuthConfig auth;

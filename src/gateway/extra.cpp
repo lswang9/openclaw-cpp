@@ -270,6 +270,40 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             r.payload = Real(deps.plugins.InvokeNative(id, m, p));
             return r;
         }
+        if (method == "plugins.js.status" || method == "plugins.js.start" ||
+            method == "plugins.js.call" || method == "plugins.js.list_tools") {
+            if (!deps.js_host) {
+                r.ok = false;
+                r.error = "js_host not attached";
+                return r;
+            }
+            if (method == "plugins.js.status") {
+                r.payload = Real(deps.js_host->Status());
+                return r;
+            }
+            if (method == "plugins.js.start") {
+                auto root = deps.plugins.Root().empty()
+                                ? std::filesystem::path("plugins")
+                                : deps.plugins.Root();
+                deps.js_host->Start(root);
+                auto n = deps.js_host->RegisterTools(deps.tools);
+                r.payload = Real({{"started", true},
+                                  {"tools_registered", n},
+                                  {"status", deps.js_host->Status()},
+                                  {"init", deps.js_host->Status().value("init", nlohmann::json::object())}});
+                return r;
+            }
+            if (method == "plugins.js.list_tools") {
+                r.payload = Real(deps.js_host->ListTools());
+                return r;
+            }
+            if (method == "plugins.js.call") {
+                auto name = params.value("name", params.value("tool", ""));
+                auto args = params.value("arguments", params.value("args", nlohmann::json::object()));
+                r.payload = Real(deps.js_host->CallTool(name, args));
+                return r;
+            }
+        }
         r.payload = Real({{"plugins", deps.plugins.ListJson()}, {"method", method}});
         return r;
     }
