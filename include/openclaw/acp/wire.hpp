@@ -1,7 +1,13 @@
 #pragma once
 
+#include "openclaw/agent/loop.hpp"
+#include "openclaw/agent/types.hpp"
+#include "openclaw/provider/provider.hpp"
+#include "openclaw/tools/registry.hpp"
+
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -11,12 +17,10 @@
 namespace openclaw::acp {
 
 // Agent-side ACP JSON-RPC (subset of Agent Client Protocol v2).
-// Transport-agnostic: Handle() processes one request object and returns a response.
-// Notifications produced while handling (e.g. session/update) are queued for the peer.
+// session/prompt runs openclaw::agent::RunAgentLoop (default: mock provider).
 //
-// Implemented: initialize, session/new, session/list, session/prompt, session/cancel,
-//              session/close, session/resume (thin), ping.
-// Not implemented: auth/*, full MCP-in-session, rich multimodal prompt, acpx adapters.
+// Implemented: initialize, session/new|list|prompt|cancel|close|resume, ping.
+// Not implemented: auth/*, multimodal, session MCP, acpx adapters, channel-bound ACP.
 
 constexpr int kAcpProtocolVersion = 2;
 
@@ -24,25 +28,35 @@ struct WireSession {
     std::string id;
     std::string cwd;
     std::string status;  // idle | running
-    std::vector<nlohmann::json> messages;  // {role, text, messageId}
+    std::vector<nlohmann::json> messages;  // ACP wire log {role, text, messageId}
+    std::vector<agent::Message> history;   // agent-loop conversation
+    std::shared_ptr<std::atomic<bool>> cancel = std::make_shared<std::atomic<bool>>(false);
+};
+
+struct LoopBackend {
+    std::shared_ptr<provider::Provider> provider;
+    std::shared_ptr<tools::Registry> tools;
+    agent::LoopOptions opts;
+    std::string provider_name = "mock";
 };
 
 class AgentEndpoint {
 public:
     explicit AgentEndpoint(std::string agent_name = "openclaw-cpp",
-                           std::string agent_version = "1.7.0-dev");
+                           std::string agent_version = "1.8.0-dev");
 
-    // Process one JSON-RPC request; returns response object (always has jsonrpc).
+    // Inject provider/tools (e.g. mock for tests, DeepSeek when configured).
+    // If unset, EnsureDefaultBackend() installs MockProvider + empty tools.
+    void SetLoopBackend(LoopBackend backend);
+    const LoopBackend& GetLoopBackend() const { return backend_; }
+
     nlohmann::json Handle(const nlohmann::json& request);
-
-    // Drain notifications generated since last drain (session/update, …).
     std::vector<nlohmann::json> DrainNotifications();
 
     nlohmann::json StatusJson() const;
     nlohmann::json ListSessionsJson() const;
     bool Initialized() const { return initialized_; }
 
-    // For gateway / Registry bridge: create or prompt without full JSON-RPC envelope.
     nlohmann::json NewSession(const nlohmann::json& params);
     nlohmann::json Prompt(const std::string& session_id, const nlohmann::json& prompt_blocks);
 
@@ -57,6 +71,13 @@ private:
     std::vector<nlohmann::json> pending_notifications_;
     int sess_seq_ = 1;
     int msg_seq_ = 1;
+    LoopBackend backend_;
+    bool backend_ready_ = false;
+
+    void EnsureDefaultBackend();
+    // Runs loop; unlocks `lock` while looping so session/cancel can proceed.
+    nlohmann::json RunPromptTurn(std::unique_lock<std::mutex>& lock, WireSession& session,
+                                 const std::string& text, const std::string& user_mid);
 
     nlohmann::json Ok(const nlohmann::json& id, nlohmann::json result);
     nlohmann::json Err(const nlohmann::json& id, int code, const std::string& message,
@@ -66,7 +87,6 @@ private:
     static std::string PromptText(const nlohmann::json& prompt_blocks);
 };
 
-// Client-side helper over newline (or any) line transport.
 using WriteLineFn = std::function<void(const std::string&)>;
 using ReadLineFn = std::function<std::string()>;
 
@@ -80,9 +100,9 @@ public:
                               const nlohmann::json& mcp_servers = nlohmann::json::array());
     nlohmann::json SessionList();
     nlohmann::json SessionPrompt(const std::string& session_id, const std::string& text);
+    nlohmann::json SessionCancel(const std::string& session_id);
     nlohmann::json SessionClose(const std::string& session_id);
 
-    // In-process: pair with AgentEndpoint (no threads).
     static std::pair<std::shared_ptr<Client>, std::shared_ptr<AgentEndpoint>> MakeInProcessPair();
 
     const std::vector<nlohmann::json>& LastNotifications() const { return last_notifications_; }

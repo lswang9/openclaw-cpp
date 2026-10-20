@@ -85,7 +85,7 @@ nlohmann::json Registry::AgentsListJson() const {
          {"protocolVersion", kAcpProtocolVersion},
          {"transport", nlohmann::json::array({"in-process", "stdio"})},
          {"impl", "real"},
-         {"note", "built-in subset agent — not Claude Code / Codex acpx"}},
+         {"note", "built-in agent — session/prompt → RunAgentLoop (default mock); not acpx"}},
     });
 }
 

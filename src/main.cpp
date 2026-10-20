@@ -60,7 +60,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.7.0-dev";
+constexpr const char* kVersion = "1.8.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -436,7 +436,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.7.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.8.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -508,16 +508,76 @@ int CmdSelfTest() {
             } else {
                 auto sid = created["result"].value("sessionId", "");
                 auto prompted = cli->SessionPrompt(sid, "analyze hello");
+                std::string agent_text;
                 bool has_agent_note = false;
                 for (const auto& n : cli->LastNotifications()) {
-                    if (n.value("method", "") == "session/update") has_agent_note = true;
+                    if (n.value("method", "") != "session/update") continue;
+                    has_agent_note = true;
+                    auto upd = n.value("params", nlohmann::json::object()).value("update", nlohmann::json::object());
+                    if (upd.value("sessionUpdate", "") == "agent_message") {
+                        auto content = upd.value("content", nlohmann::json::array());
+                        if (!content.empty() && content[0].contains("text"))
+                            agent_text = content[0].value("text", "");
+                    }
                 }
                 auto listed = cli->SessionList();
+                // MockProvider empty script → "mock-default" via AgentLoop
                 if (prompted.contains("error") || !prompted.contains("result") ||
                     !prompted["result"].contains("messageId") || !has_agent_note ||
-                    listed.contains("error")) {
-                    std::cerr << "FAIL acp prompt/list " << prompted.dump() << "\n"; ++failures;
-                } else std::cerr << "PASS acp initialize/session/prompt (in-process)\n";
+                    agent_text != "mock-default" || listed.contains("error")) {
+                    std::cerr << "FAIL acp prompt/loop text='" << agent_text << "' "
+                              << prompted.dump() << "\n";
+                    ++failures;
+                } else std::cerr << "PASS acp session/prompt → AgentLoop (mock)\n";
+
+                // cancel path: delay before loop; cancel on AgentEndpoint from another thread
+                setenv("OPENCLAW_ACP_TURN_DELAY_MS", "300", 1);
+                {
+                    acp::LoopBackend b;
+                    b.provider = std::make_shared<provider::MockProvider>();
+                    b.tools = std::make_shared<tools::Registry>();
+                    b.opts.max_turns = 2;
+                    b.provider_name = "mock";
+                    agent->SetLoopBackend(std::move(b));
+                    auto init = agent->Handle({{"jsonrpc","2.0"},{"id",10},{"method","initialize"},
+                        {"params",{{"protocolVersion",2},{"capabilities",nlohmann::json::object()},
+                                   {"info",{{"name","t"},{"version","0"}}}}}});
+                    auto ns = agent->Handle({{"jsonrpc","2.0"},{"id",11},{"method","session/new"},
+                                             {"params",{{"cwd","/tmp"},{"mcpServers",nlohmann::json::array()}}}});
+                    auto sid2 = ns["result"].value("sessionId", "");
+                    nlohmann::json prompt_resp;
+                    std::thread th([&] {
+                        prompt_resp = agent->Handle(
+                            {{"jsonrpc","2.0"},{"id",12},{"method","session/prompt"},
+                             {"params",{{"sessionId",sid2},
+                                        {"prompt",nlohmann::json::array({{{"type","text"},{"text","slow"}}})}}}});
+                    });
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                    auto canc = agent->Handle({{"jsonrpc","2.0"},{"id",13},{"method","session/cancel"},
+                                               {"params",{{"sessionId",sid2}}}});
+                    th.join();
+                    unsetenv("OPENCLAW_ACP_TURN_DELAY_MS");
+                    auto notes = agent->DrainNotifications();
+                    bool saw = false;
+                    for (const auto& n : notes) {
+                        auto upd = n.value("params", nlohmann::json::object())
+                                       .value("update", nlohmann::json::object());
+                        auto meta = upd.value("_meta", nlohmann::json::object());
+                        if (meta.value("cancelled", false) || meta.value("cancel_requested", false)) saw = true;
+                        if (upd.value("sessionUpdate", "") == "agent_message") {
+                            auto content = upd.value("content", nlohmann::json::array());
+                            if (!content.empty() && content[0].value("text", "") == "[cancelled]") saw = true;
+                        }
+                    }
+                    auto meta = prompt_resp.value("result", nlohmann::json::object())
+                                    .value("_meta", nlohmann::json::object())
+                                    .value("openclawCpp", nlohmann::json::object());
+                    if (!canc.contains("result") || (!saw && !meta.value("cancelled", false))) {
+                        std::cerr << "FAIL acp cancel canc=" << canc.dump()
+                                  << " prompt=" << prompt_resp.dump() << "\n";
+                        ++failures;
+                    } else std::cerr << "PASS acp session/cancel → loop cancel\n";
+                }
                 (void)cli->SessionClose(sid);
             }
         }
