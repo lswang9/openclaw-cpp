@@ -55,16 +55,19 @@ Chosen at approve time (`pairing.link.approve {id, role}` or the selector in `/p
 Forbidden RPCs return `{"ok":false,"error":"forbidden: <role> role cannot call …","code":403}`. Applies to HTTP `/v1/rpc` and WS frames.
 Tokens issued before 1.24 (no stored role) are treated as `device`. `GET /v1/whoami` reports the caller role.
 
-## Control UI login (1.24)
+## Control UI login (1.24, hardened 1.25)
 
-- `/login` (public): paste gateway or `ocd_` token → `POST /login` validates and sets cookie `oc_token` (**HttpOnly; SameSite=Strict**, 30 days). `POST /logout` clears it.
+- `/login` (public): paste gateway or `ocd_` token → `POST /login` validates and creates a **server-side session**. Cookies: `oc_session=ocs_…` (random id, **HttpOnly; SameSite=Strict**, 30 days, `OPENCLAW_SESSION_TTL_SEC`) and `oc_csrf` (readable by JS). The raw token is never put in a cookie; the store keeps only SHA-256(session id) and SHA-256(credential).
+- Session role is re-derived on every request: revoking the `ocd_` token or rotating `OPENCLAW_GATEWAY_TOKEN` ends the session. `POST /logout` deletes it server-side. The 1.24 `oc_token` raw cookie is no longer accepted (cleared on login).
+- **CSRF**: any non-GET request authenticated *only* by the session cookie must send `X-CSRF-Token` equal to the session's token (double-submit, checked server-side against the stored value) → else 403. UI pages get a small injected `fetch` wrapper that adds the header. Bearer / `X-OpenClaw-Token` requests are not CSRF-checked.
+- **WS**: cookie-authenticated WebSocket upgrades require `Origin` matching `Host` (anti cross-site WS hijacking). Role checks apply to every WS RPC frame (smoke covers device/operator over WS).
 - With auth on, `/`, `/board`, `/canvas`, `/pairing` redirect (302) to `/login?next=…` when unauthenticated; with the cookie they load and their same-origin `/v1/rpc` calls authenticate via the cookie.
 
 ## Gaps
 
 - Roles are a fixed denylist (two roles), not fine-grained scopes; non-RPC HTTP endpoints besides `/v1/config` are not role-filtered
-- Cookie auth relies on SameSite=Strict for CSRF protection (no CSRF token); cookie holds the raw token
-- WS role enforcement is implemented but only HTTP paths are covered by smoke
+- Claim rate limit is per client IP (`OPENCLAW_PAIR_CLAIM_MAX_PER_MIN`, 60s window) persisted in `device_links.json`; IP is the TCP peer (no `X-Forwarded-For` trust, so behind a reverse proxy all clients share one bucket); single-process file store, no cross-instance sharing
+- No session listing/admin UI, no idle timeout (absolute TTL only), no MFA/OIDC
 - Rate limit is in-process (resets on restart), global not per-IP
 - No QR, push approval, cross-instance sync, or upstream cloud device-link
 - Control UI pages (`/pairing`, `/board`…) load without a header-capable login when auth is on

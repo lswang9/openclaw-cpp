@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace openclaw::auth {
 
@@ -28,6 +29,17 @@ public:
     // "" if not a valid, non-revoked device token; else its role.
     std::string TokenRole(const std::string& token) const;
     static bool ValidRole(const std::string& role) { return role == "device" || role == "operator"; }
+    // Browser sessions (1.25): cookie carries a random session id; only SHA-256(sid) + SHA-256(token) persisted.
+    // Session role is re-derived from the backing credential on every request (revocation ends the session).
+    struct SessionInfo { std::string role; std::string csrf; };
+    // Returns {sid, csrf}; credential_sha256 = SHA-256 of the gateway token or ocd_ token used at login.
+    std::pair<std::string, std::string> CreateSession(const std::string& credential_sha256, bool is_gateway_token);
+    // gateway_token_sha256: current gateway token hash ("" if none). Empty role = invalid/expired/revoked.
+    SessionInfo SessionLookup(const std::string& sid, const std::string& gateway_token_sha256);
+    void DeleteSession(const std::string& sid);
+    // Per-IP claim rate limiting (persisted). Set by the gateway per connection thread.
+    static void SetThreadClientIp(const std::string& ip);
+    static std::string ThreadClientIp();
     nlohmann::json Revoke(const std::string& id_or_token_id);
     std::filesystem::path Path() const { return path_; }
     static std::string Sha256Hex(const std::string& s);
@@ -38,7 +50,6 @@ private:
     nlohmann::json* FindLink(const std::string& id_or_code);
     void ExpireLocked();
     bool ClaimRateLimitedLocked(std::int64_t now);
-    std::vector<std::int64_t> claim_times_;
     mutable std::mutex mu_;
     std::filesystem::path path_;
     nlohmann::json data_;

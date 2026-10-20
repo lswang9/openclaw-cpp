@@ -35,7 +35,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.24.0-dev";
+constexpr const char* kVersion = "1.25.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -277,6 +277,8 @@ void Server::Run() {
         socklen_t plen = sizeof(peer);
         int client = accept(listen_fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
         if (client < 0) { if (!running_.load()) break; continue; }
+        { char ipbuf[INET_ADDRSTRLEN] = {0}; inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf));
+          auth::DeviceLinkStore::SetThreadClientIp(ipbuf); }
         bool should_close = true;
         try { should_close = HandleClient(client); } catch (const std::exception& e) {
             if (opts_.verbose) std::cerr << "[gateway] " << e.what() << '\n';
@@ -500,6 +502,21 @@ namespace {
 // admin = gateway token / auth off / in-process; operator|device = ocd_ device token role.
 thread_local std::string g_rpc_role = "admin";
 thread_local bool g_rpc_role_pending_device = false;
+// Set by AuthRole: true when the only valid credential was the oc_session cookie (CSRF check required).
+thread_local bool g_auth_via_cookie = false;
+thread_local std::string g_session_csrf;
+
+// Inject a fetch() wrapper that sends the double-submit CSRF header (from the non-HttpOnly oc_csrf cookie).
+std::string WithCsrfShim(const std::string& html) {
+    static const std::string shim =
+        "<script>(function(){var f=window.fetch;window.fetch=function(u,o){o=o||{};var m=(o.method||'GET').toUpperCase();"
+        "if(m!=='GET'&&m!=='HEAD'){var c=(document.cookie.match(/(?:^|; )oc_csrf=([^;]*)/)||[])[1];"
+        "if(c){var h=new Headers(o.headers||{});h.set('X-CSRF-Token',decodeURIComponent(c));o.headers=h;}}"
+        "return f.call(this,u,o);};})();</script>";
+    auto pos = html.find("<head>");
+    if (pos == std::string::npos) return shim + html;
+    return html.substr(0, pos + 6) + shim + html.substr(pos + 6);
+}
 
 std::string CookieValue(const std::string& req, const std::string& name) {
     auto cookies = HeaderValue(req, "Cookie");
@@ -548,16 +565,23 @@ bool OperatorRoleForbidden(const std::string& m) {
 }  // namespace
 
 std::string Server::AuthRole(const std::string& req) const {
+    g_auth_via_cookie = false;
+    g_session_csrf.clear();
     if (!deps_.auth.require_auth) return "admin";
     const auto authz = HeaderValue(req, "Authorization");
     const auto xtok = HeaderValue(req, "X-OpenClaw-Token");
-    const auto ctok = CookieValue(req, "oc_token");
     if (!auth::CheckHttpAuth(deps_.auth, authz, xtok)) return "admin";
-    if (!deps_.auth.gateway_token.empty() && ctok == deps_.auth.gateway_token) return "admin";
     if (deps_.device_links) {
-        for (const auto& tok : {BearerOf(authz), xtok, ctok}) {
+        for (const auto& tok : {BearerOf(authz), xtok}) {
             auto role = deps_.device_links->TokenRole(tok);
             if (!role.empty()) return role;
+        }
+        const auto sid = CookieValue(req, "oc_session");
+        if (!sid.empty()) {
+            const auto gw_sha = deps_.auth.gateway_token.empty()
+                ? std::string() : auth::DeviceLinkStore::Sha256Hex(deps_.auth.gateway_token);
+            auto s = deps_.device_links->SessionLookup(sid, gw_sha);
+            if (!s.role.empty()) { g_auth_via_cookie = true; g_session_csrf = s.csrf; return s.role; }
         }
     }
     return {};
@@ -613,6 +637,11 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", *deny}}.dump()));
             return;
         }
+        if (method != "GET" && method != "HEAD" && method != "OPTIONS" && g_auth_via_cookie &&
+            (g_session_csrf.empty() || HeaderValue(req, "X-CSRF-Token") != g_session_csrf)) {
+            send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", "csrf: missing or bad X-CSRF-Token"}}.dump()));
+            return;
+        }
     }
 
     if (method == "GET" && (path == "/health" || path == "/healthz")) {
@@ -623,39 +652,57 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         static const std::string kUi =
 #include "control_ui_html.inc"
         ;
-        send(HttpResponse(200, "OK", kUi, "text/html; charset=utf-8"));
+        send(HttpResponse(200, "OK", WithCsrfShim(kUi), "text/html; charset=utf-8"));
         return;
     }
     if (method == "GET" && (path == "/board" || path == "/ui/board")) {
         static const std::string kBoard =
 #include "board_ui_html.inc"
         ;
-        send(HttpResponse(200, "OK", kBoard, "text/html; charset=utf-8"));
+        send(HttpResponse(200, "OK", WithCsrfShim(kBoard), "text/html; charset=utf-8"));
         return;
     }
     if (method == "POST" && path == "/login") {
         std::string tok;
         try { tok = nlohmann::json::parse(BodyOf(req)).value("token", std::string()); } catch (...) {}
-        auto role = deps_.auth.require_auth ? AuthRole("GET / HTTP/1.1\r\nAuthorization: Bearer " + tok + "\r\n\r\n")
-                                            : std::string("admin");
-        if (tok.empty() || role.empty() || tok.find_first_of(";\r\n ") != std::string::npos) {
+        if (!deps_.auth.require_auth) {
+            send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"role", "admin"}, {"auth_required", false}}.dump()));
+            return;
+        }
+        auto role = AuthRole("GET / HTTP/1.1\r\nAuthorization: Bearer " + tok + "\r\n\r\n");
+        if (tok.empty() || role.empty() || !deps_.device_links) {
             send(HttpResponse(401, "Unauthorized", nlohmann::json{{"ok", false}, {"error", "invalid token"}}.dump()));
             return;
         }
-        send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"role", role}}.dump(), "application/json",
-                          "Set-Cookie: oc_token=" + tok + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000\r\n"));
+        const bool is_gw = !deps_.auth.gateway_token.empty() && tok == deps_.auth.gateway_token;
+        auto [sid, csrf] = deps_.device_links->CreateSession(auth::DeviceLinkStore::Sha256Hex(tok), is_gw);
+        send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"role", role}, {"csrf", csrf}}.dump(),
+                          "application/json",
+                          "Set-Cookie: oc_session=" + sid + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000\r\n"
+                          "Set-Cookie: oc_csrf=" + csrf + "; Path=/; SameSite=Strict; Max-Age=2592000\r\n"
+                          "Set-Cookie: oc_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0\r\n"));
         return;
     }
     if (method == "POST" && path == "/logout") {
+        const auto sid = CookieValue(req, "oc_session");
+        if (!sid.empty() && deps_.device_links) {
+            auto role = AuthRole(req);
+            if (!role.empty() && g_auth_via_cookie && HeaderValue(req, "X-CSRF-Token") != g_session_csrf) {
+                send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", "csrf: missing or bad X-CSRF-Token"}}.dump()));
+                return;
+            }
+            deps_.device_links->DeleteSession(sid);
+        }
         send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}}.dump(), "application/json",
-                          "Set-Cookie: oc_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0\r\n"));
+                          "Set-Cookie: oc_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0\r\n"
+                          "Set-Cookie: oc_csrf=; Path=/; SameSite=Strict; Max-Age=0\r\n"));
         return;
     }
     if (method == "GET" && (path == "/login" || path == "/ui/login")) {
         static const std::string kLogin =
 #include "login_ui_html.inc"
         ;
-        send(HttpResponse(200, "OK", kLogin, "text/html; charset=utf-8"));
+        send(HttpResponse(200, "OK", WithCsrfShim(kLogin), "text/html; charset=utf-8"));
         return;
     }
     if (method == "GET" && path == "/v1/whoami") {
@@ -666,14 +713,14 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         static const std::string kPairing =
 #include "pairing_ui_html.inc"
         ;
-        send(HttpResponse(200, "OK", kPairing, "text/html; charset=utf-8"));
+        send(HttpResponse(200, "OK", WithCsrfShim(kPairing), "text/html; charset=utf-8"));
         return;
     }
     if (method == "GET" && (path == "/canvas" || path == "/ui/canvas")) {
         static const std::string kCanvas =
 #include "canvas_ui_html.inc"
         ;
-        send(HttpResponse(200, "OK", kCanvas, "text/html; charset=utf-8"));
+        send(HttpResponse(200, "OK", WithCsrfShim(kCanvas), "text/html; charset=utf-8"));
         return;
     }
     if (method == "GET" && path == "/v1/status") {
@@ -1612,6 +1659,13 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
 void Server::HandleWebSocket(int client_fd, const std::string& req) {
     // Optional auth on WS via header
     auto deny = GatewayAuthDeny(req);
+    if (!deny && g_auth_via_cookie) {
+        // Cookie-authenticated WS: reject cross-site upgrades (CSWSH) by checking Origin against Host.
+        const auto origin = HeaderValue(req, "Origin");
+        const auto host = HeaderValue(req, "Host");
+        if (origin.empty() || (origin != "http://" + host && origin != "https://" + host))
+            deny = std::string("forbidden: cookie-authenticated WebSocket requires same-origin Origin");
+    }
     if (deny) {
         auto resp = HttpResponse(401, "Unauthorized", nlohmann::json{{"error", *deny}}.dump());
         (void)::send(client_fd, resp.data(), resp.size(), 0);

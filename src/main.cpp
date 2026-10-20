@@ -70,7 +70,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.24.0-dev";
+constexpr const char* kVersion = "1.25.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1176,6 +1176,45 @@ int CmdSelfTest() {
         else std::cerr << "PASS device token roles (operator/device, persisted, invalid role rejected)\n";
     } catch (const std::exception& e) {
         std::cerr << "FAIL device roles exception: " << e.what() << "\n"; ++failures;
+    }
+
+    // browser sessions (sid hashed, role re-derived, revocation ends session) + per-IP persisted claim limit
+    try {
+        auto path = std::filesystem::temp_directory_path() / "oc-devlink-sess" / "device_links.json";
+        std::filesystem::remove_all(path.parent_path());
+        auth::DeviceLinkStore dl(path);
+        auto a = dl.Start({{"device_name", "op"}});
+        dl.Approve(a["link"].value("id", ""), "operator");
+        auto ta = dl.Claim(a["link"].value("id", ""), a.value("poll_secret", ""));
+        const auto tok = ta.value("token", "");
+        auto [sid, csrf] = dl.CreateSession(auth::DeviceLinkStore::Sha256Hex(tok), false);
+        auto [gsid, gcsrf] = dl.CreateSession(auth::DeviceLinkStore::Sha256Hex("gw"), true);
+        std::ifstream raw(path); std::string disk((std::istreambuf_iterator<char>(raw)), {});
+        auth::DeviceLinkStore dl2(path);
+        bool ok = disk.find(sid) == std::string::npos && disk.find(tok) == std::string::npos &&
+                  dl2.SessionLookup(sid, "").role == "operator" && dl2.SessionLookup(sid, "").csrf == csrf &&
+                  dl2.SessionLookup(gsid, auth::DeviceLinkStore::Sha256Hex("gw")).role == "admin" &&
+                  dl2.SessionLookup(gsid, auth::DeviceLinkStore::Sha256Hex("rotated")).role.empty() &&
+                  dl2.SessionLookup("ocs_bogus", "").role.empty();
+        dl2.Revoke(ta.value("token_id", ""));
+        ok = ok && dl2.SessionLookup(sid, "").role.empty();
+        dl2.DeleteSession(gsid);
+        ok = ok && dl2.SessionLookup(gsid, auth::DeviceLinkStore::Sha256Hex("gw")).role.empty();
+        // per-IP limit, persisted across reload
+        ::setenv("OPENCLAW_PAIR_CLAIM_MAX_PER_MIN", "2", 1);
+        auth::DeviceLinkStore::SetThreadClientIp("10.0.0.1");
+        dl2.Claim("x", "y"); dl2.Claim("x", "y");
+        auth::DeviceLinkStore dl3(path);
+        bool limited = dl3.Claim("x", "y").value("rate_limited", false);
+        auth::DeviceLinkStore::SetThreadClientIp("10.0.0.2");
+        bool other = !dl3.Claim("x", "y").value("rate_limited", false);
+        auth::DeviceLinkStore::SetThreadClientIp("");
+        ::unsetenv("OPENCLAW_PAIR_CLAIM_MAX_PER_MIN");
+        ok = ok && limited && other;
+        if (!ok) { std::cerr << "FAIL sessions/per-ip limited=" << limited << " other=" << other << "\n"; ++failures; }
+        else std::cerr << "PASS browser sessions (hashed sid, role re-derived, revoke ends) + per-IP persisted claim limit\n";
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL sessions exception: " << e.what() << "\n"; ++failures;
     }
 
     // canvas disk store + sim bridge

@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.24.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.25.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 构建
 
@@ -57,7 +57,7 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 - Health / Status、sessions / tools 列表
 - Chat（可勾选 SSE）；**Invoke** 工具；**Export** 会话
 - **Board**（`/board`）：本地 JSON 看板 CRUD（非上游完整 board UX）。见 `docs/BOARD.md`
-- **Pairing**（`/pairing`）：设备配对码 → 批准/拒绝 → 一次性 token（磁盘仅存 SHA-256；token 可作网关 HTTP/WS 鉴权，撤销即 401；claim 限流+错误锁定；批准时选择角色 operator/device（device 不能管理配对/secrets/config）；`/login` 设置 HttpOnly cookie，开启鉴权后 UI 页面可用）。见 `docs/PAIRING.md`
+- **Pairing**（`/pairing`）：设备配对码 → 批准/拒绝 → 一次性 token（磁盘仅存 SHA-256；token 可作网关 HTTP/WS 鉴权，撤销即 401；claim 限流+错误锁定；批准时选择角色 operator/device（device 不能管理配对/secrets/config）；`/login` 创建服务端会话（cookie 仅存会话 ID，吊销 token 即失效），cookie POST 需 CSRF token，WS 角色检查已有冒烟测试，claim 限流按 IP 持久化）。见 `docs/PAIRING.md`
 - **Canvas**（`/canvas`）：本地 HTML/JSON 画布 + 事件日志（非上游 A2UI）。见 `docs/CANVAS.md`
 - **不是**上游完整 Control UI（无完整 GitHub/PR 面板等）
 

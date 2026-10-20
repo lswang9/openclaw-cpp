@@ -72,6 +72,8 @@ void DeviceLinkStore::Load() {
         if (j.is_object()) {
             if (j.contains("links") && j["links"].is_array()) data_["links"] = j["links"];
             if (j.contains("tokens") && j["tokens"].is_array()) data_["tokens"] = j["tokens"];
+            if (j.contains("sessions") && j["sessions"].is_array()) data_["sessions"] = j["sessions"];
+            if (j.contains("claim_rate") && j["claim_rate"].is_object()) data_["claim_rate"] = j["claim_rate"];
         }
     } catch (...) {}
 }
@@ -163,14 +165,76 @@ nlohmann::json DeviceLinkStore::Deny(const std::string& k) {
     return {{"ok", true}, {"impl", "real"}, {"link", Public(*l)}};
 }
 
+namespace { thread_local std::string g_client_ip; }
+void DeviceLinkStore::SetThreadClientIp(const std::string& ip) { g_client_ip = ip; }
+std::string DeviceLinkStore::ThreadClientIp() { return g_client_ip; }
+
+// Sliding 60s window per client IP, persisted in the store (survives restart).
 bool DeviceLinkStore::ClaimRateLimitedLocked(std::int64_t now) {
     const int max_per_min = EnvInt("OPENCLAW_PAIR_CLAIM_MAX_PER_MIN", 30);
-    claim_times_.erase(std::remove_if(claim_times_.begin(), claim_times_.end(),
-                                      [&](std::int64_t t0) { return now - t0 > 60000; }),
-                       claim_times_.end());
-    if (static_cast<int>(claim_times_.size()) >= max_per_min) return true;
-    claim_times_.push_back(now);
+    const std::string ip = g_client_ip.empty() ? std::string("local") : g_client_ip;
+    if (!data_.contains("claim_rate") || !data_["claim_rate"].is_object()) data_["claim_rate"] = nlohmann::json::object();
+    auto& rate = data_["claim_rate"];
+    for (auto it = rate.begin(); it != rate.end();) {  // prune all IPs
+        nlohmann::json kept = nlohmann::json::array();
+        if (it.value().is_array())
+            for (auto& t0 : it.value()) if (t0.is_number() && now - t0.get<std::int64_t>() <= 60000) kept.push_back(t0);
+        if (kept.empty() && it.key() != ip) it = rate.erase(it); else { it.value() = kept; ++it; }
+    }
+    auto& mine = rate[ip];
+    if (!mine.is_array()) mine = nlohmann::json::array();
+    if (static_cast<int>(mine.size()) >= max_per_min) return true;
+    mine.push_back(now);
+    Save();
     return false;
+}
+
+std::pair<std::string, std::string> DeviceLinkStore::CreateSession(const std::string& cred_sha, bool is_gw) {
+    std::lock_guard lock(mu_);
+    auto sid = "ocs_" + RandHex(24);
+    auto csrf = RandHex(16);
+    if (!data_.contains("sessions") || !data_["sessions"].is_array()) data_["sessions"] = nlohmann::json::array();
+    const auto now = NowMs();
+    auto& ss = data_["sessions"];
+    ss.erase(std::remove_if(ss.begin(), ss.end(), [&](const nlohmann::json& s) {
+        return s.value("expires_ms", (std::int64_t)0) < now; }), ss.end());
+    ss.push_back({{"sid_sha256", Sha256Hex(sid)}, {"csrf", csrf}, {"cred_sha256", cred_sha},
+                  {"gateway", is_gw}, {"created_ms", now},
+                  {"expires_ms", now + (std::int64_t)EnvInt("OPENCLAW_SESSION_TTL_SEC", 2592000) * 1000}});
+    Save();
+    return {sid, csrf};
+}
+
+DeviceLinkStore::SessionInfo DeviceLinkStore::SessionLookup(const std::string& sid, const std::string& gw_sha) {
+    if (sid.rfind("ocs_", 0) != 0) return {};
+    std::lock_guard lock(mu_);
+    if (!data_.contains("sessions")) return {};
+    const auto h = Sha256Hex(sid);
+    for (auto& s : data_["sessions"]) {
+        if (S(s, "sid_sha256") != h) continue;
+        if (s.value("expires_ms", (std::int64_t)0) < NowMs()) return {};
+        const auto cred = S(s, "cred_sha256");
+        if (s.value("gateway", false)) {
+            if (!gw_sha.empty() && cred == gw_sha) return {"admin", S(s, "csrf")};
+            return {};
+        }
+        for (auto& t : data_["tokens"])
+            if (S(t, "token_sha256") == cred && !t.value("revoked", false))
+                return {t.contains("role") && t["role"].is_string() ? t["role"].get<std::string>() : "device",
+                        S(s, "csrf")};
+        return {};
+    }
+    return {};
+}
+
+void DeviceLinkStore::DeleteSession(const std::string& sid) {
+    std::lock_guard lock(mu_);
+    if (!data_.contains("sessions")) return;
+    const auto h = Sha256Hex(sid);
+    auto& ss = data_["sessions"];
+    ss.erase(std::remove_if(ss.begin(), ss.end(), [&](const nlohmann::json& s) { return S(s, "sid_sha256") == h; }),
+             ss.end());
+    Save();
 }
 
 nlohmann::json DeviceLinkStore::Claim(const std::string& id, const std::string& secret) {

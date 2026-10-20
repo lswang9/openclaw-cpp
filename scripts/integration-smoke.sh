@@ -153,11 +153,35 @@ rpcas "$OTOK" '{"method":"secrets.list","params":{}}' | grep -q 'forbidden: oper
 [[ $(code "$U2/login") == 200 ]] || fail2 "/login public"
 [[ $(code -X POST "$U2/login" -H 'Content-Type: application/json' -d '{"token":"nope"}') == 401 ]] || fail2 "bad login 401"
 CJ=$(mktemp)
-curl -sf -c "$CJ" -X POST "$U2/login" -H 'Content-Type: application/json' -d "{\"token\":\"$OTOK\"}" | grep -q operator || fail2 "login"
-grep -q oc_token "$CJ" || fail2 "cookie set"
+LOGIN=$(curl -sf -c "$CJ" -X POST "$U2/login" -H 'Content-Type: application/json' -d "{\"token\":\"$OTOK\"}")
+printf '%s' "$LOGIN" | grep -q operator || fail2 "login"
+grep -q oc_session "$CJ" || fail2 "session cookie set"
+grep -q "$OTOK" "$CJ" && fail2 "cookie must not contain raw token"
+CSRF=$(awk '$6=="oc_csrf"{print $7}' "$CJ")
+[[ -n "$CSRF" ]] || fail2 "csrf cookie"
 [[ $(code -b "$CJ" "$U2/pairing") == 200 ]] || fail2 "/pairing with cookie"
 [[ $(code -b "$CJ" "$U2/board") == 200 ]] || fail2 "/board with cookie"
+curl -sf -b "$CJ" "$U2/pairing" | grep -q 'X-CSRF-Token' || fail2 "csrf shim injected"
 curl -sf -b "$CJ" "$U2/v1/whoami" | grep -q operator || fail2 "whoami operator"
+echo "[smoke] csrf: cookie POST without/with X-CSRF-Token"
+[[ $(code -b "$CJ" -X POST "$U2/v1/rpc" -H 'Content-Type: application/json' -d '{"method":"pairing.link.list","params":{}}') == 403 ]] || fail2 "cookie POST without csrf must 403"
+[[ $(code -b "$CJ" -X POST "$U2/v1/rpc" -H 'X-CSRF-Token: wrong' -H 'Content-Type: application/json' -d '{"method":"pairing.link.list","params":{}}') == 403 ]] || fail2 "bad csrf 403"
+curl -sf -b "$CJ" -X POST "$U2/v1/rpc" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' -d '{"method":"pairing.link.list","params":{}}' | grep -q '"links"' || fail2 "cookie POST with csrf"
+echo "[smoke] ws roles: device forbidden / allowed over WebSocket; cookie WS origin check"
+python3 scripts/ws_rpc.py "$U2/ws" "$DTOK" pairing.link.list | grep -q 'forbidden: device role' || fail2 "WS device pairing.link.list must be forbidden"
+python3 scripts/ws_rpc.py "$U2/ws" "$DTOK" secrets.list | grep -q 'forbidden' || fail2 "WS device secrets forbidden"
+python3 scripts/ws_rpc.py "$U2/ws" "$DTOK" tools.list | grep -q '"ok": true' || fail2 "WS device tools.list allowed"
+python3 scripts/ws_rpc.py "$U2/ws" "$OTOK" pairing.link.list | grep -q '"ok": true' || fail2 "WS operator list allowed"
+python3 scripts/ws_rpc.py "$U2/ws" "$OTOK" secrets.list | grep -q 'forbidden: operator' || fail2 "WS operator secrets forbidden"
+SID=$(awk '$6=="oc_session"{print $7}' "$CJ")
+HOSTP=${U2#http://}
+python3 scripts/ws_rpc.py "$U2/ws" - pairing.link.list "Cookie: oc_session=$SID|Origin: http://$HOSTP" | grep -q '"ok": true' || fail2 "cookie WS same-origin"
+python3 scripts/ws_rpc.py "$U2/ws" - tools.list "Cookie: oc_session=$SID|Origin: http://evil.example" && fail2 "cookie WS cross-origin must fail"
+echo "[smoke] logout invalidates session server-side"
+[[ $(code -b "$CJ" -X POST "$U2/logout") == 403 ]] || fail2 "logout without csrf 403"
+[[ $(code -b "$CJ" -X POST -H "X-CSRF-Token: $CSRF" "$U2/logout") == 200 ]] || fail2 "logout"
+[[ $(code -b "oc_session=$SID" "$U2/v1/whoami") == 401 ]] || fail2 "session must be dead after logout"
+[[ $(code -b "oc_token=$OTOK" "$U2/v1/whoami") == 401 ]] || fail2 "legacy raw-token cookie no longer accepted"
 rm -f "$CJ"
 kill "$GW2" 2>/dev/null; wait "$GW2" 2>/dev/null || true; rm -rf "$SESS2"
 

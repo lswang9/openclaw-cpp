@@ -37,6 +37,7 @@
 - **1.22.0-dev**: Device pairing/link flow (codes, /pairing approve/deny, one-time token, sha256 on disk); docs/PAIRING.md
 - **1.23.0-dev**: ocd_ device tokens accepted by gateway HTTP+WS auth; revoke→401; claim rate limit + lockout; legacy pairing RPCs routed
 - **1.24.0-dev**: device token roles (operator/device, chosen at approve, persisted, RPC denylist); /login HttpOnly cookie; UI pages redirect when unauthenticated
+- **1.25.0-dev**: auth hardening — server-side sessions (cookie holds session id, not token; revoke ends session), CSRF token on cookie POSTs, cookie-WS Origin check, WS role smoke, per-IP persisted claim rate limit
 
 - **1.17.0-dev**: ACP multimodal prompt (image_base64/url → vision content); mock-saw-image
 
