@@ -6,6 +6,7 @@
 #include "openclaw/sim/backend.hpp"
 #include "openclaw/mcp/client.hpp"
 #include <memory>
+#include <optional>
 #include "openclaw/approvals/store.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/auth/device_link.hpp"
@@ -97,6 +98,7 @@ public:
 private:
     bool HandleClient(int client_fd);
     void HandleHttp(int client_fd, const std::string& req);
+    std::optional<std::string> GatewayAuthDeny(const std::string& req) const;
     void HandleWebSocket(int client_fd, const std::string& req);
     void HandleChatCompletions(int client_fd, const nlohmann::json& body, bool stream);
     nlohmann::json DispatchRpc(const nlohmann::json& msg);

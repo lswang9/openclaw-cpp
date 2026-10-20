@@ -35,6 +35,7 @@
 - **1.20.0-dev**: Canvas disk store + /canvas UI + create/get/patch/events; not full A2UI; docs/CANVAS.md
 - **1.21.0-dev**: ACP auth/* minimal (token/passphrase gate; auth/login; fail-closed); docs/ACP-GAP.md
 - **1.22.0-dev**: Device pairing/link flow (codes, /pairing approve/deny, one-time token, sha256 on disk); docs/PAIRING.md
+- **1.23.0-dev**: ocd_ device tokens accepted by gateway HTTP+WS auth; revoke→401; claim rate limit + lockout; legacy pairing RPCs routed
 
 - **1.17.0-dev**: ACP multimodal prompt (image_base64/url → vision content); mock-saw-image
 

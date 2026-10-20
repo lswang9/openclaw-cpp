@@ -2,7 +2,9 @@
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <mutex>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace openclaw::auth {
 
@@ -19,6 +21,9 @@ public:
     nlohmann::json Deny(const std::string& id_or_code);
     nlohmann::json Claim(const std::string& link_id, const std::string& poll_secret);
     nlohmann::json Verify(const std::string& token) const;
+    bool IsValidToken(const std::string& token) const;
+    // Extract bearer / X-OpenClaw-Token and check against issued, non-revoked device tokens.
+    bool AcceptsHeaders(const std::string& authorization, const std::string& x_token) const;
     nlohmann::json Revoke(const std::string& id_or_token_id);
     std::filesystem::path Path() const { return path_; }
     static std::string Sha256Hex(const std::string& s);
@@ -28,6 +33,8 @@ private:
     void Save() const;
     nlohmann::json* FindLink(const std::string& id_or_code);
     void ExpireLocked();
+    bool ClaimRateLimitedLocked(std::int64_t now);
+    std::vector<std::int64_t> claim_times_;
     mutable std::mutex mu_;
     std::filesystem::path path_;
     nlohmann::json data_;

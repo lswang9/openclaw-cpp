@@ -95,4 +95,36 @@ CLAIM=$(rpc "{\"method\":\"pairing.link.claim\",\"params\":{\"id\":\"$LID\",\"po
 TOK=$(printf '%s' "$CLAIM" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["token"])')
 rpc "{\"method\":\"pairing.token.verify\",\"params\":{\"token\":\"$TOK\"}}" | grep -q '"valid": *true' || { echo "[smoke] FAIL pairing verify" >&2; exit 1; }
 
+echo "[smoke] gateway auth: OPENCLAW_GATEWAY_TOKEN + ocd_ device token (HTTP + WS) + revoke"
+PORT2=$((PORT + 1))
+SESS2=$(mktemp -d)
+OPENCLAW_GATEWAY_TOKEN=smoke-gw-token OPENCLAW_SESSION_DIR="$SESS2" OPENCLAW_PIDFILE="$SESS2/pid" \
+  "$BIN" gateway --port "$PORT2" --host "$HOST" >/tmp/oc-smoke2-$$.log 2>&1 &
+GW2=$!
+for i in $(seq 1 50); do curl -sf "http://${HOST}:${PORT2}/health" >/dev/null && break; sleep 0.1; done
+U2="http://${HOST}:${PORT2}"
+code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+fail2() { echo "[smoke] FAIL $1" >&2; kill "$GW2" 2>/dev/null; rm -rf "$SESS2"; exit 1; }
+[[ $(code "$U2/v1/status") == 401 ]] || fail2 "no-token should be 401"
+[[ $(code -H 'Authorization: Bearer smoke-gw-token' "$U2/v1/status") == 200 ]] || fail2 "gw token"
+[[ $(code -H 'Authorization: Bearer ocd_bogus' "$U2/v1/status") == 401 ]] || fail2 "bogus ocd"
+S2=$(curl -sf -X POST "$U2/v1/rpc" -H 'Content-Type: application/json' -d '{"method":"pairing.link.start","params":{"device_name":"smoke2"}}') || fail2 "unauth start"
+L2=$(printf '%s' "$S2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["link"]["id"])')
+P2=$(printf '%s' "$S2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["poll_secret"])')
+[[ $(code -X POST "$U2/v1/rpc" -H 'Content-Type: application/json' -d "{\"method\":\"pairing.link.approve\",\"params\":{\"id\":\"$L2\"}}") == 401 ]] || fail2 "unauth approve must be 401"
+curl -sf -X POST "$U2/v1/rpc" -H 'Authorization: Bearer smoke-gw-token' -H 'Content-Type: application/json' \
+  -d "{\"method\":\"device.pair.approve\",\"params\":{\"id\":\"$L2\"}}" | grep -q 'pairing.link.approve' || fail2 "legacy approve route"
+C2=$(curl -sf -X POST "$U2/v1/rpc" -H 'Content-Type: application/json' -d "{\"method\":\"pairing.link.claim\",\"params\":{\"id\":\"$L2\",\"poll_secret\":\"$P2\"}}")
+T2=$(printf '%s' "$C2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["token"])')
+TID=$(printf '%s' "$C2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["token_id"])')
+[[ $(code -H "Authorization: Bearer $T2" "$U2/v1/status") == 200 ]] || fail2 "ocd token HTTP"
+[[ $(code -H "X-OpenClaw-Token: $T2" "$U2/v1/tools") == 200 ]] || fail2 "ocd token X-OpenClaw-Token"
+WS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Authorization: Bearer $T2" "$U2/ws" || true)
+[[ "$WS" == 101 ]] || fail2 "ocd token WS upgrade got $WS"
+curl -sf -X POST "$U2/v1/rpc" -H "Authorization: Bearer $T2" -H 'Content-Type: application/json' \
+  -d "{\"method\":\"pairing.token.revoke\",\"params\":{\"token_id\":\"$TID\"}}" | grep -q revoked || fail2 "revoke"
+[[ $(code -H "Authorization: Bearer $T2" "$U2/v1/status") == 401 ]] || fail2 "revoked token must be 401"
+kill "$GW2" 2>/dev/null; wait "$GW2" 2>/dev/null || true; rm -rf "$SESS2"
+
 echo "[smoke] ALL PASS"

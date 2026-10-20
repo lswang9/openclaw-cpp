@@ -35,7 +35,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.22.0-dev";
+constexpr const char* kVersion = "1.23.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -495,6 +495,16 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     return std::string("error: ") + result.error;
 }
 
+std::optional<std::string> Server::GatewayAuthDeny(const std::string& req) const {
+    const auto authz = HeaderValue(req, "Authorization");
+    const auto xtok = HeaderValue(req, "X-OpenClaw-Token");
+    auto deny = auth::CheckHttpAuth(deps_.auth, authz, xtok);
+    if (!deny) return std::nullopt;
+    // Device tokens issued via pairing.link.claim (non-revoked) are accepted alongside the gateway token.
+    if (deps_.device_links && deps_.device_links->AcceptsHeaders(authz, xtok)) return std::nullopt;
+    return deny;
+}
+
 void Server::HandleHttp(int client_fd, const std::string& req) {
     std::istringstream first(req);
     std::string method, path_raw, version;
@@ -503,10 +513,20 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
     auto send = [&](const std::string& resp) { (void)::send(client_fd, resp.data(), resp.size(), 0); };
 
     // Auth (health exempt)
-    const bool public_ok = (path == "/health" || path == "/healthz");
+    bool public_ok = (path == "/health" || path == "/healthz");
+    // Unpaired devices may start/claim/poll a link without a token (operator approval still required).
+    if (!public_ok && method == "POST" && path == "/v1/rpc") {
+        auto pos = req.find("\r\n\r\n");
+        if (pos != std::string::npos) {
+            try {
+                auto j = nlohmann::json::parse(req.substr(pos + 4));
+                auto m = j.value("method", std::string());
+                public_ok = (m == "pairing.link.start" || m == "pairing.link.claim" || m == "pairing.link.status");
+            } catch (...) {}
+        }
+    }
     if (!public_ok) {
-        auto deny = auth::CheckHttpAuth(deps_.auth, HeaderValue(req, "Authorization"),
-                                        HeaderValue(req, "X-OpenClaw-Token"));
+        auto deny = GatewayAuthDeny(req);
         if (deny) {
             send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", *deny}}.dump()));
             return;
@@ -957,18 +977,40 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         }
         return ok({{"id", cid}, {"enabled", a->Enabled()}, {"status", a->Status()}});
     }
+    // Legacy pairing RPCs: device links (link-*/codes) route to DeviceLinkStore; channel
+    // sender pairing (PairingStore) stays as-is for chat-channel approvals.
+    auto link_key = [&]() {
+        return params.value("id", params.value("code", params.value("link_id", std::string())));
+    };
     if (method == "channels.pairing.list" || method == "node.pair.list" || method == "device.pair.list") {
-        return ok({{"pairing", deps_.pairing.ListJson()}});
+        nlohmann::json out{{"pairing", deps_.pairing.ListJson()}};
+        if (deps_.device_links) out["device_links"] = deps_.device_links->List();
+        return ok(out);
     }
-    if (method == "channels.pairing.approve") {
+    if (method == "device.pair.request" && deps_.device_links) {
+        nlohmann::json p = params;
+        if (!p.contains("device_name") && params.contains("name")) p["device_name"] = params["name"];
+        auto r = deps_.device_links->Start(p);
+        r["routed"] = "pairing.link.start";
+        return ok(r);
+    }
+    if (method == "channels.pairing.approve" || method == "device.pair.approve") {
+        if (deps_.device_links) {
+            auto r = deps_.device_links->Approve(link_key());
+            if (r.value("ok", false)) { r["approved"] = true; r["routed"] = "pairing.link.approve"; return ok(r); }
+        }
         auto ap = deps_.pairing.Approve(params.value("id", ""));
         PersistAll();
-        return ok({{"approved", ap}});
+        return ok({{"approved", ap}, {"store", "channel_pairing"}});
     }
-    if (method == "channels.pairing.dismiss") {
+    if (method == "channels.pairing.dismiss" || method == "device.pair.reject" || method == "device.pair.remove") {
+        if (deps_.device_links) {
+            auto r = deps_.device_links->Deny(link_key());
+            if (r.value("ok", false)) { r["dismissed"] = true; r["removed"] = true; r["routed"] = "pairing.link.deny"; return ok(r); }
+        }
         auto di = deps_.pairing.Dismiss(params.value("id", ""));
         PersistAll();
-        return ok({{"dismissed", di}});
+        return ok({{"dismissed", di}, {"removed", di}, {"store", "channel_pairing"}});
     }
 
     // agents (in-memory via config.raw["agents_list"])
@@ -1231,17 +1273,6 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         return ok({{"agentId", aid}, {"name", name}, {"saved", true}});
     }
 
-    // device pairing deepen
-    if (method == "device.pair.approve") {
-        auto ap = deps_.pairing.Approve(params.value("id", ""));
-        PersistAll();
-        return ok({{"approved", ap}});
-    }
-    if (method == "device.pair.reject" || method == "device.pair.remove") {
-        auto rm = deps_.pairing.Dismiss(params.value("id", ""));
-        PersistAll();
-        return ok({{"removed", rm}});
-    }
 
     if (method == "logs.tail") {
         const std::size_t n = params.value("n", params.value("limit", 100));
@@ -1453,8 +1484,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
 
 void Server::HandleWebSocket(int client_fd, const std::string& req) {
     // Optional auth on WS via header
-    auto deny = auth::CheckHttpAuth(deps_.auth, HeaderValue(req, "Authorization"),
-                                    HeaderValue(req, "X-OpenClaw-Token"));
+    auto deny = GatewayAuthDeny(req);
     if (deny) {
         auto resp = HttpResponse(401, "Unauthorized", nlohmann::json{{"error", *deny}}.dump());
         (void)::send(client_fd, resp.data(), resp.size(), 0);

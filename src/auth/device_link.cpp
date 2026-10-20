@@ -1,8 +1,10 @@
 #include "openclaw/auth/device_link.hpp"
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <algorithm>
 #include <fstream>
 
 namespace openclaw::auth {
@@ -31,6 +33,10 @@ std::int64_t TtlMs() {
     const char* v = std::getenv("OPENCLAW_PAIR_TTL_SEC");
     long s = (v && *v) ? std::atol(v) : 600;
     return static_cast<std::int64_t>(s) * 1000;
+}
+int EnvInt(const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v && *v) ? std::atoi(v) : d;
 }
 std::string S(const nlohmann::json& j, const char* k) {
     return (j.contains(k) && j[k].is_string()) ? j[k].get<std::string>() : std::string();
@@ -155,12 +161,33 @@ nlohmann::json DeviceLinkStore::Deny(const std::string& k) {
     return {{"ok", true}, {"impl", "real"}, {"link", Public(*l)}};
 }
 
+bool DeviceLinkStore::ClaimRateLimitedLocked(std::int64_t now) {
+    const int max_per_min = EnvInt("OPENCLAW_PAIR_CLAIM_MAX_PER_MIN", 30);
+    claim_times_.erase(std::remove_if(claim_times_.begin(), claim_times_.end(),
+                                      [&](std::int64_t t0) { return now - t0 > 60000; }),
+                       claim_times_.end());
+    if (static_cast<int>(claim_times_.size()) >= max_per_min) return true;
+    claim_times_.push_back(now);
+    return false;
+}
+
 nlohmann::json DeviceLinkStore::Claim(const std::string& id, const std::string& secret) {
     std::lock_guard lock(mu_);
     ExpireLocked();
+    const auto now = NowMs();
+    if (ClaimRateLimitedLocked(now))
+        return {{"ok", false}, {"error", "rate limited"}, {"rate_limited", true}, {"retry_after_sec", 60}};
     auto* l = FindLink(id);
-    if (!l || secret.empty() || S(*l, "poll_secret_sha256") != Sha256Hex(secret))
-        return {{"ok", false}, {"error", "invalid link or poll_secret"}};
+    if (!l) return {{"ok", false}, {"error", "invalid link or poll_secret"}};
+    if (S(*l, "state") == "locked")
+        return {{"ok", false}, {"error", "link locked after too many bad secrets"}, {"state", "locked"}};
+    if (secret.empty() || S(*l, "poll_secret_sha256") != Sha256Hex(secret)) {
+        const int fails = l->value("failed_claims", 0) + 1;
+        (*l)["failed_claims"] = fails;
+        if (fails >= EnvInt("OPENCLAW_PAIR_MAX_BAD_SECRET", 5)) (*l)["state"] = "locked";
+        Save();
+        return {{"ok", false}, {"error", "invalid link or poll_secret"}, {"failed_claims", fails}};
+    }
     auto st = S(*l, "state");
     if (st == "pending") return {{"ok", false}, {"pending", true}, {"state", st}};
     if (st != "approved") return {{"ok", false}, {"error", "link " + st}, {"state", st}};
@@ -184,6 +211,26 @@ nlohmann::json DeviceLinkStore::Verify(const std::string& token) const {
                     {"device_name", t["device_name"]}};
     }
     return {{"ok", true}, {"valid", false}};
+}
+
+bool DeviceLinkStore::IsValidToken(const std::string& token) const {
+    if (token.rfind("ocd_", 0) != 0) return false;
+    auto v = Verify(token);
+    return v.value("valid", false);
+}
+
+bool DeviceLinkStore::AcceptsHeaders(const std::string& authorization, const std::string& x_token) const {
+    std::string bearer;
+    if (authorization.size() > 7) {
+        std::string pre = authorization.substr(0, 7);
+        for (auto& ch : pre) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (pre == "bearer ") {
+            bearer = authorization.substr(7);
+            while (!bearer.empty() && (bearer.front() == ' ' || bearer.front() == '\t')) bearer.erase(bearer.begin());
+            while (!bearer.empty() && (bearer.back() == ' ' || bearer.back() == '\r')) bearer.pop_back();
+        }
+    }
+    return IsValidToken(bearer) || IsValidToken(x_token);
 }
 
 nlohmann::json DeviceLinkStore::Revoke(const std::string& k) {

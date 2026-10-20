@@ -1564,7 +1564,9 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
                 r.payload = Real({{"pairs", pairs}});
                 return r;
             }
-            r.payload = Real({{"pairs", pairs}, {"pairing", deps.pairing.ListJson()}, {"method", method}});
+            r.payload = Real({{"pairs", pairs}, {"pairing", deps.pairing.ListJson()}, {"method", method},
+                              {"legacy", true},
+                              {"note", "legacy config-backed device.pair.* record; use pairing.link.* for token-issuing flow"}});
             return r;
         }
         if (starts("device.token") || starts("device.scopes")) {
@@ -1572,6 +1574,8 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             if (method.find("rotate") != std::string::npos || method.find("request") != std::string::npos) {
                 auto id = params.value("id", "main");
                 tok[id] = "tok-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+                // NOTE: legacy device.token.* values are config labels only and are NOT accepted by
+                // gateway auth; only ocd_ tokens from pairing.link.claim are.
                 PersistCfg(deps);
                 r.payload = Real({{"id", id}, {"token_set", true}});  // never echo secret full
                 return r;

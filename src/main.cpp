@@ -70,7 +70,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.22.0-dev";
+constexpr const char* kVersion = "1.23.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1116,6 +1116,41 @@ int CmdSelfTest() {
         } else std::cerr << "PASS device link pairing (approve/deny/claim/verify/revoke/persist)\n";
     } catch (const std::exception& e) {
         std::cerr << "FAIL device link exception: " << e.what() << "\n"; ++failures;
+    }
+
+    // device tokens accepted as gateway auth headers; claim rate limit + bad-secret lockout
+    try {
+        auto path = std::filesystem::temp_directory_path() / "oc-devlink-rl" / "device_links.json";
+        std::filesystem::remove_all(path.parent_path());
+        setenv("OPENCLAW_PAIR_MAX_BAD_SECRET", "3", 1);
+        setenv("OPENCLAW_PAIR_CLAIM_MAX_PER_MIN", "10", 1);
+        auth::DeviceLinkStore dl(path);
+        auto a = dl.Start({{"device_name", "a"}});
+        auto aid = a["link"].value("id", "");
+        dl.Approve(aid);
+        auto tok = dl.Claim(aid, a.value("poll_secret", "")).value("token", "");
+        bool hdr_ok = dl.AcceptsHeaders("Bearer " + tok, "") && dl.AcceptsHeaders("", tok) &&
+                      !dl.AcceptsHeaders("Bearer secret", "") && !dl.AcceptsHeaders("", "ocd_nope");
+        auto b = dl.Start({{"device_name", "b"}});
+        auto bid = b["link"].value("id", "");
+        for (int i = 0; i < 3; ++i) dl.Claim(bid, "bad");
+        dl.Approve(bid);  // not pending anymore (locked) → fails
+        auto locked = dl.Claim(bid, b.value("poll_secret", ""));
+        bool lock_ok = locked.value("state", "") == "locked";
+        nlohmann::json last;
+        for (int i = 0; i < 12; ++i) last = dl.Claim("link-none", "x");
+        bool rl_ok = last.value("rate_limited", false);
+        dl.Revoke(tok);
+        bool revoked_ok = !dl.AcceptsHeaders("Bearer " + tok, "");
+        unsetenv("OPENCLAW_PAIR_MAX_BAD_SECRET");
+        unsetenv("OPENCLAW_PAIR_CLAIM_MAX_PER_MIN");
+        if (!hdr_ok || !lock_ok || !rl_ok || !revoked_ok) {
+            std::cerr << "FAIL device token auth/ratelimit hdr=" << hdr_ok << " lock=" << locked.dump()
+                      << " rl=" << last.dump() << " revoked=" << revoked_ok << "\n";
+            ++failures;
+        } else std::cerr << "PASS device token gateway-auth + claim rate limit/lockout + revoke\n";
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL device token auth exception: " << e.what() << "\n"; ++failures;
     }
 
     // canvas disk store + sim bridge
