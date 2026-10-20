@@ -5,6 +5,7 @@
 #include "openclaw/config/config.hpp"
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/slack.hpp"
+#include "openclaw/channels/discord.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -615,6 +616,48 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
+
+    // ---- discord (webhook + Gateway WS) ----
+    if (starts("discord.") || method == "channels.discord.inbound") {
+        r.handled = true;
+        auto* dc = dynamic_cast<channels::DiscordAdapter*>(deps.adapters.Get("discord"));
+        if (!dc) { r.ok = false; r.error = "discord adapter missing"; return r; }
+        if (method == "discord.status" || method == "discord.gateway.status") {
+            r.payload = Real(dc->Status());
+            return r;
+        }
+        if (method == "discord.gateway.feed" || method == "discord.gateway.mock") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            if (params.contains("frames") && params["frames"].is_array()) {
+                std::vector<nlohmann::json> frames;
+                for (auto& f : params["frames"]) frames.push_back(f);
+                r.payload = Real(dc->Gateway().RunMockFrames(frames, deliver));
+                return r;
+            }
+            nlohmann::json payload = params.contains("payload") ? params["payload"] : params;
+            r.payload = Real({{"handled", dc->Gateway().FeedPayload(payload, deliver)},
+                              {"status", dc->Gateway().Status()}});
+            return r;
+        }
+        if (method == "discord.gateway.start") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            bool started = dc->Gateway().Start(deliver);
+            r.payload = Real({{"started", started}, {"status", dc->Gateway().Status()}});
+            return r;
+        }
+        if (method == "discord.gateway.stop") {
+            dc->Gateway().Stop();
+            r.payload = Real({{"stopped", true}, {"status", dc->Gateway().Status()}});
+            return r;
+        }
+        if (method == "channels.discord.inbound") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            r.payload = Real(dc->HandleHttpInbound(params, deliver));
+            return r;
+        }
+        r.payload = Real(dc->Status());
+        return r;
+    }
 
     // ---- slack (HTTP inbound + Socket Mode) ----
     if (starts("slack.") || method == "channels.slack.inbound") {

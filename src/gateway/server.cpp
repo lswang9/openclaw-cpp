@@ -7,6 +7,7 @@
 #include "openclaw/config/validate.hpp"
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/slack.hpp"
+#include "openclaw/channels/discord.hpp"
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -32,7 +33,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.13.0-dev";
+constexpr const char* kVersion = "1.14.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1210,6 +1211,41 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             if (n.rfind("mcp.", 0) == 0) tools.push_back(n);
         }
         return ok({{"tools", tools}, {"note", "mcp.* tools bridged into registry when MCP client attached"}});
+    }
+
+    // Discord Gateway WS (real deliver into agent)
+    if (method.rfind("discord.", 0) == 0 || method == "channels.discord.inbound") {
+        auto* dc = dynamic_cast<channels::DiscordAdapter*>(deps_.adapters.Get("discord"));
+        if (!dc) return err("discord adapter missing");
+        auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
+        if (method == "discord.status" || method == "discord.gateway.status") {
+            return ok(dc->Status());
+        }
+        if (method == "discord.gateway.feed" || method == "discord.gateway.mock") {
+            if (params.contains("frames") && params["frames"].is_array()) {
+                std::vector<nlohmann::json> frames;
+                for (const auto& f : params["frames"]) frames.push_back(f);
+                return ok(dc->Gateway().RunMockFrames(frames, deliver));
+            }
+            nlohmann::json payload = params.contains("payload") ? params["payload"] : params;
+            auto handled = dc->Gateway().FeedPayload(payload, deliver);
+            return ok({{"ok", true}, {"handled", handled}, {"status", dc->Gateway().Status()},
+                       {"impl", "real-sim"}});
+        }
+        if (method == "discord.gateway.start") {
+            dc->Start(deliver);
+            return ok({{"started", dc->Gateway().Running()},
+                       {"status", dc->Status()},
+                       {"note", "live requires DISCORD_BOT_TOKEN; else idle/mock"}});
+        }
+        if (method == "discord.gateway.stop") {
+            dc->Stop();
+            return ok({{"stopped", true}, {"status", dc->Status()}});
+        }
+        if (method == "channels.discord.inbound") {
+            return ok(dc->HandleHttpInbound(params, deliver));
+        }
+        return ok(dc->Status());
     }
 
     // Slack Socket Mode (real deliver into agent)

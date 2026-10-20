@@ -30,6 +30,8 @@
 
 - **1.5.1-dev**: docs STATUS.md (zh), PARITY executive summary, EnsureObj store_key lifetime fix
 
+- **1.14.0-dev**: Discord Gateway WS (MESSAGE_CREATE + heartbeat + mock feed); docs/DISCORD-GATEWAY.md
+
 - **1.13.0-dev**: channel-bound ACP sessions (acp.bind / auto-bind); Slack outbound chat.postMessage
 
 - **1.12.0-dev**: JS plugin host (Node stdio bridge + sample_js); FORCE_MOCK; docs/JS-PLUGIN-HOST.md

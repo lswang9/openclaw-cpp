@@ -37,6 +37,7 @@
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/slack_socket.hpp"
 #include "openclaw/channels/discord.hpp"
+#include "openclaw/channels/discord_gateway.hpp"
 #include "openclaw/channels/simple_inbound.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/persist/store.hpp"
@@ -64,7 +65,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.13.0-dev";
+constexpr const char* kVersion = "1.14.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -440,7 +441,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.13.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.14.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -868,6 +869,54 @@ int CmdSelfTest() {
     }
 
 
+
+
+    // Discord Gateway — offline recorded frames (no network)
+    {
+        setenv("DISCORD_GATEWAY_FORCE_MOCK", "1", 1);
+        channels::DiscordGateway gw;
+        int got_n = 0;
+        std::string first_text;
+        auto deliver = [&](const channels::InboundMessage& m) {
+            if (got_n == 0) first_text = m.text;
+            ++got_n;
+            return std::string("d-pong-") + m.text;
+        };
+        std::vector<nlohmann::json> frames = {
+            {{"op", 10}, {"d", {{"heartbeat_interval", 41250}}}},
+            {{"op", 0},
+             {"t", "READY"},
+             {"s", 1},
+             {"d", {{"session_id", "sess_mock"}, {"user", {{"id", "bot1"}}}}}},
+            {{"op", 0},
+             {"t", "MESSAGE_CREATE"},
+             {"s", 2},
+             {"d",
+              {{"id", "m1"},
+               {"content", "discord-hi"},
+               {"channel_id", "Dchan"},
+               {"author", {{"id", "Uuser"}, {"bot", false}}}}}},
+            {{"op", 11}},
+        };
+        auto res = gw.RunMockFrames(frames, deliver);
+        const bool started = gw.Start(deliver);  // FORCE_MOCK → false
+        gw.Stop();
+        unsetenv("DISCORD_GATEWAY_FORCE_MOCK");
+        const auto st = gw.Status();
+        bool identify_sent = false;
+        if (res.contains("results") && res["results"].is_array() && !res["results"].empty()) {
+            auto& hello = res["results"][0];
+            identify_sent = hello.contains("send") && hello["send"].is_array() &&
+                            !hello["send"].empty() && hello["send"][0].value("op", -1) == 2;
+        }
+        if (!res.value("ok", false) || got_n < 1 || first_text != "discord-hi" || started ||
+            !identify_sent || st.value("delivered", 0) < 1) {
+            std::cerr << "FAIL discord gateway mock " << res.dump() << " status=" << st.dump()
+                      << " first=" << first_text << " n=" << got_n << "\n";
+            ++failures;
+        } else
+            std::cerr << "PASS discord gateway mock frames\n";
+    }
 
     // JS plugin host (Node bridge or FORCE_MOCK)
     {

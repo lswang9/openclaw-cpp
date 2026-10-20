@@ -11,7 +11,7 @@ std::string Env(const char* k) {
 
 DiscordAdapter::DiscordAdapter()
     : OutboundRecordAdapter("discord",
-                            "Discord outbound via DISCORD_BOT_TOKEN; inbound interactions/webhook",
+                            "Discord outbound + webhook inbound + Gateway WS (MESSAGE_CREATE)",
                             "/api/v10/channels/{id}/messages") {
     SetEnabled(true);
 }
@@ -46,8 +46,16 @@ nlohmann::json DiscordAdapter::Status() const {
     s["inbound"] = inbound_;
     s["inbound_path"] = "/api/channels/discord/inbound";
     s["verify_token_set"] = !Env("DISCORD_VERIFY_TOKEN").empty();
+    s["gateway"] = gateway_.Status();
     return s;
 }
+
+void DiscordAdapter::Start(DeliverFn deliver) {
+    SetEnabled(true);
+    (void)gateway_.Start(std::move(deliver));
+}
+
+void DiscordAdapter::Stop() { gateway_.Stop(); }
 
 nlohmann::json DiscordAdapter::HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
     if (!Enabled()) return {{"ok", false}, {"error", "adapter disabled"}};
