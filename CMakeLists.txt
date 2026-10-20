@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.12.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.13.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,7 @@ set(OPENCLAW_SOURCES
   src/agent/loop.cpp
   src/agent/files.cpp
   src/acp/session.cpp
+  src/acp/bindings.cpp
   src/acp/wire.cpp
   src/sim/backend.cpp
   src/sim/capture.cpp

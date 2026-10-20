@@ -64,7 +64,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.12.0-dev";
+constexpr const char* kVersion = "1.13.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -440,7 +440,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.12.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.13.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -589,6 +589,45 @@ int CmdSelfTest() {
         if (acp.AgentsListJson().empty()) {
             std::cerr << "FAIL acp agents list\n"; ++failures;
         } else std::cerr << "PASS acp agents.list\n";
+
+        // Channel-bound ACP (mock inbound, no live Slack)
+        {
+            setenv("OPENCLAW_ACP_AUTO_BIND", "1", 1);
+            setenv("OPENCLAW_DEFAULT_PROVIDER", "mock", 1);
+            acp::Registry reg;
+            auto bound = reg.BindChannel("slack", "Cbind1", "");
+            if (!bound.value("ok", false)) {
+                std::cerr << "FAIL acp.bind " << bound.dump() << "\n"; ++failures;
+            } else {
+                auto list = reg.Bindings().ListJson();
+                channels::InboundMessage msg;
+                msg.channel = "slack";
+                msg.sender = "U1";
+                msg.text = "bind-hello";
+                msg.session_key = "slack-Cbind1";
+                nlohmann::json out_log;
+                auto r = reg.HandleChannelInbound(msg, [&](const std::string& ch, const std::string& cid,
+                                                           const std::string& text) {
+                    out_log = {{"channel", ch}, {"chat_id", cid}, {"text", text}, {"recorded", true}};
+                    return out_log;
+                });
+                // Second channel auto-creates
+                channels::InboundMessage msg2;
+                msg2.channel = "feishu";
+                msg2.sender = "ou_1";
+                msg2.text = "feishu-hi";
+                msg2.session_key = "feishu-oc_chat";
+                auto r2 = reg.HandleChannelInbound(msg2, {});
+                unsetenv("OPENCLAW_ACP_AUTO_BIND");
+                if (!r.handled || r.reply.empty() || r.channel_key != "slack:Cbind1" ||
+                    !out_log.value("recorded", false) || !r2.handled || list.empty()) {
+                    std::cerr << "FAIL acp channel bind " << r.detail.dump() << " out=" << out_log.dump()
+                              << " r2=" << r2.detail.dump() << "\n";
+                    ++failures;
+                } else std::cerr << "PASS acp channel-bound sessions\n";
+            }
+        }
+
     }
 
     // outbound record without tokens (graceful)

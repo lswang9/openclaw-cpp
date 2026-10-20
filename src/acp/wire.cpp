@@ -119,7 +119,7 @@ nlohmann::json AgentEndpoint::StatusJson() const {
             {"sessions", sessions_.size()},
             {"capabilities", AgentCapabilities()},
             {"gap_doc", "docs/ACP-GAP.md"},
-            {"note", "session/prompt → RunAgentLoop; default mock provider; not acpx/channel-bound"}};
+            {"note", "session/prompt → RunAgentLoop; default mock provider; channel bindings via acp.bind; not acpx"}};
 }
 
 nlohmann::json AgentEndpoint::ListSessionsJson() const {
@@ -250,6 +250,8 @@ nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, 
     }
 
     return {{"messageId", user_mid},
+            {"text", reply},
+            {"stopReason", loop_out.cancelled ? "cancelled" : (loop_out.ok ? "end_turn" : "error")},
             {"_meta",
              {{"openclawCpp",
                {{"agentMessageId", agent_mid},
@@ -259,6 +261,7 @@ nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, 
                 {"turns", loop_out.turns},
                 {"cancelled", loop_out.cancelled},
                 {"ok", loop_out.ok},
+                {"text", reply},
                 {"note", "RunAgentLoop result surfaced as session/update agent_message"}}}}}};
 }
 

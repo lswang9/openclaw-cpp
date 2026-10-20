@@ -1,3 +1,4 @@
+#include "openclaw/acp/session.hpp"
 #include "openclaw/gateway/extra.hpp"
 #include "openclaw/agent/types.hpp"
 #include "openclaw/gateway/methods.hpp"
@@ -147,9 +148,33 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
                     }
                 }
             }
-            if (!deps.acp->AppendPrompt(id, text)) { r.ok = false; r.error = "session not found"; return r; }
-            r.payload = Real({{"id", id}, {"queued", true}, {"wire", true},
+            if (deps.acp->GetJson(id).contains("error")) {
+                r.ok = false; r.error = "session not found"; return r;
+            }
+            auto reply = deps.acp->AppendPrompt(id, text);
+            r.payload = Real({{"id", id}, {"queued", true}, {"wire", true}, {"reply", reply},
                               {"note", "routed through in-process ACP AgentEndpoint"}});
+            return r;
+        }
+        if (method == "acp.bind") {
+            auto channel = params.value("channel", "");
+            auto chat_id = params.value("chat_id", params.value("channel_id", ""));
+            auto sid = params.value("session_id", params.value("acp_session_id", ""));
+            r.payload = Real(deps.acp->BindChannel(channel, chat_id, sid));
+            return r;
+        }
+        if (method == "acp.unbind") {
+            auto key = params.value("channel_key", "");
+            if (key.empty()) {
+                key = openclaw::acp::BindingStore::MakeKey(params.value("channel", ""),
+                                                params.value("chat_id", params.value("channel_id", "")));
+            }
+            bool ok = deps.acp->UnbindChannel(key);
+            r.payload = Real({{"ok", ok}, {"channel_key", key}});
+            return r;
+        }
+        if (method == "acp.bindings.list" || method == "acp.bindings") {
+            r.payload = Real(deps.acp->Bindings().StatusJson());
             return r;
         }
         if (method == "acp.wire" || method == "acp.rpc") {

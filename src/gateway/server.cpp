@@ -32,7 +32,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.12.0-dev";
+constexpr const char* kVersion = "1.13.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -402,6 +402,27 @@ void Server::Emit(const std::string& event, const nlohmann::json& payload) {
 }
 
 std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
+    // Channel-bound ACP: slack/feishu/discord → session/prompt + outbound reply
+    if (deps_.acp) {
+        auto outbound = [this](const std::string& channel, const std::string& chat_id,
+                               const std::string& text) -> nlohmann::json {
+            auto* adapter = deps_.adapters.Get(channel);
+            auto* out = dynamic_cast<channels::OutboundRecordAdapter*>(adapter);
+            if (!out) return {{"ok", false}, {"error", "no outbound adapter"}, {"channel", channel}};
+            out->SetEnabled(true);
+            return out->SendText(chat_id, text, {{"via", "acp-channel-bind"}});
+        };
+        auto bound = deps_.acp->HandleChannelInbound(msg, outbound);
+        if (bound.handled) {
+            Emit("acp.channel", {{"channel_key", bound.channel_key},
+                                 {"acp_session_id", bound.acp_session_id},
+                                 {"reply", bound.reply},
+                                 {"outbound", bound.outbound}});
+            Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "assistant"},
+                                     {"text", bound.reply}, {"via", "acp-bind"}});
+            return bound.reply;
+        }
+    }
     auto messages = deps_.sessions.Load(msg.session_key);
     std::string content = msg.text;
     if (!msg.sender.empty()) {

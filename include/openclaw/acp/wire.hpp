@@ -20,7 +20,8 @@ namespace openclaw::acp {
 // session/prompt runs openclaw::agent::RunAgentLoop (default: mock provider).
 //
 // Implemented: initialize, session/new|list|prompt|cancel|close|resume, ping.
-// Not implemented: auth/*, multimodal, session MCP, acpx adapters, channel-bound ACP.
+// Not implemented: auth/*, multimodal, session MCP, acpx adapters.
+// Channel bindings: see acp::Registry BindChannel / HandleChannelInbound.
 
 constexpr int kAcpProtocolVersion = 2;
 

@@ -9,7 +9,12 @@ std::string Env(const char* k) {
 }
 }  // namespace
 
-SlackAdapter::SlackAdapter() = default;
+SlackAdapter::SlackAdapter()
+    : OutboundRecordAdapter("slack",
+                            "Slack Events API + Socket Mode + chat.postMessage when SLACK_BOT_TOKEN set",
+                            "/api/chat.postMessage") {
+    SetEnabled(true);
+}
 
 bool SlackAdapter::Verify(const nlohmann::json& body) const {
     const auto expect = Env("SLACK_VERIFY_TOKEN");
@@ -19,26 +24,25 @@ bool SlackAdapter::Verify(const nlohmann::json& body) const {
 }
 
 nlohmann::json SlackAdapter::Status() const {
-    return {{"id", "slack"},
-            {"enabled", enabled_},
-            {"type", "slack"},
-            {"inbound", inbound_},
-            {"inbound_path", "/api/channels/slack/inbound"},
-            {"verify_token_set", !Env("SLACK_VERIFY_TOKEN").empty()},
-            {"socket_mode", socket_.Status()}};
+    auto s = OutboundRecordAdapter::Status();
+    s["type"] = "slack";
+    s["inbound"] = inbound_;
+    s["inbound_path"] = "/api/channels/slack/inbound";
+    s["verify_token_set"] = !Env("SLACK_VERIFY_TOKEN").empty();
+    s["socket_mode"] = socket_.Status();
+    s["bot_token_set"] = !Env("SLACK_BOT_TOKEN").empty();
+    return s;
 }
 
 void SlackAdapter::Start(DeliverFn deliver) {
-    enabled_ = true;
+    SetEnabled(true);
     (void)socket_.Start(std::move(deliver));
 }
 
-void SlackAdapter::Stop() {
-    socket_.Stop();
-}
+void SlackAdapter::Stop() { socket_.Stop(); }
 
 nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
-    if (!enabled_) return {{"ok", false}, {"error", "adapter disabled"}};
+    if (!Enabled()) return {{"ok", false}, {"error", "adapter disabled"}};
     if (!Verify(body)) return {{"ok", false}, {"error", "verify token mismatch"}, {"impl", "real"}};
 
     const auto typ = body.value("type", "");

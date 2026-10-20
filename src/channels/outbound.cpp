@@ -30,6 +30,7 @@ nlohmann::json OutboundRecordAdapter::Status() const {
     if (id_ == "telegram") token = !Env("TELEGRAM_BOT_TOKEN").empty();
     if (id_ == "discord") token = !Env("DISCORD_BOT_TOKEN").empty();
     if (id_ == "feishu") token = !Env("FEISHU_WEBHOOK_URL").empty();
+    if (id_ == "slack") token = !Env("SLACK_BOT_TOKEN").empty();
     return {{"id", id_},
             {"enabled", enabled_},
             {"type", "outbound"},
@@ -110,6 +111,21 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
             http_result = HttpPostJson(hook, {{"msg_type", "text"}, {"content", {{"text", text}}}}, {});
             entry["mode"] = "live_http";
             entry["delivered"] = http_result.value("http", 0) >= 200 && http_result.value("http", 0) < 300;
+            entry["http"] = http_result;
+        }
+    } else if (id_ == "slack") {
+        const auto token = Env("SLACK_BOT_TOKEN");
+        if (!token.empty() && !chat_id.empty()) {
+            http_result = HttpPostJson("https://slack.com/api/chat.postMessage",
+                                       {{"channel", chat_id}, {"text", text}},
+                                       {"Authorization: Bearer " + token});
+            entry["mode"] = "live_http";
+            bool ok_http = http_result.value("http", 0) >= 200 && http_result.value("http", 0) < 300;
+            bool ok_slack = true;
+            if (http_result.contains("json") && http_result["json"].is_object()) {
+                ok_slack = http_result["json"].value("ok", false);
+            }
+            entry["delivered"] = ok_http && ok_slack;
             entry["http"] = http_result;
         }
     }
