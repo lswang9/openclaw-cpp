@@ -24,7 +24,17 @@ nlohmann::json SlackAdapter::Status() const {
             {"type", "slack"},
             {"inbound", inbound_},
             {"inbound_path", "/api/channels/slack/inbound"},
-            {"verify_token_set", !Env("SLACK_VERIFY_TOKEN").empty()}};
+            {"verify_token_set", !Env("SLACK_VERIFY_TOKEN").empty()},
+            {"socket_mode", socket_.Status()}};
+}
+
+void SlackAdapter::Start(DeliverFn deliver) {
+    enabled_ = true;
+    (void)socket_.Start(std::move(deliver));
+}
+
+void SlackAdapter::Stop() {
+    socket_.Stop();
 }
 
 nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {

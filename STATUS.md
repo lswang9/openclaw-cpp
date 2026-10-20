@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.10.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.11.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 构建
 
@@ -63,7 +63,7 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 1. **computer/desktop**：有 display 时 **截图**（ffmpeg/scrot…）与 **click/type/move**（xdotool）可为 `impl:real`；否则 `real-sim`。canvas 仍仿真。`OPENCLAW_COMPUTER_FORCE_SIM=1` / `OPENCLAW_INPUT_FORCE_SIM=1` 强制仿真。见 `docs/COMPUTER-CAPTURE.md`。
 2. **browser**：优先 **CDP**（已运行的 Chrome `--remote-debugging-port`，见 [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md)）；不可用时回退 **curl-session**（cookie/重定向/链接表单）。**不是** Playwright。可用 `OPENCLAW_BROWSER_CDP_MOCK=1` 自测。
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
-3. **IM**：webhook 入站较完整；出站需对应 env token，否则只本地记录。
+3. **IM**：webhook 入站较完整；**Slack Socket Mode**（WSS）可在有 `SLACK_APP_TOKEN` 时入站，无 token / `SLACK_SOCKET_FORCE_MOCK=1` 时用 `slack.socket.feed` 离线回放。出站需对应 env token，否则只本地记录。见 `docs/SLACK-SOCKET.md`。
 4. **MCP App**：可 list/call tools、resources；宿主 UI 类 RPC 多为本地 ack。
 5. **ACP**：`session/prompt` 已接 **AgentLoop**（默认 mock）；`session/cancel` 可取消；`acp-stdio` 可用。**无** acpx/通道绑定/多模态。见 `docs/ACP-GAP.md`。
 6. **对齐数字**：ImplementedMethods 很多 ≠ 与 OpenClaw 2026.10.5 行为一一等价。

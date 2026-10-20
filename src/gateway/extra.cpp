@@ -3,6 +3,7 @@
 #include "openclaw/gateway/methods.hpp"
 #include "openclaw/config/config.hpp"
 #include "openclaw/channels/outbound.hpp"
+#include "openclaw/channels/slack.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -552,6 +553,56 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         r.payload = Real({{"agents", agents}, {"method", method}});
+        return r;
+    }
+
+
+    // ---- slack (HTTP inbound + Socket Mode) ----
+    if (starts("slack.") || method == "channels.slack.inbound") {
+        r.handled = true;
+        auto* adapter = deps.adapters.Get("slack");
+        auto* sl = dynamic_cast<channels::SlackAdapter*>(adapter);
+        if (!sl) { r.ok = false; r.error = "slack adapter missing"; return r; }
+        if (method == "slack.status" || method == "slack.socket.status") {
+            r.payload = Real(sl->Status());
+            return r;
+        }
+        if (method == "slack.socket.feed" || method == "slack.socket.mock") {
+            nlohmann::json env = params.value("envelope", params);
+            if (params.contains("frames") && params["frames"].is_array()) {
+                std::vector<nlohmann::json> frames;
+                for (auto& f : params["frames"]) frames.push_back(f);
+                auto deliver = [&](const channels::InboundMessage& m) {
+                    // Prefer gateway deliver if we can — ExtraDispatch has no Server*;
+                    // record text echo for tests.
+                    return std::string("ack:") + m.text;
+                };
+                // If params has use_agent and we somehow had deliver… keep test echo.
+                r.payload = Real(sl->Socket().RunMockFrames(frames, deliver));
+                return r;
+            }
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            auto ack = sl->Socket().FeedEnvelope(env, deliver);
+            r.payload = Real({{"ack", ack}, {"status", sl->Socket().Status()}});
+            return r;
+        }
+        if (method == "slack.socket.start") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            bool started = sl->Socket().Start(deliver);
+            r.payload = Real({{"started", started}, {"status", sl->Socket().Status()}});
+            return r;
+        }
+        if (method == "slack.socket.stop") {
+            sl->Socket().Stop();
+            r.payload = Real({{"stopped", true}, {"status", sl->Socket().Status()}});
+            return r;
+        }
+        if (method == "channels.slack.inbound") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            r.payload = Real(sl->HandleHttpInbound(params, deliver));
+            return r;
+        }
+        r.payload = Real(sl->Status());
         return r;
     }
 

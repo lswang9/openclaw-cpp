@@ -34,6 +34,7 @@
 #include "openclaw/browser/cdp_client.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/slack.hpp"
+#include "openclaw/channels/slack_socket.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/simple_inbound.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
@@ -62,7 +63,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.10.0-dev";
+constexpr const char* kVersion = "1.11.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -438,7 +439,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.10.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.11.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -779,6 +780,51 @@ int CmdSelfTest() {
                 std::cerr << "FAIL slack/discord inbound\n"; ++failures;
             } else std::cerr << "PASS slack/discord inbound\n";
         }
+    }
+
+    // Slack Socket Mode — offline recorded frames (no network)
+    {
+        setenv("SLACK_SOCKET_FORCE_MOCK", "1", 1);
+        channels::SlackSocketMode sock;
+        int got_n = 0;
+        std::string first_text;
+        auto deliver = [&](const channels::InboundMessage& m) {
+            if (got_n == 0) first_text = m.text;
+            ++got_n;
+            return std::string("pong-") + m.text;
+        };
+        std::vector<nlohmann::json> frames = {
+            {{"type", "hello"}},
+            {{"envelope_id", "e1"},
+             {"type", "events_api"},
+             {"payload",
+              {{"type", "event_callback"},
+               {"event",
+                {{"type", "message"},
+                 {"text", "sock-hi"},
+                 {"channel", "C9"},
+                 {"user", "U9"}}}}}},
+            {{"envelope_id", "e2"},
+             {"type", "slash_commands"},
+             {"accepts_response_payload", true},
+             {"payload",
+              {{"command", "/oc"},
+               {"text", "ping"},
+               {"user_id", "U9"},
+               {"channel_id", "C9"}}}},
+        };
+        auto res = sock.RunMockFrames(frames, deliver);
+        const bool started = sock.Start(deliver);  // FORCE_MOCK → false
+        sock.Stop();
+        unsetenv("SLACK_SOCKET_FORCE_MOCK");
+        const auto st = sock.Status();
+        if (!res.value("ok", false) || got_n < 2 || first_text != "sock-hi" || started ||
+            st.value("acked", 0) < 2) {
+            std::cerr << "FAIL slack socket mock " << res.dump() << " status=" << st.dump()
+                      << " first=" << first_text << " n=" << got_n << "\n";
+            ++failures;
+        } else
+            std::cerr << "PASS slack socket mode mock frames\n";
     }
 
 

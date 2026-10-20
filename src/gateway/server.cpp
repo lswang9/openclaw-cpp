@@ -6,6 +6,7 @@
 #include "openclaw/context/assemble.hpp"
 #include "openclaw/config/validate.hpp"
 #include "openclaw/channels/outbound.hpp"
+#include "openclaw/channels/slack.hpp"
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -31,7 +32,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.10.0-dev";
+constexpr const char* kVersion = "1.11.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -835,7 +836,14 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         const std::string cid = params.value("id", params.value("channel", ""));
         auto* a = deps_.adapters.Get(cid);
         if (!a) return err("unknown adapter: " + cid);
-        a->SetEnabled(method == "channels.start");
+        if (method == "channels.start") {
+            a->SetEnabled(true);
+            auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
+            a->Start(deliver);
+        } else {
+            a->Stop();
+            a->SetEnabled(false);
+        }
         return ok({{"id", cid}, {"enabled", a->Enabled()}, {"status", a->Status()}});
     }
     if (method == "channels.pairing.list" || method == "node.pair.list" || method == "device.pair.list") {
@@ -1181,6 +1189,40 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             if (n.rfind("mcp.", 0) == 0) tools.push_back(n);
         }
         return ok({{"tools", tools}, {"note", "mcp.* tools bridged into registry when MCP client attached"}});
+    }
+
+    // Slack Socket Mode (real deliver into agent)
+    if (method.rfind("slack.", 0) == 0 || method == "channels.slack.inbound") {
+        auto* sl = dynamic_cast<channels::SlackAdapter*>(deps_.adapters.Get("slack"));
+        if (!sl) return err("slack adapter missing");
+        auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
+        if (method == "slack.status" || method == "slack.socket.status") {
+            return ok(sl->Status());
+        }
+        if (method == "slack.socket.feed" || method == "slack.socket.mock") {
+            if (params.contains("frames") && params["frames"].is_array()) {
+                std::vector<nlohmann::json> frames;
+                for (const auto& f : params["frames"]) frames.push_back(f);
+                return ok(sl->Socket().RunMockFrames(frames, deliver));
+            }
+            nlohmann::json env = params.contains("envelope") ? params["envelope"] : params;
+            auto ack = sl->Socket().FeedEnvelope(env, deliver);
+            return ok({{"ok", true}, {"ack", ack}, {"status", sl->Socket().Status()}, {"impl", "real-sim"}});
+        }
+        if (method == "slack.socket.start") {
+            sl->Start(deliver);
+            return ok({{"started", sl->Socket().Running()},
+                       {"status", sl->Status()},
+                       {"note", "live requires SLACK_APP_TOKEN; else idle/mock"}});
+        }
+        if (method == "slack.socket.stop") {
+            sl->Stop();
+            return ok({{"stopped", true}, {"status", sl->Status()}});
+        }
+        if (method == "channels.slack.inbound") {
+            return ok(sl->HandleHttpInbound(params, deliver));
+        }
+        return ok(sl->Status());
     }
 
     {
