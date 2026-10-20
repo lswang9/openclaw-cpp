@@ -67,7 +67,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.16.0-dev";
+constexpr const char* kVersion = "1.17.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -443,7 +443,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.16.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.17.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -536,6 +536,39 @@ int CmdSelfTest() {
                               << prompted.dump() << "\n";
                     ++failures;
                 } else std::cerr << "PASS acp session/prompt → AgentLoop (mock)\n";
+
+                // Multimodal prompt (tiny PNG base64, mock provider)
+                {
+                    const char* png =
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+                    nlohmann::json parts = nlohmann::json::array({
+                        {{"type", "text"}, {"text", "describe"}},
+                        {{"type", "image"}, {"mimeType", "image/png"}, {"data", png}},
+                    });
+                    (void)agent->DrainNotifications();
+                    auto direct = agent->Prompt(sid, parts);
+                    auto meta = direct.value("_meta", nlohmann::json::object())
+                                    .value("openclawCpp", nlohmann::json::object());
+                    std::string reply = direct.value("text", "");
+                    for (const auto& n : agent->DrainNotifications()) {
+                        if (n.value("method", "") != "session/update") continue;
+                        auto u = n.value("params", nlohmann::json::object())
+                                     .value("update", nlohmann::json::object());
+                        if (u.value("sessionUpdate", "") != "agent_message") continue;
+                        for (const auto& c : u.value("content", nlohmann::json::array())) {
+                            if (c.value("type", "") == "text") reply += c.value("text", "");
+                        }
+                    }
+                    const bool ok_img = meta.value("images", 0) == 1 &&
+                                        reply.find("mock-saw-image:1") != std::string::npos;
+                    if (!ok_img) {
+                        std::cerr << "FAIL acp multimodal meta=" << meta.dump()
+                                  << " reply='" << reply << "' direct=" << direct.dump() << "\n";
+                        ++failures;
+                    } else
+                        std::cerr << "PASS acp multimodal image prompt\n";
+                }
+
 
                 // cancel path: delay before loop; cancel on AgentEndpoint from another thread
                 setenv("OPENCLAW_ACP_TURN_DELAY_MS", "300", 1);

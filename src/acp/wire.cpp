@@ -2,6 +2,7 @@
 #include "openclaw/provider/mock.hpp"
 #include "openclaw/util.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <queue>
@@ -13,10 +14,10 @@ namespace {
 
 nlohmann::json AgentCapabilities() {
     return {{"session",
-             {{"prompt", nlohmann::json::object()},
+             {{"prompt", {{"image", true}, {"file", true}}},
               {"_meta",
                {{"openclawCpp",
-                 {{"note", "subset — AgentLoop on prompt; no multimodal / session MCP / acpx"}}}}}}}};
+                 {{"note", "subset — AgentLoop on prompt; text+image(+file) parts; no session MCP / acpx"}}}}}}}};
 }
 
 int TurnDelayMs() {
@@ -77,25 +78,142 @@ WireSession* AgentEndpoint::Find(const std::string& id) {
 }
 
 std::string AgentEndpoint::PromptText(const nlohmann::json& prompt_blocks) {
-    if (prompt_blocks.is_string()) return prompt_blocks.get<std::string>();
-    if (!prompt_blocks.is_array()) return {};
-    std::string out;
+    return ParsePrompt(prompt_blocks).text;
+}
+
+AgentEndpoint::PromptParsed AgentEndpoint::ParsePrompt(const nlohmann::json& prompt_blocks) {
+    PromptParsed out;
+    auto push_text = [&](const std::string& text) {
+        if (text.empty()) return;
+        if (!out.text.empty()) out.text += "\n";
+        out.text += text;
+        out.openai_parts.push_back({{"type", "text"}, {"text", text}});
+        out.notify_parts.push_back({{"type", "text"}, {"text", text}});
+    };
+    auto push_image_data_url = [&](const std::string& data_url, const std::string& mime,
+                                   const std::string& raw_b64) {
+        ++out.images;
+        std::string url = data_url;
+        if (url.empty() && !raw_b64.empty()) {
+            std::string m = mime.empty() ? "image/png" : mime;
+            url = "data:" + m + ";base64," + raw_b64;
+        }
+        if (url.empty()) return;
+        out.openai_parts.push_back({{"type", "image_url"}, {"image_url", {{"url", url}}}});
+        nlohmann::json note{{"type", "image"}, {"mimeType", mime.empty() ? "image/png" : mime}};
+        if (!raw_b64.empty()) note["data"] = raw_b64.substr(0, std::min<size_t>(raw_b64.size(), 32)) +
+                                             (raw_b64.size() > 32 ? "…" : "");
+        else note["url"] = url.substr(0, std::min<size_t>(url.size(), 64));
+        out.notify_parts.push_back(note);
+        if (out.text.find("[image]") == std::string::npos) {
+            // keep text field informative for non-vision sinks
+            if (!out.text.empty()) out.text += "\n";
+            out.text += "[image]";
+        }
+    };
+    auto push_file = [&](const std::string& name, const std::string& mime, const std::string& b64) {
+        ++out.files;
+        out.notify_parts.push_back({{"type", "file"},
+                                    {"name", name},
+                                    {"mimeType", mime},
+                                    {"bytes_b64", b64.size()}});
+        if (!b64.empty() && mime.rfind("image/", 0) == 0) {
+            push_image_data_url("", mime, b64);
+            return;
+        }
+        std::string marker = "[file " + (name.empty() ? "attachment" : name) +
+                             (mime.empty() ? "" : (" " + mime)) +
+                             " b64_len=" + std::to_string(b64.size()) + "]";
+        if (!out.text.empty()) out.text += "\n";
+        out.text += marker;
+        out.openai_parts.push_back({{"type", "text"}, {"text", marker}});
+    };
+
+    if (prompt_blocks.is_string()) {
+        push_text(prompt_blocks.get<std::string>());
+        return out;
+    }
+    if (!prompt_blocks.is_array()) return out;
+
     for (const auto& b : prompt_blocks) {
         if (b.is_string()) {
-            if (!out.empty()) out += "\n";
-            out += b.get<std::string>();
+            push_text(b.get<std::string>());
             continue;
         }
         if (!b.is_object()) continue;
         auto type = b.value("type", "");
-        if (type == "text" || b.contains("text")) {
-            if (!out.empty()) out += "\n";
-            out += b.value("text", "");
-        } else if (type == "resource_link" || type == "resource") {
-            if (!out.empty()) out += "\n";
-            out += "[resource " +
-                   b.value("uri", b.value("resource", nlohmann::json::object()).value("uri", "")) + "]";
+        if (type == "text" || (type.empty() && b.contains("text") && !b.contains("data") &&
+                               !b.contains("image_url") && !b.contains("source"))) {
+            push_text(b.value("text", ""));
+            continue;
         }
+        // ACP / openclaw: image with base64 data
+        if (type == "image" || type == "image_base64" || type == "input_image") {
+            std::string mime = b.value("mimeType", b.value("media_type", b.value("mime", "image/png")));
+            std::string data = b.value("data", b.value("base64", b.value("image_base64", "")));
+            std::string url = b.value("url", "");
+            if (b.contains("image_url")) {
+                if (b["image_url"].is_string()) url = b["image_url"].get<std::string>();
+                else if (b["image_url"].is_object()) url = b["image_url"].value("url", url);
+            }
+            if (b.contains("source") && b["source"].is_object()) {
+                auto& src = b["source"];
+                if (src.value("type", "") == "base64") {
+                    data = src.value("data", data);
+                    mime = src.value("media_type", src.value("mimeType", mime));
+                } else if (src.value("type", "") == "url") {
+                    url = src.value("url", url);
+                }
+            }
+            if (!url.empty() && url.rfind("data:", 0) == 0) push_image_data_url(url, mime, "");
+            else if (!data.empty()) push_image_data_url("", mime, data);
+            else if (!url.empty()) {
+                ++out.images;
+                out.openai_parts.push_back({{"type", "image_url"}, {"image_url", {{"url", url}}}});
+                out.notify_parts.push_back({{"type", "image"}, {"url", url}});
+                if (!out.text.empty()) out.text += "\n";
+                out.text += "[image]";
+            }
+            continue;
+        }
+        if (type == "image_url") {
+            std::string url;
+            if (b.contains("image_url")) {
+                if (b["image_url"].is_string()) url = b["image_url"].get<std::string>();
+                else url = b["image_url"].value("url", "");
+            } else url = b.value("url", "");
+            if (!url.empty()) {
+                if (url.rfind("data:", 0) == 0) push_image_data_url(url, "image/png", "");
+                else {
+                    ++out.images;
+                    out.openai_parts.push_back({{"type", "image_url"}, {"image_url", {{"url", url}}}});
+                    out.notify_parts.push_back({{"type", "image"}, {"url", url}});
+                    if (!out.text.empty()) out.text += "\n";
+                    out.text += "[image]";
+                }
+            }
+            continue;
+        }
+        if (type == "file" || type == "input_file" || type == "blob") {
+            push_file(b.value("name", b.value("filename", "")),
+                      b.value("mimeType", b.value("media_type", "")),
+                      b.value("data", b.value("base64", "")));
+            continue;
+        }
+        if (type == "resource_link" || type == "resource") {
+            push_text("[resource " +
+                      b.value("uri", b.value("resource", nlohmann::json::object()).value("uri", "")) +
+                      "]");
+            continue;
+        }
+        // Fallback: unknown object with text
+        if (b.contains("text")) push_text(b.value("text", ""));
+    }
+    // If only images and text is just [image] markers, fine.
+    // Ensure openai_parts non-empty when we have text-only — already handled.
+    // If we have multimodal parts but OpenAI parts empty somehow, synthesize from text.
+    if (out.openai_parts.empty() && !out.text.empty()) {
+        out.openai_parts.push_back({{"type", "text"}, {"text", out.text}});
     }
     return out;
 }
@@ -119,7 +237,7 @@ nlohmann::json AgentEndpoint::StatusJson() const {
             {"sessions", sessions_.size()},
             {"capabilities", AgentCapabilities()},
             {"gap_doc", "docs/ACP-GAP.md"},
-            {"note", "session/prompt → RunAgentLoop; default mock provider; channel bindings via acp.bind; not acpx"}};
+            {"note", "session/prompt → RunAgentLoop; multimodal text+image(+file); channel bind; not acpx"}};
 }
 
 nlohmann::json AgentEndpoint::ListSessionsJson() const {
@@ -152,22 +270,35 @@ nlohmann::json AgentEndpoint::NewSession(const nlohmann::json& params) {
 }
 
 nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, WireSession& session,
-                                            const std::string& text, const std::string& user_mid) {
+                                            const PromptParsed& parsed, const std::string& user_mid) {
     EnsureDefaultBackend();
     const std::string sid = session.id;
     auto cancel = session.cancel;
     cancel->store(false);
 
-    session.history.push_back(agent::Message{.role = "user", .content = text});
-    session.messages.push_back({{"role", "user"}, {"messageId", user_mid}, {"text", text}});
+    agent::Message user_msg;
+    user_msg.role = "user";
+    user_msg.content = parsed.text;
+    if (parsed.images > 0 || parsed.files > 0) {
+        user_msg.multimodal_parts = parsed.openai_parts;
+    }
+    session.history.push_back(std::move(user_msg));
+    session.messages.push_back({{"role", "user"},
+                                {"messageId", user_mid},
+                                {"text", parsed.text},
+                                {"images", parsed.images},
+                                {"files", parsed.files}});
     session.status = "running";
 
+    auto notify_content = parsed.notify_parts.empty()
+                              ? nlohmann::json::array({{{"type", "text"}, {"text", parsed.text}}})
+                              : parsed.notify_parts;
     Notify("session/update",
            {{"sessionId", sid},
             {"update",
              {{"sessionUpdate", "user_message"},
               {"messageId", user_mid},
-              {"content", nlohmann::json::array({{{"type", "text"}, {"text", text}}})}}}});
+              {"content", notify_content}}}});
     Notify("session/update",
            {{"sessionId", sid},
             {"update", {{"sessionUpdate", "state_update"}, {"state", "running"}}}});
@@ -262,6 +393,9 @@ nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, 
                 {"cancelled", loop_out.cancelled},
                 {"ok", loop_out.ok},
                 {"text", reply},
+                {"images", parsed.images},
+                {"files", parsed.files},
+                {"multimodal", parsed.images > 0 || parsed.files > 0},
                 {"note", "RunAgentLoop result surfaced as session/update agent_message"}}}}}};
 }
 
@@ -271,9 +405,9 @@ nlohmann::json AgentEndpoint::Prompt(const std::string& session_id,
     EnsureDefaultBackend();
     auto* s = Find(session_id);
     if (!s) return {{"error", "session not found"}, {"sessionId", session_id}};
-    const std::string text = PromptText(prompt_blocks);
+    auto parsed = ParsePrompt(prompt_blocks);
     const std::string user_mid = "msg_user_" + std::to_string(msg_seq_++);
-    return RunPromptTurn(lock, *s, text, user_mid);
+    return RunPromptTurn(lock, *s, parsed, user_mid);
 }
 
 nlohmann::json AgentEndpoint::Handle(const nlohmann::json& request) {
@@ -378,9 +512,9 @@ nlohmann::json AgentEndpoint::Handle(const nlohmann::json& request) {
         auto* s = Find(sid);
         if (!s) return Err(id, -32001, "Session not found", {{"sessionId", sid}});
         auto prompt = params.contains("prompt") ? params["prompt"] : nlohmann::json::array();
-        const std::string text = PromptText(prompt);
+        auto parsed = ParsePrompt(prompt);
         const std::string user_mid = "msg_user_" + std::to_string(msg_seq_++);
-        auto meta = RunPromptTurn(lock, *s, text, user_mid);
+        auto meta = RunPromptTurn(lock, *s, parsed, user_mid);
         // ACP: return messageId of inserted user message; loop outcome in notifications + _meta
         nlohmann::json result{{"messageId", meta.value("messageId", user_mid)}};
         if (meta.contains("_meta")) result["_meta"] = meta["_meta"];
@@ -433,6 +567,11 @@ nlohmann::json Client::SessionList() { return Request("session/list", nlohmann::
 nlohmann::json Client::SessionPrompt(const std::string& session_id, const std::string& text) {
     nlohmann::json blocks = nlohmann::json::array({{{"type", "text"}, {"text", text}}});
     return Request("session/prompt", {{"sessionId", session_id}, {"prompt", blocks}});
+}
+
+nlohmann::json Client::SessionPromptParts(const std::string& session_id,
+                                          const nlohmann::json& prompt_blocks) {
+    return Request("session/prompt", {{"sessionId", session_id}, {"prompt", prompt_blocks}});
 }
 
 nlohmann::json Client::SessionCancel(const std::string& session_id) {

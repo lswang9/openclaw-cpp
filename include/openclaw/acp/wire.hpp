@@ -20,7 +20,8 @@ namespace openclaw::acp {
 // session/prompt runs openclaw::agent::RunAgentLoop (default: mock provider).
 //
 // Implemented: initialize, session/new|list|prompt|cancel|close|resume, ping.
-// Not implemented: auth/*, multimodal, session MCP, acpx adapters.
+// Multimodal: text + image_base64 / image_url (+ optional file) on session/prompt.
+// Not implemented: auth/*, session MCP, acpx adapters, audio/video.
 // Channel bindings: see acp::Registry BindChannel / HandleChannelInbound.
 
 constexpr int kAcpProtocolVersion = 2;
@@ -76,9 +77,17 @@ private:
     bool backend_ready_ = false;
 
     void EnsureDefaultBackend();
+    struct PromptParsed {
+        std::string text;
+        nlohmann::json openai_parts = nlohmann::json::array();  // provider wire
+        nlohmann::json notify_parts = nlohmann::json::array();  // ACP session/update
+        int images = 0;
+        int files = 0;
+    };
+
     // Runs loop; unlocks `lock` while looping so session/cancel can proceed.
     nlohmann::json RunPromptTurn(std::unique_lock<std::mutex>& lock, WireSession& session,
-                                 const std::string& text, const std::string& user_mid);
+                                 const PromptParsed& parsed, const std::string& user_mid);
 
     nlohmann::json Ok(const nlohmann::json& id, nlohmann::json result);
     nlohmann::json Err(const nlohmann::json& id, int code, const std::string& message,
@@ -86,6 +95,7 @@ private:
     void Notify(const std::string& method, nlohmann::json params);
     WireSession* Find(const std::string& id);
     static std::string PromptText(const nlohmann::json& prompt_blocks);
+    static PromptParsed ParsePrompt(const nlohmann::json& prompt_blocks);
 };
 
 using WriteLineFn = std::function<void(const std::string&)>;
@@ -101,6 +111,8 @@ public:
                               const nlohmann::json& mcp_servers = nlohmann::json::array());
     nlohmann::json SessionList();
     nlohmann::json SessionPrompt(const std::string& session_id, const std::string& text);
+    nlohmann::json SessionPromptParts(const std::string& session_id,
+                                      const nlohmann::json& prompt_blocks);
     nlohmann::json SessionCancel(const std::string& session_id);
     nlohmann::json SessionClose(const std::string& session_id);
 
