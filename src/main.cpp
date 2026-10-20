@@ -34,6 +34,7 @@
 #include "openclaw/browser/engine.hpp"
 #include "openclaw/browser/cdp_client.hpp"
 #include "openclaw/channels/feishu.hpp"
+#include "openclaw/channels/feishu_ws.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/slack_socket.hpp"
 #include "openclaw/channels/discord.hpp"
@@ -65,7 +66,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.14.0-dev";
+constexpr const char* kVersion = "1.15.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -441,7 +442,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.14.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.15.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -870,6 +871,52 @@ int CmdSelfTest() {
 
 
 
+
+
+    // Feishu long-connection — offline recorded frames (no network)
+    {
+        setenv("FEISHU_WS_FORCE_MOCK", "1", 1);
+        channels::FeishuLongConn lc;
+        int got_n = 0;
+        std::string first_text;
+        auto deliver = [&](const channels::InboundMessage& m) {
+            if (got_n == 0) first_text = m.text;
+            ++got_n;
+            return std::string("f-pong-") + m.text;
+        };
+        std::vector<nlohmann::json> frames = {
+            {{"type", "ping"}},
+            {{"type", "event"},
+             {"message_id", "mid-1"},
+             {"data",
+              {{"schema", "2.0"},
+               {"header", {{"event_type", "im.message.receive_v1"}}},
+               {"event",
+                {{"sender", {{"sender_id", {{"open_id", "ou_1"}}}}},
+                 {"message",
+                  {{"chat_id", "oc_chat1"},
+                   {"content", "{\"text\":\"feishu-hi\"}"}}}}}}}},
+            {{"type", "pong"}},
+        };
+        auto res = lc.RunMockFrames(frames, deliver);
+        const bool started = lc.Start(deliver);
+        lc.Stop();
+        unsetenv("FEISHU_WS_FORCE_MOCK");
+        const auto st = lc.Status();
+        bool pong_sent = false;
+        if (res.contains("results") && res["results"].is_array() && !res["results"].empty()) {
+            auto& ping = res["results"][0];
+            pong_sent = ping.contains("send") && ping["send"].is_array() &&
+                        !ping["send"].empty() && ping["send"][0].value("type", "") == "pong";
+        }
+        if (!res.value("ok", false) || got_n < 1 || first_text != "feishu-hi" || started ||
+            !pong_sent || st.value("delivered", 0) < 1) {
+            std::cerr << "FAIL feishu longconn mock " << res.dump() << " status=" << st.dump()
+                      << " first=" << first_text << " n=" << got_n << "\n";
+            ++failures;
+        } else
+            std::cerr << "PASS feishu longconn mock frames\n";
+    }
 
     // Discord Gateway — offline recorded frames (no network)
     {

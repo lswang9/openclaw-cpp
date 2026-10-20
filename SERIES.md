@@ -30,6 +30,8 @@
 
 - **1.5.1-dev**: docs STATUS.md (zh), PARITY executive summary, EnsureObj store_key lifetime fix
 
+- **1.15.0-dev**: Feishu/Lark long-connection WS (mock feed + tenant token live); docs/FEISHU-WS.md
+
 - **1.14.0-dev**: Discord Gateway WS (MESSAGE_CREATE + heartbeat + mock feed); docs/DISCORD-GATEWAY.md
 
 - **1.13.0-dev**: channel-bound ACP sessions (acp.bind / auto-bind); Slack outbound chat.postMessage

@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.14.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.15.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 构建
 
@@ -63,7 +63,7 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 1. **computer/desktop**：有 display 时 **截图**（ffmpeg/scrot…）与 **click/type/move**（xdotool）可为 `impl:real`；否则 `real-sim`。canvas 仍仿真。`OPENCLAW_COMPUTER_FORCE_SIM=1` / `OPENCLAW_INPUT_FORCE_SIM=1` 强制仿真。见 `docs/COMPUTER-CAPTURE.md`。
 2. **browser**：优先 **CDP**（已运行的 Chrome `--remote-debugging-port`，见 [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md)）；不可用时回退 **curl-session**（cookie/重定向/链接表单）。**不是** Playwright。可用 `OPENCLAW_BROWSER_CDP_MOCK=1` 自测。
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
-3. **IM**：webhook 入站较完整；**Slack Socket Mode** 与 **Discord Gateway WS** （`FORCE_MOCK` / `.feed` 离线回放；有 token 时可 live）。出站需对应 env token，否则只本地记录。见 `docs/SLACK-SOCKET.md` / `docs/DISCORD-GATEWAY.md`。
+3. **IM**：webhook 入站较完整；**Slack Socket Mode** / **Discord Gateway** / **Feishu 长连接 WS**（`FORCE_MOCK` / `.feed`；有凭证时可 live）。出站需 token/webhook，否则只本地记录。见 `docs/SLACK-SOCKET.md` / `docs/DISCORD-GATEWAY.md` / `docs/FEISHU-WS.md`。
 4. **MCP App**：可 list/call tools、resources；宿主 UI 类 RPC 多为本地 ack。
 5. **ACP**：`session/prompt`→AgentLoop（默认 mock）；`session/cancel`；`acp-stdio`；**通道绑定** `acp.bind` / auto-bind（Slack/Feishu/Discord→prompt+outbound）。**无** acpx/多模态。见 `docs/ACP-GAP.md`。
 6. **JS 插件**：Node stdio 桥（`plugins/js_bridge`）可加载 `plugins/sample_js` 并注册 `js.*` 工具；`OPENCLAW_JS_FORCE_MOCK=1` 走内存 mock。**不是**上游完整 JS 插件 API。见 `docs/JS-PLUGIN-HOST.md`。

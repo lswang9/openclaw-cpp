@@ -12,7 +12,7 @@ std::string Env(const char* k) {
 
 FeishuAdapter::FeishuAdapter()
     : OutboundRecordAdapter("feishu",
-                            "Feishu outbound via FEISHU_WEBHOOK_URL; inbound verify FEISHU_VERIFY_TOKEN",
+                            "Feishu outbound + webhook inbound + long-connection WS",
                             "/open-apis/im/v1/messages") {
     SetEnabled(true);
 }
@@ -57,8 +57,17 @@ nlohmann::json FeishuAdapter::Status() const {
     s["inbound"] = inbound_;
     s["inbound_path"] = "/api/channels/feishu/inbound";
     s["verify_token_set"] = !Env("FEISHU_VERIFY_TOKEN").empty();
+    s["app_id_set"] = !Env("FEISHU_APP_ID").empty();
+    s["longconn"] = longconn_.Status();
     return s;
 }
+
+void FeishuAdapter::Start(DeliverFn deliver) {
+    SetEnabled(true);
+    (void)longconn_.Start(std::move(deliver));
+}
+
+void FeishuAdapter::Stop() { longconn_.Stop(); }
 
 nlohmann::json FeishuAdapter::HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
     if (!Enabled()) return {{"ok", false}, {"error", "adapter disabled"}};

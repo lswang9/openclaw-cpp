@@ -6,6 +6,7 @@
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
+#include "openclaw/channels/feishu.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -616,6 +617,48 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
+
+    // ---- feishu (webhook + long-connection WS) ----
+    if (starts("feishu.") || method == "channels.feishu.inbound") {
+        r.handled = true;
+        auto* fs = dynamic_cast<channels::FeishuAdapter*>(deps.adapters.Get("feishu"));
+        if (!fs) { r.ok = false; r.error = "feishu adapter missing"; return r; }
+        if (method == "feishu.status" || method == "feishu.ws.status") {
+            r.payload = Real(fs->Status());
+            return r;
+        }
+        if (method == "feishu.ws.feed" || method == "feishu.ws.mock") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            if (params.contains("frames") && params["frames"].is_array()) {
+                std::vector<nlohmann::json> frames;
+                for (auto& f : params["frames"]) frames.push_back(f);
+                r.payload = Real(fs->LongConn().RunMockFrames(frames, deliver));
+                return r;
+            }
+            nlohmann::json payload = params.contains("payload") ? params["payload"] : params;
+            r.payload = Real({{"handled", fs->LongConn().FeedPayload(payload, deliver)},
+                              {"status", fs->LongConn().Status()}});
+            return r;
+        }
+        if (method == "feishu.ws.start") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            bool started = fs->LongConn().Start(deliver);
+            r.payload = Real({{"started", started}, {"status", fs->LongConn().Status()}});
+            return r;
+        }
+        if (method == "feishu.ws.stop") {
+            fs->LongConn().Stop();
+            r.payload = Real({{"stopped", true}, {"status", fs->LongConn().Status()}});
+            return r;
+        }
+        if (method == "channels.feishu.inbound") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            r.payload = Real(fs->HandleHttpInbound(params, deliver));
+            return r;
+        }
+        r.payload = Real(fs->Status());
+        return r;
+    }
 
     // ---- discord (webhook + Gateway WS) ----
     if (starts("discord.") || method == "channels.discord.inbound") {

@@ -8,6 +8,7 @@
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
+#include "openclaw/channels/feishu.hpp"
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -33,7 +34,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.14.0-dev";
+constexpr const char* kVersion = "1.15.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1211,6 +1212,43 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             if (n.rfind("mcp.", 0) == 0) tools.push_back(n);
         }
         return ok({{"tools", tools}, {"note", "mcp.* tools bridged into registry when MCP client attached"}});
+    }
+
+    // Feishu long-connection WS
+    if (method.rfind("feishu.", 0) == 0 || method == "channels.feishu.inbound") {
+        auto* fs = dynamic_cast<channels::FeishuAdapter*>(deps_.adapters.Get("feishu"));
+        if (!fs) return err("feishu adapter missing");
+        auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
+        if (method == "feishu.status" || method == "feishu.ws.status" ||
+            method == "feishu.longconn.status") {
+            return ok(fs->Status());
+        }
+        if (method == "feishu.ws.feed" || method == "feishu.ws.mock" ||
+            method == "feishu.longconn.feed") {
+            if (params.contains("frames") && params["frames"].is_array()) {
+                std::vector<nlohmann::json> frames;
+                for (const auto& f : params["frames"]) frames.push_back(f);
+                return ok(fs->LongConn().RunMockFrames(frames, deliver));
+            }
+            nlohmann::json payload = params.contains("payload") ? params["payload"] : params;
+            auto handled = fs->LongConn().FeedPayload(payload, deliver);
+            return ok({{"ok", true}, {"handled", handled}, {"status", fs->LongConn().Status()},
+                       {"impl", "real-sim"}});
+        }
+        if (method == "feishu.ws.start" || method == "feishu.longconn.start") {
+            fs->Start(deliver);
+            return ok({{"started", fs->LongConn().Running()},
+                       {"status", fs->Status()},
+                       {"note", "live needs FEISHU_APP_ID/SECRET (+ FEISHU_WS_URL if discovery fails)"}});
+        }
+        if (method == "feishu.ws.stop" || method == "feishu.longconn.stop") {
+            fs->Stop();
+            return ok({{"stopped", true}, {"status", fs->Status()}});
+        }
+        if (method == "channels.feishu.inbound") {
+            return ok(fs->HandleHttpInbound(params, deliver));
+        }
+        return ok(fs->Status());
     }
 
     // Discord Gateway WS (real deliver into agent)

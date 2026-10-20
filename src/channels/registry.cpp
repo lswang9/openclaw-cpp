@@ -34,7 +34,7 @@ Registry MakeDefaultChannels() {
     r.Register({"slack", "Slack Events API + Socket Mode inbound", true});
     r.Register({"whatsapp", "WhatsApp Cloud-style inbound", true});
     r.Register({"imessage", "iMessage bridge inbound", true});
-    r.Register({"feishu", "Feishu/Lark inbound+outbound", true});
+    r.Register({"feishu", "Feishu webhook + long-connection WS inbound+outbound", true});
     return r;
 }
 
