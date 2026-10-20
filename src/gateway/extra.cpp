@@ -126,7 +126,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         if (method == "pairing.link.start") r.payload = Real(dl.Start(params));
         else if (method == "pairing.link.status") r.payload = Real(dl.Status(key));
         else if (method == "pairing.link.list" || method == "pairing.status") r.payload = Real(dl.List());
-        else if (method == "pairing.link.approve") r.payload = Real(dl.Approve(key));
+        else if (method == "pairing.link.approve") r.payload = Real(dl.Approve(key, params.value("role", std::string("device"))));
         else if (method == "pairing.link.deny") r.payload = Real(dl.Deny(key));
         else if (method == "pairing.link.claim") r.payload = Real(dl.Claim(key, params.value("poll_secret", std::string())));
         else if (method == "pairing.token.verify") r.payload = Real(dl.Verify(params.value("token", std::string())));

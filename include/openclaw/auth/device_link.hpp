@@ -17,13 +17,17 @@ public:
     nlohmann::json Start(const nlohmann::json& params);   // {device_name, channel?}
     nlohmann::json Status(const std::string& link_id) const;
     nlohmann::json List() const;                          // no secrets
-    nlohmann::json Approve(const std::string& id_or_code);
+    // role: "device" (default, least privilege) or "operator" (may administer pairing).
+    nlohmann::json Approve(const std::string& id_or_code, const std::string& role = "device");
     nlohmann::json Deny(const std::string& id_or_code);
     nlohmann::json Claim(const std::string& link_id, const std::string& poll_secret);
     nlohmann::json Verify(const std::string& token) const;
     bool IsValidToken(const std::string& token) const;
     // Extract bearer / X-OpenClaw-Token and check against issued, non-revoked device tokens.
     bool AcceptsHeaders(const std::string& authorization, const std::string& x_token) const;
+    // "" if not a valid, non-revoked device token; else its role.
+    std::string TokenRole(const std::string& token) const;
+    static bool ValidRole(const std::string& role) { return role == "device" || role == "operator"; }
     nlohmann::json Revoke(const std::string& id_or_token_id);
     std::filesystem::path Path() const { return path_; }
     static std::string Sha256Hex(const std::string& s);

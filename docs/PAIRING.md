@@ -42,9 +42,29 @@ device can request + poll). Approve/deny/list/revoke still require auth.
 | `*.pair.list` | channel pairing + `device_links` |
 | `device.pair.rename|resolve|…`, `device.token.*` | **legacy** config records, flagged `legacy:true`; `device.token.*` values are **not** accepted by gateway auth |
 
+## Roles (1.24)
+
+Chosen at approve time (`pairing.link.approve {id, role}` or the selector in `/pairing`), persisted on the link and token.
+
+| Caller | Source | May |
+|--------|--------|-----|
+| `admin` | `OPENCLAW_GATEWAY_TOKEN`, or auth off | everything |
+| `operator` | `ocd_` token approved with `role:"operator"` | pairing admin (list/approve/deny/revoke); **not** `secrets.*`, `config.set|patch|apply`, `update.*`, gateway stop/restart |
+| `device` (default) | `ocd_` token approved with `role:"device"` | normal RPC/chat/tools; **not** `pairing.*` admin, `channels.pairing.*`, `device.pair*`, `device.token*`, `node.pair*`, `secrets.*`, `config.*`, `approvals.*`, plugin install, `acp.auth.*`, `GET /v1/config` |
+
+Forbidden RPCs return `{"ok":false,"error":"forbidden: <role> role cannot call …","code":403}`. Applies to HTTP `/v1/rpc` and WS frames.
+Tokens issued before 1.24 (no stored role) are treated as `device`. `GET /v1/whoami` reports the caller role.
+
+## Control UI login (1.24)
+
+- `/login` (public): paste gateway or `ocd_` token → `POST /login` validates and sets cookie `oc_token` (**HttpOnly; SameSite=Strict**, 30 days). `POST /logout` clears it.
+- With auth on, `/`, `/board`, `/canvas`, `/pairing` redirect (302) to `/login?next=…` when unauthenticated; with the cookie they load and their same-origin `/v1/rpc` calls authenticate via the cookie.
+
 ## Gaps
 
-- **No scopes/roles**: any accepted device token has full gateway access (incl. approve/revoke)
+- Roles are a fixed denylist (two roles), not fine-grained scopes; non-RPC HTTP endpoints besides `/v1/config` are not role-filtered
+- Cookie auth relies on SameSite=Strict for CSRF protection (no CSRF token); cookie holds the raw token
+- WS role enforcement is implemented but only HTTP paths are covered by smoke
 - Rate limit is in-process (resets on restart), global not per-IP
 - No QR, push approval, cross-instance sync, or upstream cloud device-link
 - Control UI pages (`/pairing`, `/board`…) load without a header-capable login when auth is on

@@ -122,9 +122,43 @@ TID=$(printf '%s' "$C2" | python3 -c 'import sys,json;print(json.load(sys.stdin)
 WS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 --http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H "Authorization: Bearer $T2" "$U2/ws" || true)
 [[ "$WS" == 101 ]] || fail2 "ocd token WS upgrade got $WS"
-curl -sf -X POST "$U2/v1/rpc" -H "Authorization: Bearer $T2" -H 'Content-Type: application/json' \
+curl -s -X POST "$U2/v1/rpc" -H "Authorization: Bearer $T2" -H 'Content-Type: application/json' \
+  -d "{\"method\":\"pairing.token.revoke\",\"params\":{\"token_id\":\"$TID\"}}" | grep -q 'forbidden' || fail2 "device self-revoke must be forbidden"
+curl -sf -X POST "$U2/v1/rpc" -H "Authorization: Bearer smoke-gw-token" -H 'Content-Type: application/json' \
   -d "{\"method\":\"pairing.token.revoke\",\"params\":{\"token_id\":\"$TID\"}}" | grep -q revoked || fail2 "revoke"
 [[ $(code -H "Authorization: Bearer $T2" "$U2/v1/status") == 401 ]] || fail2 "revoked token must be 401"
+
+echo "[smoke] roles: device token forbidden from pairing admin; operator allowed; /login cookie"
+newtok() { # $1=name $2=role -> prints token
+  local s l p
+  s=$(curl -sf -X POST "$U2/v1/rpc" -H 'Content-Type: application/json' -d "{\"method\":\"pairing.link.start\",\"params\":{\"device_name\":\"$1\"}}")
+  l=$(printf '%s' "$s" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["link"]["id"])')
+  p=$(printf '%s' "$s" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["poll_secret"])')
+  curl -sf -X POST "$U2/v1/rpc" -H 'Authorization: Bearer smoke-gw-token' -H 'Content-Type: application/json' \
+    -d "{\"method\":\"pairing.link.approve\",\"params\":{\"id\":\"$l\",\"role\":\"$2\"}}" >/dev/null
+  curl -sf -X POST "$U2/v1/rpc" -H 'Content-Type: application/json' \
+    -d "{\"method\":\"pairing.link.claim\",\"params\":{\"id\":\"$l\",\"poll_secret\":\"$p\"}}" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["token"])'
+}
+DTOK=$(newtok dev device); OTOK=$(newtok op operator)
+rpcas() { curl -s -X POST "$U2/v1/rpc" -H "Authorization: Bearer $1" -H 'Content-Type: application/json' -d "$2"; }
+rpcas "$DTOK" '{"method":"pairing.link.list","params":{}}' | grep -q 'forbidden: device role' || fail2 "device list must be forbidden"
+rpcas "$DTOK" '{"method":"pairing.token.revoke","params":{"token_id":"x"}}' | grep -q 'forbidden' || fail2 "device revoke forbidden"
+rpcas "$DTOK" '{"method":"secrets.list","params":{}}' | grep -q 'forbidden' || fail2 "device secrets forbidden"
+rpcas "$DTOK" '{"method":"tools.list","params":{}}' | grep -q '"ok": *true\|"ok":true' || fail2 "device tools.list allowed"
+[[ $(code -H "Authorization: Bearer $DTOK" "$U2/v1/config") == 403 ]] || fail2 "device /v1/config 403"
+rpcas "$OTOK" '{"method":"pairing.link.list","params":{}}' | grep -q '"links"' || fail2 "operator list allowed"
+rpcas "$OTOK" '{"method":"secrets.list","params":{}}' | grep -q 'forbidden: operator' || fail2 "operator secrets forbidden"
+[[ $(code "$U2/pairing") == 302 ]] || fail2 "/pairing without auth should redirect"
+[[ $(code "$U2/login") == 200 ]] || fail2 "/login public"
+[[ $(code -X POST "$U2/login" -H 'Content-Type: application/json' -d '{"token":"nope"}') == 401 ]] || fail2 "bad login 401"
+CJ=$(mktemp)
+curl -sf -c "$CJ" -X POST "$U2/login" -H 'Content-Type: application/json' -d "{\"token\":\"$OTOK\"}" | grep -q operator || fail2 "login"
+grep -q oc_token "$CJ" || fail2 "cookie set"
+[[ $(code -b "$CJ" "$U2/pairing") == 200 ]] || fail2 "/pairing with cookie"
+[[ $(code -b "$CJ" "$U2/board") == 200 ]] || fail2 "/board with cookie"
+curl -sf -b "$CJ" "$U2/v1/whoami" | grep -q operator || fail2 "whoami operator"
+rm -f "$CJ"
 kill "$GW2" 2>/dev/null; wait "$GW2" 2>/dev/null || true; rm -rf "$SESS2"
 
 echo "[smoke] ALL PASS"

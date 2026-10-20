@@ -35,7 +35,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.23.0-dev";
+constexpr const char* kVersion = "1.24.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -495,14 +495,80 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     return std::string("error: ") + result.error;
 }
 
-std::optional<std::string> Server::GatewayAuthDeny(const std::string& req) const {
+namespace {
+// Role of the caller for the current client thread (each connection runs on its own thread).
+// admin = gateway token / auth off / in-process; operator|device = ocd_ device token role.
+thread_local std::string g_rpc_role = "admin";
+thread_local bool g_rpc_role_pending_device = false;
+
+std::string CookieValue(const std::string& req, const std::string& name) {
+    auto cookies = HeaderValue(req, "Cookie");
+    std::size_t pos = 0;
+    while (pos < cookies.size()) {
+        auto end = cookies.find(';', pos);
+        auto part = cookies.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        while (!part.empty() && part.front() == ' ') part.erase(part.begin());
+        if (part.rfind(name + "=", 0) == 0) return part.substr(name.size() + 1);
+        if (end == std::string::npos) break;
+        pos = end + 1;
+    }
+    return {};
+}
+
+std::string BearerOf(const std::string& authz) {
+    if (authz.size() <= 7) return {};
+    std::string pre = authz.substr(0, 7);
+    for (auto& ch : pre) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (pre != "bearer ") return {};
+    auto b = authz.substr(7);
+    while (!b.empty() && (b.front() == ' ' || b.front() == '\t')) b.erase(b.begin());
+    return b;
+}
+
+// RPCs a "device" role may NOT call (pairing/device admin, secrets, config, approvals, plugins, gateway control).
+bool DeviceRoleForbidden(const std::string& m) {
+    auto starts = [&](const char* p) { return m.rfind(p, 0) == 0; };
+    if (m == "pairing.link.start" || m == "pairing.link.claim" || m == "pairing.link.status" ||
+        m == "pairing.token.verify")
+        return false;
+    if (starts("pairing.") || starts("channels.pairing.") || starts("device.pair") || starts("device.token") ||
+        starts("node.pair") || starts("secrets.") || starts("config.") || starts("approvals.") ||
+        starts("exec.approval") || starts("plugins.install") || starts("plugins.uninstall") ||
+        starts("update.") || starts("acp.auth.") || m == "gateway.restart" || m == "gateway.stop" ||
+        m == "shutdown")
+        return true;
+    return false;
+}
+
+// Operators may administer pairing but not read/write secrets or rewrite config.
+bool OperatorRoleForbidden(const std::string& m) {
+    return m.rfind("secrets.", 0) == 0 || m == "config.set" || m == "config.patch" || m == "config.apply" ||
+           m.rfind("update.", 0) == 0 || m == "gateway.restart" || m == "gateway.stop" || m == "shutdown";
+}
+}  // namespace
+
+std::string Server::AuthRole(const std::string& req) const {
+    if (!deps_.auth.require_auth) return "admin";
     const auto authz = HeaderValue(req, "Authorization");
     const auto xtok = HeaderValue(req, "X-OpenClaw-Token");
-    auto deny = auth::CheckHttpAuth(deps_.auth, authz, xtok);
-    if (!deny) return std::nullopt;
-    // Device tokens issued via pairing.link.claim (non-revoked) are accepted alongside the gateway token.
-    if (deps_.device_links && deps_.device_links->AcceptsHeaders(authz, xtok)) return std::nullopt;
-    return deny;
+    const auto ctok = CookieValue(req, "oc_token");
+    if (!auth::CheckHttpAuth(deps_.auth, authz, xtok)) return "admin";
+    if (!deps_.auth.gateway_token.empty() && ctok == deps_.auth.gateway_token) return "admin";
+    if (deps_.device_links) {
+        for (const auto& tok : {BearerOf(authz), xtok, ctok}) {
+            auto role = deps_.device_links->TokenRole(tok);
+            if (!role.empty()) return role;
+        }
+    }
+    return {};
+}
+
+std::optional<std::string> Server::GatewayAuthDeny(const std::string& req) const {
+    auto role = AuthRole(req);
+    g_rpc_role = role.empty() ? "admin" : role;
+    if (!role.empty()) return std::nullopt;
+    return "unauthorized: provide Authorization: Bearer <OPENCLAW_GATEWAY_TOKEN or ocd_ device token>, "
+           "X-OpenClaw-Token, or log in at /login";
 }
 
 void Server::HandleHttp(int client_fd, const std::string& req) {
@@ -513,6 +579,8 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
     auto send = [&](const std::string& resp) { (void)::send(client_fd, resp.data(), resp.size(), 0); };
 
     // Auth (health exempt)
+    g_rpc_role = "admin";
+    g_rpc_role_pending_device = false;
     bool public_ok = (path == "/health" || path == "/healthz");
     // Unpaired devices may start/claim/poll a link without a token (operator approval still required).
     if (!public_ok && method == "POST" && path == "/v1/rpc") {
@@ -522,11 +590,25 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                 auto j = nlohmann::json::parse(req.substr(pos + 4));
                 auto m = j.value("method", std::string());
                 public_ok = (m == "pairing.link.start" || m == "pairing.link.claim" || m == "pairing.link.status");
+                if (public_ok && AuthRole(req).empty()) {
+                    // run unauthenticated pairing calls with least privilege
+                    g_rpc_role_pending_device = true;
+                }
             } catch (...) {}
         }
     }
+    if (path == "/login" || path == "/ui/login" || path == "/logout") public_ok = true;
+    if (public_ok) g_rpc_role = g_rpc_role_pending_device ? "device" : "admin";
+    g_rpc_role_pending_device = false;
     if (!public_ok) {
         auto deny = GatewayAuthDeny(req);
+        const bool html_page = method == "GET" &&
+            (path == "/" || path == "/control" || path == "/ui" || path == "/board" || path == "/ui/board" ||
+             path == "/canvas" || path == "/ui/canvas" || path == "/pairing" || path == "/ui/pairing");
+        if (deny && html_page) {
+            send(HttpResponse(302, "Found", "", "text/plain", "Location: /login?next=" + path + "\r\n"));
+            return;
+        }
         if (deny) {
             send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", *deny}}.dump()));
             return;
@@ -549,6 +631,35 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
 #include "board_ui_html.inc"
         ;
         send(HttpResponse(200, "OK", kBoard, "text/html; charset=utf-8"));
+        return;
+    }
+    if (method == "POST" && path == "/login") {
+        std::string tok;
+        try { tok = nlohmann::json::parse(BodyOf(req)).value("token", std::string()); } catch (...) {}
+        auto role = deps_.auth.require_auth ? AuthRole("GET / HTTP/1.1\r\nAuthorization: Bearer " + tok + "\r\n\r\n")
+                                            : std::string("admin");
+        if (tok.empty() || role.empty() || tok.find_first_of(";\r\n ") != std::string::npos) {
+            send(HttpResponse(401, "Unauthorized", nlohmann::json{{"ok", false}, {"error", "invalid token"}}.dump()));
+            return;
+        }
+        send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"role", role}}.dump(), "application/json",
+                          "Set-Cookie: oc_token=" + tok + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000\r\n"));
+        return;
+    }
+    if (method == "POST" && path == "/logout") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}}.dump(), "application/json",
+                          "Set-Cookie: oc_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0\r\n"));
+        return;
+    }
+    if (method == "GET" && (path == "/login" || path == "/ui/login")) {
+        static const std::string kLogin =
+#include "login_ui_html.inc"
+        ;
+        send(HttpResponse(200, "OK", kLogin, "text/html; charset=utf-8"));
+        return;
+    }
+    if (method == "GET" && path == "/v1/whoami") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"role", g_rpc_role}, {"auth_required", deps_.auth.require_auth}}.dump()));
         return;
     }
     if (method == "GET" && (path == "/pairing" || path == "/ui/pairing")) {
@@ -603,6 +714,10 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
     }
     if (method == "GET" && path == "/v1/channels") {
         send(HttpResponse(200, "OK", nlohmann::json{{"channels", deps_.channels.ListJson()}}.dump(2)));
+        return;
+    }
+    if (method == "GET" && path == "/v1/config" && g_rpc_role == "device") {
+        send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", "forbidden: device role"}}.dump()));
         return;
     }
     if (method == "GET" && path == "/v1/config") {
@@ -809,6 +924,18 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         return r;
     };
 
+    if (g_rpc_role == "device" && DeviceRoleForbidden(method)) {
+        nlohmann::json r{{"type", "res"}, {"ok", false}, {"error", "forbidden: device role cannot call " + method},
+                         {"role", "device"}, {"code", 403}};
+        if (!id.is_null()) r["id"] = id;
+        return r;
+    }
+    if (g_rpc_role == "operator" && OperatorRoleForbidden(method)) {
+        nlohmann::json r{{"type", "res"}, {"ok", false}, {"error", "forbidden: operator role cannot call " + method},
+                         {"role", "operator"}, {"code", 403}};
+        if (!id.is_null()) r["id"] = id;
+        return r;
+    }
     if (method == "health" || method == "status" || method == "gateway.status" || method == "system.info") {
         return ok({{"runtime", "running"}, {"version", kVersion}, {"align_target", kAlign},
                    {"tools", deps_.tools.Names()}, {"sessions", deps_.sessions.List()},
@@ -996,7 +1123,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
     if (method == "channels.pairing.approve" || method == "device.pair.approve") {
         if (deps_.device_links) {
-            auto r = deps_.device_links->Approve(link_key());
+            auto r = deps_.device_links->Approve(link_key(), params.value("role", std::string("device")));
             if (r.value("ok", false)) { r["approved"] = true; r["routed"] = "pairing.link.approve"; return ok(r); }
         }
         auto ap = deps_.pairing.Approve(params.value("id", ""));

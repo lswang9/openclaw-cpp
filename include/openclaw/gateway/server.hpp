@@ -99,6 +99,7 @@ private:
     bool HandleClient(int client_fd);
     void HandleHttp(int client_fd, const std::string& req);
     std::optional<std::string> GatewayAuthDeny(const std::string& req) const;
+    std::string AuthRole(const std::string& req) const;
     void HandleWebSocket(int client_fd, const std::string& req);
     void HandleChatCompletions(int client_fd, const nlohmann::json& body, bool stream);
     nlohmann::json DispatchRpc(const nlohmann::json& msg);

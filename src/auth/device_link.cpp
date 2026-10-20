@@ -139,13 +139,15 @@ nlohmann::json DeviceLinkStore::List() const {
     return {{"ok", true}, {"impl", "real"}, {"links", links}, {"tokens", toks}, {"path", path_.string()}};
 }
 
-nlohmann::json DeviceLinkStore::Approve(const std::string& k) {
+nlohmann::json DeviceLinkStore::Approve(const std::string& k, const std::string& role_in) {
+    const std::string role = role_in.empty() ? "device" : role_in;
+    if (!ValidRole(role)) return {{"ok", false}, {"error", "invalid role (device|operator)"}};
     std::lock_guard lock(mu_);
     ExpireLocked();
     auto* l = FindLink(k);
     if (!l) return {{"ok", false}, {"error", "not found"}};
     if (S(*l, "state") != "pending") return {{"ok", false}, {"error", "not pending"}, {"state", (*l)["state"]}};
-    (*l)["state"] = "approved"; (*l)["decided_ms"] = NowMs();
+    (*l)["state"] = "approved"; (*l)["decided_ms"] = NowMs(); (*l)["role"] = role;
     Save();
     return {{"ok", true}, {"impl", "real"}, {"link", Public(*l)}};
 }
@@ -193,11 +195,12 @@ nlohmann::json DeviceLinkStore::Claim(const std::string& id, const std::string& 
     if (st != "approved") return {{"ok", false}, {"error", "link " + st}, {"state", st}};
     auto token = "ocd_" + RandHex(24);
     nlohmann::json t{{"id", "tok-" + RandHex(6)}, {"link_id", S(*l, "id")}, {"device_name", (*l)["device_name"]},
-                     {"token_sha256", Sha256Hex(token)}, {"created_ms", NowMs()}, {"revoked", false}};
+                     {"token_sha256", Sha256Hex(token)}, {"created_ms", NowMs()}, {"revoked", false},
+                     {"role", l->contains("role") ? (*l)["role"] : nlohmann::json("device")}};
     data_["tokens"].push_back(t);
     (*l)["state"] = "claimed"; (*l)["token_id"] = t["id"];
     Save();
-    return {{"ok", true}, {"impl", "real"}, {"token", token}, {"token_id", t["id"]},
+    return {{"ok", true}, {"impl", "real"}, {"token", token}, {"token_id", t["id"]}, {"role", t["role"]},
             {"note", "token shown once; only SHA-256 persisted"}};
 }
 
@@ -208,7 +211,8 @@ nlohmann::json DeviceLinkStore::Verify(const std::string& token) const {
     for (const auto& t : data_["tokens"]) {
         if (S(t, "token_sha256") == h)
             return {{"ok", true}, {"valid", !t.value("revoked", false)}, {"token_id", t["id"]},
-                    {"device_name", t["device_name"]}};
+                    {"device_name", t["device_name"]},
+                    {"role", (t.contains("role") && t["role"].is_string()) ? t["role"].get<std::string>() : "device"}};
     }
     return {{"ok", true}, {"valid", false}};
 }
@@ -217,6 +221,13 @@ bool DeviceLinkStore::IsValidToken(const std::string& token) const {
     if (token.rfind("ocd_", 0) != 0) return false;
     auto v = Verify(token);
     return v.value("valid", false);
+}
+
+std::string DeviceLinkStore::TokenRole(const std::string& token) const {
+    if (token.rfind("ocd_", 0) != 0) return {};
+    auto v = Verify(token);
+    if (!v.value("valid", false)) return {};
+    return v.value("role", std::string("device"));
 }
 
 bool DeviceLinkStore::AcceptsHeaders(const std::string& authorization, const std::string& x_token) const {

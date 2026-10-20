@@ -70,7 +70,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.23.0-dev";
+constexpr const char* kVersion = "1.24.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1151,6 +1151,31 @@ int CmdSelfTest() {
         } else std::cerr << "PASS device token gateway-auth + claim rate limit/lockout + revoke\n";
     } catch (const std::exception& e) {
         std::cerr << "FAIL device token auth exception: " << e.what() << "\n"; ++failures;
+    }
+
+    // device token roles chosen at approve time, persisted
+    try {
+        auto path = std::filesystem::temp_directory_path() / "oc-devlink-roles" / "device_links.json";
+        std::filesystem::remove_all(path.parent_path());
+        auth::DeviceLinkStore dl(path);
+        auto a = dl.Start({{"device_name", "op"}});
+        auto b = dl.Start({{"device_name", "dev"}});
+        auto c = dl.Start({{"device_name", "bad"}});
+        auto bad = dl.Approve(c["link"].value("id", ""), "root");
+        dl.Approve(a["link"].value("id", ""), "operator");
+        dl.Approve(b["link"].value("id", ""));
+        auto ta = dl.Claim(a["link"].value("id", ""), a.value("poll_secret", ""));
+        auto tb = dl.Claim(b["link"].value("id", ""), b.value("poll_secret", ""));
+        auth::DeviceLinkStore dl2(path);
+        bool ok = !bad.value("ok", true) && ta.value("role", "") == "operator" && tb.value("role", "") == "device" &&
+                  dl2.TokenRole(ta.value("token", "")) == "operator" && dl2.TokenRole(tb.value("token", "")) == "device" &&
+                  dl2.TokenRole("ocd_x").empty();
+        dl2.Revoke(ta.value("token_id", ""));
+        ok = ok && dl2.TokenRole(ta.value("token", "")).empty();
+        if (!ok) { std::cerr << "FAIL device roles ta=" << ta.dump() << " tb=" << tb.dump() << "\n"; ++failures; }
+        else std::cerr << "PASS device token roles (operator/device, persisted, invalid role rejected)\n";
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL device roles exception: " << e.what() << "\n"; ++failures;
     }
 
     // canvas disk store + sim bridge
