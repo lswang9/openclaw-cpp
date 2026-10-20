@@ -1,4 +1,5 @@
 #include "openclaw/sim/backend.hpp"
+#include "openclaw/sim/capture.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -32,13 +33,20 @@ std::string SimulationBackend::MinimalPngBytes() {
 
 nlohmann::json SimulationBackend::Status() const {
     auto br = browser_ ? browser_->Status() : nlohmann::json::object();
-    return {{"mode", "simulation"},
+    auto cap = ProbeCaptureEnv();
+    return {{"mode", "hybrid"},
             {"backend", "SimulationBackend"},
             {"events", events_.size()},
             {"desktop", desktop_},
             {"canvas_title", canvas_.value("title", "")},
             {"browser", br},
-            {"note", "NOT production OS/desktop automation — deterministic local sim"}};
+            {"screenshot",
+             {{"has_display", cap.has_display},
+              {"display", cap.display},
+              {"wayland", cap.wayland},
+              {"force_sim", cap.force_sim},
+              {"tools_available", cap.tools_available}}},
+            {"note", "screenshot may be live (impl:real); mouse/keyboard/canvas still real-sim"}};
 }
 
 nlohmann::json SimulationBackend::EventLog(std::size_t limit) const {
@@ -49,29 +57,35 @@ nlohmann::json SimulationBackend::EventLog(std::size_t limit) const {
 }
 
 nlohmann::json SimulationBackend::ComputerStatus() {
-    return {{"mode", "simulation"},
+    auto cap = ProbeCaptureEnv();
+    const bool live = cap.has_display && !cap.force_sim && !cap.tools_available.empty();
+    return {{"mode", live ? "hybrid" : "simulation"},
             {"online", true},
+            {"impl", live ? "real" : "real-sim"},
             {"capabilities", nlohmann::json::array({"screenshot", "mouse", "keyboard", "invoke"})},
-            {"events", events_.size()}};
+            {"screenshot_live", live},
+            {"display", cap.display},
+            {"wayland", cap.wayland},
+            {"tools_available", cap.tools_available},
+            {"events", events_.size()},
+            {"note", live ? "screenshot can be live; click/type remain real-sim"
+                          : "no capture path — screenshot placeholder; click/type real-sim"}};
 }
 
 nlohmann::json SimulationBackend::Screenshot(const nlohmann::json& params) {
-    (void)params;
-    auto png = MinimalPngBytes();
     auto path = root_ / ("screenshot-" + std::to_string(seq_++) + ".png");
-    std::ofstream out(path, std::ios::binary);
-    out.write(png.data(), static_cast<std::streamsize>(png.size()));
-    Record("screenshot", {{"path", path.string()}, {"bytes", png.size()}});
-    return {{"mode", "simulation"},
-            {"path", path.string()},
-            {"bytes", png.size()},
-            {"content_type", "image/png"},
-            {"note", "placeholder 1x1 PNG — not a real display capture"}};
+    auto got = CaptureScreenshotPng(path, params);
+    Record("screenshot", {{"path", path.string()},
+                          {"bytes", got.value("bytes", 0)},
+                          {"impl", got.value("impl", "")},
+                          {"engine", got.value("engine", "")}});
+    got["ok"] = got.value("ok", true);
+    return got;
 }
 
 nlohmann::json SimulationBackend::ComputerInvoke(const nlohmann::json& params) {
     auto action = params.value("action", params.value("op", "noop"));
-    nlohmann::json result{{"mode", "simulation"}, {"action", action}, {"ok", true}};
+    nlohmann::json result{{"mode", "simulation"}, {"action", action}, {"ok", true}, {"impl", "real-sim"}};
     if (action == "screenshot" || action == "capture") {
         result.merge_patch(Screenshot(params));
     } else if (action == "mouse_move" || action == "move") {
@@ -127,10 +141,13 @@ nlohmann::json SimulationBackend::DesktopObserve(const nlohmann::json& params) {
     (void)params;
     Record("desktop.observe", desktop_);
     auto shot = Screenshot({});
-    return {{"mode", "simulation"},
-            {"desktop", desktop_},
-            {"screenshot", shot},
-            {"events_recent", EventLog(10)}};
+    nlohmann::json out{{"mode", shot.value("mode", "simulation")},
+                       {"desktop", desktop_},
+                       {"screenshot", shot},
+                       {"events_recent", EventLog(10)},
+                       {"impl", shot.value("impl", "real-sim")},
+                       {"note", "observe bundles screenshot; input still real-sim"}};
+    return out;
 }
 
 nlohmann::json SimulationBackend::DesktopRelease(const nlohmann::json& params) {

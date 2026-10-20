@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.8.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.9.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +18,7 @@ set(OPENCLAW_SOURCES
   src/acp/session.cpp
   src/acp/wire.cpp
   src/sim/backend.cpp
+  src/sim/capture.cpp
   src/browser/cdp_client.cpp
   src/browser/engine.cpp
   src/voice/tts.cpp

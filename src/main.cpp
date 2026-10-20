@@ -28,6 +28,7 @@
 #include "openclaw/daemon/lifecycle.hpp"
 #include "openclaw/voice/tts.hpp"
 #include "openclaw/sim/backend.hpp"
+#include "openclaw/sim/capture.hpp"
 #include "openclaw/browser/engine.hpp"
 #include "openclaw/browser/cdp_client.hpp"
 #include "openclaw/channels/feishu.hpp"
@@ -60,7 +61,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.8.0-dev";
+constexpr const char* kVersion = "1.9.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -436,7 +437,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.8.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.9.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -811,17 +812,36 @@ int CmdSelfTest() {
     }
 
 
-    // simulation backend
+    // simulation backend + screenshot capture
     {
+        setenv("OPENCLAW_SCREENSHOT_FORCE_SIM", "1", 1);
         sim::SimulationBackend sim(std::filesystem::temp_directory_path() / "oc-sim");
         auto shot = sim.Screenshot({});
         auto inv = sim.ComputerInvoke({{"action", "mouse_click"}, {"x", 1}, {"y", 2}});
         auto cv = sim.CanvasPut({{"title", "t1"}, {"widgets", nlohmann::json::array()}});
         auto dl = sim.DesktopLaunch({{"app", "sim"}});
-        if (!shot.contains("path") || inv.value("action", "") != "mouse_click" ||
-            !cv.value("saved", false) || !dl["desktop"].value("running", false)) {
-            std::cerr << "FAIL sim backend\n"; ++failures;
-        } else std::cerr << "PASS simulation backend\n";
+        if (!shot.contains("path") || shot.value("impl", "") != "real-sim" ||
+            inv.value("action", "") != "mouse_click" || !cv.value("saved", false) ||
+            !dl["desktop"].value("running", false)) {
+            std::cerr << "FAIL sim backend " << shot.dump() << "\n"; ++failures;
+        } else std::cerr << "PASS simulation backend (force-sim screenshot)\n";
+        unsetenv("OPENCLAW_SCREENSHOT_FORCE_SIM");
+
+        // Live path when DISPLAY + capture tool exist (optional; do not fail CI headless)
+        auto env = sim::ProbeCaptureEnv();
+        if (env.has_display && !env.tools_available.empty()) {
+            sim::SimulationBackend live(std::filesystem::temp_directory_path() / "oc-sim-live");
+            auto live_shot = live.Screenshot({});
+            if (live_shot.value("impl", "") == "real" && live_shot.value("bytes", 0) > 100) {
+                std::cerr << "PASS computer.screenshot live (" << live_shot.value("engine", "")
+                          << " bytes=" << live_shot.value("bytes", 0) << ")\n";
+            } else {
+                std::cerr << "WARN computer.screenshot live skipped/fallback " << live_shot.dump() << "\n";
+            }
+        } else {
+            std::cerr << "PASS computer.screenshot no-display probe (tools="
+                      << env.tools_available.size() << ")\n";
+        }
         auto br = sim.BrowserOpenUrl("https://example.com");
         if (!br.value("ok", false)) std::cerr << "WARN browser.open_url " << br.dump() << "\n";
         else std::cerr << "PASS browser.open_url curl-or-cdp\n";

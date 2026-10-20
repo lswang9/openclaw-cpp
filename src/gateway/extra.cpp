@@ -1385,19 +1385,27 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
-    // ---- Explicit NOT implemented (no fake computer/canvas/desktop) ----
-    // ---- computer / canvas / desktop SIMULATION (real-sim) ----
+    // ---- computer / canvas / desktop (screenshot may be live; input still real-sim) ----
     if (starts("computer.") || starts("canvas.") || starts("desktop.")) {
         r.handled = true;
         if (!deps.sim) {
             r.payload = RealSim({{"error", "sim backend not wired"}, {"method", method}});
             return r;
         }
+        auto tag_computer = [](nlohmann::json payload) {
+            if (payload.value("impl", "") == "real") return Real(std::move(payload));
+            return RealSim(std::move(payload));
+        };
         auto& sim = *deps.sim;
-        if (method == "computer.status") { r.payload = RealSim(sim.ComputerStatus()); return r; }
-        if (method == "computer.invoke") { r.payload = RealSim(sim.ComputerInvoke(params)); return r; }
+        if (method == "computer.status") { r.payload = tag_computer(sim.ComputerStatus()); return r; }
+        if (method == "computer.invoke") {
+            auto inv = sim.ComputerInvoke(params);
+            // screenshot action may be live; mouse/key stay real-sim
+            r.payload = tag_computer(std::move(inv));
+            return r;
+        }
         if (method.find("screenshot") != std::string::npos) {
-            r.payload = RealSim(sim.Screenshot(params));
+            r.payload = tag_computer(sim.Screenshot(params));
             return r;
         }
         if (starts("canvas.")) {
@@ -1422,7 +1430,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
                 return r;
             }
             if (method.find("observe") != std::string::npos) {
-                r.payload = RealSim(sim.DesktopObserve(params));
+                r.payload = tag_computer(sim.DesktopObserve(params));
                 return r;
             }
             if (method.find("release") != std::string::npos) {

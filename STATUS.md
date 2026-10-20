@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.8.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.9.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 构建
 
@@ -60,8 +60,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ## 已知限制（务必读）
 
-1. **computer/canvas/desktop**：仿真（`real-sim`），截图是占位 PNG，不会真控鼠标键盘。
+1. **computer/desktop**：有 `DISPLAY`/`WAYLAND` 且存在 scrot/import/ffmpeg/grim 时，**截图可为 `impl:real`**；否则占位 PNG（`real-sim`）。鼠标/键盘/canvas 仍为仿真。可用 `OPENCLAW_SCREENSHOT_FORCE_SIM=1` 强制占位。
 2. **browser**：优先 **CDP**（已运行的 Chrome `--remote-debugging-port`，见 [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md)）；不可用时回退 **curl-session**（cookie/重定向/链接表单）。**不是** Playwright。可用 `OPENCLAW_BROWSER_CDP_MOCK=1` 自测。
+| [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 3. **IM**：webhook 入站较完整；出站需对应 env token，否则只本地记录。
 4. **MCP App**：可 list/call tools、resources；宿主 UI 类 RPC 多为本地 ack。
 5. **ACP**：`session/prompt` 已接 **AgentLoop**（默认 mock）；`session/cancel` 可取消；`acp-stdio` 可用。**无** acpx/通道绑定/多模态。见 `docs/ACP-GAP.md`。
@@ -78,4 +79,5 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/ACP-GAP.md](docs/ACP-GAP.md) | ACP 缺口 |
 | [docs/PLUGIN-SDK.md](docs/PLUGIN-SDK.md) | 原生插件 ABI |
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
+| [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |

@@ -30,6 +30,8 @@
 
 - **1.5.1-dev**: docs STATUS.md (zh), PARITY executive summary, EnsureObj store_key lifetime fix
 
+- **1.9.0-dev**: computer.screenshot live capture (ffmpeg/scrot/import/grim) with honest impl tags; force-sim for CI
+
 - **1.8.0-dev**: ACP session/prompt → RunAgentLoop (mock default) + session/cancel; ACP-GAP refresh
 
 - **1.7.0-dev**: ACP JSON-RPC wire subset (initialize/session/*), acp-stdio, in-process client self-test; ACP-GAP.md refresh
