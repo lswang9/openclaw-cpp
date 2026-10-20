@@ -1,0 +1,202 @@
+#include "openclaw/auth/device_link.hpp"
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+
+namespace openclaw::auth {
+namespace {
+std::int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
+}
+std::string RandHex(int bytes) {
+    std::string raw(bytes, '\0');
+    RAND_bytes(reinterpret_cast<unsigned char*>(raw.data()), bytes);
+    static const char* h = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : raw) { out += h[c >> 4]; out += h[c & 15]; }
+    return out;
+}
+std::string RandCode() {  // 8 chars, no ambiguous glyphs
+    static const char* a = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    unsigned char b[8];
+    RAND_bytes(b, 8);
+    std::string s;
+    for (int i = 0; i < 8; ++i) { if (i == 4) s += '-'; s += a[b[i] % 32]; }
+    return s;
+}
+std::int64_t TtlMs() {
+    const char* v = std::getenv("OPENCLAW_PAIR_TTL_SEC");
+    long s = (v && *v) ? std::atol(v) : 600;
+    return static_cast<std::int64_t>(s) * 1000;
+}
+std::string S(const nlohmann::json& j, const char* k) {
+    return (j.contains(k) && j[k].is_string()) ? j[k].get<std::string>() : std::string();
+}
+nlohmann::json Public(const nlohmann::json& l) {
+    nlohmann::json o = l;
+    o.erase("poll_secret_sha256");
+    return o;
+}
+}  // namespace
+
+std::string DeviceLinkStore::Sha256Hex(const std::string& s) {
+    unsigned char d[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), d);
+    static const char* h = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : d) { out += h[c >> 4]; out += h[c & 15]; }
+    return out;
+}
+
+DeviceLinkStore::DeviceLinkStore(std::filesystem::path path) : path_(std::move(path)) {
+    std::error_code ec;
+    std::filesystem::create_directories(path_.parent_path(), ec);
+    Load();
+}
+
+void DeviceLinkStore::Load() {
+    data_ = {{"version", 1}, {"links", nlohmann::json::array()}, {"tokens", nlohmann::json::array()}};
+    std::ifstream in(path_);
+    if (!in) return;
+    try {
+        nlohmann::json j; in >> j;
+        if (j.is_object()) {
+            if (j.contains("links") && j["links"].is_array()) data_["links"] = j["links"];
+            if (j.contains("tokens") && j["tokens"].is_array()) data_["tokens"] = j["tokens"];
+        }
+    } catch (...) {}
+}
+
+void DeviceLinkStore::Save() const {
+    auto tmp = path_; tmp += ".tmp";
+    { std::ofstream out(tmp); out << data_.dump(2); }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path_, ec);
+    std::filesystem::permissions(path_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace, ec);
+}
+
+void DeviceLinkStore::ExpireLocked() {
+    auto now = NowMs();
+    for (auto& l : data_["links"]) {
+        if (S(l, "state") == "pending" && l.value("expires_ms", (std::int64_t)0) < now) l["state"] = "expired";
+    }
+}
+
+nlohmann::json* DeviceLinkStore::FindLink(const std::string& k) {
+    for (auto& l : data_["links"]) if (S(l, "id") == k || S(l, "code") == k) return &l;
+    return nullptr;
+}
+
+nlohmann::json DeviceLinkStore::Start(const nlohmann::json& p) {
+    std::lock_guard lock(mu_);
+    ExpireLocked();
+    auto secret = RandHex(16);
+    nlohmann::json l{{"id", "link-" + RandHex(6)}, {"code", RandCode()},
+                     {"device_name", S(p, "device_name").empty() ? std::string("device") : S(p, "device_name")},
+                     {"channel", S(p, "channel").empty() ? std::string("gateway") : S(p, "channel")},
+                     {"state", "pending"}, {"created_ms", NowMs()}, {"expires_ms", NowMs() + TtlMs()},
+                     {"poll_secret_sha256", Sha256Hex(secret)}};
+    data_["links"].push_back(l);
+    Save();
+    auto out = Public(l);
+    return {{"ok", true}, {"impl", "real"}, {"link", out}, {"poll_secret", secret},
+            {"note", "show code to operator; approve in /pairing; then pairing.link.claim with poll_secret"}};
+}
+
+nlohmann::json DeviceLinkStore::Status(const std::string& id) const {
+    std::lock_guard lock(mu_);
+    auto now = NowMs();
+    for (const auto& l : data_["links"]) {
+        if (S(l, "id") == id || S(l, "code") == id) {
+            auto o = Public(l);
+            if (S(o, "state") == "pending" && o.value("expires_ms", (std::int64_t)0) < now) o["state"] = "expired";
+            return {{"ok", true}, {"impl", "real"}, {"link", o}};
+        }
+    }
+    return {{"ok", false}, {"error", "not found"}};
+}
+
+nlohmann::json DeviceLinkStore::List() const {
+    std::lock_guard lock(mu_);
+    nlohmann::json links = nlohmann::json::array(), toks = nlohmann::json::array();
+    auto now = NowMs();
+    for (const auto& l : data_["links"]) {
+        auto o = Public(l);
+        if (S(o, "state") == "pending" && o.value("expires_ms", (std::int64_t)0) < now) o["state"] = "expired";
+        links.push_back(o);
+    }
+    for (const auto& t : data_["tokens"]) { auto o = t; o.erase("token_sha256"); toks.push_back(o); }
+    return {{"ok", true}, {"impl", "real"}, {"links", links}, {"tokens", toks}, {"path", path_.string()}};
+}
+
+nlohmann::json DeviceLinkStore::Approve(const std::string& k) {
+    std::lock_guard lock(mu_);
+    ExpireLocked();
+    auto* l = FindLink(k);
+    if (!l) return {{"ok", false}, {"error", "not found"}};
+    if (S(*l, "state") != "pending") return {{"ok", false}, {"error", "not pending"}, {"state", (*l)["state"]}};
+    (*l)["state"] = "approved"; (*l)["decided_ms"] = NowMs();
+    Save();
+    return {{"ok", true}, {"impl", "real"}, {"link", Public(*l)}};
+}
+
+nlohmann::json DeviceLinkStore::Deny(const std::string& k) {
+    std::lock_guard lock(mu_);
+    ExpireLocked();
+    auto* l = FindLink(k);
+    if (!l) return {{"ok", false}, {"error", "not found"}};
+    if (S(*l, "state") != "pending") return {{"ok", false}, {"error", "not pending"}, {"state", (*l)["state"]}};
+    (*l)["state"] = "denied"; (*l)["decided_ms"] = NowMs();
+    Save();
+    return {{"ok", true}, {"impl", "real"}, {"link", Public(*l)}};
+}
+
+nlohmann::json DeviceLinkStore::Claim(const std::string& id, const std::string& secret) {
+    std::lock_guard lock(mu_);
+    ExpireLocked();
+    auto* l = FindLink(id);
+    if (!l || secret.empty() || S(*l, "poll_secret_sha256") != Sha256Hex(secret))
+        return {{"ok", false}, {"error", "invalid link or poll_secret"}};
+    auto st = S(*l, "state");
+    if (st == "pending") return {{"ok", false}, {"pending", true}, {"state", st}};
+    if (st != "approved") return {{"ok", false}, {"error", "link " + st}, {"state", st}};
+    auto token = "ocd_" + RandHex(24);
+    nlohmann::json t{{"id", "tok-" + RandHex(6)}, {"link_id", S(*l, "id")}, {"device_name", (*l)["device_name"]},
+                     {"token_sha256", Sha256Hex(token)}, {"created_ms", NowMs()}, {"revoked", false}};
+    data_["tokens"].push_back(t);
+    (*l)["state"] = "claimed"; (*l)["token_id"] = t["id"];
+    Save();
+    return {{"ok", true}, {"impl", "real"}, {"token", token}, {"token_id", t["id"]},
+            {"note", "token shown once; only SHA-256 persisted"}};
+}
+
+nlohmann::json DeviceLinkStore::Verify(const std::string& token) const {
+    std::lock_guard lock(mu_);
+    if (token.empty()) return {{"ok", false}, {"valid", false}};
+    auto h = Sha256Hex(token);
+    for (const auto& t : data_["tokens"]) {
+        if (S(t, "token_sha256") == h)
+            return {{"ok", true}, {"valid", !t.value("revoked", false)}, {"token_id", t["id"]},
+                    {"device_name", t["device_name"]}};
+    }
+    return {{"ok", true}, {"valid", false}};
+}
+
+nlohmann::json DeviceLinkStore::Revoke(const std::string& k) {
+    std::lock_guard lock(mu_);
+    auto h = Sha256Hex(k);
+    for (auto& t : data_["tokens"]) {
+        if (S(t, "id") == k || S(t, "link_id") == k || S(t, "token_sha256") == h) {
+            t["revoked"] = true; t["revoked_ms"] = NowMs();
+            Save();
+            return {{"ok", true}, {"impl", "real"}, {"revoked", t["id"]}};
+        }
+    }
+    return {{"ok", false}, {"error", "token not found"}};
+}
+
+}  // namespace openclaw::auth

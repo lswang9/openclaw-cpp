@@ -8,6 +8,7 @@
 #include <memory>
 #include "openclaw/approvals/store.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
+#include "openclaw/auth/device_link.hpp"
 #include "openclaw/agent/loop.hpp"
 #include "openclaw/channels/adapter.hpp"
 #include "openclaw/channels/outbound.hpp"
@@ -73,6 +74,7 @@ struct ServerDeps {
     plugins::JsHost* js_host = nullptr;
     board::Store* board = nullptr;
     canvas::Store* canvas = nullptr;
+    auth::DeviceLinkStore* device_links = nullptr;
     std::shared_ptr<mcp::Client> mcp_client;
     config::Snapshot config;
     auth::AuthConfig auth;

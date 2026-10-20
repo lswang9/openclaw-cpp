@@ -20,6 +20,7 @@
 #include "openclaw/plugins/js_host.hpp"
 #include "openclaw/board/store.hpp"
 #include "openclaw/canvas/store.hpp"
+#include "openclaw/auth/device_link.hpp"
 #include "openclaw/provider/deepseek.hpp"
 #include "openclaw/provider/mock.hpp"
 #include "openclaw/session/store.hpp"
@@ -69,7 +70,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.21.0-dev";
+constexpr const char* kVersion = "1.22.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1078,6 +1079,45 @@ int CmdSelfTest() {
             std::cerr << "PASS board store CRUD+persist\n";
     }
 
+    // device link pairing flow (disk, token once, sha256 only)
+    try {
+        auto path = std::filesystem::temp_directory_path() / "oc-devlink-st" / "device_links.json";
+        std::filesystem::remove_all(path.parent_path());
+        auth::DeviceLinkStore dl(path);
+        auto st = dl.Start({{"device_name", "phone"}});
+        auto lid = st["link"].value("id", "");
+        auto code = st["link"].value("code", "");
+        auto secret = st.value("poll_secret", "");
+        auto early = dl.Claim(lid, secret);                 // pending → no token
+        auto badsec = dl.Claim(lid, "nope");                // wrong secret
+        auto ap = dl.Approve(code);                         // approve by code
+        auto claim = dl.Claim(lid, secret);
+        auto tok = claim.value("token", "");
+        auto again = dl.Claim(lid, secret);                 // already claimed
+        auth::DeviceLinkStore dl2(path);                    // reload from disk
+        auto v1 = dl2.Verify(tok);
+        auto vbad = dl2.Verify("ocd_wrong");
+        auto rv = dl2.Revoke(claim.value("token_id", ""));
+        auto v2 = dl2.Verify(tok);
+        auto st2 = dl2.Start({{"device_name", "tablet"}});
+        auto dn = dl2.Deny(st2["link"].value("id", ""));
+        auto dclaim = dl2.Claim(st2["link"].value("id", ""), st2.value("poll_secret", ""));
+        std::ifstream raw(path); std::string disk((std::istreambuf_iterator<char>(raw)), {});
+        bool ok = !lid.empty() && code.size() == 9 && !early.value("ok", true) && early.value("pending", false) &&
+                  !badsec.value("ok", true) && ap.value("ok", false) && tok.rfind("ocd_", 0) == 0 &&
+                  !again.value("ok", true) && v1.value("valid", false) && !vbad.value("valid", true) &&
+                  rv.value("ok", false) && !v2.value("valid", true) && dn.value("ok", false) &&
+                  !dclaim.value("ok", true) && disk.find(tok) == std::string::npos &&
+                  disk.find(secret) == std::string::npos;
+        if (!ok) {
+            std::cerr << "FAIL device link flow st=" << st.dump() << " claim=" << claim.dump()
+                      << " v1=" << v1.dump() << " v2=" << v2.dump() << "\n";
+            ++failures;
+        } else std::cerr << "PASS device link pairing (approve/deny/claim/verify/revoke/persist)\n";
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL device link exception: " << e.what() << "\n"; ++failures;
+    }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -1640,6 +1680,7 @@ int CmdGateway(int argc, char** argv, int argi) {
     auto nodes = nodes::Registry::MakeDefault();
     media::Store media(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "media");
     board::Store board_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "board.json");
+    auth::DeviceLinkStore device_links(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "device_links.json");
     canvas::Store canvas_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "canvas");
     events::Bus bus;
     agent::FileStore agent_files(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "agents");
@@ -1706,6 +1747,7 @@ int CmdGateway(int argc, char** argv, int argi) {
         .js_host = &js_host,
         .board = &board_store,
         .canvas = &canvas_store,
+        .device_links = &device_links,
         .mcp_client = mcp_client,
         .config = cfg,
         .auth = auth::FromEnv(),

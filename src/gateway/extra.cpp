@@ -117,6 +117,24 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
+    // ---- device link / pairing codes (disk-backed; token issued once) ----
+    if (starts("pairing.link.") || starts("pairing.token.") || method == "pairing.status") {
+        r.handled = true;
+        if (!deps.device_links) { r.payload = Real({{"error", "device links not wired"}}); return r; }
+        auto& dl = *deps.device_links;
+        auto key = params.value("id", params.value("code", params.value("link_id", std::string())));
+        if (method == "pairing.link.start") r.payload = Real(dl.Start(params));
+        else if (method == "pairing.link.status") r.payload = Real(dl.Status(key));
+        else if (method == "pairing.link.list" || method == "pairing.status") r.payload = Real(dl.List());
+        else if (method == "pairing.link.approve") r.payload = Real(dl.Approve(key));
+        else if (method == "pairing.link.deny") r.payload = Real(dl.Deny(key));
+        else if (method == "pairing.link.claim") r.payload = Real(dl.Claim(key, params.value("poll_secret", std::string())));
+        else if (method == "pairing.token.verify") r.payload = Real(dl.Verify(params.value("token", std::string())));
+        else if (method == "pairing.token.revoke") r.payload = Real(dl.Revoke(params.value("token_id", key)));
+        else r.payload = Real({{"error", "unknown pairing method"}, {"method", method}});
+        return r;
+    }
+
     // ---- ACP wire subset (JSON-RPC agent + gateway sessions) ----
     if (method == "acp.status" || method.rfind("acp.", 0) == 0) {
         r.handled = true;

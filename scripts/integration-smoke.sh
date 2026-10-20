@@ -84,4 +84,15 @@ CHAT=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/chat/completions" \
 echo "$CHAT" | grep -Eq 'mock|choices|content' || { echo "[smoke] FAIL chat: $CHAT" >&2; exit 1; }
 echo "$CHAT" | head -c 200; echo
 
+echo "[smoke] GET /pairing + pairing.link start/approve/claim/verify"
+curl -sf "http://${HOST}:${PORT}/pairing" | grep -q 'Device pairing'
+rpc() { curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" -H 'Content-Type: application/json' -d "$1"; }
+START=$(rpc '{"method":"pairing.link.start","params":{"device_name":"smoke"}}')
+LID=$(printf '%s' "$START" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["link"]["id"])')
+SEC=$(printf '%s' "$START" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["poll_secret"])')
+rpc "{\"method\":\"pairing.link.approve\",\"params\":{\"id\":\"$LID\"}}" | grep -q '"approved"'
+CLAIM=$(rpc "{\"method\":\"pairing.link.claim\",\"params\":{\"id\":\"$LID\",\"poll_secret\":\"$SEC\"}}")
+TOK=$(printf '%s' "$CLAIM" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["token"])')
+rpc "{\"method\":\"pairing.token.verify\",\"params\":{\"token\":\"$TOK\"}}" | grep -q '"valid": *true' || { echo "[smoke] FAIL pairing verify" >&2; exit 1; }
+
 echo "[smoke] ALL PASS"

@@ -35,7 +35,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.21.0-dev";
+constexpr const char* kVersion = "1.22.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -529,6 +529,13 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
 #include "board_ui_html.inc"
         ;
         send(HttpResponse(200, "OK", kBoard, "text/html; charset=utf-8"));
+        return;
+    }
+    if (method == "GET" && (path == "/pairing" || path == "/ui/pairing")) {
+        static const std::string kPairing =
+#include "pairing_ui_html.inc"
+        ;
+        send(HttpResponse(200, "OK", kPairing, "text/html; charset=utf-8"));
         return;
     }
     if (method == "GET" && (path == "/canvas" || path == "/ui/canvas")) {

@@ -34,6 +34,7 @@ R"OCUI(<!DOCTYPE html>
     <button class="secondary" id="btnExport">Export session</button>
     <a href="/board"><button class="secondary" type="button">Board</button></a>
     <a href="/canvas"><button class="secondary" type="button">Canvas</button></a>
+    <a href="/pairing"><button class="secondary" type="button">Pairing</button></a>
     <span id="badge" class="muted">—</span>
     <pre id="meta" class="muted" style="margin-top:.75rem">Ready.</pre>
   </div>
