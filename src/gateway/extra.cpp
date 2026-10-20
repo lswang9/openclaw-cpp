@@ -111,7 +111,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
-    // ---- ACP skeleton ----
+    // ---- ACP wire subset (JSON-RPC agent + gateway sessions) ----
     if (method == "acp.status" || method.rfind("acp.", 0) == 0) {
         r.handled = true;
         if (!deps.acp) {
@@ -119,20 +119,49 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         if (method == "acp.status") { r.payload = Real(deps.acp->StatusJson()); return r; }
+        if (method == "acp.agents.list") {
+            r.payload = Real({{"agents", deps.acp->AgentsListJson()}});
+            return r;
+        }
         if (method == "acp.sessions.list") {
-            r.payload = Real({{"sessions", deps.acp->ListJson()}});
+            r.payload = Real({{"sessions", deps.acp->ListJson()},
+                              {"wire_sessions", deps.acp->Endpoint().ListSessionsJson()}});
             return r;
         }
         if (method == "acp.sessions.create") {
             auto id = deps.acp->Create(params.value("agentId", params.value("agent", "openclaw")));
-            r.payload = Real({{"id", id}});
+            r.payload = Real({{"id", id}, {"wire", true}});
             return r;
         }
         if (method == "acp.sessions.prompt") {
             auto id = params.value("id", params.value("sessionId", ""));
-            auto prompt = params.value("prompt", params.value("text", ""));
-            if (!deps.acp->AppendPrompt(id, prompt)) { r.ok = false; r.error = "session not found"; return r; }
-            r.payload = Real({{"id", id}, {"queued", true}, {"wire", "not_implemented"}});
+            std::string text;
+            if (params.contains("prompt") && params["prompt"].is_string()) text = params["prompt"].get<std::string>();
+            else if (params.contains("text")) text = params.value("text", "");
+            else if (params.contains("prompt") && params["prompt"].is_array()) {
+                for (const auto& b : params["prompt"]) {
+                    if (b.is_object() && b.value("type", "") == "text") {
+                        if (!text.empty()) text += "\n";
+                        text += b.value("text", "");
+                    }
+                }
+            }
+            if (!deps.acp->AppendPrompt(id, text)) { r.ok = false; r.error = "session not found"; return r; }
+            r.payload = Real({{"id", id}, {"queued", true}, {"wire", true},
+                              {"note", "routed through in-process ACP AgentEndpoint"}});
+            return r;
+        }
+        if (method == "acp.wire" || method == "acp.rpc") {
+            nlohmann::json req = params.contains("request") ? params["request"] : params;
+            if (!req.contains("method") && params.contains("acpMethod")) {
+                req = {{"jsonrpc", "2.0"},
+                       {"id", params.value("id", 1)},
+                       {"method", params["acpMethod"]},
+                       {"params", params.value("params", nlohmann::json::object())}};
+            }
+            auto resp = deps.acp->WireHandle(req);
+            auto notes = deps.acp->Endpoint().DrainNotifications();
+            r.payload = Real({{"response", resp}, {"notifications", notes}});
             return r;
         }
         r.payload = Real(deps.acp->StatusJson());

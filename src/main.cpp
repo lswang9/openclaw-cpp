@@ -24,6 +24,7 @@
 #include "openclaw/tools/registry.hpp"
 #include "openclaw/util.hpp"
 #include "openclaw/acp/session.hpp"
+#include "openclaw/acp/wire.hpp"
 #include "openclaw/daemon/lifecycle.hpp"
 #include "openclaw/voice/tts.hpp"
 #include "openclaw/sim/backend.hpp"
@@ -59,7 +60,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.6.0-dev";
+constexpr const char* kVersion = "1.7.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -82,7 +83,7 @@ void PrintUsage() {
     std::cerr
         << "openclaw-cpp " << kVersion << " — align OpenClaw 2026.10.5\n"
         << "  chat [-s SESSION] <msg> | gateway [--port N] | gateway start|stop|status\n"
-        << "  cron-daemon | mcp-mock-server | self-test\n"
+        << "  cron-daemon | mcp-mock-server | acp-stdio | self-test\n"
         << "  status | tools | channels | config | methods | skills | memory | cron\n";
 }
 
@@ -435,7 +436,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.6.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.7.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -487,15 +488,43 @@ int CmdSelfTest() {
     } else std::cerr << "PASS implemented count (" << gateway::ImplementedMethods().size() << ")\n";
 
 
-    // ACP skeleton
+    // ACP wire (in-process JSON-RPC subset)
     {
         acp::Registry acp;
         auto id = acp.Create("codex");
         acp.AppendPrompt(id, "hi");
         auto st = acp.StatusJson();
-        if (!st.value("skeleton", false) || acp.ListJson().empty()) {
-            std::cerr << "FAIL acp skeleton\n"; ++failures;
-        } else std::cerr << "PASS acp skeleton\n";
+        if (!st.value("implemented", false) || !st.value("wire", false) || acp.ListJson().empty()) {
+            std::cerr << "FAIL acp registry wire " << st.dump() << "\n"; ++failures;
+        } else std::cerr << "PASS acp registry+wire status\n";
+
+        auto [cli, agent] = acp::Client::MakeInProcessPair();
+        if (!cli->Initialize()) {
+            std::cerr << "FAIL acp initialize\n"; ++failures;
+        } else {
+            auto created = cli->SessionNew("/tmp");
+            if (created.contains("error") || !created.contains("result")) {
+                std::cerr << "FAIL acp session/new " << created.dump() << "\n"; ++failures;
+            } else {
+                auto sid = created["result"].value("sessionId", "");
+                auto prompted = cli->SessionPrompt(sid, "analyze hello");
+                bool has_agent_note = false;
+                for (const auto& n : cli->LastNotifications()) {
+                    if (n.value("method", "") == "session/update") has_agent_note = true;
+                }
+                auto listed = cli->SessionList();
+                if (prompted.contains("error") || !prompted.contains("result") ||
+                    !prompted["result"].contains("messageId") || !has_agent_note ||
+                    listed.contains("error")) {
+                    std::cerr << "FAIL acp prompt/list " << prompted.dump() << "\n"; ++failures;
+                } else std::cerr << "PASS acp initialize/session/prompt (in-process)\n";
+                (void)cli->SessionClose(sid);
+            }
+        }
+        // agents list surface
+        if (acp.AgentsListJson().empty()) {
+            std::cerr << "FAIL acp agents list\n"; ++failures;
+        } else std::cerr << "PASS acp agents.list\n";
     }
 
     // outbound record without tokens (graceful)
@@ -1141,6 +1170,32 @@ int CmdStatus() {
 }
 
 
+int CmdAcpStdio() {
+    // Line-delimited ACP JSON-RPC agent on stdio (no external acpx required).
+    openclaw::acp::AgentEndpoint agent;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        try {
+            auto req = nlohmann::json::parse(line);
+            auto resp = agent.Handle(req);
+            for (auto& n : agent.DrainNotifications()) {
+                std::cout << n.dump() << std::endl;
+            }
+            if (!resp.is_null() && !resp.empty()) {
+                std::cout << resp.dump() << std::endl;
+            }
+            std::cout.flush();
+        } catch (const std::exception& e) {
+            std::cout << nlohmann::json{{"jsonrpc", "2.0"},
+                                        {"id", nullptr},
+                                        {"error", {{"code", -32700}, {"message", e.what()}}}}.dump()
+                      << std::endl;
+        }
+    }
+    return 0;
+}
+
 int CmdMcpMockServer() {
     // Line-delimited JSON-RPC MCP mock on stdio (for MakeStdioClient self-test).
     std::string line;
@@ -1217,6 +1272,7 @@ int main(int argc, char** argv) {
         }
         if (cmd == "cron-daemon") return CmdCronDaemon();
         if (cmd == "mcp-mock-server") return CmdMcpMockServer();
+        if (cmd == "acp-stdio") return CmdAcpStdio();
         if (cmd == "gateway") return CmdGateway(argc, argv, 2);
         if (cmd == "chat") return CmdChat(argc, argv, 2);
         if (cmd == "-h" || cmd == "--help" || cmd == "help") { PrintUsage(); return 0; }
