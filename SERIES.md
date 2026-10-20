@@ -30,6 +30,8 @@
 
 - **1.5.1-dev**: docs STATUS.md (zh), PARITY executive summary, EnsureObj store_key lifetime fix
 
+- **1.18.0-dev**: WhatsApp Cloud API (verify/inbound/send + mock feed); docs/WA-CLOUD.md; Baileys still missing
+
 - **1.17.0-dev**: ACP multimodal prompt (image_base64/url → vision content); mock-saw-image
 
 - **1.16.0-dev**: Control UI board (disk JSON + /board HTML CRUD); docs/BOARD.md

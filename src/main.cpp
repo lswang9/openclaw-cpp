@@ -41,6 +41,7 @@
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/discord_gateway.hpp"
 #include "openclaw/channels/simple_inbound.hpp"
+#include "openclaw/channels/whatsapp.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/persist/store.hpp"
 #include "openclaw/provider/openai_compat.hpp"
@@ -67,7 +68,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.17.0-dev";
+constexpr const char* kVersion = "1.18.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -443,7 +444,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.17.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.18.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -1066,26 +1067,31 @@ int CmdSelfTest() {
         }
     }
 
-    // whatsapp / imessage inbound
+    // whatsapp Cloud API + imessage inbound
     {
+        setenv("WHATSAPP_FORCE_MOCK", "1", 1);
         auto hub = channels::AdapterHub::MakeDefault();
-        auto* wa = dynamic_cast<channels::SimpleInboundAdapter*>(hub.Get("whatsapp"));
+        auto* wa = dynamic_cast<channels::WhatsAppCloudAdapter*>(hub.Get("whatsapp"));
         auto* im = dynamic_cast<channels::SimpleInboundAdapter*>(hub.Get("imessage"));
         if (!wa || !im) { std::cerr << "FAIL wa/imessage adapters\n"; ++failures; }
         else {
-            auto ch = wa->HandleHttpInbound({{"hub.challenge", "m-ch"}, {"hub.verify_token", ""}}, {});
+            auto ch = wa->HandleVerifyGet("", "m-ch");
             bool ok = false;
             nlohmann::json wa_body = nlohmann::json::parse(R"({
-              "entry":[{"changes":[{"value":{"messages":[{"from":"1","text":{"body":"wa-hi"}}]}}]}]
+              "entry":[{"changes":[{"value":{"messages":[{"from":"15551234567","type":"text","text":{"body":"wa-hi"}}],"contacts":[{"wa_id":"15551234567"}]}}]}]
             })");
-            wa->HandleHttpInbound(wa_body,
-                [&](const channels::InboundMessage& m){ ok = m.text=="wa-hi"; return std::string("r"); });
+            auto fed = wa->RunMockFrames({wa_body},
+                [&](const channels::InboundMessage& m){
+                    ok = m.text=="wa-hi" && m.session_key.find("15551234567")!=std::string::npos;
+                    return std::string("pong-wa");
+                });
             bool ok2 = false;
             im->HandleHttpInbound({{"text", "im-hi"}, {"sender", "me"}},
                 [&](const channels::InboundMessage& m){ ok2 = m.text=="im-hi"; return std::string("r"); });
-            if (ch.value("challenge","")!="m-ch" || !ok || !ok2) {
-                std::cerr << "FAIL wa/imessage inbound\n"; ++failures;
-            } else std::cerr << "PASS whatsapp/imessage inbound\n";
+            unsetenv("WHATSAPP_FORCE_MOCK");
+            if (ch.value("challenge","")!="m-ch" || !ok || !ok2 || !fed.value("ok", false)) {
+                std::cerr << "FAIL wa/imessage inbound " << fed.dump() << "\n"; ++failures;
+            } else std::cerr << "PASS whatsapp cloud + imessage inbound\n";
         }
     }
 

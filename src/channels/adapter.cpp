@@ -4,6 +4,7 @@
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/simple_inbound.hpp"
+#include "openclaw/channels/whatsapp.hpp"
 
 namespace openclaw::channels {
 
@@ -91,9 +92,7 @@ AdapterHub AdapterHub::MakeDefault() {
     hub.Add(std::make_unique<DiscordAdapter>());
     hub.Add(std::make_unique<SlackAdapter>());
     hub.Add(std::make_unique<FeishuAdapter>());
-    hub.Add(std::make_unique<SimpleInboundAdapter>(
-        "whatsapp", "WHATSAPP_VERIFY_TOKEN",
-        "WhatsApp Cloud API-style inbound; outbound TODO"));
+    hub.Add(std::make_unique<WhatsAppCloudAdapter>());
     hub.Add(std::make_unique<SimpleInboundAdapter>(
         "imessage", "IMESSAGE_VERIFY_TOKEN",
         "iMessage bridge inbound webhook; outbound TODO"));

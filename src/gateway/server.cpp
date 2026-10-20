@@ -9,6 +9,7 @@
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/feishu.hpp"
+#include "openclaw/channels/whatsapp.hpp"
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -34,7 +35,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.17.0-dev";
+constexpr const char* kVersion = "1.18.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -67,6 +68,43 @@ std::string BodyOf(const std::string& req) {
     auto pos = req.find("\r\n\r\n");
     return pos == std::string::npos ? std::string{} : req.substr(pos + 4);
 }
+
+std::string PathOnly(const std::string& path_with_q) {
+    auto q = path_with_q.find('?');
+    return q == std::string::npos ? path_with_q : path_with_q.substr(0, q);
+}
+
+std::string QueryParam(const std::string& path_with_q, const std::string& key) {
+    auto q = path_with_q.find('?');
+    if (q == std::string::npos) return {};
+    std::string qs = path_with_q.substr(q + 1);
+    const std::string needle = key + "=";
+    size_t pos = 0;
+    while (pos < qs.size()) {
+        auto amp = qs.find('&', pos);
+        auto part = qs.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
+        if (part.rfind(needle, 0) == 0) {
+            auto val = part.substr(needle.size());
+            // minimal URL decode for %XX and +
+            std::string out;
+            for (size_t i = 0; i < val.size(); ++i) {
+                if (val[i] == '+') out.push_back(' ');
+                else if (val[i] == '%' && i + 2 < val.size()) {
+                    auto hex = val.substr(i + 1, 2);
+                    char* endp = nullptr;
+                    long v = std::strtol(hex.c_str(), &endp, 16);
+                    out.push_back(static_cast<char>(v));
+                    i += 2;
+                } else out.push_back(val[i]);
+            }
+            return out;
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return {};
+}
+
 
 namespace sha1 {
 using u32 = uint32_t;
@@ -459,8 +497,9 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
 
 void Server::HandleHttp(int client_fd, const std::string& req) {
     std::istringstream first(req);
-    std::string method, path, version;
-    first >> method >> path >> version;
+    std::string method, path_raw, version;
+    first >> method >> path_raw >> version;
+    const std::string path = PathOnly(path_raw);
     auto send = [&](const std::string& resp) { (void)::send(client_fd, resp.data(), resp.size(), 0); };
 
     // Auth (health exempt)
@@ -651,6 +690,34 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         send(HttpResponse(200, "OK", nlohmann::json{{"approvals", deps_.approvals.ListJson()}}.dump(2)));
         return;
     }
+    // GET /api/channels/whatsapp/inbound?hub.mode=subscribe&hub.verify_token=&hub.challenge=
+    if (method == "GET" && path.rfind("/api/channels/", 0) == 0 &&
+        path.find("/inbound") != std::string::npos) {
+        auto rest = path.substr(std::string("/api/channels/").size());
+        auto slash = rest.find('/');
+        std::string chan_id = slash == std::string::npos ? rest : rest.substr(0, slash);
+        if (chan_id == "whatsapp") {
+            auto* wa = dynamic_cast<channels::WhatsAppCloudAdapter*>(deps_.adapters.Get("whatsapp"));
+            if (!wa) {
+                send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "whatsapp missing"}}.dump()));
+                return;
+            }
+            auto mode = QueryParam(path_raw, "hub.mode");
+            auto token = QueryParam(path_raw, "hub.verify_token");
+            auto challenge = QueryParam(path_raw, "hub.challenge");
+            if (mode == "subscribe" || !challenge.empty()) {
+                auto result = wa->HandleVerifyGet(token, challenge);
+                if (!result.value("ok", false)) {
+                    send(HttpResponse(403, "Forbidden", result.dump()));
+                    return;
+                }
+                // Meta expects plain-text challenge body
+                send(HttpResponse(200, "OK", challenge, "text/plain; charset=utf-8"));
+                return;
+            }
+        }
+    }
+
     // POST /api/channels/<id>/inbound
     if (method == "POST" && path.rfind("/api/channels/", 0) == 0 && path.size() > 14 &&
         path.find("/inbound") != std::string::npos) {
@@ -1219,6 +1286,34 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             if (n.rfind("mcp.", 0) == 0) tools.push_back(n);
         }
         return ok({{"tools", tools}, {"note", "mcp.* tools bridged into registry when MCP client attached"}});
+    }
+
+    // WhatsApp Cloud API
+    if (method.rfind("whatsapp.", 0) == 0 || method == "channels.whatsapp.inbound") {
+        auto* wa = dynamic_cast<channels::WhatsAppCloudAdapter*>(deps_.adapters.Get("whatsapp"));
+        if (!wa) return err("whatsapp adapter missing");
+        auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
+        if (method == "whatsapp.status" || method == "whatsapp.cloud.status") {
+            return ok(wa->Status());
+        }
+        if (method == "whatsapp.feed" || method == "whatsapp.cloud.feed" || method == "whatsapp.mock") {
+            if (params.contains("frames") && params["frames"].is_array()) {
+                std::vector<nlohmann::json> frames;
+                for (const auto& f : params["frames"]) frames.push_back(f);
+                return ok(wa->RunMockFrames(frames, deliver));
+            }
+            nlohmann::json payload = params.contains("payload") ? params["payload"] : params;
+            return ok(wa->FeedPayload(payload, deliver));
+        }
+        if (method == "whatsapp.send" || method == "whatsapp.cloud.send") {
+            wa->SetEnabled(true);
+            return ok(wa->SendText(params.value("to", params.value("chat_id", "")),
+                                   params.value("text", params.value("message", "")), params));
+        }
+        if (method == "channels.whatsapp.inbound") {
+            return ok(wa->HandleHttpInbound(params, deliver));
+        }
+        return ok(wa->Status());
     }
 
     // Feishu long-connection WS

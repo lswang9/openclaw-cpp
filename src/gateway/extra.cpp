@@ -8,6 +8,7 @@
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/feishu.hpp"
+#include "openclaw/channels/whatsapp.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -618,6 +619,41 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
+
+    // ---- whatsapp cloud ----
+    if (starts("whatsapp.") || method == "channels.whatsapp.inbound") {
+        r.handled = true;
+        auto* wa = dynamic_cast<channels::WhatsAppCloudAdapter*>(deps.adapters.Get("whatsapp"));
+        if (!wa) { r.ok = false; r.error = "whatsapp adapter missing"; return r; }
+        if (method == "whatsapp.status" || method == "whatsapp.cloud.status") {
+            r.payload = Real(wa->Status());
+            return r;
+        }
+        if (method == "whatsapp.feed" || method == "whatsapp.cloud.feed" || method == "whatsapp.mock") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            if (params.contains("frames") && params["frames"].is_array()) {
+                std::vector<nlohmann::json> frames;
+                for (auto& f : params["frames"]) frames.push_back(f);
+                r.payload = Real(wa->RunMockFrames(frames, deliver));
+                return r;
+            }
+            nlohmann::json payload = params.contains("payload") ? params["payload"] : params;
+            r.payload = Real(wa->FeedPayload(payload, deliver));
+            return r;
+        }
+        if (method == "whatsapp.send") {
+            wa->SetEnabled(true);
+            r.payload = Real(wa->SendText(params.value("to", ""), params.value("text", ""), params));
+            return r;
+        }
+        if (method == "channels.whatsapp.inbound") {
+            auto deliver = [&](const channels::InboundMessage& m) { return std::string("ack:") + m.text; };
+            r.payload = Real(wa->HandleHttpInbound(params, deliver));
+            return r;
+        }
+        r.payload = Real(wa->Status());
+        return r;
+    }
 
     // ---- feishu (webhook + long-connection WS) ----
     if (starts("feishu.") || method == "channels.feishu.inbound") {

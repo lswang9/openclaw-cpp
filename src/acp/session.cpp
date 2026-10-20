@@ -23,7 +23,7 @@ bool Registry::AutoBindEnabled() const {
 }
 
 bool Registry::IsBindableChannel(const std::string& channel) const {
-    return channel == "slack" || channel == "feishu" || channel == "discord";
+    return channel == "slack" || channel == "feishu" || channel == "discord" || channel == "whatsapp";
 }
 
 std::string Registry::WireIdFor(const Session& s) const {

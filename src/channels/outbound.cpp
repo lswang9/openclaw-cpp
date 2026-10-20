@@ -31,6 +31,8 @@ nlohmann::json OutboundRecordAdapter::Status() const {
     if (id_ == "discord") token = !Env("DISCORD_BOT_TOKEN").empty();
     if (id_ == "feishu") token = !Env("FEISHU_WEBHOOK_URL").empty();
     if (id_ == "slack") token = !Env("SLACK_BOT_TOKEN").empty();
+    if (id_ == "whatsapp")
+        token = !Env("WHATSAPP_TOKEN").empty() || !Env("WHATSAPP_ACCESS_TOKEN").empty();
     return {{"id", id_},
             {"enabled", enabled_},
             {"type", "outbound"},
@@ -126,6 +128,24 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
                 ok_slack = http_result["json"].value("ok", false);
             }
             entry["delivered"] = ok_http && ok_slack;
+            entry["http"] = http_result;
+        }
+    } else if (id_ == "whatsapp") {
+        auto token = Env("WHATSAPP_TOKEN");
+        if (token.empty()) token = Env("WHATSAPP_ACCESS_TOKEN");
+        const auto phone_id = Env("WHATSAPP_PHONE_NUMBER_ID");
+        if (!token.empty() && !phone_id.empty() && !chat_id.empty()) {
+            std::string base = Env("WHATSAPP_API_BASE");
+            if (base.empty()) base = "https://graph.facebook.com";
+            const std::string url = base + "/v21.0/" + phone_id + "/messages";
+            nlohmann::json body{{"messaging_product", "whatsapp"},
+                                {"to", chat_id},
+                                {"type", "text"},
+                                {"text", {{"body", text}}}};
+            http_result = HttpPostJson(url, body, {"Authorization: Bearer " + token});
+            entry["mode"] = "live_http";
+            entry["delivered"] =
+                http_result.value("http", 0) >= 200 && http_result.value("http", 0) < 300;
             entry["http"] = http_result;
         }
     }
