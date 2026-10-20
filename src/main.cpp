@@ -18,6 +18,7 @@
 #include "openclaw/memory/store.hpp"
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/plugins/js_host.hpp"
+#include "openclaw/board/store.hpp"
 #include "openclaw/provider/deepseek.hpp"
 #include "openclaw/provider/mock.hpp"
 #include "openclaw/session/store.hpp"
@@ -66,7 +67,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.15.0-dev";
+constexpr const char* kVersion = "1.16.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -442,7 +443,7 @@ int CmdSelfTest() {
 
     // doctor
     {
-        auto doc = diagnostics::RunDoctorJson({{"version", "1.15.0-dev"},
+        auto doc = diagnostics::RunDoctorJson({{"version", "1.16.0-dev"},
                                               {"methods_implemented", 10},
                                               {"providers", nlohmann::json::array({"mock"})},
                                               {"deepseek_key_set", false},
@@ -872,6 +873,33 @@ int CmdSelfTest() {
 
 
 
+
+
+    // Board store (disk JSON)
+    {
+        auto dir = std::filesystem::temp_directory_path() / "oc-board-test";
+        std::filesystem::create_directories(dir);
+        board::Store store(dir / "board.json");
+        auto b0 = store.EnsureDefaults();
+        auto add = store.AddCard("todo", "test-card", "body1");
+        auto id = add["card"].value("id", "");
+        auto mv = store.MoveCard(id, "doing");
+        auto got = store.Get();
+        int in_doing = 0;
+        for (const auto& c : got["cards"])
+            if (c.value("id", "") == id && c.value("column_id", "") == "doing") ++in_doing;
+        store.DeleteCard(id);
+        auto after = store.Get();
+        // reload
+        board::Store store2(dir / "board.json");
+        auto re = store2.Get();
+        if (b0["columns"].size() < 3 || id.empty() || in_doing != 1 ||
+            after["cards"].size() != 0 || re["columns"].size() < 3) {
+            std::cerr << "FAIL board store " << add.dump() << " " << got.dump() << "\n";
+            ++failures;
+        } else
+            std::cerr << "PASS board store CRUD+persist\n";
+    }
 
     // Feishu long-connection — offline recorded frames (no network)
     {
@@ -1378,6 +1406,7 @@ int CmdGateway(int argc, char** argv, int argi) {
                              EnvOr("OPENCLAW_SECRETS_PASSPHRASE", ""));
     auto nodes = nodes::Registry::MakeDefault();
     media::Store media(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "media");
+    board::Store board_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "board.json");
     events::Bus bus;
     agent::FileStore agent_files(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "agents");
     auto& logs = logging::GlobalLog();
@@ -1441,6 +1470,7 @@ int CmdGateway(int argc, char** argv, int argi) {
         .tts = &tts_engine,
         .sim = &sim_backend,
         .js_host = &js_host,
+        .board = &board_store,
         .mcp_client = mcp_client,
         .config = cfg,
         .auth = auth::FromEnv(),

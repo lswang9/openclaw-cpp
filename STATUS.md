@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.15.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.16.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 构建
 
@@ -55,7 +55,8 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 ## Control UI 能做什么
 
 - Health / Status、sessions / tools 列表
-- Chat（可勾选 SSE）；**Invoke** 工具；**Export** 会话（`GET /v1/sessions/:id/export`）
+- Chat（可勾选 SSE）；**Invoke** 工具；**Export** 会话
+- **Board**（`/board`）：本地 JSON 看板 CRUD（非上游完整 board UX）。见 `docs/BOARD.md`
 - **不是**上游完整 Control UI（无完整 GitHub/PR 面板等）
 
 ## 已知限制（务必读）

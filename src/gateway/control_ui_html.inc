@@ -26,12 +26,13 @@ R"OCUI(<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>openclaw-cpp Control <span class="muted">1.3 · align 2026.10.5</span></h1>
+  <h1>openclaw-cpp Control <span class="muted">1.16 · align 2026.10.5</span></h1>
   <div class="card">
     <button class="secondary" id="btnHealth">Health</button>
     <button class="secondary" id="btnStatus">Status</button>
     <button class="secondary" id="btnRefresh">Refresh</button>
     <button class="secondary" id="btnExport">Export session</button>
+    <a href="/board"><button class="secondary" type="button">Board</button></a>
     <span id="badge" class="muted">—</span>
     <pre id="meta" class="muted" style="margin-top:.75rem">Ready.</pre>
   </div>

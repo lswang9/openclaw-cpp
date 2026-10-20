@@ -4,6 +4,7 @@
 #include "openclaw/gateway/methods.hpp"
 #include "openclaw/config/config.hpp"
 #include "openclaw/channels/outbound.hpp"
+#include "openclaw/board/store.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/feishu.hpp"
@@ -1737,6 +1738,80 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             return r;
         }
         r.payload = Real({{"method", method}, {"client", cli ? true : false}});
+        return r;
+    }
+
+    // ---- Board (disk JSON + Control UI /board) ----
+    if (starts("board.")) {
+        r.handled = true;
+        if (!deps.board) {
+            r.ok = false;
+            r.error = "board store not attached";
+            return r;
+        }
+        if (method == "board.get" || method == "board.data.read" || method == "board.status") {
+            auto board = deps.board->EnsureDefaults();
+            r.payload = Real({{"board", board}, {"status", deps.board->Status()},
+                              {"note", "local JSON board — not full OpenClaw board UX"}});
+            return r;
+        }
+        if (method == "board.update" || method == "board.put") {
+            auto board = params.contains("board") ? params["board"] : params;
+            r.payload = Real({{"board", deps.board->SetBoard(board)}, {"saved", true}});
+            return r;
+        }
+        if (method == "board.column.create" || method == "board.columns.add") {
+            r.payload = Real(deps.board->AddColumn(params.value("title", params.value("name", "Column")),
+                                                   params.value("id", "")));
+            return r;
+        }
+        if (method == "board.card.create" || method == "board.card.add") {
+            r.payload = Real(deps.board->AddCard(params.value("column_id", params.value("column", "todo")),
+                                                 params.value("title", params.value("name", "")),
+                                                 params.value("body", params.value("text", ""))));
+            return r;
+        }
+        if (method == "board.card.update") {
+            r.payload = Real(deps.board->UpdateCard(params.value("id", ""), params));
+            return r;
+        }
+        if (method == "board.card.move" || method == "board.move") {
+            r.payload = Real(deps.board->MoveCard(params.value("id", params.value("card_id", "")),
+                                                  params.value("column_id", params.value("column", "")),
+                                                  params.value("order", -1)));
+            return r;
+        }
+        if (method == "board.card.delete" || method == "board.card.remove") {
+            r.payload = Real(deps.board->DeleteCard(params.value("id", params.value("card_id", ""))));
+            return r;
+        }
+        if (method == "board.action") {
+            auto action = params.value("action", "");
+            if (action == "create" || action == "add") {
+                r.payload = Real(deps.board->AddCard(params.value("column_id", "todo"),
+                                                     params.value("title", ""),
+                                                     params.value("body", "")));
+                return r;
+            }
+            if (action == "move") {
+                r.payload = Real(deps.board->MoveCard(params.value("id", ""),
+                                                      params.value("column_id", ""),
+                                                      params.value("order", -1)));
+                return r;
+            }
+            if (action == "delete") {
+                r.payload = Real(deps.board->DeleteCard(params.value("id", "")));
+                return r;
+            }
+            r.payload = Real({{"board", deps.board->Get()}, {"action", action},
+                              {"note", "unknown board.action — use card.create/move/delete"}});
+            return r;
+        }
+        // other board.* (widget etc.) — return live board + honest note
+        r.payload = Real({{"board", deps.board->Get()},
+                          {"status", deps.board->Status()},
+                          {"method", method},
+                          {"note", "local board subset — widget/prompt APIs not implemented"}});
         return r;
     }
 
