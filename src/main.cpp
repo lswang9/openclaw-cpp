@@ -96,7 +96,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.70.0-dev";
+constexpr const char* kVersion = "1.71.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2990,6 +2990,31 @@ int CmdGateway(int argc, char** argv, int argi) {
     board::Store board_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "board.json");
     auth::DeviceLinkStore device_links(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "device_links.json");
     canvas::Store canvas_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "canvas");
+    canvas::a2ui::Host a2ui_host(canvas_store.Dir() / "a2ui-state.json");
+    {
+        auto* host = &a2ui_host;
+        auto* cs = &canvas_store;
+        tools.Register({"canvas", "Gateway canvas (A2UI v0.8). action=a2ui_push with jsonl (one v0.8 message per line: surfaceUpdate, dataModelUpdate, beginRendering, deleteSurface) or text; a2ui_reset; state; actions (recent userAction events from button clicks). Rendered at /__openclaw__/a2ui/.",
+                        {{"type", "object"}, {"properties", {{"action", {{"type", "string"}, {"enum", {"a2ui_push", "a2ui_reset", "state", "actions"}}}},
+                                                             {"jsonl", {{"type", "string"}}}, {"text", {{"type", "string"}}}}},
+                         {"required", nlohmann::json::array({"action"})}},
+                        [host, cs](const nlohmann::json& a) {
+                            const auto act = a.value("action", std::string());
+                            if (act == "a2ui_push") {
+                                auto v = canvas::a2ui::ValidateJsonl(a.contains("jsonl") ? a.value("jsonl", std::string())
+                                                                                        : canvas::a2ui::BuildTextJsonl(a.value("text", std::string())));
+                                if (!v.ok) return nlohmann::json{{"ok", false}, {"error", v.error}}.dump();
+                                return host->Apply(v.messages).dump();
+                            }
+                            if (act == "a2ui_reset") return host->Reset().dump();
+                            if (act == "actions") return cs->Events(20, "a2ui").dump();
+                            auto st = host->State();
+                            nlohmann::json out{{"rev", st["rev"]}, {"surfaces", nlohmann::json::object()}};
+                            for (auto& [k, v] : st["surfaces"].items())
+                                out["surfaces"][k] = {{"rendering", v.value("rendering", false)}, {"root", v.value("root", "")}, {"components", v["components"].size()}};
+                            return out.dump();
+                        }});
+    }
     events::Bus bus;
     agent::FileStore agent_files(agent::AgentsRoot());
     auto& logs = logging::GlobalLog();
@@ -3073,6 +3098,7 @@ int CmdGateway(int argc, char** argv, int argi) {
     };
 
 
+    deps.a2ui = &a2ui_host;
     deps.system_prompt = BuildAgentSystemPrompt(tools);
     deps.system_prompt_for_agent = [&tools](const std::string&, const std::filesystem::path& ws) {
         return BuildAgentSystemPrompt(tools, ws);

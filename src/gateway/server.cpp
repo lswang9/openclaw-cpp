@@ -48,7 +48,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.70.0-dev";
+constexpr const char* kVersion = "1.71.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1464,7 +1464,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         auto deny = GatewayAuthDeny(req);
         const bool html_page = method == "GET" &&
             (path == "/" || path == "/control" || path == "/ui" || path == "/board" || path == "/ui/board" ||
-             path == "/canvas" || path == "/ui/canvas" || path == "/pairing" || path == "/ui/pairing");
+             path == "/canvas" || path == "/ui/canvas" || path == "/pairing" || path == "/ui/pairing" || path == "/__openclaw__/a2ui/" || path == "/__openclaw__/a2ui");
         if (deny && html_page) {
             send(HttpResponse(302, "Found", "", "text/plain", "Location: /login?next=" + path + "\r\n"));
             return;
@@ -1626,6 +1626,26 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         ;
         send(HttpResponse(200, "OK", WithCsrfShim(kPairing), "text/html; charset=utf-8"));
         return;
+    }
+    if (deps_.a2ui && path.rfind("/__openclaw__/a2ui", 0) == 0) {
+        if (method == "GET" && (path == "/__openclaw__/a2ui" || path == "/__openclaw__/a2ui/")) {
+            send(HttpResponse(200, "OK", WithCsrfShim(deps_.a2ui->RenderPage()), "text/html; charset=utf-8",
+                              "Content-Security-Policy: default-src 'self'; img-src 'self' https: http: data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'\r\n"));
+            return;
+        }
+        if (method == "GET" && path == "/__openclaw__/a2ui/state") {
+            send(HttpResponse(200, "OK", nlohmann::json{{"rev", deps_.a2ui->Revision()}}.dump()));
+            return;
+        }
+        if (method == "POST" && path == "/__openclaw__/a2ui/action") {
+            nlohmann::json b;
+            try { b = nlohmann::json::parse(BodyOf(req)); } catch (...) {}
+            auto ua = deps_.a2ui->ResolveAction(b.value("surfaceId", std::string()), b.value("componentId", std::string()), b.value("scope", std::string()));
+            if (!ua) { send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "no such button action"}}.dump())); return; }
+            if (deps_.canvas) deps_.canvas->RecordEvent("a2ui.userAction", *ua, "a2ui");
+            send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"event", *ua}}.dump()));
+            return;
+        }
     }
     if (method == "GET" && (path == "/canvas" || path == "/ui/canvas")) {
         static const std::string kCanvas =

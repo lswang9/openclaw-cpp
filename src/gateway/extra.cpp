@@ -1778,6 +1778,25 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
                 r.payload = RealSim({{"error", "canvas not wired"}, {"method", method}});
                 return r;
             }
+            if (starts("canvas.a2ui.")) {
+                if (!deps.a2ui) { r.payload = RealSim({{"error", "a2ui host not wired"}}); return r; }
+                if (method == "canvas.a2ui.reset") { r.payload = Real(deps.a2ui->Reset()); return r; }
+                if (method == "canvas.a2ui.state" || method == "canvas.a2ui.get") { r.payload = Real(deps.a2ui->State()); return r; }
+                if (method == "canvas.a2ui.render") { r.payload = Real({{"html", deps.a2ui->RenderSurface(params.value("surfaceId", std::string("main")))}}); return r; }
+                if (method == "canvas.a2ui.validate" || method == "canvas.a2ui.push" || method == "canvas.a2ui.pushJSONL") {
+                    canvas::a2ui::Validation v;
+                    if (params.contains("jsonl")) v = canvas::a2ui::ValidateJsonl(params.value("jsonl", std::string()));
+                    else if (params.contains("messages")) v = canvas::a2ui::ValidateMessages(params["messages"]);
+                    else if (params.contains("text")) v = canvas::a2ui::ValidateJsonl(canvas::a2ui::BuildTextJsonl(params.value("text", std::string()), params.value("surfaceId", std::string("main"))));
+                    else v.error = "jsonl, messages or text required";
+                    if (!v.ok) { r.payload = Real({{"ok", false}, {"error", v.error}}); return r; }
+                    if (method == "canvas.a2ui.validate") { r.payload = Real({{"ok", true}, {"version", v.version}, {"messageCount", v.message_count}}); return r; }
+                    r.payload = Real(deps.a2ui->Apply(v.messages));
+                    return r;
+                }
+                r.payload = Real({{"error", "unknown a2ui method"}, {"method", method}});
+                return r;
+            }
             if (method == "canvas.status") {
                 r.payload = Real(store ? store->Status() : nlohmann::json{{"error", "no store"}});
                 return r;

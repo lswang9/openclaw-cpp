@@ -1,4 +1,5 @@
 #pragma once
+#include "openclaw/canvas/a2ui.hpp"
 #include <condition_variable>
 #include <queue>
 #include <thread>
@@ -84,6 +85,7 @@ struct ServerDeps {
     plugins::JsHost* js_host = nullptr;
     board::Store* board = nullptr;
     canvas::Store* canvas = nullptr;
+    canvas::a2ui::Host* a2ui = nullptr;
     auth::DeviceLinkStore* device_links = nullptr;
     std::shared_ptr<mcp::Client> mcp_client;
     config::Snapshot config;
