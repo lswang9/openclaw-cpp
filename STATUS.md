@@ -1,6 +1,13 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.40.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.41.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.41.0-dev 新增
+
+- 记忆向量检索支持接入真实 embedding 服务：配置 `agents.defaults.memorySearch.provider: "openai"`、`model`、`remote.baseUrl` / `remote.apiKey`，任意 OpenAI 兼容的 `/embeddings` 接口都可以用；`provider: "auto"` 有 key 时用远程，否则用本地。
+- 向量索引和缓存会持久化到 `$OPENCLAW_DATA_DIR/memory/main.index.json`，没变的内容不会重复调用接口；远程失败自动退回本地向量。
+- 新命令：`memory search <问题>`、`memory status`、`memory index`。
+- 测试用本地假服务器（`scripts/e2e-embeddings.sh`），不需要任何真实密钥。
 
 ## 1.40.0-dev 新增
 

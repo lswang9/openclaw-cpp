@@ -1,4 +1,6 @@
 #pragma once
+#include <memory>
+namespace openclaw::workspace { class EmbeddingProvider; }
 
 #include <nlohmann/json.hpp>
 
@@ -43,6 +45,10 @@ struct RegistryOptions {
     bool enable_shell = true;
     bool shell_requires_approval = true;  // OPENCLAW_SHELL_REQUIRE_APPROVAL default true
     std::string workspace_root;           // empty = workspace::Workspace::DefaultRoot()
+    // Memory embeddings: explicit provider, else agents.defaults.memorySearch from config (non-local only).
+    std::shared_ptr<workspace::EmbeddingProvider> embedder;
+    std::string memory_index_file;        // empty = $OPENCLAW_DATA_DIR/memory/main.index.json or ~/.openclaw/memory/
+    bool embedder_from_config = true;
 };
 
 Registry MakeDefaultRegistry(RegistryOptions opts = {});

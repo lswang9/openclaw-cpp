@@ -2,6 +2,7 @@
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <optional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,8 +39,14 @@ public:
     nlohmann::json MemoryAppend(const std::string& text) const;
     bool IsMemoryPath(const std::string& rel) const;
 
+    // Optional embedding provider + persisted index (default: local hashed embeddings, no index).
+    void SetEmbedder(std::shared_ptr<class EmbeddingProvider> p, std::filesystem::path index_file);
+    nlohmann::json IndexStats() const;
+
 private:
     std::filesystem::path root_;
+    std::shared_ptr<class EmbeddingProvider> embedder_;
+    std::shared_ptr<class VectorIndex> index_;
 };
 
 }  // namespace openclaw::workspace

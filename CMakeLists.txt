@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.40.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.41.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +42,7 @@ set(OPENCLAW_SOURCES
   src/tools/registry.cpp
   src/tools/runenv.cpp
   src/workspace/workspace.cpp
+  src/workspace/embeddings.cpp
   src/context/system_prompt.cpp
   src/context/compaction.cpp
   src/tokenizer/bpe.cpp

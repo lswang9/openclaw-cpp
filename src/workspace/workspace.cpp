@@ -1,4 +1,5 @@
 #include "openclaw/workspace/workspace.hpp"
+#include "openclaw/workspace/embeddings.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -248,9 +249,28 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
         }
         bm[i] = s; bmax = std::max(bmax, s);
     }
+    std::string vec_backend = "local", fallback;
+    nlohmann::json index_info;
     if (mode != "bm25") {
-        auto qv = LocalEmbed(query);
-        for (std::size_t i = 0; i < chunks.size(); ++i) vec[i] = std::max(0.0, Cosine(qv, LocalEmbed(chunks[i].text)));
+        bool done = false;
+        if (embedder_ && index_) {
+            try {
+                std::vector<std::string> texts;
+                for (auto& c : chunks) texts.push_back(c.text);
+                auto vs = index_->Get(*embedder_, texts);
+                auto qv = embedder_->Embed({query}).at(0);
+                for (std::size_t i = 0; i < chunks.size(); ++i) vec[i] = std::max(0.0, Cosine(qv, vs[i]));
+                vec_backend = embedder_->Id();
+                index_info = {{"hits", index_->last_hits}, {"misses", index_->last_misses}};
+                done = true;
+            } catch (const std::exception& e) {
+                fallback = e.what();  // remote provider failed → local embeddings
+            }
+        }
+        if (!done) {
+            auto qv = LocalEmbed(query);
+            for (std::size_t i = 0; i < chunks.size(); ++i) vec[i] = std::max(0.0, Cosine(qv, LocalEmbed(chunks[i].text)));
+        }
     }
     std::vector<std::pair<double, std::size_t>> scored;
     for (std::size_t i = 0; i < chunks.size(); ++i) {
@@ -276,7 +296,23 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
                            {"textScore", std::round(bm[scored[k].second] * 1000) / 1000},
                            {"vectorScore", std::round(vec[scored[k].second] * 1000) / 1000}, {"snippet", snip}});
     }
-    return {{"ok", true}, {"results", results}, {"files", files.size()}, {"chunks", chunks.size()}, {"backend", backend}};
+    nlohmann::json out{{"ok", true}, {"results", results}, {"files", files.size()}, {"chunks", chunks.size()},
+                       {"backend", mode == "bm25" ? backend : (mode == "vector" ? "vector-" : "hybrid-") + vec_backend}};
+    if (!fallback.empty()) out["fallback"] = fallback;
+    if (!index_info.is_null()) out["index"] = index_info;
+    return out;
+}
+
+void Workspace::SetEmbedder(std::shared_ptr<EmbeddingProvider> p, fs::path index_file) {
+    embedder_ = std::move(p);
+    index_ = embedder_ ? std::make_shared<VectorIndex>(std::move(index_file)) : nullptr;
+}
+
+nlohmann::json Workspace::IndexStats() const {
+    if (!index_) return {{"provider", "local"}, {"persisted", false}};
+    auto s = index_->Stats();
+    s["provider"] = embedder_->Id(); s["model"] = embedder_->Model(); s["persisted"] = true;
+    return s;
 }
 
 nlohmann::json Workspace::MemoryGet(const std::string& path, int from, int lines) const {

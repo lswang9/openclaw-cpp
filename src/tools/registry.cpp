@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <sstream>
 #include "openclaw/tools/registry.hpp"
+#include "openclaw/config/config.hpp"
+#include "openclaw/workspace/embeddings.hpp"
 #include "openclaw/tools/runenv.hpp"
 #include <algorithm>
 #include "openclaw/approvals/store.hpp"
@@ -105,6 +107,26 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
     auto ws = std::make_shared<workspace::Workspace>(opts.workspace_root.empty()
                                                           ? workspace::Workspace::DefaultRoot()
                                                           : std::filesystem::path(opts.workspace_root));
+    {
+        auto emb = opts.embedder;
+        if (!emb && opts.embedder_from_config) {
+            try {
+                auto raw = config::Load(config::DefaultPath()).snap.raw;
+                auto e = workspace::MakeEmbedderFromConfig(raw);
+                if (e && e->Id() != "local") emb = e;
+            } catch (...) {}
+        }
+        if (emb) {
+            std::filesystem::path idx = opts.memory_index_file;
+            if (idx.empty()) {
+                const char* d = std::getenv("OPENCLAW_DATA_DIR");
+                const char* h = std::getenv("HOME");
+                idx = (d && *d) ? std::filesystem::path(d) / "memory" / "main.index.json"
+                                : std::filesystem::path(h && *h ? h : "/tmp") / ".openclaw" / "memory" / "main.index.json";
+            }
+            ws->SetEmbedder(emb, idx);
+        }
+    }
     auto str = [](const char* d) { return nlohmann::json{{"type", "string"}, {"description", d}}; };
     auto num = [](const char* d) { return nlohmann::json{{"type", "integer"}, {"description", d}}; };
     r.Register({"read", "Read a text file in the agent workspace (line-numbered window).",

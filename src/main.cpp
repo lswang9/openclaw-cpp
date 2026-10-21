@@ -57,6 +57,7 @@
 #include "openclaw/context/compaction.hpp"
 #include "openclaw/tokenizer/bpe.hpp"
 #include "openclaw/tools/runenv.hpp"
+#include "openclaw/workspace/embeddings.hpp"
 #include "openclaw/workspace/workspace.hpp"
 #include "openclaw/mcp/stdio.hpp"
 
@@ -77,7 +78,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.40.0-dev";
+constexpr const char* kVersion = "1.41.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1578,6 +1579,49 @@ int CmdSelfTest() {
         else std::cerr << "PASS upstream session keys (dmScope main/per-peer/per-channel-peer, group/channel/thread) + adapter fields\n";
     }
 
+    // embedding provider interface + persisted index/cache (counting mock provider; no network)
+    try {
+        namespace fs = std::filesystem;
+        struct CountingEmb : workspace::EmbeddingProvider {
+            int calls = 0; std::size_t texts = 0;
+            std::string Id() const override { return "mock"; }
+            std::string Model() const override { return "m1"; }
+            std::vector<workspace::Vec> Embed(const std::vector<std::string>& t) override {
+                ++calls; texts += t.size();
+                std::vector<workspace::Vec> o;
+                for (auto& s : t) o.push_back(workspace::LocalEmbed(s));
+                return o;
+            }
+        };
+        auto root = fs::temp_directory_path() / "oc-emb-st";
+        fs::remove_all(root); fs::create_directories(root / "ws");
+        std::ofstream(root / "ws/MEMORY.md") << "# A\nUser prefers dark roast coffee.\n\n# B\nDeploys on kubernetes.\n";
+        auto emb = std::make_shared<CountingEmb>();
+        tools::RegistryOptions o; o.enable_shell = false; o.workspace_root = (root / "ws").string();
+        o.embedder = emb; o.memory_index_file = (root / "idx.json").string();
+        auto reg = tools::MakeDefaultRegistry(o);
+        auto r1 = nlohmann::json::parse(reg.Invoke("memory_search", {{"query", "coffee preferences"}}));
+        auto r2 = nlohmann::json::parse(reg.Invoke("memory_search", {{"query", "kubernetes"}}));
+        bool ok = r1["backend"] == "hybrid-mock" && r1["index"]["misses"] == 2 && r2["index"]["hits"] == 2 &&
+                  r2["index"]["misses"] == 0 && emb->texts == 4 /* 2 chunks + 2 queries */ && fs::exists(root / "idx.json") &&
+                  r1["results"][0]["start_line"] == 1;
+        // restart: a fresh registry reuses the persisted cache
+        auto emb2 = std::make_shared<CountingEmb>(); o.embedder = emb2;
+        auto reg2 = tools::MakeDefaultRegistry(o);
+        auto r3 = nlohmann::json::parse(reg2.Invoke("memory_search", {{"query", "coffee"}}));
+        ok = ok && r3["index"]["hits"] == 2 && emb2->texts == 1;
+        // remote failure falls back to local embeddings
+        o.embedder = workspace::MakeOpenAiEmbedder("http://127.0.0.1:9", "", "x"); o.memory_index_file = (root / "idx2.json").string();
+        auto reg3 = tools::MakeDefaultRegistry(o);
+        auto r4 = nlohmann::json::parse(reg3.Invoke("memory_search", {{"query", "coffee"}}));
+        ok = ok && r4.contains("fallback") && r4["backend"] == "hybrid-local" && !r4["results"].empty();
+        auto e = workspace::MakeEmbedderFromConfig({{"agents", {{"defaults", {{"memorySearch", {{"provider", "openai"}, {"model", "text-embedding-3-large"}}}}}}}});
+        ok = ok && e->Id() == "openai" && e->Model() == "text-embedding-3-large" &&
+             workspace::MakeEmbedderFromConfig({{"agents", {{"defaults", {{"memorySearch", {{"enabled", false}}}}}}}}) == nullptr;
+        if (!ok) { std::cerr << "FAIL embeddings/index " << r1.dump() << r2.dump() << r3.dump() << "\n"; ++failures; }
+        else std::cerr << "PASS embedding provider interface + persisted vector index/cache + remote fallback\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL embeddings exception: " << e.what() << "\n"; ++failures; }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -2527,6 +2571,17 @@ int main(int argc, char** argv) {
             openclaw::memory::Store store(openclaw::EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
             if (argc == 2) { std::cout << store.Dump().dump(2) << '\n'; return 0; }
             std::string sub = argv[2];
+            if (sub == "search" || sub == "status" || sub == "index") {
+                openclaw::tools::RegistryOptions o; o.enable_shell = false;
+                auto reg = openclaw::tools::MakeDefaultRegistry(o);
+                std::string q = sub == "search" ? JoinArgs(argc, argv, 3) : std::string("index warmup");
+                auto r = nlohmann::json::parse(reg.Invoke("memory_search", {{"query", q}}));
+                if (sub == "search") std::cout << r.dump(2) << '\n';
+                else std::cout << nlohmann::json{{"backend", r.value("backend", "")}, {"chunks", r.value("chunks", 0)},
+                                                 {"files", r.value("files", 0)}, {"index", r.value("index", nlohmann::json())},
+                                                 {"fallback", r.value("fallback", "")}}.dump(2) << '\n';
+                return r.value("ok", false) ? 0 : 1;
+            }
             if (sub == "set" && argc >= 5) { store.Set(argv[3], argv[4]); std::cout << "{\"ok\":true}\n"; return 0; }
             if (sub == "get" && argc >= 4) {
                 auto v = store.Get(argv[3]);
