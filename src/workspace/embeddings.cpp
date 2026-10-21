@@ -93,11 +93,102 @@ public:
 private:
     std::string base_, key_, model_;
 };
+nlohmann::json PostJson(const std::string& url, const nlohmann::json& req, const std::vector<std::string>& headers) {
+    std::string body = req.dump(), resp;
+    CURL* c = curl_easy_init();
+    if (!c) throw std::runtime_error("curl init failed");
+    curl_slist* h = curl_slist_append(nullptr, "Content-Type: application/json");
+    for (auto& x : headers) h = curl_slist_append(h, x.c_str());
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, Sink);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+    auto rc = curl_easy_perform(c);
+    long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(h); curl_easy_cleanup(c);
+    if (rc != CURLE_OK) throw std::runtime_error(std::string("embeddings request failed: ") + curl_easy_strerror(rc));
+    if (code != 200) throw std::runtime_error("embeddings HTTP " + std::to_string(code) + ": " + resp.substr(0, 200));
+    return nlohmann::json::parse(resp);
+}
+void Normalize(Vec& v) {
+    double n = 0; for (float x : v) n += double(x) * x;
+    if (n > 0) { float inv = static_cast<float>(1.0 / std::sqrt(n)); for (auto& x : v) x *= inv; }
+}
+
+class GeminiEmbedder : public EmbeddingProvider {
+public:
+    GeminiEmbedder(std::string b, std::string k, std::string m, int d) : base_(std::move(b)), key_(std::move(k)), model_(std::move(m)), dims_(d) {
+        while (!base_.empty() && base_.back() == '/') base_.pop_back();
+        if (model_.rfind("models/", 0) == 0) model_ = model_.substr(7);
+    }
+    std::string Id() const override { return "gemini"; }
+    std::string Model() const override { return dims_ > 0 ? model_ + "@" + std::to_string(dims_) : model_; }
+    std::vector<Vec> Embed(const std::vector<std::string>& texts) override { return Run(texts, "RETRIEVAL_DOCUMENT"); }
+    Vec EmbedQuery(const std::string& t) override { return Run({t}, "RETRIEVAL_QUERY").at(0); }
+private:
+    std::vector<Vec> Run(const std::vector<std::string>& texts, const char* task) {
+        std::vector<Vec> out;
+        for (std::size_t off = 0; off < texts.size(); off += 100) {
+            nlohmann::json req{{"requests", nlohmann::json::array()}};
+            for (std::size_t i = off; i < texts.size() && i < off + 100; ++i) {
+                nlohmann::json r{{"model", "models/" + model_}, {"content", {{"parts", {{{"text", texts[i]}}}}}}, {"taskType", task}};
+                if (dims_ > 0) r["outputDimensionality"] = dims_;
+                req["requests"].push_back(r);
+            }
+            auto j = PostJson(base_ + "/models/" + model_ + ":batchEmbedContents", req, {"x-goog-api-key: " + key_});
+            for (auto& e : j.at("embeddings")) { Vec v = e.at("values").get<Vec>(); Normalize(v); out.push_back(std::move(v)); }
+        }
+        if (out.size() != texts.size()) throw std::runtime_error("gemini embedding count mismatch");
+        return out;
+    }
+    std::string base_, key_, model_;
+    int dims_;
+};
+
+class VoyageEmbedder : public EmbeddingProvider {
+public:
+    VoyageEmbedder(std::string b, std::string k, std::string m) : base_(std::move(b)), key_(std::move(k)), model_(std::move(m)) {
+        while (!base_.empty() && base_.back() == '/') base_.pop_back();
+    }
+    std::string Id() const override { return "voyage"; }
+    std::string Model() const override { return model_; }
+    std::vector<Vec> Embed(const std::vector<std::string>& texts) override { return Run(texts, "document"); }
+    Vec EmbedQuery(const std::string& t) override { return Run({t}, "query").at(0); }
+private:
+    std::vector<Vec> Run(const std::vector<std::string>& texts, const char* type) {
+        std::vector<Vec> out;
+        for (std::size_t off = 0; off < texts.size(); off += 128) {
+            nlohmann::json req{{"model", model_}, {"input_type", type}, {"input", nlohmann::json::array()}};
+            for (std::size_t i = off; i < texts.size() && i < off + 128; ++i) req["input"].push_back(texts[i]);
+            auto j = PostJson(base_ + "/embeddings", req, {"Authorization: Bearer " + key_});
+            auto data = j.at("data");
+            std::vector<Vec> batch(data.size());
+            for (auto& d : data) {
+                auto idx = d.value("index", std::size_t{0});
+                if (idx >= batch.size()) throw std::runtime_error("bad embedding index");
+                Vec v = d.at("embedding").get<Vec>(); Normalize(v); batch[idx] = std::move(v);
+            }
+            for (auto& v : batch) out.push_back(std::move(v));
+        }
+        if (out.size() != texts.size()) throw std::runtime_error("voyage embedding count mismatch");
+        return out;
+    }
+    std::string base_, key_, model_;
+};
 }  // namespace
 
 std::shared_ptr<EmbeddingProvider> MakeLocalEmbedder(int dims) { return std::make_shared<LocalEmbedder>(dims); }
 std::shared_ptr<EmbeddingProvider> MakeOpenAiEmbedder(std::string b, std::string k, std::string m) {
     return std::make_shared<OpenAiEmbedder>(std::move(b), std::move(k), std::move(m));
+}
+
+std::shared_ptr<EmbeddingProvider> MakeGeminiEmbedder(std::string b, std::string k, std::string m, int d) {
+    return std::make_shared<GeminiEmbedder>(std::move(b), std::move(k), std::move(m), d);
+}
+std::shared_ptr<EmbeddingProvider> MakeVoyageEmbedder(std::string b, std::string k, std::string m) {
+    return std::make_shared<VoyageEmbedder>(std::move(b), std::move(k), std::move(m));
 }
 
 std::shared_ptr<EmbeddingProvider> MakeEmbedderFromConfig(const nlohmann::json& raw) {
@@ -107,11 +198,29 @@ std::shared_ptr<EmbeddingProvider> MakeEmbedderFromConfig(const nlohmann::json& 
     if (!ms.value("enabled", true)) return nullptr;
     std::string prov = ms.value("provider", std::string("local"));
     auto remote = ms.value("remote", nlohmann::json::object());
-    std::string key = remote.value("apiKey", std::string());
-    if (key.empty()) if (const char* e = std::getenv("OPENAI_API_KEY")) key = e;
-    std::string base = remote.value("baseUrl", std::string("https://api.openai.com/v1"));
-    if (prov == "auto") prov = key.empty() ? "local" : "openai";
-    if (prov == "openai") return MakeOpenAiEmbedder(base, key, ms.value("model", std::string("text-embedding-3-small")));
+    const std::string cfg_key = remote.value("apiKey", std::string());
+    auto env = [](const char* n) { const char* e = std::getenv(n); return std::string(e ? e : ""); };
+    auto key_for = [&](const std::string& p) {
+        if (!cfg_key.empty()) return cfg_key;
+        if (p == "openai") return env("OPENAI_API_KEY");
+        if (p == "gemini") { auto k = env("GEMINI_API_KEY"); return k.empty() ? env("GOOGLE_API_KEY") : k; }
+        if (p == "voyage") return env("VOYAGE_API_KEY");
+        return std::string();
+    };
+    if (prov == "auto") {
+        prov = "local";
+        for (const char* p : {"openai", "gemini", "voyage"}) if (!key_for(p).empty()) { prov = p; break; }
+    }
+    const std::string key = key_for(prov);
+    if (prov == "openai")
+        return MakeOpenAiEmbedder(remote.value("baseUrl", std::string("https://api.openai.com/v1")), key,
+                                  ms.value("model", std::string("text-embedding-3-small")));
+    if (prov == "gemini")
+        return MakeGeminiEmbedder(remote.value("baseUrl", std::string("https://generativelanguage.googleapis.com/v1beta")), key,
+                                  ms.value("model", std::string("gemini-embedding-001")), ms.value("outputDimensionality", 0));
+    if (prov == "voyage")
+        return MakeVoyageEmbedder(remote.value("baseUrl", std::string("https://api.voyageai.com/v1")), key,
+                                  ms.value("model", std::string("voyage-3.5")));
     return MakeLocalEmbedder();
 }
 

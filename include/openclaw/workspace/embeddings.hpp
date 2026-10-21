@@ -18,13 +18,20 @@ public:
     virtual std::string Model() const = 0;
     // Batch embed; throws std::runtime_error on failure.
     virtual std::vector<Vec> Embed(const std::vector<std::string>& texts) = 0;
+    // Query-side embedding (providers with task types: Gemini RETRIEVAL_QUERY, Voyage input_type=query).
+    virtual Vec EmbedQuery(const std::string& text) { return Embed({text}).at(0); }
 };
 
 // Offline hashed-feature embeddings (LocalEmbed).
 std::shared_ptr<EmbeddingProvider> MakeLocalEmbedder(int dims = 512);
 // OpenAI-compatible POST {baseUrl}/embeddings {model, input:[...]} (Bearer apiKey). baseUrl like https://api.openai.com/v1
 std::shared_ptr<EmbeddingProvider> MakeOpenAiEmbedder(std::string base_url, std::string api_key, std::string model);
-// From agents.defaults.memorySearch: provider local|openai|auto (+model, remote.baseUrl, remote.apiKey; apiKey
+// Gemini: POST {baseUrl}/models/{model}:batchEmbedContents (x-goog-api-key), taskType RETRIEVAL_DOCUMENT/QUERY,
+// optional outputDimensionality. baseUrl default https://generativelanguage.googleapis.com/v1beta, model gemini-embedding-001.
+std::shared_ptr<EmbeddingProvider> MakeGeminiEmbedder(std::string base_url, std::string api_key, std::string model, int dims = 0);
+// Voyage: POST {baseUrl}/embeddings {input, model, input_type: document|query} (Bearer). Default https://api.voyageai.com/v1, voyage-3.5.
+std::shared_ptr<EmbeddingProvider> MakeVoyageEmbedder(std::string base_url, std::string api_key, std::string model);
+// From agents.defaults.memorySearch: provider local|openai|gemini|voyage|auto (+model, remote.baseUrl, remote.apiKey; apiKey
 // falls back to OPENAI_API_KEY). auto = openai when a key is available, else local. Disabled → nullptr.
 std::shared_ptr<EmbeddingProvider> MakeEmbedderFromConfig(const nlohmann::json& raw);
 

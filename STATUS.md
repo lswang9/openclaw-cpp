@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.59.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.60.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.60.0-dev
+- 新增 Gemini / Voyage embedding provider（任务类型、维度、鉴权、auto 选择、失败回退本地）；只用本地假服务端测试，未连真实 API。
 
 ### 1.59.0-dev
 - 向量存储改为 SQLite（float32 BLOB + `vec_distance_cosine` SQL 函数，多模型并存、过期行清理、旧 JSON 自动导入）；等价实现，并非 sqlite-vec 扩展本身（无 ANN 索引）。
