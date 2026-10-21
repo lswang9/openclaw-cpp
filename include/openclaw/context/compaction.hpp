@@ -31,6 +31,15 @@ struct CompactionResult {
 CompactionResult CompactWithSummary(provider::Provider& prov, const std::vector<agent::Message>& history,
                                     std::size_t keep_recent, const std::string& instructions = "");
 
+struct MemoryFlushPolicy {
+    bool enabled = true;      // agents.defaults.compaction.memoryFlush.enabled
+    std::string prompt = "Pre-compaction memory flush. The session is about to be compacted. Store any durable "
+                         "memories now (append to memory/YYYY-MM-DD.md or MEMORY.md with your tools). "
+                         "If nothing to store, reply with NO_REPLY.";
+    std::string system_prompt = "Session nearing compaction. Store durable memories now.";
+};
+MemoryFlushPolicy MemoryFlushFromConfig(const nlohmann::json& raw);
+
 bool ParseCompactCommand(const std::string& text, std::string& instructions);
 
 inline constexpr const char* kSummaryPrefix = "[Summary of earlier conversation]\n";

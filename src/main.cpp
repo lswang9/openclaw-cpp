@@ -74,7 +74,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.31.0-dev";
+constexpr const char* kVersion = "1.32.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1418,6 +1418,22 @@ int CmdSelfTest() {
         if (!ok) { std::cerr << "FAIL jsonl transcripts\n"; ++failures; }
         else std::cerr << "PASS JSONL transcripts (header+parentId chain, migration, torn-line tolerant)\n";
     } catch (const std::exception& e) { std::cerr << "FAIL jsonl exception: " << e.what() << "\n"; ++failures; }
+
+    // per-channel/per-type reset policy + memory flush config
+    {
+        nlohmann::json raw = {{"session", {{"reset", {{"mode", "daily"}, {"atHour", 4}}},
+                                           {"resetByType", {{"group", {{"mode", "idle"}, {"idleMinutes", 120}}}}},
+                                           {"resetByChannel", {{"discord", {{"mode", "off"}}}}}}}};
+        auto d = session::PolicyFor(raw, "slack", "direct");
+        auto g = session::PolicyFor(raw, "slack", session::InferChatType("agent:main:slack:group:C1"));
+        auto dc = session::PolicyFor(raw, "discord", "group");
+        auto mf = context::MemoryFlushFromConfig({{"agents", {{"defaults", {{"compaction", {{"memoryFlush", {{"enabled", false}}}}}}}}}});
+        bool ok = d.mode == "daily" && g.mode == "idle" && g.idle_minutes == 120 && dc.mode == "off" &&
+                  session::InferChatType("agent:main:tg:thread:9") == "thread" && session::InferChatType("x") == "direct" &&
+                  !mf.enabled && context::MemoryFlushFromConfig({}).enabled;
+        if (!ok) { std::cerr << "FAIL reset-by-type/channel\n"; ++failures; }
+        else std::cerr << "PASS resetByChannel > resetByType > reset; memoryFlush config\n";
+    }
 
     // canvas disk store + sim bridge
     try {

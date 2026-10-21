@@ -36,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.31.0-dev";
+constexpr const char* kVersion = "1.32.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -475,7 +475,8 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
             Emit("session.reset", {{"sessionKey", msg.session_key}, {"sessionId", e.value("sessionId", "")}, {"reason", "command"}});
             if (rest.empty()) return "✅ New session started.";
             text_in = rest;
-        } else if (deps_.sessions.ResetIfStale(msg.session_key, session::PolicyFromConfig(deps_.config.raw))) {
+        } else if (deps_.sessions.ResetIfStale(msg.session_key, session::PolicyFor(deps_.config.raw, msg.channel,
+                                          msg.chat_type.empty() ? session::InferChatType(msg.session_key) : msg.chat_type))) {
             Emit("session.reset", {{"sessionKey", msg.session_key}, {"reason", "policy"}});
         }
     }
@@ -502,6 +503,18 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     {
         auto pol = context::CompactionFromConfig(deps_.config.raw);
         if (context::NeedsCompaction(pol, messages)) {
+            auto mf = context::MemoryFlushFromConfig(deps_.config.raw);
+            if (mf.enabled) {
+                // Silent agentic turn so the model can write durable memory before older turns are summarized.
+                std::vector<agent::Message> fm;
+                fm.push_back({.role = "system", .content = deps_.system_prompt + "\n\n" + mf.system_prompt});
+                for (const auto& m : messages) if (m.role != "system") fm.push_back(m);
+                fm.push_back({.role = "user", .content = mf.prompt});
+                agent::LoopOptions flo = MakeLoopOpts(deps_);
+                flo.cancel = &cancel_agents_;
+                auto fr = agent::RunAgentLoop(*cprov, deps_.tools, fm, flo);
+                Emit("session.memoryFlush", {{"sessionKey", msg.session_key}, {"ok", fr.ok}, {"turns", fr.turns}});
+            }
             auto cr = context::CompactWithSummary(*cprov, messages, pol.keep_recent);
             if (cr.compacted) {
                 messages = std::move(cr.messages);

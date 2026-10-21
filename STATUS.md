@@ -1,6 +1,11 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.31.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.32.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.32.0-dev 新增
+
+- 分渠道/分类型重置：`session.resetByChannel.<渠道>` 优先于 `session.resetByType.<direct|group|thread>`，再退回 `session.reset`。
+- 自动压缩前先做一次“记忆落盘”静默轮：模型可用工具把重要信息写入 `memory/日期.md`，这轮输出不写入会话记录；可用 `agents.defaults.compaction.memoryFlush.enabled: false` 关闭。
 
 ## 1.31.0-dev 新增
 

@@ -278,6 +278,34 @@ ResetPolicy PolicyFromConfig(const nlohmann::json& raw) {
     return p;
 }
 
+namespace {
+void ApplyPolicy(ResetPolicy& p, const nlohmann::json& r) {
+    if (!r.is_object()) return;
+    p.mode = r.value("mode", p.mode);
+    p.at_hour = r.value("atHour", p.at_hour);
+    p.idle_minutes = r.value("idleMinutes", p.idle_minutes);
+}
+}  // namespace
+
+ResetPolicy PolicyFor(const nlohmann::json& raw, const std::string& channel, const std::string& chat_type) {
+    ResetPolicy p = PolicyFromConfig(raw);
+    if (!raw.is_object() || !raw.contains("session") || !raw["session"].is_object()) return p;
+    const auto& s = raw["session"];
+    std::string t = chat_type == "dm" ? "direct" : chat_type;
+    if (!t.empty() && s.contains("resetByType") && s["resetByType"].is_object() && s["resetByType"].contains(t))
+        ApplyPolicy(p, s["resetByType"][t]);
+    if (!channel.empty() && s.contains("resetByChannel") && s["resetByChannel"].is_object() &&
+        s["resetByChannel"].contains(channel))
+        ApplyPolicy(p, s["resetByChannel"][channel]);
+    return p;
+}
+
+std::string InferChatType(const std::string& key) {
+    if (key.find(":thread:") != std::string::npos || key.find(":topic:") != std::string::npos) return "thread";
+    if (key.find(":group:") != std::string::npos || key.find(":channel:") != std::string::npos) return "group";
+    return "direct";
+}
+
 bool IsStale(const ResetPolicy& p, std::int64_t updated_ms, std::int64_t now_ms) {
     if (p.mode == "off" || updated_ms <= 0 || now_ms <= updated_ms) return false;
     if (p.idle_minutes > 0 && now_ms - updated_ms >= std::int64_t(p.idle_minutes) * 60000) return true;

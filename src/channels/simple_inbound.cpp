@@ -95,6 +95,7 @@ nlohmann::json SimpleInboundAdapter::HandleHttpInbound(const nlohmann::json& bod
         }
     }
     msg.session_key = body.value("session_key", id_ + "-" + msg.sender);
+    msg.chat_type = body.value("chat_type", body.value("chatType", std::string()));
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
     return {{"ok", true},

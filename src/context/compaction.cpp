@@ -80,6 +80,19 @@ CompactionResult CompactWithSummary(provider::Provider& prov, const std::vector<
     return r;
 }
 
+MemoryFlushPolicy MemoryFlushFromConfig(const nlohmann::json& raw) {
+    MemoryFlushPolicy p;
+    try {
+        const auto& f = raw.at("agents").at("defaults").at("compaction").at("memoryFlush");
+        if (f.is_object()) {
+            p.enabled = f.value("enabled", p.enabled);
+            p.prompt = f.value("prompt", p.prompt);
+            p.system_prompt = f.value("systemPrompt", p.system_prompt);
+        }
+    } catch (...) {}
+    return p;
+}
+
 bool ParseCompactCommand(const std::string& text, std::string& instructions) {
     std::size_t i = 0;
     while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;

@@ -21,6 +21,10 @@ struct ResetPolicy {
     int idle_minutes = 0;        // >0 enables idle expiry (also with daily)
 };
 ResetPolicy PolicyFromConfig(const nlohmann::json& raw);
+// Upstream precedence: session.resetByChannel.<channel> > session.resetByType.<direct|group|thread> > session.reset.
+ResetPolicy PolicyFor(const nlohmann::json& raw, const std::string& channel, const std::string& chat_type);
+// Infer direct|group|thread from an upstream-style session key (agent:main:<ch>:group:<id>, ...:thread:...).
+std::string InferChatType(const std::string& session_key);
 // True if a session last updated at `updated` must be reset at `now` under policy.
 bool IsStale(const ResetPolicy& p, std::int64_t updated_ms, std::int64_t now_ms);
 

@@ -15,6 +15,7 @@ struct InboundMessage {
     std::string sender;
     std::string text;
     std::string session_key;
+    std::string chat_type;  // direct | group | thread ("" = infer from session_key)
 };
 
 using InboundHandler = std::function<void(const InboundMessage&)>;
