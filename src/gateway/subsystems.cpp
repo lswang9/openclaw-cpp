@@ -1145,9 +1145,267 @@ std::string AgentGitHubPublish(const json& args, const std::string& agent, const
     return r.ok ? r.payload.dump() : json{{"ok", false}, {"error", r.error}}.dump();
 }
 
+
+// ---------------------------------------------------------------- worktrees (git worktree, upstream worktrees.*)
+fs::path WorktreesPath(const fs::path& root) { return root / "worktrees.json"; }
+json PublicWt(const json& r) { json o = r; o.erase("snapshots"); return o; }
+std::string SafeName(std::string s) { for (auto& c : s) if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_' && c != '.') c = '-'; return s.substr(0, 64); }
+bool GitOk(const fs::path& repo, std::vector<std::string> args, std::string* out = nullptr, std::string* err = nullptr) {
+    args.insert(args.begin(), {"git", "-C", repo.string()});
+    auto r = Run(args, {});
+    if (out) *out = Trim(r.out);
+    if (err) *err = Trim(r.err);
+    return r.code == 0;
+}
+ExtraResult Worktrees(ServerDeps&, const fs::path& root, const std::string& method, const json& p) {
+    std::lock_guard<std::mutex> l(g_mu);
+    auto db = ReadJsonFile(WorktreesPath(root), json::object());
+    auto save = [&] { WriteJsonFile(WorktreesPath(root), db); };
+    auto need = [&](const char* k) { return p.contains(k) && p[k].is_string() && !p[k].get<std::string>().empty(); };
+    if (method == "worktrees.list") { json out = json::array(); for (auto& [k, v] : db.items()) out.push_back(PublicWt(v)); return Ok({{"worktrees", out}}); }
+    if (method == "worktrees.branches") {
+        if (!need("repoRoot")) return Fail("repoRoot is required");
+        std::string out, cur;
+        if (!GitOk(p["repoRoot"].get<std::string>(), {"for-each-ref", "--format=%(refname:short)\t%(objectname)", "refs/heads"}, &out)) return Fail("not a git repository");
+        GitOk(p["repoRoot"].get<std::string>(), {"rev-parse", "--abbrev-ref", "HEAD"}, &cur);
+        json br = json::array(); std::istringstream is(out); std::string line;
+        while (std::getline(is, line)) { auto tab = line.find('\t'); if (tab == std::string::npos) continue; auto n = line.substr(0, tab);
+            bool used = false; for (auto& [k, v] : db.items()) used = used || (v.value("branch", "") == n && v.value("status", "") == "active");
+            br.push_back({{"name", n}, {"sha", line.substr(tab + 1)}, {"current", n == cur}, {"checkedOutInWorktree", used}}); }
+        json res{{"branches", br}, {"currentBranch", cur}};
+        if (p.value("includeRepositoryStatus", false)) { std::string st; GitOk(p["repoRoot"].get<std::string>(), {"status", "--porcelain"}, &st); res["repositoryStatus"] = {{"dirty", !st.empty()}}; }
+        return Ok(res);
+    }
+    if (method == "worktrees.create") {
+        if (!need("repoRoot") || !need("name")) return Fail("repoRoot and name are required");
+        const fs::path repo = p["repoRoot"].get<std::string>();
+        std::string top; if (!GitOk(repo, {"rev-parse", "--show-toplevel"}, &top)) return Fail("repoRoot is not a git repository");
+        const auto name = SafeName(p["name"].get<std::string>());
+        const auto id = "wt-" + name + "-" + std::to_string(NowMs() % 100000000);
+        const fs::path path = root / "worktrees" / id;
+        fs::create_directories(path.parent_path());
+        const auto branch = "openclaw/" + name;
+        std::string err;
+        std::vector<std::string> args{"worktree", "add", "-b", branch, path.string()};
+        if (need("baseRef")) args.push_back(p["baseRef"].get<std::string>());
+        if (!GitOk(top, args, nullptr, &err)) return Fail("git worktree add failed: " + err);
+        std::string base; GitOk(path, {"rev-parse", "HEAD"}, &base);
+        db[id] = {{"id", id}, {"name", name}, {"repoRoot", top}, {"path", path.string()}, {"branch", branch}, {"baseRef", p.value("baseRef", std::string("HEAD"))},
+                  {"baseSha", base}, {"ownerKind", "manual"}, {"status", "active"}, {"createdAt", NowMs()}, {"profiles", p.value("profiles", json::array())}};
+        save();
+        return Ok(PublicWt(db[id]));
+    }
+    const auto id = p.value("id", std::string());
+    if (method == "worktrees.gc") {
+        int pruned = 0;
+        std::set<std::string> repos;
+        for (auto& [k, v] : db.items()) repos.insert(v.value("repoRoot", ""));
+        for (auto& r : repos) if (!r.empty()) GitOk(r, {"worktree", "prune"});
+        for (auto& [k, v] : db.items()) if (v.value("status", "") == "active" && !fs::exists(v.value("path", ""))) { v["status"] = "missing"; ++pruned; }
+        save();
+        return Ok({{"jobId", p.value("jobId", "gc-" + std::to_string(NowMs()))}, {"status", "completed"}, {"pruned", pruned}});
+    }
+    if (id.empty() || !db.contains(id)) return Fail("unknown worktree: " + id);
+    auto& rec = db[id];
+    const fs::path path = rec.value("path", "");
+    const std::string repo = rec.value("repoRoot", "");
+    if (method == "worktrees.remove") {
+        if (rec.value("status", "") != "active") return Fail("worktree is not active");
+        std::string st, ahead;
+        GitOk(path, {"status", "--porcelain"}, &st);
+        GitOk(path, {"rev-list", "--count", rec.value("baseSha", "HEAD") + "..HEAD"}, &ahead);
+        const bool lossless = st.empty();
+        if (p.value("ifLossless", false) && !lossless) return Ok({{"removed", false}, {"reason", "worktree has uncommitted changes"}});
+        json out{{"removed", true}};
+        if (!lossless && !p.value("force", false)) {
+            // Snapshot uncommitted work into refs/openclaw/worktree-snapshots/<id> before removing.
+            std::string err;
+            if (!GitOk(path, {"add", "-A"}, nullptr, &err) ||
+                !GitOk(path, {"-c", "user.name=openclaw", "-c", "user.email=openclaw@localhost", "commit", "-q", "--no-verify", "-m", "openclaw worktree snapshot " + id}, nullptr, &err))
+                return Ok({{"removed", false}, {"snapshotError", {{"message", err}}}});
+            std::string sha; GitOk(path, {"rev-parse", "HEAD"}, &sha);
+            const auto ref = "refs/openclaw/worktree-snapshots/" + id;
+            GitOk(repo, {"update-ref", ref, sha});
+            rec["snapshotRef"] = ref; out["snapshotRef"] = ref;
+        }
+        std::string err;
+        rec["status"] = "removing"; save();
+        if (!GitOk(repo, {"worktree", "remove", "--force", path.string()}, nullptr, &err)) return Fail("git worktree remove failed: " + err);
+        rec["status"] = "removed"; rec["removedAt"] = NowMs(); save();
+        return Ok(out);
+    }
+    if (method == "worktrees.restore") {
+        if (rec.value("status", "") == "active") return Ok(PublicWt(rec));
+        std::string err;
+        const auto from = rec.contains("snapshotRef") ? rec["snapshotRef"].get<std::string>() : rec.value("branch", "");
+        if (!GitOk(repo, {"worktree", "add", path.string(), rec.value("branch", "")}, nullptr, &err)) return Fail("git worktree add failed: " + err);
+        if (rec.contains("snapshotRef")) { GitOk(path, {"reset", "--hard", from}); GitOk(path, {"reset", "--soft", "HEAD~1"}); GitOk(path, {"reset", "-q"}); }
+        rec["status"] = "active"; rec["restoredAt"] = NowMs(); save();
+        return Ok(PublicWt(rec));
+    }
+    if (method == "worktrees.recoverRemoval") {
+        if (rec.value("status", "") != "removing") return Ok({{"recovered", false}, {"status", rec.value("status", "")}});
+        GitOk(repo, {"worktree", "remove", "--force", path.string()}); GitOk(repo, {"worktree", "prune"});
+        rec["status"] = "removed"; save();
+        return Ok({{"recovered", true}, {"status", "removed"}});
+    }
+    if (method == "worktrees.retireSnapshot") {
+        if (!rec.contains("snapshotRef")) return Ok({{"retired", false}, {"reason", "no snapshot"}});
+        GitOk(repo, {"update-ref", "-d", rec["snapshotRef"].get<std::string>()});
+        rec.erase("snapshotRef"); save();
+        return Ok({{"retired", true}});
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------- storage locations
+ExtraResult Storage(ServerDeps& d, const fs::path& root, const std::string& method, const json& p) {
+    auto locs = json::array();
+    auto add = [&](const std::string& name, const fs::path& path, const std::string& kind) {
+        std::error_code ec; auto sp = fs::space(path.empty() ? fs::path("/") : path, ec);
+        locs.push_back({{"name", name}, {"kind", kind}, {"provider", "local"}, {"path", path.string()}, {"exists", fs::exists(path, ec)},
+                        {"freeBytes", ec ? 0 : static_cast<long long>(sp.available)}, {"totalBytes", ec ? 0 : static_cast<long long>(sp.capacity)}});
+    };
+    add("data", root, "data"); add("sessions", d.sessions.Root(), "sessions"); add("workspace", WorkspaceOf(d, "main"), "workspace");
+    if (method == "storage.locations.list") return Ok({{"locations", locs}});
+    const auto name = p.value("name", std::string());
+    for (auto& l : locs) if (l["name"] == name) {
+        const fs::path probe = fs::path(l["path"].get<std::string>()) / (".openclaw-probe-" + std::to_string(NowMs()));
+        std::error_code ec; fs::create_directories(probe.parent_path(), ec);
+        bool w = static_cast<bool>(std::ofstream(probe) << "x"); fs::remove(probe, ec);
+        return Ok({{"name", name}, {"ok", w}, {"writable", w}, {"location", l}});
+    }
+    return Fail("unknown storage location: " + name);
+}
+
+// ---------------------------------------------------------------- user profiles (users.*)
+fs::path ProfilesPath(const fs::path& root) { return root / "user-profiles.json"; }
+ExtraResult Users(ServerDeps&, const fs::path& root, const std::string& method, const json& p) {
+    std::lock_guard<std::mutex> l(g_mu);
+    auto db = ReadJsonFile(ProfilesPath(root), json{{"profiles", json::object()}});
+    auto& pr = db["profiles"];
+    if (!pr.contains("operator")) pr["operator"] = {{"id", "operator"}, {"displayName", "operator"}, {"role", "owner"}, {"emails", json::array()},
+                                                   {"channelIdentities", json::array()}, {"authLinks", json::array()}, {"personalFiles", json::object()}};
+    auto save = [&] { WriteJsonFile(ProfilesPath(root), db); };
+    const auto pid = p.value("profileId", p.value("targetProfileId", t_principal.empty() ? std::string("operator") : t_principal));
+    auto prof = [&](const std::string& id) -> json& {
+        if (!pr.contains(id)) pr[id] = {{"id", id}, {"displayName", id}, {"role", "member"}, {"emails", json::array()}, {"channelIdentities", json::array()},
+                                         {"authLinks", json::array()}, {"personalFiles", json::object()}};
+        return pr[id];
+    };
+    auto admin = [&] { return t_full_write; };
+    if (method == "users.mentionable") {
+        json out = json::array(); for (auto& [k, v] : pr.items()) out.push_back({{"id", k}, {"displayName", v.value("displayName", k)}}); return Ok({{"users", out}});
+    }
+    if (method == "users.linkEmail") {
+        auto email = Trim(p.value("email", std::string()));
+        if (email.empty() || email.find('@') == std::string::npos) return Fail("email must not be empty");
+        for (auto& [k, v] : pr.items()) for (auto& e : v["emails"]) if (e == email && k != pid) return Fail("email already linked to profile " + k);
+        auto& P = prof(pid); bool have = false; for (auto& e : P["emails"]) have = have || e == email;
+        if (!have) P["emails"].push_back(email);
+        save(); return Ok({{"profile", P}});
+    }
+    if (method == "users.merge") {
+        if (!admin()) return Fail("users.merge requires admin");
+        const auto src = p.value("sourceProfileId", std::string()), dst = p.value("targetProfileId", std::string());
+        if (src.empty() || dst.empty() || src == dst || !pr.contains(src) || !pr.contains(dst)) return Fail("sourceProfileId and targetProfileId must be distinct existing profiles");
+        json moved = json::array();
+        for (auto k : {"emails", "channelIdentities", "authLinks"}) {
+            for (auto& x : pr[src][k]) { bool dup = false; for (auto& y : pr[dst][k]) dup = dup || y == x; if (!dup) pr[dst][k].push_back(x); }
+            if (!pr[src][k].empty()) moved.push_back(k);
+        }
+        for (auto& [k, v] : pr[src]["personalFiles"].items()) if (!pr[dst]["personalFiles"].contains(k)) pr[dst]["personalFiles"][k] = v;
+        pr.erase(src); save();
+        return Ok({{"profile", pr[dst]}, {"movedAliasKinds", moved}});
+    }
+    if (method == "users.setRole") {
+        if (!admin()) return Fail("users.setRole requires admin");
+        const auto role = p.value("role", std::string());
+        if (role != "owner" && role != "admin" && role != "member" && role != "viewer") return Fail("role must be owner, admin, member or viewer");
+        prof(pid)["role"] = role; save(); return Ok({{"profile", pr[pid]}});
+    }
+    if (method == "users.setAvatar") {
+        auto& P = prof(pid);
+        if (p.contains("avatar") && p["avatar"].is_null()) P.erase("avatar"); else P["avatar"] = p.value("avatar", p.value("url", std::string()));
+        save(); return Ok({{"profile", P}});
+    }
+    if (method == "users.linkChannelIdentity" || method == "users.unlinkChannelIdentity") {
+        json idj{{"channel", p.value("channel", std::string())}, {"accountId", p.value("accountId", std::string())}, {"senderId", p.value("senderId", p.value("peerId", std::string()))}};
+        if (idj["channel"] == "" || idj["senderId"] == "") return Fail("channel and senderId are required");
+        auto& P = prof(pid); auto& arr = P["channelIdentities"];
+        for (size_t i = 0; i < arr.size(); ++i) if (arr[i] == idj) { if (method[6] == 'u') arr.erase(arr.begin() + i); save(); return Ok({{"profile", P}}); }
+        if (method == "users.linkChannelIdentity") {
+            for (auto& [k, v] : pr.items()) for (auto& x : v["channelIdentities"]) if (x == idj && k != pid) return Fail("identity already linked to profile " + k);
+            arr.push_back(idj);
+        }
+        save(); return Ok({{"profile", P}});
+    }
+    if (method == "users.listChannelIdentities") return Ok({{"identities", prof(pid)["channelIdentities"]}});
+    if (method == "users.linkAuthProfile" || method == "users.unlinkAuthProfile") {
+        const auto ap = p.value("authProfileId", p.value("authProfile", std::string()));
+        if (ap.empty()) return Fail("authProfileId is required");
+        auto& arr = prof(pid)["authLinks"];
+        for (size_t i = 0; i < arr.size(); ++i) if (arr[i] == ap) { if (method == "users.unlinkAuthProfile") arr.erase(arr.begin() + i); save(); return Ok({{"profile", pr[pid]}}); }
+        if (method == "users.linkAuthProfile") arr.push_back(ap);
+        save(); return Ok({{"profile", pr[pid]}});
+    }
+    if (method == "users.listAuthLinks") return Ok({{"links", prof(pid)["authLinks"]}});
+    if (method == "users.listModelAccounts") {
+        json accts = json::array();
+        for (auto& a : prof(pid)["authLinks"]) accts.push_back({{"id", a}, {"selected", prof(pid).value("modelAccount", std::string()) == a.get<std::string>()}});
+        return Ok({{"accounts", accts}, {"selected", prof(pid).value("modelAccount", std::string())}});
+    }
+    if (method == "users.selectModelAccount") {
+        const auto acc = p.value("accountId", std::string());
+        bool ok = acc.empty(); for (auto& a : prof(pid)["authLinks"]) ok = ok || a == acc;
+        if (!ok) return Fail("account is not linked to this profile");
+        prof(pid)["modelAccount"] = acc; save(); return Ok({{"selected", acc}});
+    }
+    if (method == "users.personalFile.get" || method == "users.personalFile.set") {
+        const auto name = p.value("name", p.value("file", std::string("USER.md")));
+        if (name.empty() || name.find('/') != std::string::npos || name.find("..") != std::string::npos) return Fail("invalid file name");
+        auto& files = prof(pid)["personalFiles"];
+        if (method == "users.personalFile.get") return Ok({{"name", name}, {"content", files.value(name, std::string())}, {"exists", files.contains(name)}});
+        const auto c = p.value("content", std::string());
+        if (c.size() > 256 * 1024) return Fail("content too large");
+        files[name] = c; save(); return Ok({{"name", name}, {"saved", true}});
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------- device rename, message actions
+ExtraResult DeviceRename(const fs::path& root, const json& p) {
+    std::lock_guard<std::mutex> l(g_mu);
+    const auto id = p.value("deviceId", p.value("id", std::string()));
+    const auto nm = Trim(p.value("displayName", p.value("name", std::string())));
+    if (id.empty() || nm.empty() || nm.size() > 128) return Fail("deviceId and displayName (≤128) are required");
+    auto db = ReadJsonFile(root / "device-names.json", json::object());
+    db[id] = nm; WriteJsonFile(root / "device-names.json", db);
+    return Ok({{"deviceId", id}, {"displayName", nm}});
+}
+ExtraResult MessageAction(const fs::path& root, const json& p) {
+    const auto channel = p.value("channel", std::string()), action = p.value("action", std::string());
+    if (channel.empty() || action.empty()) return Fail("channel and action are required");
+    static const std::set<std::string> known{"send", "react", "edit", "delete", "unsend", "pin", "unpin", "reply", "thread-reply", "read", "typing", "poll"};
+    if (!known.count(action)) return Fail("unsupported message action: " + action);
+    if (action == "send") { auto r = GatewayRpc("send", {{"channel", channel}, {"to", p.value("to", p.value("target", std::string()))}, {"message", p.value("message", p.value("params", json::object()).value("message", std::string()))}});
+        return r.value("ok", false) ? Ok(r["payload"]) : Fail(r.value("error", json()).is_object() ? r["error"].value("message", "send failed") : "send failed"); }
+    // Non-send actions are recorded in the outbound action log (offline adapters replay them; live adapters are out of scope).
+    std::lock_guard<std::mutex> l(g_mu);
+    json rec{{"id", "act-" + std::to_string(NowMs())}, {"channel", channel}, {"action", action}, {"accountId", p.value("accountId", std::string())},
+             {"params", p.value("params", json::object())}, {"at", NowMs()}, {"status", "recorded"}};
+    std::ofstream(root / "message-actions.jsonl", std::ios::app) << rec.dump() << "\n";
+    return Ok({{"ok", true}, {"result", rec}});
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
+        if (method.rfind("worktrees.", 0) == 0) { auto r = Worktrees(deps, root, method, params); if (r.handled) return r; }
+        if (method == "storage.locations.list" || method == "storage.locations.probe") return Storage(deps, root, method, params);
+        if (method.rfind("users.", 0) == 0 && method.rfind("users.authConnect.", 0) != 0) { auto r = Users(deps, root, method, params); if (r.handled) return r; }
+        if (method == "device.pair.rename") return DeviceRename(root, params);
+        if (method == "message.action") return MessageAction(root, params);
         if (method == "projects.list" || method == "projects.register" || method == "projects.add" || method == "projects.remove") return Projects(deps, root, method, params);
         if (method == "sessions.companion.ask" || method == "sessions.companion.state" || method == "sessions.companion.reset")
             return Companion(deps, method, params);
