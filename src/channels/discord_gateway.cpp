@@ -1,3 +1,4 @@
+#include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/discord_gateway.hpp"
 
 #include <curl/curl.h>
@@ -95,10 +96,12 @@ nlohmann::json DiscordGateway::HandleDispatch(const std::string& event, const nl
             return {{"ignored", true}, {"reason", "bot_author"}};
         }
         const auto content = data.value("content", "");
-        if (content.empty()) return {{"ignored", true}, {"reason", "empty content"}};
+        auto audio = voice::ExtractAudioRefs(data);
+        if (content.empty() && audio.empty()) return {{"ignored", true}, {"reason", "empty content"}};
         InboundMessage msg;
         msg.channel = "discord";
         msg.text = content;
+        msg.media = audio;
         msg.sender = data.contains("author") ? data["author"].value("id", "discord") : "discord";
         auto chan = data.value("channel_id", "");
         msg.session_key = chan.empty() ? "discord-default" : ("discord-" + chan);

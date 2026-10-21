@@ -1,3 +1,4 @@
+#include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/outbound.hpp"
 
 #include <curl/curl.h>
@@ -211,5 +212,31 @@ nlohmann::json OutboundRecordAdapter::SendTyping(const std::string& chat_id) {
 
 nlohmann::json OutboundRecordAdapter::OutboundLog() const { return sent_; }
 void OutboundRecordAdapter::ClearLog() { sent_.clear(); }
+
+nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
+    if (id_ != "telegram") return {{"ok", false}, {"error", "unsupported"}};
+    const auto secret = ChannelCred(Config(), "telegram", "webhookSecret", "TELEGRAM_WEBHOOK_SECRET");
+    if (!secret.empty() && body.value("_secret_token", std::string()) != secret) return {{"ok", false}, {"error", "webhook secret mismatch"}};
+    const auto& tm = body.contains("message") ? body["message"] : (body.contains("edited_message") ? body["edited_message"] : nlohmann::json());
+    if (!tm.is_object() || !tm.contains("chat")) return {{"ok", true}, {"ignored", true}, {"note", "no message"}};
+    InboundMessage m;
+    m.channel = "telegram";
+    m.text = tm.value("text", tm.value("caption", std::string()));
+    m.media = voice::ExtractAudioRefs(body);
+    if (m.text.empty() && m.media.empty()) return {{"ok", true}, {"ignored", true}, {"note", "no text or audio"}};
+    const auto& chat = tm["chat"];
+    const std::string cid = chat["id"].is_string() ? chat["id"].get<std::string>() : chat["id"].dump();
+    m.sender = tm.contains("from") ? (tm["from"]["id"].is_string() ? tm["from"]["id"].get<std::string>() : tm["from"]["id"].dump()) : cid;
+    const auto type = chat.value("type", std::string("private"));
+    m.chat_type = type == "private" ? "direct" : "group";
+    if (m.chat_type == "group") m.conversation_id = cid;
+    m.peer_id = m.sender;
+    m.session_key = "telegram-" + cid;
+    if (tm.value("is_topic_message", false) && tm.contains("message_thread_id")) m.thread_id = tm["message_thread_id"].dump();
+    auto reply = deliver ? deliver(m) : std::string();
+    nlohmann::json sent;
+    if (!reply.empty()) sent = SendText(cid, reply);
+    return {{"ok", true}, {"channel", "telegram"}, {"reply", reply}, {"sent", sent}, {"impl", "real"}};
+}
 
 }  // namespace openclaw::channels

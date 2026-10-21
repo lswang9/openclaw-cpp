@@ -1,3 +1,4 @@
+#include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/simple_inbound.hpp"
 #include <cstdlib>
 
@@ -76,13 +77,15 @@ nlohmann::json SimpleInboundAdapter::HandleHttpInbound(const nlohmann::json& bod
     if (!Verify(body)) return {{"ok", false}, {"error", "verify token mismatch"}, {"impl", "real"}};
 
     std::string text = ExtractText(body);
-    if (text.empty()) {
+    auto audio = voice::ExtractAudioRefs(body);
+    if (text.empty() && audio.empty()) {
         return {{"ok", true}, {"ignored", true}, {"note", "no message text"}, {"impl", "real"}};
     }
 
     InboundMessage msg;
     msg.channel = id_;
     msg.text = text;
+    msg.media = audio;
     msg.sender = body.value("from", body.value("sender", id_));
     // WhatsApp from field
     if (body.contains("entry")) {

@@ -47,6 +47,9 @@ public:
                             const nlohmann::json& extra = {});
     // Typing indicator: Telegram sendChatAction, Discord POST /channels/{id}/typing; others record only.
     nlohmann::json SendTyping(const std::string& chat_id);
+    // Telegram webhook updates (text/caption, voice/audio → auto-transcribed by the gateway); reply via sendMessage.
+    bool SupportsHttpInbound() const override { return id_ == "telegram"; }
+    nlohmann::json HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) override;
     nlohmann::json OutboundLog() const;
     void ClearLog();
 

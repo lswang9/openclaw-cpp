@@ -62,7 +62,18 @@ void TtsEngine::SetProvider(const std::string& id) { provider_ = id.empty() ? "h
 void TtsEngine::SetPersona(const std::string& persona) { persona_ = persona.empty() ? "default" : persona; }
 void TtsEngine::SetEnabled(bool on) { enabled_ = on; }
 
-nlohmann::json TtsEngine::HttpPost(const std::string& text, const std::string& voice_in) const {
+namespace {
+struct StreamSink { std::string* all; const TtsEngine::ChunkFn* fn; std::size_t chunks = 0; };
+size_t StreamCb(char* p, size_t s, size_t n, void* u) {
+    auto* k = static_cast<StreamSink*>(u);
+    std::string piece(p, s * n);
+    k->all->append(piece);
+    if (k->fn && *k->fn && !piece.empty()) { (*k->fn)(piece); ++k->chunks; }
+    return s * n;
+}
+}  // namespace
+
+nlohmann::json TtsEngine::HttpPost(const std::string& text, const std::string& voice_in, const ChunkFn* on_chunk) const {
     CURL* curl = curl_easy_init();
     if (!curl) return {{"ok", false}, {"error", "curl_easy_init failed"}};
     const std::string voice = voice_in.empty() || voice_in == "default" ? std::string() : voice_in;
@@ -77,7 +88,7 @@ nlohmann::json TtsEngine::HttpPost(const std::string& text, const std::string& v
                                  {"voice", voice.empty() ? "alloy" : voice}, {"response_format", EnvOr("OPENCLAW_TTS_FORMAT", "mp3")}}.dump();
         if (!api_key_.empty()) add("Authorization: Bearer " + api_key_);
     } else if (provider_ == "elevenlabs") {
-        url = base + "/v1/text-to-speech/" + (voice.empty() ? std::string("21m00Tcm4TlvDq8ikWAM") : voice);
+        url = base + "/v1/text-to-speech/" + (voice.empty() ? std::string("21m00Tcm4TlvDq8ikWAM") : voice) + (on_chunk ? "/stream" : "");
         payload = nlohmann::json{{"text", text}, {"model_id", EnvOr("OPENCLAW_TTS_MODEL", "eleven_multilingual_v2")}}.dump();
         add("Accept: audio/mpeg");
         if (!api_key_.empty()) add("xi-api-key: " + api_key_);
@@ -93,8 +104,14 @@ nlohmann::json TtsEngine::HttpPost(const std::string& text, const std::string& v
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    StreamSink sink{&response, on_chunk};
+    if (on_chunk) {
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, StreamCb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    }
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
     CURLcode rc = curl_easy_perform(curl);
     long http = 0;
@@ -108,6 +125,7 @@ nlohmann::json TtsEngine::HttpPost(const std::string& text, const std::string& v
                        {"content_type", ctype},
                        {"body_prefix", response.substr(0, std::min<size_t>(64, response.size()))},
                        {"error", rc == CURLE_OK ? "" : curl_easy_strerror(rc)}};
+    if (on_chunk) { out["streamed"] = true; out["chunks"] = sink.chunks; }
     if (http >= 400) out["error"] = "TTS HTTP " + std::to_string(http) + ": " + response.substr(0, 200);
     if (const char* d = std::getenv("OPENCLAW_TTS_OUT_DIR"); d && *d && http >= 200 && http < 300 && !response.empty()) {
         std::string ext = ctype.find("wav") != std::string::npos ? "wav" : ctype.find("ogg") != std::string::npos ? "ogg" : "mp3";
@@ -115,6 +133,15 @@ nlohmann::json TtsEngine::HttpPost(const std::string& text, const std::string& v
         if (FILE* f = std::fopen(path.c_str(), "wb")) { std::fwrite(response.data(), 1, response.size(), f); std::fclose(f); out["path"] = path; }
     }
     return out;
+}
+
+nlohmann::json TtsEngine::SpeakStream(const std::string& text, const std::string& voice, const ChunkFn& on_chunk) {
+    if (!enabled_ || url_.empty() || provider_ == "none") return {{"ok", false}, {"error", "tts not configured"}};
+    auto http = HttpPost(text, voice, &on_chunk);
+    const bool ok = http.value("curl_ok", false) && http.value("http", 0) >= 200 && http.value("http", 0) < 300;
+    log_.push_back({{"text", text}, {"provider", provider_}, {"mode", "live_stream"}, {"delivered", ok}});
+    if (log_.size() > 100) log_.erase(log_.begin());
+    return {{"ok", ok}, {"mode", "live_stream"}, {"http", http}};
 }
 
 nlohmann::json TtsEngine::Speak(const std::string& text, const std::string& voice) {

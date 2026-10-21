@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.75.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.76.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,10 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.76.0-dev
+- 语音消息自动转写：Telegram/WhatsApp/Discord 的语音先经 STT 转写，再交给 agent；新增 Telegram webhook 入站。
+- 流式 TTS：CLI `voice tts --stream`，RPC `tts.stream` 通过 WS 事件分块推送。
 
 ### 1.75.0-dev
 - WA Web：支持 zlib 压缩帧；离线实现 Signal 协议（X3DH + 双棘轮，pkmsg/msg 格式、乱序、防重放），尚未与 libsignal 做字节级对拍。

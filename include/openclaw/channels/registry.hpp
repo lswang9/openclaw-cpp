@@ -22,7 +22,9 @@ struct InboundMessage {
     bool explicit_key = false;
     std::string account_id;  // multi-account channels ("" = default)
     std::string guild_id;    // Discord guild (routing)
-    std::string team_id;     // Slack workspace/team (routing)    // caller supplied session_key verbatim → never canonicalised
+    std::string team_id;     // Slack workspace/team (routing)
+    // Inbound media refs (1.76): [{kind:"audio", mime, url | telegram_file_id | whatsapp_media_id, filename}]
+    nlohmann::json media = nlohmann::json::array();    // caller supplied session_key verbatim → never canonicalised
 };
 
 using InboundHandler = std::function<void(const InboundMessage&)>;

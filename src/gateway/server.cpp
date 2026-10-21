@@ -1,3 +1,4 @@
+#include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/auth/oidc.hpp"
 #include "openclaw/auth/mfa.hpp"
 #include "openclaw/gateway/server.hpp"
@@ -48,7 +49,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.75.0-dev";
+constexpr const char* kVersion = "1.76.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -263,6 +264,7 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
 }
 
 Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {
+    deps_.emit = [this](const std::string& ev, const nlohmann::json& p) { Emit(ev, p); };
     std::error_code ec;
     cfg_mtime_ = std::filesystem::last_write_time(config::DefaultPath(), ec);
     auto& broker = tools::exec::ApprovalBroker::Global();
@@ -945,6 +947,10 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     MaybeReloadConfig();  // may unique-lock; must run before the shared request lock
     auto deps_lock = LockDeps();
     channels::InboundMessage msg = msg_in;
+    if (!msg.media.empty()) {
+        auto ai = voice::TranscribeInboundAudio(deps_.config.raw, msg);
+        if (!ai.empty()) Emit("media.audio.transcribed", {{"channel", msg.channel}, {"results", ai}});
+    }
     std::string legacy_migrate_from;
     {
         // Upstream session keys (agent:main:main / :<ch>:group:<id> / :channel: / :thread:), unless the caller

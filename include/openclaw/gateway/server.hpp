@@ -93,6 +93,7 @@ struct ServerDeps {
     std::string system_prompt = "You are OpenClaw (C++ rewrite). Be concise and helpful.";
     // Hot-reload hook: re-scan skills (applying skills.entries) and return the rebuilt system prompt.
     std::function<std::string()> rebuild_system_prompt;
+    std::function<void(const std::string&, const nlohmann::json&)> emit;  // set by Server (WS event fan-out)
     // Per-agent system prompt (agents.list[].workspace); null → deps.system_prompt.
     std::function<std::string(const std::string& agent_id, const std::filesystem::path& workspace)> system_prompt_for_agent;
 };

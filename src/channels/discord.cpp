@@ -1,3 +1,4 @@
+#include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/discord_commands.hpp"
@@ -82,13 +83,15 @@ nlohmann::json DiscordAdapter::HandleHttpInbound(const nlohmann::json& body, con
     if (body.value("type", 0) == 2 || body.value("type", 0) == 3) return HandleInteraction(body, deliver, false);
 
     std::string text = ExtractText(body);
-    if (text.empty()) {
+    auto audio = voice::ExtractAudioRefs(body);
+    if (text.empty() && audio.empty()) {
         return {{"ok", true}, {"ignored", true}, {"note", "no message text"}, {"impl", "real"}};
     }
 
     InboundMessage msg;
     msg.channel = "discord";
     msg.text = text;
+    msg.media = audio;
     msg.sender = "discord";
     if (body.contains("member") && body["member"].contains("user"))
         msg.sender = body["member"]["user"].value("id", msg.sender);

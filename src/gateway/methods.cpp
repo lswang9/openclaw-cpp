@@ -45,6 +45,7 @@ std::vector<std::string> ImplementedMethods() {
         "tts.providers",
         "tts.personas",
         "tts.convert",
+        "tts.stream",
         "tts.setProvider",
         "tts.setPersona",
         "tts.speak",

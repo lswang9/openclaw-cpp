@@ -1,3 +1,4 @@
+#include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/whatsapp.hpp"
 
 #include <cstdlib>
@@ -153,6 +154,7 @@ nlohmann::json WhatsAppCloudAdapter::HandleHttpInbound(const nlohmann::json& bod
                 {"impl", "real"}};
     }
 
+    msg.media = voice::ExtractAudioRefs(body);
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
 

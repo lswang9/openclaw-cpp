@@ -1,3 +1,5 @@
+#include "openclaw/channels/waweb/noise.hpp"
+#include <chrono>
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/acp/session.hpp"
 #include "openclaw/gateway/extra.hpp"
@@ -1351,6 +1353,20 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         if (method == "tts.setPersona" || method == "talk.voice.set" || method == "talk.voice.change") {
             tts.SetPersona(params.value("persona", params.value("voice", params.value("id", "default"))));
             r.payload = Real({{"persona", tts.Persona()}, {"status", tts.Status()}});
+            return r;
+        }
+        if (method == "tts.stream") {
+            // Provider audio is forwarded as WS events tts.chunk {streamId, seq, b64} while it arrives; tts.done at end.
+            const auto sid = params.value("streamId", std::string("tts-") + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            std::size_t seq = 0, bytes = 0;
+            auto res = tts.SpeakStream(params.value("text", params.value("input", "")), params.value("voice", ""), [&](const std::string& c) {
+                bytes += c.size();
+                if (deps.emit) deps.emit("tts.chunk", {{"streamId", sid}, {"seq", seq}, {"b64", channels::waweb::Base64(channels::waweb::Bytes(c.begin(), c.end()))}});
+                ++seq;
+            });
+            if (deps.emit) deps.emit("tts.done", {{"streamId", sid}, {"chunks", seq}, {"bytes", bytes}, {"ok", res.value("ok", false)}});
+            res["streamId"] = sid; res["chunks"] = seq; res["bytes"] = bytes;
+            r.payload = Real(res);
             return r;
         }
         if (method == "tts.speak" || method == "tts.convert" || method == "talk.voice.complete") {

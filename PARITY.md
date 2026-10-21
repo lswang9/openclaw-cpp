@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.75.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.76.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,12 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.76 Auto-transcribed voice notes + streaming TTS
+- real: `InboundMessage.media` audio refs from Telegram (voice/audio file_id → getFile → file download), WhatsApp Cloud (audio id → Graph media URL → Bearer download), Discord audio attachments (SSRF-guarded fetch) and generic `media[]`; the gateway transcribes them with the configured STT provider before routing and prepends `[Audio] Transcript: …` (event `media.audio.transcribed`). Off via `tools.media.audio.enabled=false` / `OPENCLAW_AUDIO_TRANSCRIBE=0`. Telegram gained a webhook inbound (`/api/channels/telegram/inbound`, optional `TELEGRAM_WEBHOOK_SECRET` checked against `_secret_token`) with sendMessage reply.
+- real: streaming TTS: `TtsEngine::SpeakStream` hands chunked provider audio to a callback (ElevenLabs `/stream`, OpenAI/Deepgram native chunking); `voice tts --stream --out F`; RPC `tts.stream` fans chunks out as WS `tts.chunk` {streamId, seq, b64} + `tts.done`.
+- real: `scripts/e2e-voice-inbound.sh` (smoke, fake servers).
+- gaps: transcription runs inline on the inbound path; no live Deepgram websocket STT; Telegram secret is a body field (the HTTP layer does not forward the X-Telegram-Bot-Api-Secret-Token header yet); TTS streaming is not yet spoken back into channels as voice notes.
 
 ## 1.75 WA Web: zlib frames + Signal protocol offline layers
 - real: compressed WABinary frames (flag & 2) are inflated with zlib (conan `zlib` now explicit); self-test decodes a Node `zlib.deflateSync` frame byte-identically.
@@ -91,7 +97,7 @@
 - real: `OPENCLAW_STT_PROVIDER=openai|elevenlabs|deepgram`. OpenAI multipart `/v1/audio/transcriptions`. ElevenLabs multipart `/v1/speech-to-text` (`model_id=scribe_v1`, `language_code`). Deepgram raw-body `/v1/listen?model=nova-3` with the transcript taken from `results.channels[0].alternatives[0].transcript`.
 - real: CLI `voice tts [--voice V] <text>` / `voice stt <file> [--language L]`.
 - tests: `scripts/e2e-voice-providers.sh` (smoke) runs a fake server that asserts each vendor's path, headers and body. These are shape tests only: no live vendor calls.
-- gaps: no streaming TTS (chunked/websocket), no Deepgram live STT websocket, and no automatic voice-note transcription on channel inbound.
+- gaps: no Deepgram live STT websocket (streaming TTS + inbound voice-note transcription since 1.76).
 
 ## 1.64 Streaming reply blocks, deadlock-free plugin agent.reply, SavePreserving, auth rotation, autoReview.model, PTY resize, Ollama/GGUF embeddings, FTS, WA Web offline stubs
 - real: plugin `dispatchReplyWithBufferedBlockDispatcher` receives **streamed** `hostEvent` `reply.block` events (kind `block`/`final`) before the final `hostReply` (`streamed:true`). Events are chained before resolve so delivery order is stable.

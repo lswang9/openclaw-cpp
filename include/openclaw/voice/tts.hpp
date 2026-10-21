@@ -1,5 +1,6 @@
 #pragma once
 #include <nlohmann/json.hpp>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,10 @@ public:
     nlohmann::json Speak(const std::string& text, const std::string& voice = {});
     nlohmann::json Convert(const std::string& text);  // alias Speak
     nlohmann::json Log() const { return log_; }
+    // Streaming synthesis: audio bytes are handed to on_chunk as they arrive (chunked HTTP). ElevenLabs uses
+    // /v1/text-to-speech/{voice}/stream; OpenAI /v1/audio/speech and Deepgram /v1/speak stream natively.
+    using ChunkFn = std::function<void(const std::string&)>;
+    nlohmann::json SpeakStream(const std::string& text, const std::string& voice, const ChunkFn& on_chunk);
 
 private:
     bool enabled_ = false;
@@ -33,7 +38,7 @@ private:
     std::string url_;
     std::string api_key_;
     std::vector<nlohmann::json> log_;
-    nlohmann::json HttpPost(const std::string& text, const std::string& voice) const;
+    nlohmann::json HttpPost(const std::string& text, const std::string& voice, const ChunkFn* on_chunk = nullptr) const;
 };
 
 }  // namespace openclaw::voice

@@ -98,7 +98,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.75.0-dev";
+constexpr const char* kVersion = "1.76.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3395,16 +3395,27 @@ int main(int argc, char** argv) {
         }
         if (cmd == "voice") {
             // voice tts [--voice V] <text...> | voice stt <file> [--language L]
-            std::string sub = argc > 2 ? argv[2] : "", voice, lang, text, file;
+            std::string sub = argc > 2 ? argv[2] : "", voice, lang, text, file, out_path;
+            bool stream = false;
             for (int i = 3; i < argc; ++i) {
                 std::string a = argv[i];
-                if (a == "--voice" && i + 1 < argc) voice = argv[++i];
+                if (a == "--stream") stream = true;
+                else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+                else if (a == "--voice" && i + 1 < argc) voice = argv[++i];
                 else if (a == "--language" && i + 1 < argc) lang = argv[++i];
                 else if (sub == "stt" && file.empty()) file = a;
                 else text += (text.empty() ? "" : " ") + a;
             }
             if (sub == "tts") {
                 openclaw::voice::TtsEngine t;
+                if (stream) {
+                    std::ofstream of(out_path.empty() ? "/dev/null" : out_path, std::ios::binary);
+                    std::size_t n = 0;
+                    auto r = t.SpeakStream(text, voice, [&](const std::string& c) { of.write(c.data(), static_cast<std::streamsize>(c.size())); of.flush(); ++n; });
+                    r["chunks_written"] = n;
+                    std::cout << r.dump(2) << "\n";
+                    return r.value("ok", false) ? 0 : 1;
+                }
                 auto r = t.Speak(text, voice);
                 std::cout << r.dump(2) << "\n";
                 return r.value("delivered", false) ? 0 : 1;
