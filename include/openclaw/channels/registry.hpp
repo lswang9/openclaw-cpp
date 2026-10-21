@@ -19,7 +19,10 @@ struct InboundMessage {
     std::string peer_id;          // DM peer (defaults to sender)
     std::string conversation_id;  // group/channel id
     std::string thread_id;        // thread / topic id (appended as :thread:<id>)
-    bool explicit_key = false;    // caller supplied session_key verbatim → never canonicalised
+    bool explicit_key = false;
+    std::string account_id;  // multi-account channels ("" = default)
+    std::string guild_id;    // Discord guild (routing)
+    std::string team_id;     // Slack workspace/team (routing)    // caller supplied session_key verbatim → never canonicalised
 };
 
 using InboundHandler = std::function<void(const InboundMessage&)>;

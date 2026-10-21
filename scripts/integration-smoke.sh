@@ -101,6 +101,18 @@ if command -v node >/dev/null 2>&1 && [ -z "${OPENCLAW_JS_FORCE_MOCK:-}" ]; then
   rpc '{"jsonrpc":"2.0","id":14,"method":"sample.status","params":{}}' | grep -q '"to": *"u9"' || { echo "[smoke] plugin channel outbound missing" >&2; exit 1; }
   "$BIN" sample greet Smoke | grep -q 'hello, Smoke!' || { echo "[smoke] plugin CLI failed" >&2; exit 1; }
   echo "[smoke] plugin http route + plugin channel (in/out) + plugin CLI"
+  cat > "$OPENCLAW_CONFIG_PATH" <<'CFG'
+{ agents: { list: [ { id: "main", default: true }, { id: "work", model: "samplellm/echo-1", systemPrompt: "You are the work agent." } ] },
+  bindings: [ { agentId: "work", match: { channel: "slack", peer: { kind: "channel", id: "C8" } } } ] }
+CFG
+  sleep 1
+  MA=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/json' \
+    -d '{"type":"event_callback","event":{"type":"message","text":"route me","user":"U8","channel":"C8","channel_type":"channel","ts":"8.0"}}')
+  echo "$MA" | grep -q 'samplellm/echo-1' || { echo "[smoke] work agent model not used: $MA" >&2; exit 1; }
+  grep -q 'agent:work:slack:channel:C8' "$OPENCLAW_SESSION_DIR/sessions.json" || { echo "[smoke] agent:work session key missing" >&2; exit 1; }
+  rpc '{"jsonrpc":"2.0","id":15,"method":"agents.route","params":{"channel":"slack","peerKind":"channel","peerId":"C1"}}' | grep -q '"agentId": *"main"' || { echo "[smoke] default route wrong" >&2; exit 1; }
+  rm -f "$OPENCLAW_CONFIG_PATH"; sleep 1
+  echo "[smoke] multi-agent binding: slack C8 -> agent:work (plugin provider model), others -> main"
 fi
 
 SI=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/json' \

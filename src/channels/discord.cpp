@@ -91,6 +91,7 @@ nlohmann::json DiscordAdapter::HandleHttpInbound(const nlohmann::json& body, con
     msg.explicit_key = chan.empty() && body.contains("session_key");
     msg.conversation_id = chan;
     msg.chat_type = body.contains("guild_id") && !body["guild_id"].is_null() ? "channel" : "direct";
+    if (body.contains("guild_id") && body["guild_id"].is_string()) msg.guild_id = body["guild_id"];
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
     return {{"ok", true},
@@ -148,6 +149,7 @@ nlohmann::json DiscordAdapter::HandleInteraction(const nlohmann::json& in, const
     const bool guild = in.contains("guild_id") && !in["guild_id"].is_null();
     msg.chat_type = guild ? "channel" : "direct";
     if (!guild) msg.peer_id = msg.sender;
+    else if (in["guild_id"].is_string()) msg.guild_id = in["guild_id"];
     ++inbound_;
     const auto iid = in.value("id", ""), itok = in.value("token", "");
     nlohmann::json out{{"ok", true}, {"channel", "discord"}, {"command_text", text}, {"impl", "real"}};

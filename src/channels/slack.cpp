@@ -86,6 +86,7 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
     msg.explicit_key = body.contains("session_key");
     msg.chat_type = ctype == "im" ? "direct" : (ctype == "mpim" || ctype == "group") ? "group" : ctype == "channel" ? "channel" : "";
     msg.conversation_id = conv; msg.thread_id = thread;
+    msg.team_id = body.value("team_id", std::string());
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
     auto rendered = slack_interactive::RenderReply(reply);

@@ -11,6 +11,7 @@
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/discord_commands.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
+#include "openclaw/agent/routing.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/whatsapp.hpp"
 #include <thread>
@@ -38,7 +39,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.46.0-dev";
+constexpr const char* kVersion = "1.47.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -261,6 +262,20 @@ void Server::Stop() {
     cancel_agents_.store(true);
     running_.store(false);
     if (listen_fd_ >= 0) shutdown(listen_fd_, SHUT_RDWR);
+}
+
+std::string Server::AgentSystemPrompt(const std::string& agent_id) {
+    auto agents = agent::routing::ListAgents(deps_.config.raw);
+    const auto* ad = agent::routing::FindAgent(agents, agent_id);
+    if (!ad || (ad->workspace.empty() && ad->system_prompt.empty())) return deps_.system_prompt;
+    std::lock_guard l(agent_prompts_mu_);
+    auto it = agent_prompts_.find(agent_id);
+    if (it != agent_prompts_.end()) return it->second;
+    std::string sp = (!ad->workspace.empty() && deps_.system_prompt_for_agent) ? deps_.system_prompt_for_agent(agent_id, ad->workspace)
+                                                                              : deps_.system_prompt;
+    if (!ad->system_prompt.empty()) sp += "\n\n" + ad->system_prompt;
+    agent_prompts_[agent_id] = sp;
+    return sp;
 }
 
 void Server::PluginSessionHook(const std::string& event, const std::string& key, const std::string& reason) {
@@ -541,6 +556,7 @@ nlohmann::json Server::ReloadConfigNow() {
     deps_.config.gateway_host = keep_host; deps_.config.gateway_port = keep_port;  // bind changes need restart
     // 1) skills + system prompt
     bool prompt_changed = false;
+    { std::lock_guard l(agent_prompts_mu_); agent_prompts_.clear(); }
     if (deps_.rebuild_system_prompt) {
         auto np = deps_.rebuild_system_prompt();
         prompt_changed = np != deps_.system_prompt;
@@ -599,6 +615,17 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         bool legacy_fmt = fmt && fmt->is_string() && *fmt == "legacy";
         if (!msg.explicit_key && !legacy_fmt && !msg.channel.empty() && msg.session_key.rfind("agent:", 0) != 0) {
             session::KeyParts kp;
+            agent::routing::RouteInput ri;
+            ri.channel = msg.channel;
+            ri.account_id = msg.account_id;
+            ri.peer_kind = msg.chat_type.empty() ? "direct" : msg.chat_type;
+            ri.peer_id = ri.peer_kind == "direct" ? (msg.peer_id.empty() ? msg.sender : msg.peer_id) : msg.conversation_id;
+            ri.guild_id = msg.guild_id;
+            ri.team_id = msg.team_id;
+            auto route = agent::routing::ResolveRoute(deps_.config.raw, ri);
+            kp.agent_id = route.agent_id;
+            if (route.matched_by != "default")
+                Emit("agent.route", {{"agentId", route.agent_id}, {"matchedBy", route.matched_by}, {"channel", msg.channel}});
             kp.channel = msg.channel;
             kp.chat_type = msg.chat_type.empty() ? "direct" : msg.chat_type;
             kp.peer_id = msg.peer_id.empty() ? msg.sender : msg.peer_id;
@@ -753,7 +780,11 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "user"}, {"text", msg.text},
                              {"channel", msg.channel}, {"sender", msg.sender}});
     context::AssembleOptions aopts;
-    aopts.system_prompt = deps_.system_prompt;
+    const std::string agent_id = [&] {
+        auto a = agent::routing::AgentFromSessionKey(msg.session_key);
+        return a.empty() ? agent::routing::DefaultAgentId(deps_.config.raw) : a;
+    }();
+    aopts.system_prompt = AgentSystemPrompt(agent_id);
     if (deps_.js_host && deps_.js_host->HasHook("before_agent_start")) {
         auto h = deps_.js_host->EmitHook("before_agent_start", {{"prompt", content}}, {{"sessionKey", msg.session_key}});
         auto merged = h.value("merged", nlohmann::json::object());
@@ -766,6 +797,12 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     lopts.cancel = &cancel_agents_;
     provider::Provider* prov = &deps_.provider;
     if (deps_.router) prov = deps_.router;
+    {
+        auto agents = agent::routing::ListAgents(deps_.config.raw);
+        if (auto* ad = agent::routing::FindAgent(agents, agent_id); ad && !ad->model.empty() && deps_.router) {
+            if (auto* rp = deps_.router->Resolve(ad->model)) prov = rp;
+        }
+    }
     auto skill_entries = config::GetPath(deps_.config.raw, "skills.entries").value_or(nlohmann::json::object());
     agent::LoopResult result;
     {
@@ -1536,10 +1573,22 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
 
     // agents (in-memory via config.raw["agents_list"])
     if (method == "agents.list") {
+        if (auto al = config::GetPath(deps_.config.raw, "agents.list"); al && al->is_array() && !al->empty()) {
+            nlohmann::json out = nlohmann::json::array();
+            for (auto& a : agent::routing::ListAgents(deps_.config.raw))
+                out.push_back({{"id", a.id}, {"name", a.name}, {"workspace", a.workspace.string()}, {"model", a.model}, {"default", a.is_default}});
+            return ok({{"agents", out}, {"defaultId", agent::routing::DefaultAgentId(deps_.config.raw)}});
+        }
         if (deps_.config.raw.contains("agents_list")) {
             return ok({{"agents", deps_.config.raw["agents_list"]}});
         }
         return ok({{"agents", nlohmann::json::array({{{"id", "main"}, {"model", deps_.config.deepseek_model}}})}});
+    }
+    if (method == "agents.route") {
+        agent::routing::RouteInput ri{params.value("channel", ""), params.value("accountId", ""), params.value("peerKind", "direct"),
+                                      params.value("peerId", ""), params.value("guildId", ""), params.value("teamId", "")};
+        auto r = agent::routing::ResolveRoute(deps_.config.raw, ri);
+        return ok({{"agentId", r.agent_id}, {"matchedBy", r.matched_by}, {"bindingIndex", r.binding_index}});
     }
     if (method == "agents.create") {
         auto id = params.value("id", "agent-" + std::to_string(deps_.config.raw.value("agents_list", nlohmann::json::array()).size() + 1));

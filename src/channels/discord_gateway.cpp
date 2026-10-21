@@ -104,6 +104,7 @@ nlohmann::json DiscordGateway::HandleDispatch(const std::string& event, const nl
         msg.session_key = chan.empty() ? "discord-default" : ("discord-" + chan);
         msg.conversation_id = chan;
         msg.chat_type = data.contains("guild_id") && !data["guild_id"].is_null() ? "channel" : "direct";
+        if (data.contains("guild_id") && data["guild_id"].is_string()) msg.guild_id = data["guild_id"];
         std::string reply = deliver ? deliver(msg) : "";
         {
             std::lock_guard lock(mu_);

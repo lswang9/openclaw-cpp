@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.46.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.47.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -199,3 +199,6 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 ### 1.46.0-dev
 - 插件 API 补全：TypeScript 插件（Node ≥ 22.6，已在盒子安装 Node 22.20 测试）、HTTP 路由、CLI 命令、工具调用前后钩子（可拦截/改参）、会话开始/结束钩子、插件渠道（入站解析 + 出站发送）、插件模型提供商（complete 接口）。
 - 渠道与提供商为简化契约，与上游完整 ChannelPlugin / 提供商认证目录不同；插件 npm 安装尚缺。
+
+### 1.47.0-dev
+- 多智能体路由：agents.list + bindings（peer > guild > team > account > channel 优先级），会话键带智能体 ID，按智能体使用独立系统提示词与模型。会话存储与工具注册表仍为共享。

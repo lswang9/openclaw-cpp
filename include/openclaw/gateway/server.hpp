@@ -1,4 +1,5 @@
 #pragma once
+#include <map>
 #include <functional>
 #include <chrono>
 #include <filesystem>
@@ -85,6 +86,8 @@ struct ServerDeps {
     std::string system_prompt = "You are OpenClaw (C++ rewrite). Be concise and helpful.";
     // Hot-reload hook: re-scan skills (applying skills.entries) and return the rebuilt system prompt.
     std::function<std::string()> rebuild_system_prompt;
+    // Per-agent system prompt (agents.list[].workspace); null → deps.system_prompt.
+    std::function<std::string(const std::string& agent_id, const std::filesystem::path& workspace)> system_prompt_for_agent;
 };
 
 class Server {
@@ -126,6 +129,9 @@ public:
     nlohmann::json ReloadConfigNow();
 
 private:
+    std::map<std::string, std::string> agent_prompts_;
+    std::mutex agent_prompts_mu_;
+    std::string AgentSystemPrompt(const std::string& agent_id);
     std::vector<std::string> plugin_channels_;
     std::set<std::string> plugin_providers_;
     std::mutex reload_mu_;

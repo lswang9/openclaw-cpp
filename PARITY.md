@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.46.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.47.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -54,3 +54,8 @@
 - real-sim: api.registerChannel — openclaw-cpp contract is `inbound.parse(body)` → messages + `outbound.sendText({to,text})`; upstream ChannelPlugin's full adapter surface (gateway start/stop, pairing, directory, actions, threading) is missing.
 - real-sim: api.registerProvider with `complete({model, messages, tools})` → router route `<id>`; upstream provider plugins are auth/catalog descriptors (OAuth flows, model catalogs) — not implemented; a route uses the provider's first model.
 - missing: npm-based `plugins install`, plugin runtime helpers (api.runtime.*), tool_result_persist / before_compaction hooks.
+
+## 1.47 Multi-agent bindings
+- real: agents.list (id, name, default, workspace, model string|{primary}, identity.name, systemPrompt) + bindings[{agentId, match:{channel, accountId, peer:{kind,id}, guildId, teamId}}]; most-specific wins (peer > guild > team > account > channel), first listed on ties; unknown agentIds ignored; missing accountId only matches the default account.
+- real: inbound session keys use the routed agent (`agent:<id>:...`); per-agent system prompt (agent workspace bootstrap files + identity/systemPrompt, cached, cleared on reload) and per-agent model route via the provider router; `agents.list` / `agents.route` RPC.
+- real-sim: all agents share one session store directory and one tool registry/memory index (upstream isolates ~/.openclaw/agents/<id>/{sessions,agent}); per-agent tool allow/deny and sandbox settings not applied.

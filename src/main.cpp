@@ -21,6 +21,7 @@
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/plugins/js_host.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
+#include "openclaw/agent/routing.hpp"
 #include "openclaw/board/store.hpp"
 #include "openclaw/canvas/store.hpp"
 #include "openclaw/auth/device_link.hpp"
@@ -81,7 +82,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.46.0-dev";
+constexpr const char* kVersion = "1.47.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -133,11 +134,11 @@ openclaw::skills::Library LoadSkills() {
     return lib;
 }
 
-std::string BuildAgentSystemPrompt(const openclaw::tools::Registry& reg) {
+std::string BuildAgentSystemPrompt(const openclaw::tools::Registry& reg, const std::filesystem::path& ws = {}) {
     openclaw::context::SystemPromptOptions o;
     o.base = openclaw::EnvOr("OPENCLAW_SYSTEM_PROMPT",
                              "You are OpenClaw (C++ rewrite), a personal assistant. Be concise and helpful.");
-    o.workspace = openclaw::workspace::Workspace::DefaultRoot();
+    o.workspace = ws.empty() ? openclaw::workspace::Workspace::DefaultRoot() : ws;
     o.skills = LoadSkills().List();
     o.tool_names = reg.Names();
     return openclaw::context::BuildSystemPrompt(o);
@@ -1683,6 +1684,39 @@ int CmdSelfTest() {
         if (!ok) { std::cerr << "FAIL discord slash " << specs.dump() << http.dump() << gw.dump() << logs << seen << "\n"; ++failures; }
         else std::cerr << "PASS discord slash commands (specs, HTTP + gateway interactions, deferred ack, sync)\n";
     }
+    // multi-agent routing (1.47)
+    {
+        namespace rt = agent::routing;
+        auto raw = nlohmann::json::parse(R"({
+          "agents": {"list": [{"id": "main"}, {"id": "Work", "default": true, "workspace": "~/ws-work", "model": "openai/gpt-x",
+                               "identity": {"name": "Wrk"}}, {"id": "fam"}]},
+          "bindings": [
+            {"agentId": "fam", "match": {"channel": "discord", "guildId": "G1"}},
+            {"agentId": "main", "match": {"channel": "discord", "peer": {"kind": "channel", "id": "C9"}}},
+            {"agentId": "main", "match": {"channel": "slack", "teamId": "T1"}},
+            {"agentId": "ghost", "match": {"channel": "telegram"}},
+            {"agentId": "fam", "match": {"channel": "whatsapp", "accountId": "biz"}},
+            {"agentId": "fam", "match": {"channel": "telegram"}}
+          ]})");
+        auto agents = rt::ListAgents(raw);
+        bool ok = agents.size() == 3 && agents[1].id == "work" && agents[1].model == "openai/gpt-x" &&
+                  agents[1].workspace.string().find("ws-work") != std::string::npos && agents[1].system_prompt == "Your name is Wrk." &&
+                  rt::DefaultAgentId(raw) == "work";
+        auto r1 = rt::ResolveRoute(raw, {"discord", "", "channel", "C9", "G1", ""});
+        auto r2 = rt::ResolveRoute(raw, {"discord", "", "channel", "C2", "G1", ""});
+        auto r3 = rt::ResolveRoute(raw, {"slack", "", "channel", "X", "", "T1"});
+        auto r4 = rt::ResolveRoute(raw, {"telegram", "", "direct", "u", "", ""});
+        auto r5 = rt::ResolveRoute(raw, {"whatsapp", "biz", "direct", "u", "", ""});
+        auto r6 = rt::ResolveRoute(raw, {"whatsapp", "personal", "direct", "u", "", ""});
+        ok = ok && r1.agent_id == "main" && r1.matched_by == "binding.peer" && r2.agent_id == "fam" && r2.matched_by == "binding.guild" &&
+             r3.matched_by == "binding.team" && r4.agent_id == "fam" && r4.binding_index == 5 && r5.agent_id == "fam" &&
+             r5.matched_by == "binding.account" && r6.agent_id == "work" && r6.matched_by == "default" &&
+             rt::AgentFromSessionKey("agent:fam:telegram:dm:u") == "fam";
+        session::KeyParts kp; kp.agent_id = "fam"; kp.channel = "discord"; kp.chat_type = "channel"; kp.conversation_id = "C2";
+        ok = ok && session::BuildSessionKey(kp) == "agent:fam:discord:channel:C2";
+        if (!ok) { std::cerr << "FAIL multi-agent routing " << r1.matched_by << r2.matched_by << r3.matched_by << r4.binding_index << session::BuildSessionKey(kp) << "\n"; ++failures; }
+        else std::cerr << "PASS multi-agent routing (agents.list + bindings precedence, per-agent keys)\n";
+    }
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -2500,6 +2534,9 @@ int CmdGateway(int argc, char** argv, int argi) {
 
 
     deps.system_prompt = BuildAgentSystemPrompt(tools);
+    deps.system_prompt_for_agent = [&tools](const std::string&, const std::filesystem::path& ws) {
+        return BuildAgentSystemPrompt(tools, ws);
+    };
     deps.rebuild_system_prompt = [&skills, &tools]() {
         skills = LoadSkills();
         return BuildAgentSystemPrompt(tools);
