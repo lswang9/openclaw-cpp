@@ -1,3 +1,4 @@
+#include "openclaw/tokenizer/bpe.hpp"
 #include "openclaw/auth/device_link.hpp"
 #include "openclaw/auth/profiles.hpp"
 #include "openclaw/tools/exec.hpp"
@@ -1743,24 +1744,44 @@ ExtraResult Batch3(ServerDeps& d, const fs::path& root, const std::string& m, co
             return Ok({{"profiles", res}});
         }
     }
-    // ---- usage (from session transcripts)
+    // ---- usage (from session transcripts, counted with the cl100k tokenizer; priced from models.providers.*.models[].cost per 1M tokens)
     if (m == "usage.status" || m == "usage.cost" || m == "sessions.usage.logs" || m == "sessions.usage.timeseries") {
         auto& store = d.sessions;
-        long long msgs = 0, chars = 0; json per = json::array();
+        auto price_of = [&](const std::string& model) -> json {
+            auto prov = config::GetPath(d.config.raw, "models.providers");
+            if (!prov || !prov->is_object() || model.empty()) return nullptr;
+            const auto slash = model.find('/');
+            const std::string pv = slash == std::string::npos ? "" : model.substr(0, slash), mid = slash == std::string::npos ? model : model.substr(slash + 1);
+            for (auto& [pk, pvv] : prov->items()) {
+                if (!pv.empty() && pk != pv) continue;
+                if (!pvv.is_object() || !pvv.contains("models") || !pvv["models"].is_array()) continue;
+                for (auto& mm : pvv["models"]) if (mm.is_object() && mm.value("id", "") == mid && mm.contains("cost")) return mm["cost"];
+            }
+            return nullptr;
+        };
+        const std::string def_model = [&] { auto v = config::GetPath(d.config.raw, "agents.defaults.model"); if (v && v->is_string()) return v->get<std::string>(); if (v && v->is_object()) return v->value("primary", std::string()); return d.config.deepseek_model; }();
+        long long tin = 0, tout = 0, msgs = 0; double cost = 0; bool priced_all = true; json per = json::array();
         std::map<long long, long long> buckets;
         for (auto& k : store.List()) {
             auto e = store.IndexEntry(k); auto ms = store.Load(k);
-            long long c = 0; for (auto& x : ms) c += static_cast<long long>(x.content.size());
-            msgs += static_cast<long long>(ms.size()); chars += c;
+            long long in = 0, out = 0;
+            for (auto& x : ms) { const auto n = static_cast<long long>(tokenizer::CountTokens(x.content)); (x.role == "assistant" ? out : in) += n; }
+            msgs += static_cast<long long>(ms.size()); tin += in; tout += out;
+            const auto model = e.value("model", def_model);
+            auto pr = price_of(model);
+            json c = nullptr;
+            if (pr.is_object()) { const double cc = (in * pr.value("input", 0.0) + out * pr.value("output", 0.0)) / 1e6; c = cc; cost += cc; } else if (in + out > 0) priced_all = false;
             if (!str("sessionKey").empty() && k != str("sessionKey")) continue;
-            per.push_back({{"sessionKey", k}, {"messages", ms.size()}, {"chars", c}, {"estTokens", c / 4}, {"updatedAt", e.value("updatedAt", 0LL)}});
-            buckets[e.value("updatedAt", 0LL) / 3600000 * 3600000] += c / 4;
+            per.push_back({{"sessionKey", k}, {"messages", ms.size()}, {"inputTokens", in}, {"outputTokens", out}, {"model", model}, {"costUsd", c}, {"updatedAt", e.value("updatedAt", 0LL)}});
+            buckets[e.value("updatedAt", 0LL) / 3600000 * 3600000] += in + out;
         }
-        if (m == "usage.status") return Ok({{"sessions", store.List().size()}, {"messages", msgs}, {"estTokens", chars / 4}, {"source", "transcripts"}, {"providersReporting", json::array()}});
-        if (m == "usage.cost") return Ok({{"estTokens", chars / 4}, {"costUsd", nullptr}, {"note", "providers do not report billed cost offline; token counts are estimates (chars/4)"}});
-        if (m == "sessions.usage.logs") return Ok({{"entries", per}});
-        json ts = json::array(); for (auto& [b, v] : buckets) ts.push_back({{"t", b}, {"estTokens", v}});
-        return Ok({{"bucketMs", 3600000}, {"points", ts}});
+        const std::string backend = tokenizer::Backend();
+        if (m == "usage.status") return Ok({{"sessions", store.List().size()}, {"messages", msgs}, {"inputTokens", tin}, {"outputTokens", tout}, {"tokenizer", backend}, {"source", "transcripts"}});
+        if (m == "usage.cost") return Ok({{"inputTokens", tin}, {"outputTokens", tout}, {"costUsd", priced_all ? json(cost) : (cost > 0 ? json(cost) : json(nullptr))}, {"complete", priced_all},
+                                         {"tokenizer", backend}, {"note", priced_all ? "priced from models.providers.*.models[].cost (USD per 1M tokens)" : "some sessions use models without configured cost"}});
+        if (m == "sessions.usage.logs") return Ok({{"entries", per}, {"tokenizer", backend}});
+        json ts = json::array(); for (auto& [bk, v] : buckets) ts.push_back({{"t", bk}, {"tokens", v}});
+        return Ok({{"bucketMs", 3600000}, {"points", ts}, {"tokenizer", backend}});
     }
     // ---- web search
     if (m == "webSearch.status" || m == "webSearch.test") {

@@ -46,7 +46,7 @@ assert ok("models.authLogout", {"provider": "openai"})["removed"] == ["openai:de
 assert "profiles" in ok("models.authRefresh", {})
 ok("chat.send", {"sessionKey": "u1", "message": "count me"})
 assert ok("usage.status", {})["messages"] >= 2 and ok("sessions.usage.logs", {"sessionKey": "u1"})["entries"][0]["sessionKey"] == "u1"
-assert ok("sessions.usage.timeseries", {})["points"] and "estTokens" in ok("usage.cost", {})
+assert ok("sessions.usage.timeseries", {})["points"] and "inputTokens" in ok("usage.cost", {})
 assert ok("webSearch.status", {})["configured"] is False and not rpc("webSearch.test", {"query": "x"}).get("ok")
 e = ok("environments.create", {"idempotencyKey": "k1"}); assert ok("environments.create", {"idempotencyKey": "k1"})["id"] == e["id"]
 x = ok("environments.session.exec", {"environmentId": e["id"], "argv": ["sh", "-c", "pwd; echo hi"]}); assert x["exitCode"] == 0 and e["id"] in x["stdout"]
