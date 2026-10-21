@@ -185,4 +185,6 @@ echo "[smoke] logout invalidates session server-side"
 rm -f "$CJ"
 kill "$GW2" 2>/dev/null; wait "$GW2" 2>/dev/null || true; rm -rf "$SESS2"
 
+"$BIN" --version | grep -q "openclaw-cpp" && echo "[smoke] --version ok"
+if "$BIN" --definitely-unknown >/dev/null 2>&1; then echo "[smoke] unknown flag accepted" >&2; exit 1; fi; echo "[smoke] unknown flag rejected"
 echo "[smoke] ALL PASS"

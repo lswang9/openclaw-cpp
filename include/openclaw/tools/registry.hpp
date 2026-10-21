@@ -42,6 +42,7 @@ struct RegistryOptions {
     approvals::Store* approvals = nullptr;
     bool enable_shell = true;
     bool shell_requires_approval = true;  // OPENCLAW_SHELL_REQUIRE_APPROVAL default true
+    std::string workspace_root;           // empty = workspace::Workspace::DefaultRoot()
 };
 
 Registry MakeDefaultRegistry(RegistryOptions opts = {});

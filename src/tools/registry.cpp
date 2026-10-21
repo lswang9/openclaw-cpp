@@ -1,3 +1,7 @@
+#include "openclaw/workspace/workspace.hpp"
+#include <memory>
+#include <filesystem>
+#include <sstream>
 #include "openclaw/tools/registry.hpp"
 #include "openclaw/approvals/store.hpp"
 #include "openclaw/browser/engine.hpp"
@@ -95,35 +99,57 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
     };
     r.Register(std::move(now));
 
-    static nlohmann::json g_mem = nlohmann::json::object();
-    ToolSpec mset;
-    mset.name = "memory_set";
-    mset.description = "Store a short memory note by key.";
-    mset.parameters = {
-        {"type", "object"},
-        {"properties", {{"key", {{"type", "string"}}}, {"value", {{"type", "string"}}}}},
-        {"required", nlohmann::json::array({"key", "value"})},
-    };
-    mset.handler = [](const nlohmann::json& args) {
-        g_mem[args.at("key").get<std::string>()] = args.at("value").get<std::string>();
-        return nlohmann::json{{"ok", true}}.dump();
-    };
-    r.Register(std::move(mset));
-
-    ToolSpec mget;
-    mget.name = "memory_get";
-    mget.description = "Retrieve a memory note by key.";
-    mget.parameters = {
-        {"type", "object"},
-        {"properties", {{"key", {{"type", "string"}}}}},
-        {"required", nlohmann::json::array({"key"})},
-    };
-    mget.handler = [](const nlohmann::json& args) {
-        auto key = args.at("key").get<std::string>();
-        if (!g_mem.contains(key)) return nlohmann::json{{"found", false}}.dump();
-        return nlohmann::json{{"found", true}, {"value", g_mem[key]}}.dump();
-    };
-    r.Register(std::move(mget));
+    // Workspace file + Markdown memory tools (real, sandboxed to the workspace root).
+    auto ws = std::make_shared<workspace::Workspace>(opts.workspace_root.empty()
+                                                          ? workspace::Workspace::DefaultRoot()
+                                                          : std::filesystem::path(opts.workspace_root));
+    auto str = [](const char* d) { return nlohmann::json{{"type", "string"}, {"description", d}}; };
+    auto num = [](const char* d) { return nlohmann::json{{"type", "integer"}, {"description", d}}; };
+    r.Register({"read", "Read a text file in the agent workspace (line-numbered window).",
+                {{"type", "object"}, {"properties", {{"path", str("workspace-relative path")},
+                                                     {"offset", num("1-based start line")}, {"limit", num("max lines")}}},
+                 {"required", nlohmann::json::array({"path"})}},
+                [ws](const nlohmann::json& a) {
+                    return ws->Read(a.value("path", ""), a.value("offset", 1), a.value("limit", 2000)).dump(); }});
+    r.Register({"write", "Create or overwrite a file in the agent workspace.",
+                {{"type", "object"}, {"properties", {{"path", str("workspace-relative path")}, {"content", str("full file content")}}},
+                 {"required", nlohmann::json::array({"path", "content"})}},
+                [ws](const nlohmann::json& a) { return ws->Write(a.value("path", ""), a.value("content", "")).dump(); }});
+    r.Register({"edit", "Replace an exact, unique string in a workspace file (or all matches with replace_all).",
+                {{"type", "object"}, {"properties", {{"path", str("workspace-relative path")}, {"old_string", str("exact text to replace")},
+                                                     {"new_string", str("replacement")}, {"replace_all", {{"type", "boolean"}}}}},
+                 {"required", nlohmann::json::array({"path", "old_string", "new_string"})}},
+                [ws](const nlohmann::json& a) {
+                    return ws->Edit(a.value("path", ""), a.value("old_string", ""), a.value("new_string", ""),
+                                    a.value("replace_all", false)).dump(); }});
+    r.Register({"memory_search", "Search MEMORY.md and memory/*.md (BM25 over line-ranged chunks). Returns path, lines, score, snippet.",
+                {{"type", "object"}, {"properties", {{"query", str("what to recall")}, {"maxResults", num("default 6")},
+                                                     {"minScore", {{"type", "number"}}}}},
+                 {"required", nlohmann::json::array({"query"})}},
+                [ws](const nlohmann::json& a) {
+                    return ws->MemorySearch(a.value("query", ""), a.value("maxResults", 6), a.value("minScore", 0.0)).dump(); }});
+    r.Register({"memory_get", "Read lines from a memory file (MEMORY.md or memory/**/*.md). Legacy: {key} finds the latest '- ... key: value' note.",
+                {{"type", "object"}, {"properties", {{"path", str("memory file path")}, {"from", num("1-based start line")},
+                                                     {"lines", num("line count")}, {"key", str("legacy note key")}}}},
+                [ws](const nlohmann::json& a) {
+                    if (a.contains("path")) return ws->MemoryGet(a.value("path", ""), a.value("from", 1), a.value("lines", 0)).dump();
+                    const auto key = a.value("key", "");
+                    if (key.empty()) return nlohmann::json{{"ok", false}, {"error", "path or key required"}}.dump();
+                    auto hits = ws->MemorySearch(key, 50);
+                    const std::string needle = " " + key + ": ";
+                    for (auto& h : hits["results"]) {
+                        auto snip = h.value("snippet", "");
+                        auto lines_v = snip; std::string found;
+                        std::istringstream is(lines_v); std::string l;
+                        while (std::getline(is, l)) if (auto p = l.find(needle); p != std::string::npos) found = l.substr(p + needle.size());
+                        if (!found.empty()) return nlohmann::json{{"found", true}, {"value", found}, {"path", h["path"]}}.dump();
+                    }
+                    return nlohmann::json{{"found", false}}.dump(); }});
+    r.Register({"memory_set", "Append a durable note '- key: value' to today's memory/YYYY-MM-DD.md.",
+                {{"type", "object"}, {"properties", {{"key", str("note key")}, {"value", str("note text")}}},
+                 {"required", nlohmann::json::array({"key", "value"})}},
+                [ws](const nlohmann::json& a) {
+                    return ws->MemoryAppend(a.value("key", "") + ": " + a.value("value", "")).dump(); }});
 
     if (opts.enable_shell) {
         if (const char* env = std::getenv("OPENCLAW_SHELL_REQUIRE_APPROVAL"); env && std::string(env) == "0") {

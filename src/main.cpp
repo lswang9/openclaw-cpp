@@ -70,7 +70,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.25.0-dev";
+constexpr const char* kVersion = "1.26.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1217,6 +1217,42 @@ int CmdSelfTest() {
         std::cerr << "FAIL sessions exception: " << e.what() << "\n"; ++failures;
     }
 
+    // workspace file tools + Markdown memory (BM25)
+    try {
+        auto root = std::filesystem::temp_directory_path() / "oc-ws-st";
+        std::filesystem::remove_all(root);
+        tools::RegistryOptions o; o.enable_shell = false; o.workspace_root = root.string();
+        auto reg = tools::MakeDefaultRegistry(o);
+        auto J = [&](const char* n, nlohmann::json a) { return nlohmann::json::parse(reg.Invoke(n, a)); };
+        bool ok = J("write", {{"path", "notes/a.txt"}, {"content", "alpha\nbeta\ngamma\n"}}).value("ok", false);
+        ok = ok && J("read", {{"path", "notes/a.txt"}, {"offset", 2}, {"limit", 1}}).value("content", "") == "beta\n";
+        ok = ok && !J("edit", {{"path", "notes/a.txt"}, {"old_string", "zzz"}, {"new_string", "q"}}).value("ok", true);
+        ok = ok && J("edit", {{"path", "notes/a.txt"}, {"old_string", "beta"}, {"new_string", "BETA"}}).value("ok", false);
+        J("write", {{"path", "dup.txt"}, {"content", "x x"}});
+        ok = ok && !J("edit", {{"path", "dup.txt"}, {"old_string", "x"}, {"new_string", "y"}}).value("ok", true);
+        ok = ok && J("edit", {{"path", "dup.txt"}, {"old_string", "x"}, {"new_string", "y"}, {"replace_all", true}}).value("replacements", 0) == 2;
+        bool esc = !J("read", {{"path", "../../etc/passwd"}}).value("ok", true) &&
+                   !J("write", {{"path", "/etc/oc-evil"}, {"content", "x"}}).value("ok", true);
+        std::filesystem::create_symlink("/etc", root / "lnk");
+        esc = esc && !J("read", {{"path", "lnk/hostname"}}).value("ok", true);
+        J("write", {{"path", "MEMORY.md"}, {"content", "# Prefs\nUser prefers dark roast coffee.\n\n# Project\nopenclaw-cpp gateway port 18789.\n"}});
+        J("write", {{"path", "memory/2026-10-19.md"}, {"content", "# 2026-10-19\n- deployed staging; 用户喜欢乌龙茶\n"}});
+        auto s1 = J("memory_search", {{"query", "coffee preference"}});
+        auto s2 = J("memory_search", {{"query", "乌龙茶"}});
+        auto top = s1["results"].empty() ? nlohmann::json() : s1["results"][0];
+        ok = ok && top.value("path", "") == "MEMORY.md" && top.value("start_line", 0) == 1 &&
+             !s2["results"].empty() && s2["results"][0].value("path", "") == "memory/2026-10-19.md";
+        ok = ok && J("memory_get", {{"path", "MEMORY.md"}, {"from", 5}, {"lines", 1}}).value("text", "").find("18789") != std::string::npos;
+        ok = ok && !J("memory_get", {{"path", "notes/a.txt"}}).value("ok", true);
+        J("memory_set", {{"key", "editor"}, {"value", "helix"}});
+        auto mg = J("memory_get", {{"key", "editor"}});
+        ok = ok && esc && mg.value("value", "") == "helix";
+        if (!ok) { std::cerr << "FAIL workspace/memory tools s1=" << s1.dump() << " mg=" << mg.dump() << " esc=" << esc << "\n"; ++failures; }
+        else std::cerr << "PASS workspace read/write/edit (sandboxed) + memory_search BM25 / memory_get / memory_set (Markdown)\n";
+    } catch (const std::exception& e) {
+        std::cerr << "FAIL workspace exception: " << e.what() << "\n"; ++failures;
+    }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -2023,6 +2059,15 @@ int main(int argc, char** argv) {
         if (cmd == "gateway") return CmdGateway(argc, argv, 2);
         if (cmd == "chat") return CmdChat(argc, argv, 2);
         if (cmd == "-h" || cmd == "--help" || cmd == "help") { PrintUsage(); return 0; }
+        if (cmd == "-V" || cmd == "-v" || cmd == "--version" || cmd == "version") {
+            std::cout << "openclaw-cpp " << kVersion << " (align OpenClaw 2026.10.5)\n";
+            return 0;
+        }
+        if (!cmd.empty() && cmd[0] == '-') {
+            // Never treat an unknown flag as a chat prompt (would call a live LLM).
+            std::cerr << "unknown option: " << cmd << " (try --help)\n";
+            return 2;
+        }
         return CmdChat(argc, argv, 1);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';
