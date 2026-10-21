@@ -37,6 +37,7 @@
 #include "openclaw/acp/wire.hpp"
 #include "openclaw/daemon/lifecycle.hpp"
 #include "openclaw/voice/tts.hpp"
+#include "openclaw/voice/stt.hpp"
 #include "openclaw/sim/backend.hpp"
 #include "openclaw/sim/capture.hpp"
 #include "openclaw/sim/input.hpp"
@@ -92,7 +93,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.64.0-dev";
+constexpr const char* kVersion = "1.65.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3199,6 +3200,33 @@ int main(int argc, char** argv) {
                 return 0;
             }
             std::cerr << "usage: skills [list|check|info <name>|search <q>|install <slug> [--version v] [--force]|update [<slug>|--all]|uninstall <slug>|sync|installed|inspect <slug>]\n"; return 2;
+        }
+        if (cmd == "voice") {
+            // voice tts [--voice V] <text...> | voice stt <file> [--language L]
+            std::string sub = argc > 2 ? argv[2] : "", voice, lang, text, file;
+            for (int i = 3; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--voice" && i + 1 < argc) voice = argv[++i];
+                else if (a == "--language" && i + 1 < argc) lang = argv[++i];
+                else if (sub == "stt" && file.empty()) file = a;
+                else text += (text.empty() ? "" : " ") + a;
+            }
+            if (sub == "tts") {
+                openclaw::voice::TtsEngine t;
+                auto r = t.Speak(text, voice);
+                std::cout << r.dump(2) << "\n";
+                return r.value("delivered", false) ? 0 : 1;
+            }
+            if (sub == "stt") {
+                std::ifstream in(file, std::ios::binary);
+                std::string audio((std::istreambuf_iterator<char>(in)), {});
+                std::string mime = file.ends_with(".wav") ? "audio/wav" : file.ends_with(".mp3") ? "audio/mpeg" : "audio/ogg";
+                auto r = openclaw::voice::DefaultStt().Transcribe(audio, mime, std::filesystem::path(file).filename().string(), lang);
+                std::cout << r.dump(2) << "\n";
+                return r.value("ok", false) ? 0 : 1;
+            }
+            std::cerr << "usage: voice tts [--voice V] <text> | voice stt <file> [--language L]\n";
+            return 2;
         }
         if (cmd == "tokenizer") {
             namespace tk = openclaw::tokenizer;

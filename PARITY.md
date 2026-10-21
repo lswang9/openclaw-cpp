@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.64.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.65.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,13 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.65 Vendor-shaped TTS/STT clients (OpenAI / ElevenLabs / Deepgram)
+- real: `OPENCLAW_TTS_PROVIDER=openai|elevenlabs|deepgram|http`. OpenAI `POST /v1/audio/speech` `{model,input,voice,response_format}` Bearer. ElevenLabs `POST /v1/text-to-speech/{voice_id}` `{text,model_id}` `xi-api-key`. Deepgram `POST /v1/speak?model=aura-…` `{text}` `Authorization: Token`. Keys come from `OPENCLAW_TTS_API_KEY` or the vendor env (`OPENAI_API_KEY`/`ELEVENLABS_API_KEY`/`DEEPGRAM_API_KEY`), and the base URL defaults to the vendor host. `OPENCLAW_TTS_OUT_DIR` saves the audio, with the extension taken from the content type.
+- real: `OPENCLAW_STT_PROVIDER=openai|elevenlabs|deepgram`. OpenAI multipart `/v1/audio/transcriptions`. ElevenLabs multipart `/v1/speech-to-text` (`model_id=scribe_v1`, `language_code`). Deepgram raw-body `/v1/listen?model=nova-3` with the transcript taken from `results.channels[0].alternatives[0].transcript`.
+- real: CLI `voice tts [--voice V] <text>` / `voice stt <file> [--language L]`.
+- tests: `scripts/e2e-voice-providers.sh` (smoke) runs a fake server that asserts each vendor's path, headers and body. These are shape tests only: no live vendor calls.
+- gaps: no streaming TTS (chunked/websocket), no Deepgram live STT websocket, and no automatic voice-note transcription on channel inbound.
 
 ## 1.64 Streaming reply blocks, deadlock-free plugin agent.reply, SavePreserving, auth rotation, autoReview.model, PTY resize, Ollama/GGUF embeddings, FTS, WA Web offline stubs
 - real: plugin `dispatchReplyWithBufferedBlockDispatcher` receives **streamed** `hostEvent` `reply.block` events (kind `block`/`final`) before the final `hostReply` (`streamed:true`). Events are chained before resolve so delivery order is stable.
