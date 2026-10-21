@@ -66,6 +66,7 @@
 #include "openclaw/tools/runenv.hpp"
 #include "openclaw/tools/exec.hpp"
 #include "openclaw/clawhub/client.hpp"
+#include "openclaw/channels/waweb/noise.hpp"
 #include "openclaw/workspace/embeddings.hpp"
 #include "openclaw/workspace/workspace.hpp"
 #include "openclaw/mcp/stdio.hpp"
@@ -88,7 +89,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.60.0-dev";
+constexpr const char* kVersion = "1.61.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2333,6 +2334,56 @@ int CmdSelfTest() {
         std::filesystem::remove(f);
         if (!ok) { std::cerr << "FAIL sqlite vector store knn\n"; ++failures; }
         else std::cerr << "PASS sqlite vector store (cache, KNN via vec_distance_cosine)\n";
+    }
+
+    {  // 1.61: WhatsApp Web building blocks — HKDF vector, Noise XX handshake + transport, media crypto, QR
+        namespace ww = channels::waweb;
+        bool ok = true;
+        // RFC 5869 test case 1
+        ww::Bytes ikm(22, 0x0b), salt;
+        for (int i = 0; i <= 12; ++i) salt.push_back(static_cast<std::uint8_t>(i));
+        std::string info; for (int i = 0xf0; i <= 0xf9; ++i) info.push_back(static_cast<char>(i));
+        auto okm = ww::Hkdf(ikm, 42, salt, info);
+        ok = ok && okm.size() == 42 && okm[0] == 0x3c && okm[1] == 0xb2 && okm[41] == 0x65;
+        int stage = ok ? 1 : 0;
+        ww::ClientHandshake cli; ww::ServerHandshake srv;
+        auto f1 = cli.noise.EncodeFrame(cli.ClientHello());
+        auto in1 = srv.noise.DecodeFrames(f1);
+        auto sh = in1.size() == 1 ? srv.OnClientHello(in1[0], ww::FromString("server-cert")) : std::nullopt;
+        ww::Bytes srv_static, cert, cli_static;
+        auto fin = sh ? cli.OnServerHello(cli.noise.DecodeFrames(srv.noise.EncodeFrame(*sh)).at(0), ww::FromString("client-payload"), &srv_static, &cert) : std::nullopt;
+        ww::Bytes fin_frame = fin ? cli.noise.EncodeFrame(*fin) : ww::Bytes{};
+        if (fin) cli.noise.FinishInit();
+        auto cp = fin ? srv.OnClientFinish(srv.noise.DecodeFrames(fin_frame).at(0), &cli_static) : std::nullopt;
+        ok = ok && cp && *cp == ww::FromString("client-payload") && cert == ww::FromString("server-cert") &&
+             srv_static == srv.static_.pub && cli_static == cli.static_.pub && cli.noise.finished() && srv.noise.finished();
+        if (ok) stage = 2; else std::cerr << "ww hs: sh=" << bool(sh) << " fin=" << bool(fin) << " cp=" << bool(cp) << "\n";
+        if (ok) {  // transport both ways, split frames
+            auto a = cli.noise.EncodeFrame(ww::FromString("ping-1"));
+            auto b = cli.noise.EncodeFrame(ww::FromString("ping-2"));
+            ww::Bytes ab = a; ab.insert(ab.end(), b.begin(), b.end());
+            auto got = srv.noise.DecodeFrames(ww::Bytes(ab.begin(), ab.begin() + 5));
+            auto rest = srv.noise.DecodeFrames(ww::Bytes(ab.begin() + 5, ab.end()));
+            got.insert(got.end(), rest.begin(), rest.end());
+            auto back = cli.noise.DecodeFrames(srv.noise.EncodeFrame(ww::FromString("pong")));
+            ok = got.size() == 2 && got[0] == ww::FromString("ping-1") && got[1] == ww::FromString("ping-2") &&
+                 back.size() == 1 && back[0] == ww::FromString("pong");
+        }
+        // tampered ServerHello static must fail
+        { ww::ClientHandshake c2; ww::ServerHandshake s2;
+          auto h2 = s2.OnClientHello(c2.ClientHello(), ww::FromString("x"));
+          auto bad = *h2; bad[bad.size() - 1] ^= 1;
+          ok = ok && !c2.OnServerHello(bad, ww::FromString("p"), nullptr, nullptr); }
+        auto mk = ww::RandomBytes(32);
+        auto plain = ww::FromString(std::string(1000, 'z') + "media");
+        auto encm = ww::EncryptMedia(plain, mk, ww::MediaType::Image);
+        auto decm = ww::DecryptMedia(encm, mk, ww::MediaType::Image);
+        auto wrong = ww::DecryptMedia(encm, mk, ww::MediaType::Video);
+        ok = ok && decm && *decm == plain && !wrong && encm.size() % 16 == 10;
+        auto qr = ww::QrPayload("2@abc", cli.static_.pub, srv.static_.pub, ww::RandomBytes(32));
+        ok = ok && std::count(qr.begin(), qr.end(), ',') == 3 && qr.rfind("2@abc,", 0) == 0;
+        if (!ok) { std::cerr << "FAIL whatsapp-web noise/media stage=" << stage << " decm=" << bool(decm) << " wrong=" << bool(wrong) << " sz=" << encm.size() << "\n"; ++failures; }
+        else std::cerr << "PASS whatsapp-web Noise_XX handshake+transport, media crypto, QR payload\n";
     }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }

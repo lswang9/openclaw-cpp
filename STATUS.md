@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.60.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.61.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.61.0-dev
+- WhatsApp Web（Baileys 等价）：差距评估 `docs/whatsapp-web-gap.md`，以及第一批原语：Noise_XX 握手、帧封装、媒体加解密、二维码内容，均为离线自测；真实登录与 Signal 协议仍缺失。
 
 ### 1.60.0-dev
 - 新增 Gemini / Voyage embedding provider（任务类型、维度、鉴权、auto 选择、失败回退本地）；只用本地假服务端测试，未连真实 API。

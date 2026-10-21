@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.60.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.61.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,11 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.61 WhatsApp Web (Baileys-equivalent): assessment + first primitives
+- assessment: `docs/whatsapp-web-gap.md` (layer-by-layer gap, ordered plan, what needs the user).
+- real (offline, in-process tested): `channels::waweb` — `Noise_XX_25519_AESGCM_SHA256` symmetric state with the WA prologue (`WA` 6 3), both handshake roles (client = Baileys side, server = test responder), Baileys ordering (ClientFinish framed before `FinishInit`), transport framing (intro header, 3-byte length, split/merged frames), minimal protobuf `HandshakeMessage` codec, RFC 5869 HKDF (test vector), WhatsApp media encryption (HKDF type keys, AES-256-CBC, HMAC-SHA256/10), and the pairing QR payload.
+- missing: live socket login, server CertChain verification, ClientPayload/WAProto, WABinary token dictionary, ADV pairing signatures, Signal (X3DH/Double Ratchet/SenderKeys), pre-key upload, app-state/history sync, media hosts, auth persistence. Not interoperability-tested with WhatsApp servers.
 
 ## 1.60 Gemini + Voyage embedding providers
 - real (fake-server tested): `memorySearch.provider: "gemini"` — `POST {baseUrl}/models/{model}:batchEmbedContents` with `x-goog-api-key`, `taskType` `RETRIEVAL_DOCUMENT` for chunks / `RETRIEVAL_QUERY` for queries, optional `memorySearch.outputDimensionality`, batches of 100; default `gemini-embedding-001` on `generativelanguage.googleapis.com/v1beta`, key `remote.apiKey` → `GEMINI_API_KEY` → `GOOGLE_API_KEY`.
