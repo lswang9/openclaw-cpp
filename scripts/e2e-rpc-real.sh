@@ -50,9 +50,9 @@ err("node.pair.remove", {"nodeId": "n1"}, "is connected")
 assert ok("node.pair.remove", {"nodeId": "node-stub"})["removed"] is True
 err("node.pair.approve", {"requestId": "nope"}, "unknown pairing request")
 # honest contract: an unimplemented upstream method is an error, never a fake success
-u = err("portal.open", {}, "not implemented in the C++ runtime")
+u = err("board.event", {}, "not implemented in the C++ runtime")
 st = ok("methods.list", {})
-assert "portal.open" not in st["implemented"] and "agent" in st["implemented"], "implemented list excludes unimplemented"
+assert "board.event" not in st["implemented"] and "agent" in st["implemented"], "implemented list excludes unimplemented"
 print("ok")
 P
 for t in sessions_list sessions_history session_status agents_list nodes web_fetch; do

@@ -1,3 +1,10 @@
+#include <cstring>
+#include <csignal>
+#include <malloc.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <poll.h>
 #include <thread>
 #include "openclaw/plugins/registry.hpp"
 #include <optional>
@@ -2581,6 +2588,289 @@ ExtraResult SystemAgent(ServerDeps& d, const fs::path& root, const std::string& 
     return {};
 }
 
+
+// ---------------------------------------------------------------- portals: token-gated TCP reverse proxy from a listen port to a local service port
+struct PortalRt { json info; int lfd = -1; std::atomic<bool> stop{false}; std::string token; std::string owner; };
+std::mutex g_portal_mu;
+std::map<std::string, std::shared_ptr<PortalRt>> g_portals;
+void PortalSplice(int a, int b) {
+    pollfd fds[2] = {{a, POLLIN, 0}, {b, POLLIN, 0}}; char buf[16384];
+    for (;;) {
+        if (poll(fds, 2, 30000) <= 0) break;
+        bool done = false;
+        for (int i = 0; i < 2 && !done; ++i) if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+            auto n = ::recv(fds[i].fd, buf, sizeof buf, 0); if (n <= 0) { done = true; break; }
+            for (ssize_t off = 0; off < n;) { auto w = ::send(fds[1 - i].fd, buf + off, n - off, MSG_NOSIGNAL); if (w <= 0) { done = true; break; } off += w; }
+        }
+        if (done) break;
+    }
+}
+void PortalConn(std::shared_ptr<PortalRt> rt, int c) {
+    std::string head; char ch[4096];
+    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 65536) { auto n = ::recv(c, ch, sizeof ch, 0); if (n <= 0) { ::close(c); return; } head.append(ch, n); }
+    const auto line = head.substr(0, head.find("\r\n"));
+    const bool authed = line.find("oc_portal=" + rt->token) != std::string::npos || head.find("oc_portal=" + rt->token) != std::string::npos ||
+                        head.find("X-OpenClaw-Portal-Token: " + rt->token) != std::string::npos;
+    if (!authed) { const char* r = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 13\r\nConnection: close\r\n\r\nportal token\n"; ::send(c, r, strlen(r), MSG_NOSIGNAL); ::close(c); return; }
+    int u = ::socket(AF_INET, SOCK_STREAM, 0); sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(rt->info["port"].get<int>()); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(u, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) { const char* r = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"; ::send(c, r, strlen(r), MSG_NOSIGNAL); ::close(u); ::close(c); return; }
+    // Strip the portal token from the forwarded request line so the upstream never sees it.
+    auto q = head.find("oc_portal=" + rt->token);
+    if (q != std::string::npos && q < line.size()) { auto e = q + 10 + rt->token.size(); if (q > 0 && (head[q - 1] == '&')) --q; else if (e < head.size() && head[e] == '&') ++e; head.erase(q, e - q); auto l2 = head.find("\r\n"); auto qs = head.rfind('?', l2); if (qs != std::string::npos && (head[qs + 1] == ' ')) head.erase(qs, 1); }
+    ::send(u, head.data(), head.size(), MSG_NOSIGNAL);
+    PortalSplice(c, u); ::close(u); ::close(c);
+}
+json PortalList(const std::string& owner) {
+    std::lock_guard<std::mutex> l(g_portal_mu); json out = json::array();
+    for (auto& [id, rt] : g_portals) if (owner.empty() || rt->owner == owner) out.push_back(rt->info);
+    return out;
+}
+ExtraResult Portals(ServerDeps& d, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    const bool sess = m.rfind("portal.session.", 0) == 0;
+    if (sess && (str("sessionKey").empty() || str("environmentId").empty())) return Fail("sessionKey and environmentId are required");
+    const auto owner = sess ? str("sessionKey") : std::string();
+    if (!str("environmentId").empty() && str("environmentId") != "local") return Fail("unknown environment: " + str("environmentId"));
+    auto changed = [&] { GatewayEmit("portal.changed", {{"portals", PortalList("")}}); };
+    if (m == "portal.list" || m == "portal.session.list") return Ok({{"portals", PortalList(owner)}});
+    if (m == "portal.open" || m == "portal.session.open") {
+        if (!p.contains("port") || !p["port"].is_number_integer() || p["port"].get<int>() < 1 || p["port"].get<int>() > 65535) return Fail("port must be an integer 1-65535");
+        if (!str("path").empty() && str("path")[0] != '/') return Fail("path must start with /");
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0); int one = 1; ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = 0;
+        const auto host = d.config.gateway_host.empty() ? std::string("127.0.0.1") : d.config.gateway_host;
+        inet_pton(AF_INET, host == "0.0.0.0" || host == "localhost" ? (host == "localhost" ? "127.0.0.1" : "0.0.0.0") : host.c_str(), &a.sin_addr);
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0 || ::listen(fd, 64) != 0) { ::close(fd); return Fail("cannot open portal listener"); }
+        socklen_t sl = sizeof a; ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &sl);
+        auto rt = std::make_shared<PortalRt>(); rt->lfd = fd; rt->owner = owner;
+        unsigned char rb[16]; std::ifstream("/dev/urandom", std::ios::binary).read(reinterpret_cast<char*>(rb), 16);
+        static const char* hx = "0123456789abcdef"; for (auto b : rb) { rt->token.push_back(hx[b >> 4]); rt->token.push_back(hx[b & 15]); }
+        const int lp = ntohs(a.sin_port); const auto id = Rid("portal");
+        const auto shown = host == "0.0.0.0" ? std::string("127.0.0.1") : host;
+        const auto path = str("path").empty() ? std::string("/") : str("path");
+        rt->info = {{"id", id}, {"title", str("title").empty() ? "Port " + std::to_string(p["port"].get<int>()) : str("title")}, {"port", p["port"]}, {"listenPort", lp},
+                    {"publicUrl", "http://" + shown + ":" + std::to_string(lp) + path}, {"path", path}, {"createdAtMs", NowMs()}, {"origin", sess ? "session" : "operator"}};
+        if (!str("description").empty()) rt->info["description"] = str("description");
+        json out = rt->info; out["tokenQuery"] = "oc_portal=" + rt->token; out["url"] = rt->info["publicUrl"].get<std::string>() + (path.find('?') == std::string::npos ? "?" : "&") + "oc_portal=" + rt->token;
+        { std::lock_guard<std::mutex> l(g_portal_mu); g_portals[id] = rt; }
+        std::thread([rt] { while (!rt->stop) { int c = ::accept(rt->lfd, nullptr, nullptr); if (c < 0) { if (rt->stop) break; continue; } std::thread(PortalConn, rt, c).detach(); } }).detach();
+        changed();
+        return Ok(out);
+    }
+    if (m == "portal.close" || m == "portal.session.close") {
+        std::shared_ptr<PortalRt> rt;
+        { std::lock_guard<std::mutex> l(g_portal_mu); auto it = g_portals.find(str("id")); if (it == g_portals.end() || (sess && it->second->owner != owner)) return Ok({{"closed", false}}); rt = it->second; g_portals.erase(it); }
+        rt->stop = true; ::shutdown(rt->lfd, SHUT_RDWR); ::close(rt->lfd);
+        changed();
+        return Ok({{"closed", true}});
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------- doctor.memory dream diary (DREAMS.md) maintenance, ported from memory-core
+namespace dream {
+const std::string kStart = "<!-- openclaw:dreaming:diary:start -->", kEnd = "<!-- openclaw:dreaming:diary:end -->", kBackfill = "openclaw:dreaming:backfill-entry";
+std::string Ensure(const std::string& s) {
+    if (s.find(kStart) != std::string::npos && s.find(kEnd) != std::string::npos) return s;
+    std::string sec = "# Dream Diary\n\n" + kStart + "\n" + kEnd + "\n";
+    return Trim(s).empty() ? sec : sec + "\n" + s;
+}
+std::optional<std::vector<std::string>> Blocks(const std::string& s) {
+    auto a = s.find(kStart), b = s.find(kEnd); if (a == std::string::npos || b == std::string::npos || b < a) return std::nullopt;
+    std::string body = s.substr(a + kStart.size(), b - a - kStart.size()); std::vector<std::string> out;
+    size_t pos = 0; for (;;) { auto n = body.find("\n---\n", pos); auto blk = Trim(body.substr(pos, n == std::string::npos ? std::string::npos : n - pos)); if (!blk.empty()) out.push_back(blk); if (n == std::string::npos) break; pos = n + 5; }
+    // a leading "---" on the first block (joinDiaryBlocks format) is a separator, not content
+    for (auto& x : out) if (x.rfind("---", 0) == 0) x = Trim(x.substr(3));
+    out.erase(std::remove_if(out.begin(), out.end(), [](auto& x) { return x.empty(); }), out.end());
+    return out;
+}
+std::string Join(const std::vector<std::string>& bl) { std::string o; for (size_t i = 0; i < bl.size(); ++i) { if (i) o += "\n"; o += "---\n\n" + Trim(bl[i]) + "\n"; } return o; }
+std::string Replace(const std::string& s, const std::string& content) {
+    auto e = Ensure(s); auto a = e.find(kStart), b = e.find(kEnd);
+    return e.substr(0, a + kStart.size()) + (Trim(content).empty() ? "\n" : "\n" + Trim(content) + "\n") + e.substr(b);
+}
+std::string Fingerprint(const std::string& blk) {
+    std::istringstream ss(blk); std::string l, date, body;
+    while (std::getline(ss, l)) { l = Trim(l); if (l.empty() || l.rfind("<!--", 0) == 0 || l[0] == '#') continue;
+        if (date.empty() && l.size() > 2 && l.front() == '*' && l.back() == '*') { date = Trim(l.substr(1, l.size() - 2)); continue; } body += l + "\n"; }
+    return date + "\n" + body;
+}
+std::string DayLabel(const std::string& iso) {
+    static const char* mon[] = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"};
+    if (iso.size() != 10) return iso; int mo = std::atoi(iso.substr(5, 2).c_str()); if (mo < 1 || mo > 12) return iso;
+    return std::string(mon[mo - 1]) + " " + std::to_string(std::atoi(iso.substr(8, 2).c_str())) + ", " + iso.substr(0, 4);
+}
+}  // namespace dream
+ExtraResult DoctorMemory(ServerDeps& d, const std::string& m, const json& p) {
+    const auto agent = p.value("agentId", std::string("main"));
+    const auto ws = WorkspaceOf(d, agent); std::error_code ec;
+    fs::path dp = ws / "DREAMS.md"; std::string name = "DREAMS.md";
+    if (!fs::is_regular_file(dp, ec) && fs::is_regular_file(ws / "dreams.md", ec)) { dp = ws / "dreams.md"; name = "dreams.md"; }
+    const bool symlink = fs::is_symlink(dp, ec);
+    auto read = [&]() -> std::string { if (symlink) return {}; std::ifstream i(dp); return std::string(std::istreambuf_iterator<char>(i), {}); };
+    auto info = [&]() { json o{{"agentId", agent}, {"path", name}, {"found", !symlink && fs::is_regular_file(dp, ec)}};
+        if (o["found"]) { o["content"] = read(); o["updatedAtMs"] = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(fs::last_write_time(dp, ec).time_since_epoch()).count()); } return o; };
+    auto write = [&](const std::string& s) { if (symlink) throw std::runtime_error("refusing to write a redirected diary"); std::ofstream(dp) << s; };
+    try {
+        if (m == "doctor.memory.dreamDiary") return Ok(info());
+        if (m == "doctor.memory.backfillDreamDiary") {
+            std::vector<fs::path> files; static const std::regex re(R"(^(\d{4}-\d{2}-\d{2})(?:-[^/]+)?\.md$)", std::regex::icase);
+            for (auto it = fs::directory_iterator(ws / "memory", ec); !ec && it != fs::directory_iterator(); it.increment(ec)) if (std::regex_match(it->path().filename().string(), re)) files.push_back(it->path());
+            std::sort(files.begin(), files.end());
+            auto base = info(); if (files.empty()) return Ok({{"path", name}, {"found", base["found"]}, {"scannedFiles", 0}, {"written", 0}, {"replaced", 0}});
+            auto cur = dream::Ensure(read()); auto blocks = dream::Blocks(cur).value_or(std::vector<std::string>{});
+            int replaced = 0; std::vector<std::string> keep; for (auto& b : blocks) { if (b.find(dream::kBackfill) != std::string::npos) ++replaced; else keep.push_back(b); }
+            int written = 0;
+            for (auto& f : files) {
+                std::smatch mm; auto fn = f.filename().string(); std::regex_match(fn, mm, re); const auto day = mm[1].str();
+                std::ifstream in(f); std::string l, body; int n = 0;
+                while (std::getline(in, l) && n < 12) { auto tl = Trim(l); if (tl.empty() || tl[0] == '#' || tl.rfind("<!--", 0) == 0) continue; body += (tl.rfind("- ", 0) == 0 ? tl : "- " + tl) + "\n"; ++n; }
+                if (body.empty()) continue;
+                keep.push_back("*" + dream::DayLabel(day) + "*\n\n<!-- " + dream::kBackfill + " day=" + day + " source=memory/" + fn + " -->\n\n" + Trim(body)); ++written;
+            }
+            write(dream::Replace(cur, dream::Join(keep)));
+            return Ok({{"agentId", agent}, {"path", name}, {"found", true}, {"scannedFiles", files.size()}, {"written", written}, {"replaced", replaced}});
+        }
+        if (m == "doctor.memory.resetDreamDiary" || m == "doctor.memory.dedupeDreamDiary") {
+            auto cur = read(); auto e = dream::Ensure(cur); auto blocks = dream::Blocks(e).value_or(std::vector<std::string>{});
+            std::vector<std::string> keep; std::set<std::string> seen;
+            for (auto& b : blocks) { if (m == "doctor.memory.resetDreamDiary") { if (b.find(dream::kBackfill) == std::string::npos) keep.push_back(b); } else if (seen.insert(dream::Fingerprint(b)).second) keep.push_back(b); }
+            const int removed = static_cast<int>(blocks.size() - keep.size());
+            if (removed > 0 || (m == "doctor.memory.resetDreamDiary" && !cur.empty())) write(dream::Replace(e, dream::Join(keep)));
+            json o{{"agentId", agent}, {"path", name}, {"found", info()["found"]}, {"removedEntries", removed}};
+            if (m == "doctor.memory.dedupeDreamDiary") { o["dedupedEntries"] = removed; o["keptEntries"] = keep.size(); }
+            return Ok(o);
+        }
+        const auto dreams_dir = ws / "memory" / ".dreams";
+        if (m == "doctor.memory.resetGroundedShortTerm") {
+            auto f = dreams_dir / "short-term-recall.json"; auto j = ReadJsonFile(f, json());
+            int removed = 0;
+            if (j.is_object() && j.contains("entries")) {
+                json& en = j["entries"]; json keep = en.is_array() ? json::array() : json::object();
+                if (en.is_array()) { for (auto& x : en) { if (x.value("source", "") == "grounded" || x.value("grounded", false)) ++removed; else keep.push_back(x); } }
+                else for (auto& [k, x] : en.items()) { if (x.value("source", "") == "grounded" || x.value("grounded", false)) ++removed; else keep[k] = x; }
+                if (removed) { en = keep; WriteJsonFile(f, j); }
+            }
+            return Ok({{"agentId", agent}, {"removedShortTermEntries", removed}});
+        }
+        if (m == "doctor.memory.repairDreamingArtifacts") {
+            const auto arch = dreams_dir / ("repair-" + std::to_string(NowMs())); json warnings = json::array(); bool changed = false;
+            bool ad = false, ac = false, ai = false;
+            auto archive = [&](const fs::path& src, bool& flag) { fs::create_directories(arch, ec); fs::rename(src, arch / src.filename(), ec); if (ec) warnings.push_back("could not archive " + src.string() + ": " + ec.message()); else { flag = true; changed = true; } };
+            if (fs::is_regular_file(dp, ec) && !symlink) { auto s = read(); auto a = s.find(dream::kStart), b = s.find(dream::kEnd);
+                if ((a == std::string::npos) != (b == std::string::npos) || (a != std::string::npos && b < a)) archive(dp, ad); }
+            for (auto [fname, flag] : std::vector<std::pair<std::string, bool*>>{{"session-corpus", &ac}, {"session-ingestion.json", &ai}}) {
+                auto f = dreams_dir / fname; if (!fs::exists(f, ec)) continue;
+                if (fs::is_regular_file(f, ec)) { try { std::ifstream i(f); (void)json::parse(i); continue; } catch (...) {} archive(f, *flag); }
+                else if (fs::is_directory(f, ec)) { bool bad = false; for (auto& e : fs::directory_iterator(f, ec)) if (e.path().extension() == ".jsonl") { std::ifstream i(e.path()); std::string l; while (std::getline(i, l)) if (!Trim(l).empty()) { try { (void)json::parse(l); } catch (...) { bad = true; } } } if (bad) archive(f, *flag); }
+            }
+            json o{{"agentId", agent}, {"changed", changed}, {"archivedDreamsDiary", ad}, {"archivedSessionCorpus", ac}, {"archivedSessionIngestion", ai}, {"warnings", warnings}};
+            if (changed) o["archiveDir"] = arch.string();
+            return Ok(o);
+        }
+    } catch (const std::exception& e) { return Fail(std::string("memory action failed: ") + e.what()); }
+    return {};
+}
+
+// ---------------------------------------------------------------- gateway suspension (drain / ready / handoff), stop.request, diagnostics
+struct SuspendState { std::string id, owner, phase = "running", terminal; long long expires = 0; bool committed = false; };
+std::mutex g_susp_mu; SuspendState g_susp;
+bool GatewayAdmissionClosed(std::string* why) {
+    std::lock_guard<std::mutex> l(g_susp_mu);
+    if (g_susp.phase == "running") return false;
+    if (g_susp.expires && NowMs() > g_susp.expires && !g_susp.committed) { g_susp = SuspendState{}; return false; }
+    if (why) *why = "gateway is suspending (" + g_susp.phase + "); retry after resume";
+    return true;
+}
+json SuspendBlockers() {
+    json b = json::array();
+    auto tl = GatewayRpc("terminal.list", json::object());
+    if (tl.value("ok", false)) for (auto& s : tl["payload"].value("sessions", json::array())) if (s.value("running", false)) b.push_back({{"kind", "background-exec"}, {"id", s.value("sessionId", "")}, {"detail", "terminal"}});
+    auto pr = GatewayRpc("sessions.processes", json::object());
+    if (pr.value("ok", false)) for (auto& s : pr["payload"].value("processes", json::array())) if (s.value("running", s.value("status", "") == "running")) b.push_back({{"kind", "background-exec"}, {"id", s.value("id", s.value("sessionId", ""))}});
+    return b;
+}
+json ProcThreads() {
+    json out = json::array(); std::error_code ec;
+    for (auto& e : fs::directory_iterator("/proc/self/task", ec)) {
+        std::ifstream st(e.path() / "stat"); std::string s((std::istreambuf_iterator<char>(st)), {});
+        auto rp = s.rfind(')'); if (rp == std::string::npos) continue;
+        std::istringstream rest(s.substr(rp + 2)); std::vector<std::string> f; std::string x; while (rest >> x) f.push_back(x);
+        std::ifstream cn(e.path() / "comm"); std::string comm; std::getline(cn, comm);
+        if (f.size() > 12) out.push_back({{"tid", std::atoi(e.path().filename().c_str())}, {"name", comm}, {"state", f[0]}, {"utimeTicks", std::atoll(f[11].c_str())}, {"stimeTicks", std::atoll(f[12].c_str())}});
+    }
+    return out;
+}
+json ProcStatusKb() {
+    json o = json::object(); std::ifstream i("/proc/self/status"); std::string l;
+    while (std::getline(i, l)) for (auto k : {"VmRSS", "VmHWM", "VmSize", "RssAnon", "Threads"}) if (l.rfind(std::string(k) + ":", 0) == 0) o[k] = std::atoll(l.substr(l.find(':') + 1).c_str());
+    return o;
+}
+ExtraResult Lifecycle(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    const long long ttl = 5 * 60 * 1000;
+    if (m == "gateway.suspend.prepare") {
+        if (str("requestId").empty()) return Fail("requestId is required");
+        auto blockers = SuspendBlockers();
+        std::lock_guard<std::mutex> l(g_susp_mu);
+        if (g_susp.phase != "running" && g_susp.owner != str("requestId")) return Ok({{"status", "busy"}, {"reason", "gateway-draining"}, {"retryAfterMs", 1000}, {"activeCount", blockers.size()}, {"blockers", blockers}});
+        if (!blockers.empty() && !p.value("drain", false) && str("terminalPolicy") != "terminate")
+            return Ok({{"status", "busy"}, {"reason", "active-work"}, {"retryAfterMs", 1000}, {"activeCount", blockers.size()}, {"blockers", blockers}});
+        if (g_susp.id.empty()) g_susp.id = Rid("susp");
+        g_susp.owner = str("requestId"); g_susp.terminal = str("terminalPolicy"); g_susp.expires = NowMs() + ttl;
+        if (str("terminalPolicy") == "terminate") for (auto& b : blockers) if (b.value("detail", "") == "terminal") GatewayRpc("terminal.close", {{"sessionId", b["id"]}});
+        const bool ready = blockers.empty() || str("terminalPolicy") == "terminate";
+        g_susp.phase = ready ? "ready" : "draining";
+        GatewayEmit("gateway.suspend", {{"status", g_susp.phase}, {"suspensionId", g_susp.id}});
+        json o{{"status", g_susp.phase}, {"suspensionId", g_susp.id}, {"expiresAtMs", g_susp.expires}, {"activeCount", ready ? 0 : blockers.size()}, {"blockers", ready ? json::array() : blockers}};
+        if (!ready) o["retryAfterMs"] = 1000;
+        return Ok(o);
+    }
+    if (m == "gateway.suspend.status" || m == "gateway.suspend.resume" || m == "gateway.suspend.handoff") {
+        std::unique_lock<std::mutex> l(g_susp_mu);
+        if (g_susp.phase == "running") { if (m == "gateway.suspend.resume") return Ok({{"ok", true}, {"status", "running"}, {"resumed", false}}); if (m == "gateway.suspend.status") return Ok({{"status", "running"}}); return Fail("gateway is not suspended"); }
+        if (str("suspensionId") != g_susp.id) return Fail("unknown or stale suspensionId");
+        if (m == "gateway.suspend.resume") { if (g_susp.committed) return Fail("handoff committed; the gateway is exiting"); g_susp = SuspendState{}; l.unlock(); GatewayEmit("gateway.suspend", {{"status", "running"}}); return Ok({{"ok", true}, {"status", "running"}, {"resumed", true}}); }
+        if (m == "gateway.suspend.status") {
+            if (g_susp.phase == "draining") { l.unlock(); auto b = SuspendBlockers(); l.lock(); if (b.empty()) g_susp.phase = "ready";
+                if (g_susp.phase == "draining") return Ok({{"status", "draining"}, {"ownerId", g_susp.owner}, {"phase", "draining"}, {"expiresAtMs", g_susp.expires}, {"retryAfterMs", 1000}, {"activeCount", b.size()}, {"blockers", b}}); }
+            return Ok({{"status", "ready"}, {"ownerId", g_susp.owner}, {"expiresAtMs", g_susp.expires}});
+        }
+        if (g_susp.phase != "ready") return Fail("gateway is still draining");
+        if (!p.contains("target") || p["target"].value("pid", 0) != static_cast<int>(getpid())) return Fail("handoff target does not match this gateway process");
+        if (p.value("commit", false)) { g_susp.committed = true; g_susp.phase = "exiting"; }
+        return Ok({{"status", g_susp.committed ? "committed" : "armed"}, {"suspensionId", g_susp.id}, {"expiresAtMs", g_susp.expires}});
+    }
+    if (m == "gateway.stop.request") {
+        const int delay = std::clamp(p.value("delayMs", 250), 0, 60000);
+        ReadJsonFile(MetaPath(root, "stop-requests"), json::array());
+        auto led = ReadJsonFile(MetaPath(root, "stop-requests"), json::array()); led.push_back({{"at", NowMs()}, {"by", t_principal}, {"reason", str("reason")}}); WriteJsonFile(MetaPath(root, "stop-requests"), led);
+        GatewayEmit("shutdown", {{"reason", str("reason").empty() ? std::string("stop.request") : str("reason")}, {"restartExpectedMs", nullptr}});
+        std::thread([delay] { std::this_thread::sleep_for(std::chrono::milliseconds(delay)); ::kill(::getpid(), SIGTERM); }).detach();
+        return Ok({{"accepted", true}, {"pid", getpid()}, {"stopInMs", delay}});
+    }
+    if (m == "diagnostics.lanes") return Ok({{"lanes", ProcThreads()}, {"process", ProcStatusKb()}});
+    if (m == "diagnostics.cpuProfile" || m == "diagnostics.heapProfile") {
+        const int dur = std::clamp(p.value("durationMs", 1000), 50, 60000);
+        const auto t0 = NowMs(); auto a = ProcThreads(); json samples = json::array();
+        for (int waited = 0; waited < dur; waited += std::min(100, dur)) { std::this_thread::sleep_for(std::chrono::milliseconds(std::min(100, dur))); if (m == "diagnostics.heapProfile") samples.push_back({{"t", NowMs() - t0}, {"mem", ProcStatusKb()}}); }
+        if (m == "diagnostics.heapProfile") return Ok({{"durationMs", NowMs() - t0}, {"samples", samples}, {"unit", "kB"}, {"format", "openclaw-cpp.rss-samples.v1"}});
+        auto b = ProcThreads(); json th = json::array(); const long hz = sysconf(_SC_CLK_TCK);
+        for (auto& x : b) { long long before = 0; for (auto& y : a) if (y["tid"] == x["tid"]) before = y["utimeTicks"].get<long long>() + y["stimeTicks"].get<long long>();
+            long long now = x["utimeTicks"].get<long long>() + x["stimeTicks"].get<long long>(); th.push_back({{"tid", x["tid"]}, {"name", x["name"]}, {"cpuMs", (now - before) * 1000 / hz}}); }
+        return Ok({{"durationMs", NowMs() - t0}, {"threads", th}, {"format", "openclaw-cpp.thread-cpu.v1"}});
+    }
+    if (m == "diagnostics.heapSnapshot") {
+        if (str("reason").size() > 256) return Fail("reason must be at most 256 characters");
+        const auto dir = root / "diagnostics"; std::error_code ec; fs::create_directories(dir, ec);
+        const auto f = dir / ("heap-" + std::to_string(NowMs()) + ".xml");
+        FILE* fp = std::fopen(f.c_str(), "w"); if (!fp) return Fail("cannot write snapshot");
+        malloc_info(0, fp); std::fclose(fp);
+        return Ok({{"path", f.string()}, {"bytes", fs::file_size(f, ec)}, {"format", "glibc-malloc-info-xml"}, {"process", ProcStatusKb()}, {"reason", str("reason")}});
+    }
+    return {};
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
@@ -2599,6 +2889,11 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
               "sessions.providerReview.continue", "sessions.recover"};
           if (sm.count(method)) { auto r = Sessions2(deps, root, method, params); if (r.handled) return r; } }
         if (method.rfind("openclaw.", 0) == 0 || method.rfind("wizard.", 0) == 0) { auto r = SystemAgent(deps, root, method, params); if (r.handled) return r; }
+        if (method.rfind("portal.", 0) == 0) { auto r = Portals(deps, method, params); if (r.handled) return r; }
+        if (method.rfind("doctor.memory.", 0) == 0 && method != "doctor.memory.status") { auto r = DoctorMemory(deps, method, params); if (r.handled) return r; }
+        if (method.rfind("gateway.suspend.", 0) == 0 || method == "gateway.stop.request" || (method.rfind("diagnostics.", 0) == 0 &&
+            (method == "diagnostics.lanes" || method == "diagnostics.cpuProfile" || method == "diagnostics.heapProfile" || method == "diagnostics.heapSnapshot"))) {
+            auto r = Lifecycle(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("talk.", 0) == 0) { auto r = Talk(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("mcp.app.", 0) == 0 && method != "mcp.app.listTools" && method != "mcp.app.callTool" && method != "mcp.app.listResources" &&
             method != "mcp.app.listResourceTemplates" && method != "mcp.app.readResource") { auto r = McpApp(deps, root, method, params); if (r.handled) return r; }

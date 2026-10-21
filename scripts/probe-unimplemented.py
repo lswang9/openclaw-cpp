@@ -8,7 +8,7 @@ url, mode = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "--print")
 names = [l.strip() for l in open(os.path.join(ROOT, "scripts/upstream-methods.txt")) if l.strip()]
 un = []
 for m in names:
-    if "restart" in m or "shutdown" in m or m.startswith("update.") or m in ("gateway.stop", "config.reload"): continue
+    if "restart" in m or "shutdown" in m or m.startswith("update.") or m in ("gateway.stop", "gateway.stop.request", "config.reload"): continue
     req = urllib.request.Request(url, json.dumps({"jsonrpc": "2.0", "id": 1, "method": m, "params": {}}).encode(), {"Content-Type": "application/json"})
     try: body = urllib.request.urlopen(req, timeout=10).read()
     except urllib.error.HTTPError as e: body = e.read()
