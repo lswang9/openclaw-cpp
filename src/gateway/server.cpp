@@ -40,7 +40,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.48.0-dev";
+constexpr const char* kVersion = "1.49.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -603,6 +603,7 @@ nlohmann::json Server::ReloadConfigNow() {
         if (!deps_.plugins.Root().empty()) deps_.plugins.Scan(deps_.plugins.Root());
         if (deps_.js_host && deps_.js_host->Running() && !deps_.plugins.Root().empty()) {
             deps_.js_host->Stop();
+            deps_.js_host->SetConfig(deps_.config.raw);  // plugins.entries.<id>.config etc. take effect
             deps_.js_host->Start(deps_.plugins.Root());
             plugins_restarted = true;
         }
@@ -1444,8 +1445,10 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         auto args = params.contains("args") ? params["args"] : params.value("arguments", nlohmann::json::object());
         try {
             auto result = deps_.tools.Invoke(name, args);
-            Emit("session.tool", {{"tool", name}, {"args", args}, {"result", nlohmann::json::parse(result)}});
-            return ok({{"tool", name}, {"result", nlohmann::json::parse(result)}});
+            nlohmann::json rj;
+            try { rj = nlohmann::json::parse(result); } catch (...) { rj = result; }  // plain-text tool output
+            Emit("session.tool", {{"tool", name}, {"args", args}, {"result", rj}});
+            return ok({{"tool", name}, {"result", rj}});
         } catch (const std::exception& e) { return err(e.what()); }
     }
 

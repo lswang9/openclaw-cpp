@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.48.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.49.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -207,3 +207,6 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 - exec 工具默认真实执行（网关主机，security=full / ask=off，与上游默认一致），按 tools.exec 配置与审批文件取更严格者；支持允许列表（路径通配、参数正则、逐段匹配）、安全命令、严格内联代码检测、askFallback。
 - 审批流程：发出 exec.approval.requested，在原聊天发提示，可用 RPC 或聊天 /approve（仅请求者或配置的审批人）批准；allow-always 写入精确参数+目录绑定的条目。
 - 沙箱：sandbox.mode off/non-main/all；有 docker 用 docker，否则用 bwrap（只读根、可写工作区、无网络）。审批文档仍为 JSON（上游已改为 SQLite）。
+
+### 1.49.0-dev
+- 热重载渠道/插件重启有了端到端测试：只重启变更的渠道，插件配置变更时用新配置重启 JS 宿主（修复了之前沿用旧配置的问题）并重新注册插件渠道。tools.invoke 兼容纯文本工具结果。
