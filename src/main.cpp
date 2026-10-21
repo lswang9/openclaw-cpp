@@ -74,7 +74,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.33.0-dev";
+constexpr const char* kVersion = "1.34.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1453,6 +1453,30 @@ int CmdSelfTest() {
         else std::cerr << "PASS hybrid memory search (local embeddings + BM25)\n";
     } catch (const std::exception& e) { std::cerr << "FAIL vector memory exception: " << e.what() << "\n"; ++failures; }
 
+    // config $include + schema
+    try {
+        namespace fs = std::filesystem;
+        auto d = fs::temp_directory_path() / "oc-inc-st";
+        fs::remove_all(d); fs::create_directories(d / "parts");
+        std::ofstream(d / "parts/agents.json5") << "{ agents: { defaults: { model: 'deepseek-reasoner', workspace: '/w' } }, skills: { entries: { a: { enabled: true } } } }";
+        std::ofstream(d / "openclaw.json") << "{ $include: ['./parts/agents.json5'], agents: { defaults: { workspace: '/override' } }, gateway: { port: 19002 } }";
+        auto lr = config::Load(d / "openclaw.json");
+        bool ok = lr.error.empty() && lr.snap.deepseek_model == "deepseek-reasoner" &&
+                  lr.snap.raw["agents"]["defaults"]["workspace"] == "/override" && lr.snap.gateway_port == 19002;
+        config::Save(d / "openclaw.json", lr.snap);
+        auto again = config::ParseJson5([&] { std::ifstream in(d / "openclaw.json"); std::stringstream ss; ss << in.rdbuf(); return ss.str(); }());
+        ok = ok && again.contains("$include") && !again.contains("skills") && config::Load(d / "openclaw.json").snap.raw["skills"]["entries"]["a"]["enabled"] == true;
+        std::ofstream(d / "parts/loop.json5") << "{ $include: '../openclaw2.json' }";
+        std::ofstream(d / "openclaw2.json") << "{ $include: './parts/loop.json5' }";
+        ok = ok && config::Load(d / "openclaw2.json").error.find("cycle") != std::string::npos;
+        auto bad = config::ValidateSchema({{"gateway", {{"port", 70000}}}, {"session", {{"reset", {{"atHour", 25}}}}}, {"bogus", 1}});
+        ok = ok && bad.errors.size() == 2 && bad.warnings.size() == 1;
+        std::ofstream(d / "bad.json") << "{ gateway: { port: 'x' } }";
+        ok = ok && config::Load(d / "bad.json").error.find("gateway.port") != std::string::npos;
+        if (!ok) { std::cerr << "FAIL config include/schema " << lr.error << " " << lr.snap.raw.dump() << "\n"; ++failures; }
+        else std::cerr << "PASS config $include (merge, override, round-trip, cycle) + schema validation\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL config include exception: " << e.what() << "\n"; ++failures; }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -2067,7 +2091,14 @@ int CmdGateway(int argc, char** argv, int argi) {
             std::cerr << "[gateway] stdio mcp failed: " << e.what() << "\n";
         }
     }
-    auto cfg = config::LoadOrDefault(config::DefaultPath());
+    auto cfg_lr = config::Load(config::DefaultPath());
+    if (!cfg_lr.error.empty()) {
+        std::cerr << "[gateway] refusing to start: config " << config::DefaultPath().string() << ": " << cfg_lr.error
+                  << "\n  fix it or run `openclaw-cpp config validate`\n";
+        return 1;
+    }
+    for (const auto& w : cfg_lr.warnings) std::cerr << "[gateway] config warning: " << w << "\n";
+    auto cfg = cfg_lr.snap;
     cfg.gateway_host = opts.bind_host;
     cfg.gateway_port = opts.port;
 
@@ -2250,6 +2281,7 @@ int main(int argc, char** argv) {
             if (sub == "validate") {
                 if (!lr.error.empty()) { std::cout << nlohmann::json{{"ok", false}, {"path", path.string()}, {"error", lr.error}}.dump(2) << '\n'; return 1; }
                 auto v = cfgns::ValidateLightJson(lr.snap); v["path"] = path.string(); v["exists"] = lr.exists;
+                v["warnings"] = lr.warnings;
                 std::cout << v.dump(2) << '\n'; return v.value("ok", false) ? 0 : 1;
             }
             if (sub == "get" && argc > 3) {
@@ -2266,13 +2298,16 @@ int main(int argc, char** argv) {
                 }
                 auto raw = lr.snap.raw.is_object() ? lr.snap.raw : nlohmann::json::object();
                 if (!cfgns::SetPath(raw, argv[3], val)) { std::cerr << "cannot set path: " << argv[3] << '\n'; return 2; }
-                cfgns::SaveRaw(path, raw);
+                if (auto sr = cfgns::ValidateSchema(raw); !sr.errors.empty()) {
+                    std::cerr << "rejected: " << sr.errors.front() << '\n'; return 1;
+                }
+                cfgns::SaveRaw(path, cfgns::ToFileDoc(lr.snap, raw));
                 std::cout << "Updated " << argv[3] << " in " << path.string() << '\n'; return 0;
             }
             if (sub == "unset" && argc > 3) {
                 auto raw = lr.snap.raw;
                 if (!cfgns::UnsetPath(raw, argv[3])) { std::cerr << "config path not found: " << argv[3] << '\n'; return 1; }
-                cfgns::SaveRaw(path, raw);
+                cfgns::SaveRaw(path, cfgns::ToFileDoc(lr.snap, raw));
                 std::cout << "Removed " << argv[3] << '\n'; return 0;
             }
             std::cerr << "usage: config [show|file|validate|get <path>|set <path> <value> [--json]|unset <path>]\n";

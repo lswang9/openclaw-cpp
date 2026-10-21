@@ -16,7 +16,9 @@ struct Snapshot {
     std::uint16_t gateway_port = 18789;
     std::string deepseek_model = "deepseek-chat";
     std::string session_dir = "/tmp/openclaw-cpp-sessions";
-    nlohmann::json raw = nlohmann::json::object();
+    nlohmann::json raw = nlohmann::json::object();       // effective doc ($include merged, env unsubstituted)
+    nlohmann::json include_spec;                          // original "$include" value (null if none)
+    nlohmann::json included = nlohmann::json::object();   // merged content of included files
 
     nlohmann::json ToJson() const {
         return nlohmann::json{
@@ -43,10 +45,25 @@ std::optional<nlohmann::json> GetPath(const nlohmann::json& root, const std::str
 bool SetPath(nlohmann::json& root, const std::string& path, const nlohmann::json& value);
 bool UnsetPath(nlohmann::json& root, const std::string& path);
 
+// Resolve "$include" (string or array of paths, relative to the including file; JSON5; nested, max depth 10,
+// cycles rejected). Included docs are deep-merged in order, then the including doc's own keys override.
+nlohmann::json ResolveIncludes(const nlohmann::json& doc, const std::filesystem::path& base_dir,
+                               nlohmann::json* include_spec = nullptr, nlohmann::json* included = nullptr, int depth = 0,
+                               std::vector<std::string>* stack = nullptr);
+// File document to write back: keeps "$include" and only the top-level keys that differ from included content.
+nlohmann::json ToFileDoc(const Snapshot& snap, const nlohmann::json& effective);
+
+struct SchemaReport {
+    std::vector<std::string> errors;    // invalid types/values on known keys → config rejected
+    std::vector<std::string> warnings;  // unknown keys
+};
+SchemaReport ValidateSchema(const nlohmann::json& raw);
+
 struct LoadResult {
     Snapshot snap;
     bool exists = false;
-    std::string error;  // parse / env error (snap stays default)
+    std::string error;  // parse / env / include / schema error (snap stays default)
+    std::vector<std::string> warnings;
 };
 LoadResult Load(const std::filesystem::path& path);
 Snapshot LoadOrDefault(const std::filesystem::path& path);

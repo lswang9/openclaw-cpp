@@ -19,6 +19,7 @@ export OPENCLAW_GATEWAY_HOST="$HOST"
 # isolate session/data
 export OPENCLAW_SESSION_DIR="${TMPDIR:-/tmp}/oc-smoke-sessions-$$"
 export OPENCLAW_DATA_DIR="${TMPDIR:-/tmp}/oc-smoke-data-$$"
+export OPENCLAW_CONFIG_PATH="${OPENCLAW_DATA_DIR}/openclaw.json"
 mkdir -p "$OPENCLAW_SESSION_DIR" "$OPENCLAW_DATA_DIR"
 
 cleanup() {
@@ -70,6 +71,16 @@ RPC_TOOLS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools.list","params":{}}')
 echo "$RPC_TOOLS" | grep -q 'tools'
+
+rpc() { curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" -H 'Content-Type: application/json' -d "$1"; }
+echo "// hot reload test" > "$OPENCLAW_CONFIG_PATH.tmp"; echo "{ session: { reset: { mode: 'off' } }, }" >> "$OPENCLAW_CONFIG_PATH.tmp"
+mv "$OPENCLAW_CONFIG_PATH.tmp" "$OPENCLAW_CONFIG_PATH"
+rpc '{"jsonrpc":"2.0","id":9,"method":"config.reload","params":{}}' | tee /tmp/rl.out | grep -Eq "\"reloaded\": ?true" || { echo "[smoke] hot reload failed" >&2; exit 1; }
+sleep 1; echo "{ gateway: { port: 'nope' } }" > "$OPENCLAW_CONFIG_PATH"
+rpc '{"jsonrpc":"2.0","id":10,"method":"config.reload","params":{}}' | grep -q 'expected integer' || { echo "[smoke] invalid reload not rejected" >&2; exit 1; }
+rpc '{"jsonrpc":"2.0","id":11,"method":"tools.list","params":{}}' | grep -q tools
+echo "[smoke] config hot reload + invalid config rejected (gateway keeps running)"
+rm -f "$OPENCLAW_CONFIG_PATH"
 
 echo "[smoke] POST /v1/rpc sessions.create"
 RPC_SESS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \

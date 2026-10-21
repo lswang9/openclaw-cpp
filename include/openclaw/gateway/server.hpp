@@ -1,4 +1,6 @@
 #pragma once
+#include <chrono>
+#include <filesystem>
 
 #include "openclaw/agent/files.hpp"
 #include "openclaw/acp/session.hpp"
@@ -107,6 +109,17 @@ private:
     std::string DeliverInbound(const channels::InboundMessage& msg);
     void Emit(const std::string& event, const nlohmann::json& payload);
     void PersistAll() const;
+    // Hot reload (gateway.reload.mode != off): re-read config when its mtime changes (checked ≤1/s).
+    void MaybeReloadConfig();
+
+public:
+    // Force a reload check now (tests / config.reload RPC). Returns {reloaded, error, restartRequired}.
+    nlohmann::json ReloadConfigNow();
+
+private:
+    std::mutex reload_mu_;
+    std::filesystem::file_time_type cfg_mtime_{};
+    std::chrono::steady_clock::time_point last_reload_check_{};
 
     ServerOptions opts_;
     ServerDeps deps_;

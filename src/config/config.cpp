@@ -1,5 +1,6 @@
 #include "openclaw/config/config.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -201,6 +202,123 @@ bool UnsetPath(nlohmann::json& root, const std::string& path) {
     return true;
 }
 
+// ---------------- $include ----------------
+namespace {
+void DeepMerge(nlohmann::json& dst, const nlohmann::json& src) {
+    if (!dst.is_object() || !src.is_object()) { dst = src; return; }
+    for (auto it = src.begin(); it != src.end(); ++it) {
+        if (dst.contains(it.key()) && dst[it.key()].is_object() && it.value().is_object()) DeepMerge(dst[it.key()], it.value());
+        else dst[it.key()] = it.value();
+    }
+}
+std::string Slurp(const fs::path& p) { std::ifstream in(p); std::stringstream ss; ss << in.rdbuf(); return ss.str(); }
+}  // namespace
+
+nlohmann::json ResolveIncludes(const nlohmann::json& doc, const fs::path& base, nlohmann::json* spec_out,
+                               nlohmann::json* included_out, int depth, std::vector<std::string>* stack) {
+    if (!doc.is_object() || !doc.contains("$include")) return doc;
+    if (depth >= 10) throw std::runtime_error("$include nesting too deep");
+    std::vector<std::string> local_stack;
+    if (!stack) stack = &local_stack;
+    const auto spec = doc["$include"];
+    std::vector<std::string> paths;
+    if (spec.is_string()) paths.push_back(spec.get<std::string>());
+    else if (spec.is_array()) { for (auto& p : spec) { if (!p.is_string()) throw std::runtime_error("$include entries must be strings"); paths.push_back(p); } }
+    else throw std::runtime_error("$include must be a string or array");
+    nlohmann::json merged = nlohmann::json::object();
+    for (const auto& p : paths) {
+        fs::path fp = fs::path(p).is_absolute() ? fs::path(p) : base / p;
+        std::error_code ec;
+        auto canon = fs::weakly_canonical(fp, ec).string();
+        if (std::find(stack->begin(), stack->end(), canon) != stack->end()) throw std::runtime_error("$include cycle at " + p);
+        if (!fs::is_regular_file(fp, ec)) throw std::runtime_error("$include not found: " + fp.string());
+        stack->push_back(canon);
+        auto sub = ResolveIncludes(ParseJson5(Slurp(fp)), fp.parent_path(), nullptr, nullptr, depth + 1, stack);
+        stack->pop_back();
+        if (!sub.is_object()) throw std::runtime_error("$include target must be an object: " + p);
+        DeepMerge(merged, sub);
+    }
+    nlohmann::json own = doc; own.erase("$include");
+    if (spec_out) *spec_out = spec;
+    if (included_out) *included_out = merged;
+    DeepMerge(merged, own);
+    return merged;
+}
+
+nlohmann::json ToFileDoc(const Snapshot& snap, const nlohmann::json& effective) {
+    if (snap.include_spec.is_null()) return effective;
+    nlohmann::json out = nlohmann::json::object();
+    out["$include"] = snap.include_spec;
+    for (auto it = effective.begin(); it != effective.end(); ++it)
+        if (!snap.included.contains(it.key()) || snap.included[it.key()] != it.value()) out[it.key()] = it.value();
+    return out;
+}
+
+// ---------------- schema ----------------
+SchemaReport ValidateSchema(const nlohmann::json& raw) {
+    SchemaReport r;
+    static const std::vector<std::string> known = {
+        "$schema", "meta", "auth", "env", "wizard", "diagnostics", "logging", "update", "browser", "ui", "models",
+        "nodeHost", "agents", "tools", "bindings", "broadcast", "audio", "media", "messages", "commands", "approvals",
+        "session", "cron", "hooks", "web", "channels", "discovery", "canvasHost", "talk", "gateway", "memory", "skills",
+        "plugins", "acp", "secrets",
+        // openclaw-cpp extensions / gateway-managed state
+        "session_dir", "align_target", "agents_list", "audit_log"};
+    if (!raw.is_object()) { r.errors.push_back("<root>: must be an object"); return r; }
+    for (auto it = raw.begin(); it != raw.end(); ++it)
+        if (std::find(known.begin(), known.end(), it.key()) == known.end()) r.warnings.push_back(it.key() + ": unknown key");
+    auto obj = [&](const char* p) {
+        auto v = GetPath(raw, p);
+        if (v && !v->is_object()) r.errors.push_back(std::string(p) + ": expected object");
+        return v && v->is_object();
+    };
+    auto expect = [&](const std::string& p, auto pred, const char* what) {
+        if (auto v = GetPath(raw, p); v && !pred(*v)) r.errors.push_back(p + ": expected " + what);
+    };
+    auto isint = [](const nlohmann::json& v) { return v.is_number_integer(); };
+    auto isstr = [](const nlohmann::json& v) { return v.is_string(); };
+    auto isbool = [](const nlohmann::json& v) { return v.is_boolean(); };
+    for (auto p : {"gateway", "agents", "agents.defaults", "session", "session.reset", "session.resetByType",
+                   "session.resetByChannel", "skills", "skills.entries", "channels", "tools", "memory"}) obj(p);
+    expect("gateway.port", [](const nlohmann::json& v) { return v.is_number_integer() && v.get<long>() >= 1 && v.get<long>() <= 65535; }, "integer 1-65535");
+    expect("gateway.host", isstr, "string");
+    expect("gateway.bind", [](const nlohmann::json& v) { return v.is_string() && (v == "loopback" || v == "lan" || v == "all" || v == "tailnet" || v == "auto" || v == "custom"); }, "loopback|lan|tailnet|auto|custom");
+    expect("gateway.reload.mode", [](const nlohmann::json& v) { return v.is_string() && (v == "off" || v == "hot" || v == "restart" || v == "hybrid"); }, "off|hot|restart|hybrid");
+    expect("agents.defaults.model", [](const nlohmann::json& v) {
+        if (v.is_string()) return true;
+        if (!v.is_object()) return false;
+        if (v.contains("primary") && !v["primary"].is_string()) return false;
+        if (v.contains("fallbacks") && !v["fallbacks"].is_array()) return false;
+        return true; }, "string or {primary, fallbacks[]}");
+    expect("agents.defaults.workspace", isstr, "string");
+    expect("agents.defaults.contextTokens", [](const nlohmann::json& v) { return v.is_number_unsigned() && v.get<long>() > 0; }, "positive integer");
+    expect("agents.defaults.compaction.mode", [](const nlohmann::json& v) { return v == "default" || v == "safeguard" || v == "off"; }, "default|safeguard|off");
+    expect("agents.defaults.compaction.reserveTokens", [](const nlohmann::json& v) { return v.is_number_unsigned(); }, "non-negative integer");
+    expect("agents.defaults.compaction.memoryFlush.enabled", isbool, "boolean");
+    auto reset = [&](const std::string& base) {
+        expect(base + ".mode", [](const nlohmann::json& v) { return v == "daily" || v == "idle" || v == "off"; }, "daily|idle|off");
+        expect(base + ".atHour", [](const nlohmann::json& v) { return v.is_number_integer() && v.get<int>() >= 0 && v.get<int>() <= 23; }, "integer 0-23");
+        expect(base + ".idleMinutes", [](const nlohmann::json& v) { return v.is_number_unsigned(); }, "non-negative integer");
+    };
+    reset("session.reset");
+    for (auto grp : {"session.resetByType", "session.resetByChannel"})
+        if (auto g = GetPath(raw, grp); g && g->is_object())
+            for (auto it = g->begin(); it != g->end(); ++it) reset(std::string(grp) + "." + it.key());
+    if (auto e = GetPath(raw, "skills.entries"); e && e->is_object())
+        for (auto it = e->begin(); it != e->end(); ++it) {
+            auto b = "skills.entries." + it.key();
+            if (!it.value().is_object()) { r.errors.push_back(b + ": expected object"); continue; }
+            expect(b + ".enabled", isbool, "boolean");
+            expect(b + ".apiKey", isstr, "string");
+            expect(b + ".env", [](const nlohmann::json& v) {
+                if (!v.is_object()) return false;
+                for (auto& x : v) if (!x.is_string()) return false;
+                return true; }, "object of strings");
+        }
+    (void)isint;
+    return r;
+}
+
 // ---------------- load/save ----------------
 namespace {
 void ApplyTyped(Snapshot& s, const nlohmann::json& j) {
@@ -242,6 +360,14 @@ LoadResult Load(const fs::path& path) {
             auto inner = j["raw"]; j.erase("raw"); inner.merge_patch(j); j = inner;
             while (j.contains("raw") && j["raw"].is_object()) { auto x = j["raw"]; j.erase("raw"); x.merge_patch(j); j = x; }
         }
+        j = ResolveIncludes(j, path.parent_path(), &r.snap.include_spec, &r.snap.included);
+        auto schema = ValidateSchema(j);
+        r.warnings = schema.warnings;
+        if (!schema.errors.empty()) {
+            std::string m = "invalid config:";
+            for (auto& e : schema.errors) m += " " + e + ";";
+            throw std::runtime_error(m);
+        }
         r.snap.raw = j;  // keep unsubstituted for round-trip writes
         ApplyTyped(r.snap, SubstituteEnv(j));
     } catch (const std::exception& e) {
@@ -279,6 +405,6 @@ void SaveRaw(const fs::path& path, const nlohmann::json& file_json) {
     fs::rename(tmp, path);
 }
 
-void Save(const fs::path& path, const Snapshot& snap) { SaveRaw(path, ToFileJson(snap)); }
+void Save(const fs::path& path, const Snapshot& snap) { SaveRaw(path, ToFileDoc(snap, ToFileJson(snap))); }
 
 }  // namespace openclaw::config

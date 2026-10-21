@@ -36,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.33.0-dev";
+constexpr const char* kVersion = "1.34.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -238,7 +238,10 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
     return o;
 }
 
-Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {}
+Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {
+    std::error_code ec;
+    cfg_mtime_ = std::filesystem::last_write_time(config::DefaultPath(), ec);
+}
 Server::~Server() { Stop(); if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; } }
 void Server::Stop() {
     cancel_agents_.store(true);
@@ -445,7 +448,45 @@ void Server::Emit(const std::string& event, const nlohmann::json& payload) {
     }
 }
 
+nlohmann::json Server::ReloadConfigNow() {
+    std::lock_guard<std::mutex> g(reload_mu_);
+    const auto path = config::DefaultPath();
+    std::error_code ec;
+    auto mt = std::filesystem::last_write_time(path, ec);
+    if (ec) return {{"reloaded", false}, {"reason", "no config file"}};
+    if (mt == cfg_mtime_) return {{"reloaded", false}, {"reason", "unchanged"}};
+    cfg_mtime_ = mt;
+    auto lr = config::Load(path);
+    if (!lr.error.empty()) {
+        deps_.logs.Append("warn", "config reload rejected: " + lr.error);
+        Emit("config.reload", {{"ok", false}, {"error", lr.error}});
+        return {{"reloaded", false}, {"error", lr.error}};
+    }
+    bool restart = (config::GetPath(lr.snap.raw, "gateway.port") && lr.snap.gateway_port != deps_.config.gateway_port) ||
+                   ((config::GetPath(lr.snap.raw, "gateway.host") || config::GetPath(lr.snap.raw, "gateway.bind")) &&
+                    lr.snap.gateway_host != deps_.config.gateway_host);
+    auto keep_host = deps_.config.gateway_host; auto keep_port = deps_.config.gateway_port;
+    deps_.config = lr.snap;
+    deps_.config.gateway_host = keep_host; deps_.config.gateway_port = keep_port;  // bind changes need restart
+    Emit("config.reload", {{"ok", true}, {"restartRequired", restart}, {"warnings", lr.warnings}});
+    deps_.logs.Append("info", std::string("config hot-reloaded") + (restart ? " (gateway bind change needs restart)" : ""));
+    return {{"reloaded", true}, {"restartRequired", restart}, {"warnings", lr.warnings}};
+}
+
+void Server::MaybeReloadConfig() {
+    auto mode = deps_.config.raw.is_object() ? config::GetPath(deps_.config.raw, "gateway.reload.mode") : std::nullopt;
+    if (mode && mode->is_string() && *mode == "off") return;
+    auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> g(reload_mu_);
+        if (now - last_reload_check_ < std::chrono::seconds(1)) return;
+        last_reload_check_ = now;
+    }
+    ReloadConfigNow();
+}
+
 std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
+    MaybeReloadConfig();
     // Channel-bound ACP: slack/feishu/discord → session/prompt + outbound reply
     if (deps_.acp) {
         auto outbound = [this](const std::string& channel, const std::string& chat_id,
@@ -1014,6 +1055,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
 
 nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     const std::string method = msg.value("method", msg.value("type", ""));
+    if (method != "config.reload") MaybeReloadConfig();
     const auto params = msg.contains("params") ? msg["params"] : nlohmann::json::object();
     const auto id = msg.contains("id") ? msg["id"] : nlohmann::json();
     auto ok = [&](nlohmann::json payload) {
@@ -1166,6 +1208,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         };
         return ok(schema);
     }
+    if (method == "config.reload") return ok(ReloadConfigNow());
     if (method == "config.schema.lookup") {
         const std::string path = params.value("path", params.value("key", ""));
         auto v = config::ValidateLightJson(deps_.config);

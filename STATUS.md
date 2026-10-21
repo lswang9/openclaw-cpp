@@ -1,6 +1,13 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.33.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.34.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.34.0-dev 新增
+
+- 配置支持 `$include`：`"$include": "./parts/agents.json5"` 或数组，路径相对当前文件，支持嵌套与循环检测；本文件的键覆盖被包含的内容，保存时保留 `$include`。
+- 配置校验：常用字段类型/取值错误（如 `gateway.port` 不是 1–65535 的整数）会拒绝加载，网关拒绝启动并提示；未知顶层键只警告。`config validate` 输出 warnings。
+- 热重载：网关运行中修改配置文件会自动生效（每秒最多检查一次）；改坏的配置会被拒绝并保留旧配置；改 host/port 需重启。`gateway.reload.mode: "off"` 可关闭；RPC `config.reload` 立即检查。
+- 仍缺：完整上游 schema；热重载不会重建已启动的渠道/插件和系统提示词。
 
 ## 1.33.0-dev 新增
 
