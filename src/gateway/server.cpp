@@ -48,7 +48,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.72.0-dev";
+constexpr const char* kVersion = "1.73.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1637,13 +1637,34 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             send(HttpResponse(200, "OK", nlohmann::json{{"rev", deps_.a2ui->Revision()}}.dump()));
             return;
         }
+        if (method == "POST" && path == "/__openclaw__/a2ui/input") {
+            nlohmann::json b;
+            try { b = nlohmann::json::parse(BodyOf(req)); } catch (...) {}
+            auto res = deps_.a2ui->SetInput(b.value("surfaceId", std::string()), b.value("componentId", std::string()),
+                                            b.value("scope", std::string()), b.value("value", nlohmann::json()));
+            send(HttpResponse(res.value("ok", false) ? 200 : 400, res.value("ok", false) ? "OK" : "Bad Request", res.dump()));
+            return;
+        }
         if (method == "POST" && path == "/__openclaw__/a2ui/action") {
             nlohmann::json b;
             try { b = nlohmann::json::parse(BodyOf(req)); } catch (...) {}
             auto ua = deps_.a2ui->ResolveAction(b.value("surfaceId", std::string()), b.value("componentId", std::string()), b.value("scope", std::string()));
             if (!ua) { send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "no such button action"}}.dump())); return; }
             if (deps_.canvas) deps_.canvas->RecordEvent("a2ui.userAction", *ua, "a2ui");
-            send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"event", *ua}}.dump()));
+            nlohmann::json out{{"ok", true}, {"event", *ua}};
+            const char* dv = std::getenv("OPENCLAW_A2UI_DELIVER");
+            if (!(dv && std::string(dv) == "0") && b.value("deliver", true)) {
+                // Upstream forwards userAction to the agent session; we inject it as a canvas-channel inbound turn.
+                channels::InboundMessage im;
+                im.channel = "canvas";
+                im.sender = "a2ui";
+                im.session_key = b.value("sessionKey", std::string("a2ui:") + b.value("surfaceId", std::string("main")));
+                im.text = "[A2UI userAction] " + (*ua)["userAction"].dump();
+                auto reply = DeliverInbound(im);
+                out["sessionKey"] = im.session_key;
+                out["reply"] = reply;
+            }
+            send(HttpResponse(200, "OK", out.dump()));
             return;
         }
     }

@@ -126,10 +126,10 @@ struct Renderer {
             o = "<button" + attr + " class=\"a2-btn\" data-surface=\"" + Esc(sid) + "\">" +
                 (p.contains("child") ? Node(p["child"].get<std::string>(), scope) : "") + "</button>";
         } else if (type == "CheckBox") {
-            o = "<label" + attr + " class=\"a2-check\"><input type=\"checkbox\" disabled" + (Bool(p.value("value", J()), scope) ? " checked" : "") +
+            o = "<label" + attr + " class=\"a2-check\"><input class=\"a2-in\" data-surface=\"" + Esc(sid) + "\" type=\"checkbox\"" + (Bool(p.value("value", J()), scope) ? " checked" : "") +
                 "/> " + Esc(Str(p.value("label", J()), scope)) + "</label>";
         } else if (type == "TextField") {
-            o = "<label" + attr + " class=\"a2-field\">" + Esc(Str(p.value("label", J()), scope)) + " <input type=\"text\" readonly value=\"" +
+            o = "<label" + attr + " class=\"a2-field\">" + Esc(Str(p.value("label", J()), scope)) + " <input class=\"a2-in\" data-surface=\"" + Esc(sid) + "\" type=\"text\" value=\"" +
                 Esc(Str(p.value("text", J()), scope)) + "\"/></label>";
         } else if (type == "Tabs") {
             o = "<div" + attr + " class=\"a2-tabs\">";
@@ -268,8 +268,30 @@ std::string Host::RenderPage() const {
            "<script>document.addEventListener('click',async e=>{const b=e.target.closest('.a2-btn');if(!b)return;"
            "const r=await fetch('/__openclaw__/a2ui/action',{method:'POST',headers:{'Content-Type':'application/json'},"
            "body:JSON.stringify({surfaceId:b.dataset.surface,componentId:b.dataset.id,scope:b.dataset.scope})});b.dataset.status=r.status;});"
+           "document.addEventListener('change',async e=>{const i=e.target.closest('.a2-in');if(!i)return;const w=i.closest('[data-id]');"
+           "await fetch('/__openclaw__/a2ui/input',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({surfaceId:i.dataset.surface,"
+           "componentId:w.dataset.id,scope:w.dataset.scope,value:i.type==='checkbox'?i.checked:i.value})});});"
            "let rev=document.body.dataset.rev;setInterval(async()=>{try{const j=await (await fetch('/__openclaw__/a2ui/state')).json();"
            "if(String(j.rev)!==rev)location.reload();}catch(e){}},1500);</script></body></html>";
+}
+
+nlohmann::json Host::SetInput(const std::string& sid, const std::string& cid, const std::string& scope, const J& value) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto& ss = state_["surfaces"];
+    if (!ss.contains(sid) || !ss[sid]["components"].contains(cid)) return {{"ok", false}, {"error", "no such component"}};
+    auto& s = ss[sid];
+    const auto& w = s["components"][cid];
+    const auto type = w.begin().key();
+    const auto& p = w.begin().value();
+    std::string key = type == "TextField" ? "text" : type == "CheckBox" ? "value" : "";
+    if (key.empty()) return {{"ok", false}, {"error", "component is not an input"}};
+    if (!p.contains(key) || !p[key].is_object() || !p[key].contains("path")) return {{"ok", false}, {"error", "input has no bound path"}};
+    if (type == "TextField" && !value.is_string()) return {{"ok", false}, {"error", "TextField value must be a string"}};
+    if (type == "CheckBox" && !value.is_boolean()) return {{"ok", false}, {"error", "CheckBox value must be boolean"}};
+    const auto path = Join(scope, p[key]["path"].get<std::string>());
+    try { s["data"][Ptr(path)] = value; } catch (...) { return {{"ok", false}, {"error", "bad path"}}; }
+    Save();  // no rev bump: avoid reloading the page under the user's cursor
+    return {{"ok", true}, {"path", path}, {"value", value}};
 }
 
 std::optional<nlohmann::json> Host::ResolveAction(const std::string& sid, const std::string& cid, const std::string& scope) const {

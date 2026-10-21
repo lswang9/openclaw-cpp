@@ -1,3 +1,4 @@
+#include "openclaw/desktop/desktop.hpp"
 #include "openclaw/auth/mfa.hpp"
 #include <openssl/bn.h>
 #include <memory>
@@ -96,7 +97,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.72.0-dev";
+constexpr const char* kVersion = "1.73.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2991,6 +2992,28 @@ int CmdGateway(int argc, char** argv, int argi) {
     auth::DeviceLinkStore device_links(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "device_links.json");
     canvas::Store canvas_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "canvas");
     canvas::a2ui::Host a2ui_host(canvas_store.Dir() / "a2ui-state.json");
+    tools.Register({"desktop", "Control the local X11 desktop. action: status | windows | observe | focus {window} | close {window} | launch {app,args} (policy-gated by OPENCLAW_DESKTOP_APPS) | release {pid} | a11y_tree {app,max_nodes} | a11y_action {path, action|text}. Use a11y_tree to find element paths, then a11y_action to click or set text.",
+                    {{"type", "object"}, {"properties", {{"action", {{"type", "string"}, {"enum", {"status", "windows", "observe", "focus", "close", "launch", "release", "a11y_tree", "a11y_action"}}}},
+                                                         {"window", {{"type", "string"}}}, {"app", {{"type", "string"}}}, {"args", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                                                         {"pid", {{"type", "integer"}}}, {"path", {{"type", "array"}, {"items", {{"type", "integer"}}}}},
+                                                         {"text", {{"type", "string"}}}, {"max_nodes", {{"type", "integer"}}}}},
+                     {"required", nlohmann::json::array({"action"})}},
+                    [](const nlohmann::json& a) {
+                        auto& dc = desktop::Default();
+                        const auto act = a.value("action", std::string());
+                        if (act == "status") return dc.Status().dump();
+                        if (!dc.Available()) return nlohmann::json{{"ok", false}, {"error", "desktop unavailable (need DISPLAY + xdotool)"}}.dump();
+                        if (act == "windows") return dc.Windows().dump();
+                        if (act == "observe") return dc.Observe(a).dump();
+                        if (act == "focus") return dc.Focus(a).dump();
+                        if (act == "close") return dc.Close(a).dump();
+                        if (act == "launch") return dc.Launch(a).dump();
+                        if (act == "release") return dc.Release(a).dump();
+                        if (act == "a11y_tree") return dc.A11yTree(a).dump();
+                        if (act == "a11y_action") { auto x = a; if (a.contains("action_name")) x["action"] = a["action_name"]; else x["action"] = "click"; if (a.contains("text")) x.erase("action"); return dc.A11yAction(x).dump(); }
+                        return nlohmann::json{{"ok", false}, {"error", "unknown action"}}.dump();
+                    },
+                    true});
     {
         auto* host = &a2ui_host;
         auto* cs = &canvas_store;

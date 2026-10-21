@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.72.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.73.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -29,6 +29,11 @@
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
 
+## 1.73 Desktop agent tool; A2UI clicks into agent session + writable inputs
+- real: agent tool `desktop` (status|windows|observe|focus|close|launch|release|a11y_tree|a11y_action; requires_approval; launch still allowlist-gated) over the 1.72 controller; e2e via `tools.invoke`.
+- real: A2UI TextField/CheckBox are writable: `/__openclaw__/a2ui/input` writes into the bound data-model path (type-checked; non-inputs 400), so Button `userAction.context` resolves user-entered values. Button clicks are now delivered into the agent as a `canvas`-channel inbound turn (`[A2UI userAction] {...}`), routed by session rules (default main session); `OPENCLAW_A2UI_DELIVER=0` or `deliver:false` only records the event.
+- gaps: delivery is synchronous in the click request; no Slider/DateTimeInput/MultipleChoice.
+
 ## 1.72 Desktop control: real launch/windows/AT-SPI accessibility tree
 - real (when DISPLAY + xdotool): `desktop.launch` (fail-closed policy: `OPENCLAW_DESKTOP_APPS` basename allowlist or `OPENCLAW_DESKTOP_LAUNCH=1`; setsid, tracked pids, waits for a window), `desktop.windows|focus|close` (xdotool), `desktop.release` (SIGTERM→SIGKILL on the process group), `desktop.observe` (windows + a11y summary). `desktop.launch` and `desktop.a11y.action` are forbidden for the device role.
 - real (when python3-gi + Atspi + a11y bus): `desktop.a11y.tree` (role/name/states/bounds/actions/text, capped node count, filter by app) and `desktop.a11y.action` (do_action by name/index, EditableText set_text).
@@ -39,7 +44,7 @@
 - real: A2UI v0.8 server→client messages (`surfaceUpdate`, `dataModelUpdate`, `beginRendering`, `deleteSurface`) validated like upstream nodes-cli (one message per line, v0.9 `createSurface` rejected, line-numbered errors); RPC `canvas.a2ui.validate|push|pushJSONL|reset|state|render`; text helper builds surfaceUpdate+beginRendering. Surface state is persisted in `<canvas>/a2ui-state.json`.
 - real: gateway-hosted renderer at `/__openclaw__/a2ui/` (auth required, CSP, HTML-escaped) for the v0.8 standard-catalog subset (Text with h1–h5/caption, Image http(s)/data, Icon, Row, Column, List with explicitList or template+dataBinding, Card, Divider, Button, CheckBox, TextField, Tabs) with path data binding; reloads on revision change. Button clicks POST `/__openclaw__/a2ui/action`; the server resolves the stored action into an upstream-shaped `userAction` {name, surfaceId, sourceComponentId, timestamp, context} recorded as a `canvas.events` entry (`canvas_id=a2ui`). Agent tool `canvas` (a2ui_push|a2ui_reset|state|actions).
 - real: `scripts/e2e-a2ui.sh` (smoke).
-- gaps: not the upstream Lit renderer/WKWebView node surfaces (no node-scoped plugin-surface URLs, no `canvas.present/navigate/eval/snapshot` on nodes); inputs are read-only (no two-way TextField/CheckBox binding); Modal/Slider/DateTimeInput/Video/Audio unsupported; userAction is recorded, not auto-injected into the agent session.
+- gaps: not the upstream Lit renderer/WKWebView node surfaces (no node-scoped plugin-surface URLs, no `canvas.present/navigate/eval/snapshot` on nodes); inputs are read-only (no two-way TextField/CheckBox binding); Modal/Slider/DateTimeInput/Video/Audio unsupported; (1.73: userAction delivered into the agent session; inputs writable).
 
 ## 1.70 Gateway OIDC login (auth code + PKCE)
 - real: `/login/oidc` → discovery (`.well-known/openid-configuration`, issuer checked) → authorize redirect with state, nonce, PKCE S256; `/login/oidc/callback` checks the state cookie binding (single-use, 10 min), exchanges the code, verifies the RS256 id_token via JWKS (≥2048-bit; iss/aud/azp/exp/iat/nonce), and enforces a fail-closed allowlist (`OPENCLAW_OIDC_ALLOWED_EMAILS|SUBS|DOMAINS`; email needs email_verified). Creates an identity session (role `operator` by default or `admin` via `OPENCLAW_OIDC_ROLE`, 12 h TTL) that stops working when OIDC is unconfigured. `/login/methods` is public; the login UI shows an SSO link.

@@ -42,6 +42,7 @@ sleep 0.5
 rpc '{"method":"desktop.a11y.tree","params":{"app":"oc-a11y-app"}}' > "$T/tree2.json"
 grep -q 'count=1' "$T/tree2.json" || fail "click took effect"
 if [[ "$EPATH" != null ]]; then grep -q 'hello-a11y' "$T/tree2.json" || fail "entry text set"; fi
+rpc '{"method":"tools.invoke","params":{"tool":"desktop","args":{"action":"windows"}}}' | grep -q 'OC Test App' || fail "desktop agent tool"
 rpc '{"method":"desktop.observe"}' | grep -q '"windows"' || fail "observe"
 rpc "{\"method\":\"desktop.release\",\"params\":{\"pid\":$PID}}" | grep -q "$PID" || fail "release"
 sleep 0.3; kill -0 "$PID" 2>/dev/null && fail "process alive after release"

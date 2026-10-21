@@ -35,6 +35,9 @@ public:
     std::optional<nlohmann::json> ResolveAction(const std::string& surface_id, const std::string& component_id,
                                                 const std::string& item_path = {}) const;
     std::uint64_t Revision() const;
+    // Two-way input: write a TextField text / CheckBox value into the data model at the component's bound path.
+    nlohmann::json SetInput(const std::string& surface_id, const std::string& component_id, const std::string& scope,
+                            const nlohmann::json& value);
 
 private:
     void Save() const;
