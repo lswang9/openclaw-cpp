@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include "openclaw/channels/feishu_frame.hpp"
 #include "openclaw/acp/acpx.hpp"
 #include "openclaw/channels/discord_voice.hpp"
@@ -101,7 +102,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.86.0-dev";
+constexpr const char* kVersion = "1.87.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3353,6 +3354,72 @@ int CmdMcpMockServer() {
 
 }  // namespace
 
+// Upstream v2026.10.5 top-level CLI commands that are gateway-backed: route to RPC instead of
+// letting them fall through to a chat prompt. Usage: <cmd> [sub] [key=value ...] [--params JSON] [--json]
+namespace {
+const std::unordered_map<std::string, std::string>& UpstreamCliPrefix() {
+    static const std::unordered_map<std::string, std::string> k = {
+        {"devices", "device.pair"}, {"nodes", "node"}, {"node", "node"}, {"sessions", "sessions"}, {"logs", "logs"},
+        {"health", "health"}, {"doctor", "doctor.memory"}, {"pairing", "pairing.link"}, {"hooks", "hooks"},
+        {"webhooks", "webhooks"}, {"secrets", "secrets"}, {"security", "security"}, {"system", "system"},
+        {"users", "users"}, {"worktrees", "worktrees"}, {"sandbox", "sandbox"}, {"agents", "agents"},
+        {"agent", "agent"}, {"directory", "directory"}, {"backup", "backup"}, {"usage", "usage"},
+        {"update", "update"}, {"claws", "claws"}, {"automations", "cron"}, {"dashboard", "status"},
+        {"audit", "audit"}, {"transcripts", "sessions"}, {"message", "chat"}, {"telemetry", "diagnostics"},
+        {"qr", "pairing.link"}, {"infer", "models"}, {"capability", "tools"}, {"daemon", "gateway"},
+        {"exec-approvals", "exec.approvals"}, {"promos", "promos"}, {"proxy", "debugProxy"}, {"dns", "dns"},
+        {"worker", "workers"}, {"attach", "attach"}, {"database", "database"}, {"storage", "storage"}, {"triage", "triage"}};
+    return k;
+}
+std::size_t CurlSink(char* p, std::size_t s, std::size_t n, void* u) { static_cast<std::string*>(u)->append(p, s * n); return s * n; }
+int MaybeUpstreamGatewayCli(int argc, char** argv) {
+    const std::string cmd = argv[1];
+    auto it = UpstreamCliPrefix().find(cmd);
+    if (it == UpstreamCliPrefix().end()) return -1;
+    std::string sub; nlohmann::json params = nlohmann::json::object(); bool raw = false;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--params" && i + 1 < argc) { params = nlohmann::json::parse(argv[++i]); continue; }
+        if (a == "--json") { raw = true; continue; }
+        if (auto eq = a.find('='); eq != std::string::npos && a[0] != '-') {
+            auto v = a.substr(eq + 1); nlohmann::json jv;
+            try { jv = nlohmann::json::parse(v); } catch (...) { jv = v; }
+            params[a.substr(0, eq)] = jv; continue;
+        }
+        if (sub.empty() && a[0] != '-') { sub = a; continue; }
+        if (a[0] != '-' && !params.contains("id")) params["id"] = a;
+    }
+    const std::string& pre = it->second;
+    const bool single = pre.find('.') == std::string::npos && (pre == "health" || pre == "status" || pre == "agent");
+    std::string method = single && sub.empty() ? pre : pre + "." + (sub.empty() ? (pre == "logs" ? "tail" : "list") : sub);
+    if (cmd == "dashboard") method = "status";
+    const std::string base = openclaw::EnvOr("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:" + openclaw::EnvOr("OPENCLAW_GATEWAY_PORT", "18789"));
+    nlohmann::json req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", method}, {"params", params}};
+    const std::string body = req.dump();
+    std::string out;
+    CURL* h = curl_easy_init();
+    if (!h) return 1;
+    curl_slist* hdr = curl_slist_append(nullptr, "Content-Type: application/json");
+    std::string auth;
+    if (const char* tk = std::getenv("OPENCLAW_GATEWAY_TOKEN"); tk && *tk) { auth = std::string("Authorization: Bearer ") + tk; hdr = curl_slist_append(hdr, auth.c_str()); }
+    const std::string url = base + "/v1/rpc";
+    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdr);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, CurlSink);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, 30L);
+    auto rc = curl_easy_perform(h);
+    long code = 0; curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hdr); curl_easy_cleanup(h);
+    if (rc != CURLE_OK) { std::cerr << cmd << ": gateway not reachable at " << base << " (" << curl_easy_strerror(rc) << "); start it with `openclaw-cpp gateway`\n"; return 1; }
+    nlohmann::json j; try { j = nlohmann::json::parse(out); } catch (...) { std::cout << out << '\n'; return code == 200 ? 0 : 1; }
+    if (raw) std::cout << j.dump() << '\n';
+    else std::cout << "# " << method << '\n' << (j.contains("payload") ? j["payload"] : j.contains("result") ? j["result"] : j).dump(2) << '\n';
+    return (code == 200 && j.value("ok", !j.contains("error"))) ? 0 : 1;
+}
+}  // namespace
+
 int main(int argc, char** argv) {
     try {
         if (argc < 2) { PrintUsage(); return 1; }
@@ -3697,6 +3764,7 @@ int main(int argc, char** argv) {
             std::cerr << "unknown option: " << cmd << " (try --help)\n";
             return 2;
         }
+        if (int rc = MaybeUpstreamGatewayCli(argc, argv); rc >= 0) return rc;
         if (int rc = MaybePluginCli(argc, argv); rc >= 0) return rc;
         return CmdChat(argc, argv, 1);
     } catch (const std::exception& e) {
