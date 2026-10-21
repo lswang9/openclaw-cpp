@@ -1,3 +1,4 @@
+#include "openclaw/auth/mfa.hpp"
 #include <openssl/bn.h>
 #include <memory>
 #include <thread>
@@ -95,7 +96,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.68.0-dev";
+constexpr const char* kVersion = "1.69.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2460,6 +2461,24 @@ int CmdSelfTest() {
         else std::cerr << "PASS waweb cert decode + binary node + signal stubs\n";
     }
     {
+        namespace mf = openclaw::auth::mfa;
+        const std::string k = "12345678901234567890";
+        mf::Bytes key(k.begin(), k.end());
+        auto b32 = mf::Base32Encode(key);
+        auto back = mf::Base32Decode(b32);
+        bool ok = mf::Hotp(key, 59 / 30, 8) == "94287082" && mf::Hotp(key, 1111111109ull / 30, 8) == "07081804" &&
+                  mf::Totp(key, 59) == "287082" && b32 == "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" && back && *back == key;
+        auto tmp = (std::filesystem::temp_directory_path() / ("oc-mfa-" + std::to_string(::getpid()) + ".json")).string();
+        mf::Store st(tmp);
+        auto en = st.Enroll();
+        const std::uint64_t t0 = 1800000000;
+        auto code = st.CurrentCode(t0);
+        ok = ok && st.Enabled() && st.Verify(code, t0) && !st.Verify(code, t0) /*replay*/ && !st.Verify("000000", t0 + 300) == true;
+        ok = ok && st.Verify(en.recovery_codes[0], t0) && !st.Verify(en.recovery_codes[0], t0) && st.RecoveryRemaining() == 7;
+        st.Disable();
+        if (!ok) { std::cerr << "FAIL mfa totp\n"; ++failures; } else std::cerr << "PASS mfa TOTP RFC6238 vectors + replay + recovery codes\n";
+    }
+    {
         // WABinary v3 vs Baileys fixtures: decode → re-encode must be byte-identical.
 #include "openclaw/channels/waweb/wabinary_fixtures.inc"
         namespace ww = openclaw::channels::waweb;
@@ -3380,6 +3399,21 @@ int main(int argc, char** argv) {
         if (cmd == "cron") {
             openclaw::cron::Scheduler sch;
             std::cout << sch.ListJson().dump(2) << '\n';
+            return 0;
+        }
+        if (cmd == "auth" && argc > 2 && std::string(argv[2]) == "mfa") {
+            namespace mf = openclaw::auth::mfa;
+            mf::Store st;
+            const std::string sub = argc > 3 ? argv[3] : "status";
+            if (sub == "enroll") {
+                auto r = st.Enroll(argc > 4 ? argv[4] : "openclaw");
+                std::cout << nlohmann::json{{"secret", r.secret_b32}, {"otpauth", r.otpauth_uri}, {"recoveryCodes", r.recovery_codes}, {"path", mf::DefaultPath()}}.dump(2) << "\n";
+                return 0;
+            }
+            if (sub == "disable") { std::cout << nlohmann::json{{"ok", st.Disable()}}.dump() << "\n"; return 0; }
+            if (sub == "code") { auto c = st.CurrentCode(); if (c.empty()) { std::cerr << "mfa not enrolled\n"; return 1; } std::cout << c << "\n"; return 0; }
+            if (sub == "verify" && argc > 4) { std::string how; bool ok = st.Verify(argv[4], 0, &how); std::cout << nlohmann::json{{"ok", ok}, {"via", how}}.dump() << "\n"; return ok ? 0 : 1; }
+            std::cout << nlohmann::json{{"enabled", st.Enabled()}, {"source", st.FromEnv() ? "env" : "file"}, {"recoveryRemaining", st.RecoveryRemaining()}, {"path", mf::DefaultPath()}}.dump() << "\n";
             return 0;
         }
         if (cmd == "cron-daemon") return CmdCronDaemon();

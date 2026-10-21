@@ -1,3 +1,4 @@
+#include "openclaw/auth/mfa.hpp"
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/util.hpp"
 #include "openclaw/net/safe_fetch.hpp"
@@ -46,7 +47,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.68.0-dev";
+constexpr const char* kVersion = "1.69.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1508,9 +1509,22 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             send(HttpResponse(401, "Unauthorized", nlohmann::json{{"ok", false}, {"error", "invalid token"}}.dump()));
             return;
         }
+        std::string mfa_how;
+        if (auth::mfa::Store st; st.Enabled()) {
+            std::string otp;
+            try { otp = nlohmann::json::parse(BodyOf(req)).value("otp", std::string()); } catch (...) {}
+            if (otp.empty()) {
+                send(HttpResponse(401, "Unauthorized", nlohmann::json{{"ok", false}, {"error", "mfa required"}, {"mfa_required", true}}.dump()));
+                return;
+            }
+            if (!st.Verify(otp, 0, &mfa_how)) {
+                send(HttpResponse(401, "Unauthorized", nlohmann::json{{"ok", false}, {"error", "invalid otp"}, {"mfa_required", true}}.dump()));
+                return;
+            }
+        }
         const bool is_gw = !deps_.auth.gateway_token.empty() && tok == deps_.auth.gateway_token;
         auto [sid, csrf] = deps_.device_links->CreateSession(auth::DeviceLinkStore::Sha256Hex(tok), is_gw);
-        send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"role", role}, {"csrf", csrf}}.dump(),
+        send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"role", role}, {"csrf", csrf}, {"mfa", mfa_how.empty() ? nlohmann::json(nullptr) : nlohmann::json(mfa_how)}}.dump(),
                           "application/json",
                           "Set-Cookie: oc_session=" + sid + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000\r\n"
                           "Set-Cookie: oc_csrf=" + csrf + "; Path=/; SameSite=Strict; Max-Age=2592000\r\n"

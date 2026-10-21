@@ -278,6 +278,7 @@ printf -- '---\nname: echoer\ndescription: dispatch test\ncommand-dispatch: tool
 OUT=$(OPENCLAW_SKILLS_DIR="$SK" OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat "/echoer hi")
 echo "$OUT" | grep -q echoed && ! echo "$OUT" | grep -q mock-default || { echo "[smoke] command-dispatch failed: $OUT" >&2; exit 1; }
 rm -rf "$SK"; echo "[smoke] skill command-dispatch: tool (no model turn) ok"
+OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-mfa.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-memory-flush.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-embeddings.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-ts-plugin.sh"
