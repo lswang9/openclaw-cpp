@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.57.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.58.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -70,6 +70,7 @@ set(OPENCLAW_SOURCES
   src/skills/loader.cpp
   src/plugins/registry.cpp
   src/plugins/install.cpp
+  src/clawhub/client.cpp
   src/plugins/js_host.cpp
   src/plugins/js_extensions.cpp
   src/mcp/client.cpp

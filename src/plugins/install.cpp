@@ -1,4 +1,5 @@
 #include "openclaw/plugins/install.hpp"
+#include "openclaw/clawhub/client.hpp"
 
 #include "openclaw/config/config.hpp"
 #include "openclaw/tools/runenv.hpp"
@@ -76,6 +77,22 @@ fs::path ExtensionsDir() {
 nlohmann::json Install(const std::string& spec, const InstallOptions& opts) {
     if (spec.empty()) return Fail("missing spec");
     std::error_code ec;
+    if (spec.rfind("clawhub:", 0) == 0) {
+        const auto ctmp = TempDir();
+        struct C { fs::path p; ~C() { std::error_code e; fs::remove_all(p, e); } } cc{ctmp};
+        auto f = clawhub::FetchPackage(spec, ctmp);
+        if (!f.value("ok", false)) return f;
+        auto r = Install(f["path"].get<std::string>(), opts);
+        if (!r.value("ok", false)) return r;
+        auto rec = r["record"];
+        rec["source"] = "clawhub";
+        rec["spec"] = spec;
+        rec["clawhub"] = {{"registry", clawhub::RegistryBase()}, {"package", f["name"]}, {"version", f["version"]}, {"artifact", f["artifact"]}};
+        SaveInstallRecord(r["id"].get<std::string>(), rec);
+        r["record"] = rec;
+        r["source"] = "clawhub";
+        return r;
+    }
     const auto tmp = TempDir();
     struct Cleanup { fs::path p; ~Cleanup() { std::error_code e; fs::remove_all(p, e); } } cleanup{tmp};
     std::string source;

@@ -65,6 +65,7 @@
 #include "openclaw/tokenizer/bpe.hpp"
 #include "openclaw/tools/runenv.hpp"
 #include "openclaw/tools/exec.hpp"
+#include "openclaw/clawhub/client.hpp"
 #include "openclaw/workspace/embeddings.hpp"
 #include "openclaw/workspace/workspace.hpp"
 #include "openclaw/mcp/stdio.hpp"
@@ -87,7 +88,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.57.0-dev";
+constexpr const char* kVersion = "1.58.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2361,6 +2362,14 @@ int MaybePluginCli(int argc, char** argv) {
 int CmdPlugins(int argc, char** argv) {
     using namespace ::openclaw;
     const std::string sub = argc > 2 ? argv[2] : "list";
+    if (sub == "search") {
+        std::string q;
+        for (int i = 3; i < argc; ++i) q += (q.empty() ? "" : " ") + std::string(argv[i]);
+        std::string err;
+        auto r = clawhub::Get(clawhub::RegistryBase() + "/api/v1/plugins/search?q=" + clawhub::UrlEncode(q));
+        std::cout << (r.error.empty() ? r.body : nlohmann::json{{"ok", false}, {"error", r.error}}.dump(2)) << "\n";
+        return r.status == 200 ? 0 : 1;
+    }
     if (sub == "install" || sub == "uninstall" || sub == "update" || sub == "installs") {
         nlohmann::json r;
         if (sub == "installs") r = plugins::ListInstalls();
@@ -2903,9 +2912,26 @@ int main(int argc, char** argv) {
             }.dump(2) << '\n';
             return 0;
         }
-        if (cmd == "skills") {
-            auto lib = LoadSkills();
+        if (cmd == "skills" || cmd == "clawhub") {
             std::string sub = argc > 2 ? argv[2] : "list";
+            {
+                namespace ch = openclaw::clawhub;
+                std::string a3 = argc > 3 ? argv[3] : "", ver;
+                bool force = false, all = false;
+                for (int i = 4; i < argc; ++i) { std::string a = argv[i]; if (a == "--force") force = true; else if (a == "--all") all = true; else if (a == "--version" && i + 1 < argc) ver = argv[++i]; }
+                if (a3 == "--all") all = true;
+                nlohmann::json r; bool handled = true;
+                if (sub == "search") r = ch::Search(JoinArgs(argc, argv, 3));
+                else if (sub == "install" && !a3.empty()) r = ch::InstallSkill(a3, ver, ch::DefaultWorkdir(), force);
+                else if (sub == "update") r = ch::UpdateSkills(ch::DefaultWorkdir(), all ? "" : a3);
+                else if (sub == "uninstall" && !a3.empty()) r = ch::UninstallSkill(a3, ch::DefaultWorkdir());
+                else if (sub == "sync") r = ch::SyncSkills(ch::DefaultWorkdir());
+                else if (sub == "installed" || (cmd == "clawhub" && sub == "list")) r = ch::ListSkills(ch::DefaultWorkdir());
+                else if (sub == "inspect" && !a3.empty()) r = ch::SkillInfo(a3);
+                else handled = false;
+                if (handled) { std::cout << r.dump(2) << "\n"; return r.value("ok", false) ? 0 : 1; }
+            }
+            auto lib = LoadSkills();
             if (sub == "list" || sub == "status") { std::cout << lib.StatusJson().dump(2) << '\n'; return 0; }
             if (sub == "check") {
                 int el = 0; nlohmann::json miss = nlohmann::json::array();
@@ -2921,7 +2947,7 @@ int main(int argc, char** argv) {
                                             {"missing", s->missing}, {"metadata", s->metadata}}.dump(2) << '\n';
                 return 0;
             }
-            std::cerr << "usage: skills [list|check|info <name>]\n"; return 2;
+            std::cerr << "usage: skills [list|check|info <name>|search <q>|install <slug> [--version v] [--force]|update [<slug>|--all]|uninstall <slug>|sync|installed|inspect <slug>]\n"; return 2;
         }
         if (cmd == "tokenizer") {
             namespace tk = openclaw::tokenizer;

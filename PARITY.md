@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.57.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.58.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,11 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.58 ClawHub client (skills + plugins)
+- real (fake-server tested): ClawHub `/api/v1` client — `CLAWHUB_REGISTRY` (legacy `CLAWDHUB_REGISTRY`), optional `CLAWHUB_TOKEN` Bearer, 429 `Retry-After`/`RateLimit-Reset` retry. `openclaw skills search|install <@owner/slug> [--version] [--force]|update [<slug>|--all]|uninstall|sync|installed|inspect` (also `openclaw clawhub …`). Skills land in `<workdir>/skills/<slug>` (`CLAWHUB_WORKDIR` or workspace), versions in `.clawhub/lock.json`, per-skill `.clawhub/origin.json`; moderation `isMalwareBlocked` refused; zip symlinks refused; update refuses to clobber locally modified installs.
+- real: `plugins install clawhub:<pkg>[@ver]` — package resolve → version `/security` (`trust.blockedFromDownload` refused) → `/artifact` → `/artifact/download`; npm-pack `.tgz` verified against `artifactSha256`/`X-ClawHub-Artifact-Sha256`; legacy ZIP (`package/` root) extracted. Install record `source: clawhub` + artifact metadata; `plugins update` re-resolves latest. `plugins search <q>` (`/api/v1/plugins/search`).
+- real-sim / gaps: `sync` uses our fingerprint (sha256 of sorted `path:sha256` lines) against `/api/v1/resolve` — upstream's exact bundle-fingerprint algorithm is not verified, so real-registry matches may differ; no publish/login/whoami/delete (registry-auth workflows belong to the separate `clawhub` CLI upstream); GitHub source-handoff skills not supported; `pluginApi`/`minGatewayVersion` compat checks not enforced; no install telemetry. Not run against live clawhub.ai. Tests: `scripts/e2e-clawhub.sh` + `scripts/fake_clawhub.py` (smoke).
 
 ## 1.57 exec mode=auto reviewer + PTY/send-keys
 - real (mock-tested): `tools.exec.mode: "auto"` = allowlist + on-miss, but a miss first goes to a model reviewer through the provider interface (`ReviewWithProvider`, gateway router/default provider, no tools). Strict JSON verdict `allow|deny|escalate`; `allow` with `risk=high` (or inline-eval without `risk=low`) → escalate; malformed/failed reply → escalate (or deny with `autoReview.onError: "deny"`); escalate → normal human approval/askFallback. Event `exec.autoreview`. Operand SHA revalidation still applies.

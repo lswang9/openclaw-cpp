@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.57.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.58.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.58.0-dev
+- ClawHub 客户端：技能搜索/安装/更新/卸载/同步（lock.json），`plugins install clawhub:<pkg>`（sha256 校验、拦截被封禁/被篡改的发布）；用本地假 registry 测试，未连真实 clawhub.ai。
 
 ### 1.57.0-dev
 - exec `mode=auto`：allowlist 未命中时先交给模型审查（经 provider 接口，mock 测试），允许/拒绝/升级到人工；高风险自动升级。
