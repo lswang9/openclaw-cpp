@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.81.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.82.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.82.0-dev
+- 飞书长连接：实现 pbbp2 二进制帧（ping/pong、ClientConfig、分片重组、ACK），端点发现按 SDK 方式；长连接收到的消息会通过 im/v1/messages 回复。
 
 ### 1.81.0-dev
 - ACP acpx：openclaw-cpp 作为 ACP 客户端驱动外部智能体（codex/claude/gemini 预设或配置命令），处理权限请求、限定在 cwd 内的 fs 读写；音频块直通或本地转写；内置 ACP agent 支持音频与规范字段（v1、agent_message_chunk、stopReason）。RPC `acp.agents.run`、工具 `acp_agent`、CLI `acp run`。

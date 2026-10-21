@@ -1,3 +1,4 @@
+#include "openclaw/channels/feishu_frame.hpp"
 #include "openclaw/acp/acpx.hpp"
 #include "openclaw/channels/discord_voice.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
@@ -100,7 +101,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.81.0-dev";
+constexpr const char* kVersion = "1.82.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2509,6 +2510,17 @@ int CmdSelfTest() {
         if (bad || !rt || rt->attrs[0].second != "15551234567@s.whatsapp.net" || rt->children.size() != 1 || rt->children[0].content != ww::FromString("hi")) {
             std::cerr << "FAIL waweb binary v3 baileys fixtures\n"; ++failures;
         } else std::cerr << "PASS waweb binary token dictionary v3 (Baileys fixtures byte-identical)\n";
+    }
+    {
+        namespace ff = openclaw::channels::feishu_frame;
+        ff::Frame f; f.seq_id = 300; f.log_id = 1ull << 40; f.service = 33; f.method = ff::kData;
+        f.headers = {{"type", "event"}, {"message_id", "m"}, {"sum", "2"}, {"seq", "1"}}; f.payload = std::string(200, 'x');
+        auto d = ff::Decode(ff::Encode(f));
+        bool ok = d && d->seq_id == 300 && d->log_id == (1ull << 40) && d->service == 33 && d->Header("message_id") == "m" && d->payload == f.payload;
+        ff::Reassembler ra; auto g = f; g.SetHeader("seq", "0"); g.payload = "AB";
+        ok = ok && !ra.Add(f) && ra.Add(g) == std::optional<std::string>("AB" + f.payload);
+        ok = ok && !ff::Decode(std::string("\x0a\xff", 2));  // truncated length-delimited field
+        if (!ok) { std::cerr << "FAIL feishu pbbp2 frame codec\n"; ++failures; } else std::cerr << "PASS feishu pbbp2 frame codec + reassembly\n";
     }
     {
         namespace dv = openclaw::channels::discord_voice;

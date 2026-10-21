@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.81.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.82.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +28,7 @@ set(OPENCLAW_SOURCES
   src/desktop/desktop.cpp
   src/acp/wire.cpp
   src/acp/acpx.cpp
+  src/channels/feishu_frame.cpp
   src/sim/backend.cpp
   src/sim/capture.cpp
   src/sim/input.cpp

@@ -13,7 +13,7 @@ namespace openclaw::channels {
 
 // Feishu/Lark long-connection (WebSocket) event inbound.
 // Offline: FeedPayload / RunMockFrames. Live: app_id/secret → tenant token → WS
-// (FEISHU_WS_URL or discovered endpoint). Proprietary SDK binary frames = gap.
+// (FEISHU_WS_URL or /callback/ws/endpoint). Binary pbbp2 frames (ping/pong, event, multi-part, ack) since 1.82.
 class FeishuLongConn {
 public:
     FeishuLongConn();
@@ -39,6 +39,9 @@ private:
     bool FetchTenantToken(std::string& out_token, std::string& err);
     bool ResolveWsUrl(const std::string& tenant_token, std::string& out_url, std::string& err);
     void LiveLoop(DeliverFn deliver);
+    nlohmann::json SendReply(const std::string& tenant_token, const std::string& chat_id, const std::string& text);
+    int ping_interval_s_ = 120;
+    std::uint64_t pings_ = 0, binary_events_ = 0, replies_sent_ = 0;
 
     mutable std::mutex mu_;
     std::atomic<bool> running_{false};
