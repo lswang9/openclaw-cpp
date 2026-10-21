@@ -66,6 +66,7 @@
 #include "openclaw/tools/runenv.hpp"
 #include "openclaw/tools/exec.hpp"
 #include "openclaw/clawhub/client.hpp"
+#include "openclaw/net/safe_fetch.hpp"
 #include "openclaw/channels/waweb/noise.hpp"
 #include "openclaw/workspace/embeddings.hpp"
 #include "openclaw/workspace/workspace.hpp"
@@ -89,7 +90,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.61.0-dev";
+constexpr const char* kVersion = "1.62.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2384,6 +2385,17 @@ int CmdSelfTest() {
         ok = ok && std::count(qr.begin(), qr.end(), ',') == 3 && qr.rfind("2@abc,", 0) == 0;
         if (!ok) { std::cerr << "FAIL whatsapp-web noise/media stage=" << stage << " decm=" << bool(decm) << " wrong=" << bool(wrong) << " sz=" << encm.size() << "\n"; ++failures; }
         else std::cerr << "PASS whatsapp-web Noise_XX handshake+transport, media crypto, QR payload\n";
+    }
+
+    {  // 1.62: SSRF guard
+        bool ok = net::IsPrivateAddress("127.0.0.1") && net::IsPrivateAddress("10.1.2.3") && net::IsPrivateAddress("169.254.169.254") &&
+                  net::IsPrivateAddress("::1") && net::IsPrivateAddress("fd00::1") && net::IsPrivateAddress("::ffff:192.168.1.1") &&
+                  net::IsPrivateAddress("100.64.0.1") && !net::IsPrivateAddress("8.8.8.8") && !net::IsPrivateAddress("2606:4700::1111");
+        auto r = net::SafeFetch("http://localhost:9/x", 100, false);
+        auto r2 = net::SafeFetch("file:///etc/passwd", 100, true);
+        ok = ok && !r.ok && r.error.find("blocked") != std::string::npos && !r2.ok;
+        if (!ok) { std::cerr << "FAIL ssrf guard " << r.error << "\n"; ++failures; }
+        else std::cerr << "PASS SSRF guard (private ranges, resolve+pin, scheme)\n";
     }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }

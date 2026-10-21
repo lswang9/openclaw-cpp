@@ -201,6 +201,7 @@ nlohmann::json JsHost::Request(const std::string& method, const nlohmann::json& 
         return MockHandle(method, params);
     }
     const int id = next_id_++;
+    inflight_ = method;
     nlohmann::json req{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}};
     try {
         proc_->WriteLine(req.dump());
@@ -208,6 +209,21 @@ nlohmann::json JsHost::Request(const std::string& method, const nlohmann::json& 
         for (int guard = 0; guard < 1000; ++guard) {  // skip any stray/non-matching lines
             const auto line = proc_->ReadLine();
             try { resp = nlohmann::json::parse(line); } catch (...) { continue; }
+            if (resp.contains("hostCall")) {  // reverse call from a plugin (api.runtime.*)
+                const long long hid = resp["hostCall"].get<long long>();
+                nlohmann::json out;
+                std::string err;
+                try {
+                    if (!host_call) err = "host calls not supported";
+                    else out = host_call(hid, resp.value("method", ""), resp.value("params", nlohmann::json::object()));
+                } catch (const std::exception& e) { err = e.what(); }
+                if (out.is_object() && out.value("__deferred", false)) { guard = 0; continue; }
+                nlohmann::json reply{{"hostReply", hid}};
+                if (!err.empty()) reply["error"] = err; else reply["result"] = out;
+                proc_->WriteLine(reply.dump());
+                guard = 0;
+                continue;
+            }
             if (resp.contains("id") && resp["id"] == id) break;
         }
         if (resp.contains("error")) return {{"error", resp["error"]}};
@@ -216,6 +232,14 @@ nlohmann::json JsHost::Request(const std::string& method, const nlohmann::json& 
         last_error_ = e.what();
         return {{"error", {{"message", e.what()}}}};
     }
+}
+
+void JsHost::SendHostReply(long long id, const nlohmann::json& result, const std::string& error) {
+    std::lock_guard lock(mu_);
+    if (mock_ || !proc_) return;
+    nlohmann::json reply{{"hostReply", id}};
+    if (!error.empty()) reply["error"] = error; else reply["result"] = result;
+    try { proc_->WriteLine(reply.dump()); } catch (...) {}
 }
 
 nlohmann::json JsHost::Initialize() {

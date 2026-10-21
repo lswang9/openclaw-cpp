@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.61.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.62.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,14 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.62 Plugin runtime: reply dispatcher, media fetch/store, TTS/STT, writeConfigFile
+- real: plugin → host **reverse calls** over the existing stdio JSON-RPC (`{"hostCall"}` / `{"hostReply"}`; replies bypass the host's request chain). They are served while any host request is in flight, including the 200 ms event pump; agent turns are deferred to a gateway thread so the plugin host lock is never held across them.
+- real: `runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({ctx, dispatcherOptions:{deliver, onReplyStart, onIdle, onError, blockLimit}})` runs an agent turn for the inbound ctx and delivers paragraph-aware blocks (`block`… then `final`). It is refused, with a clear error, when called inside a synchronous plugin call (tool/command), where it would deadlock.
+- real: `runtime.media.fetchRemoteMedia({url, maxBytes})` uses a new SSRF guard (`net::SafeFetch`: resolve + pin via CURLOPT_RESOLVE, blocks loopback/RFC1918/link-local/CGNAT/ULA/multicast/v4-mapped, manual redirects re-checked, byte cap). Private hosts need `plugins.entries.<id>.allowPrivateNetwork`. `runtime.media.saveMediaBuffer(buf, type, dir, maxBytes, name)` writes to the gateway media store. The `http_get` tool now uses the same guard; its old substring check is gone.
+- real: `runtime.tts.textToSpeech` goes through the gateway TTS engine (`OPENCLAW_TTS_URL`). New STT interface `voice::SttEngine` with an OpenAI-compatible multipart backend (`OPENCLAW_STT_URL`, `OPENCLAW_STT_MODEL`, `OPENCLAW_STT_API_KEY`), exposed as `runtime.stt.transcribeAudioFile({filePath|buffer, mime, language})`.
+- real: `runtime.config.writeConfigFile(cfg)` is schema-validated (invalid config rejected), written atomically with `.bak`, and picked up by hot reload.
+- gaps: blocks are buffered after the full reply (no token streaming or typing keep-alive); TTS/STT have only the generic HTTP backends (no OpenAI/ElevenLabs/Deepgram presets, no telephony format); writeConfigFile writes plain JSON (comments and `$include` structure are not preserved); no `mutateConfigFile`. Tests: `scripts/e2e-plugin-runtime.sh` (smoke) and self-test (SSRF).
 
 ## 1.61 WhatsApp Web (Baileys-equivalent): assessment + first primitives
 - assessment: `docs/whatsapp-web-gap.md` (layer-by-layer gap, ordered plan, what needs the user).

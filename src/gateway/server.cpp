@@ -1,4 +1,7 @@
 #include "openclaw/gateway/server.hpp"
+#include "openclaw/net/safe_fetch.hpp"
+#include <openssl/evp.h>
+#include "openclaw/voice/stt.hpp"
 #include "openclaw/context/compaction.hpp"
 #include "openclaw/gateway/methods.hpp"
 #include "openclaw/gateway/extra.hpp"
@@ -42,7 +45,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.52.0-dev";
+constexpr const char* kVersion = "1.62.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -413,6 +416,100 @@ nlohmann::json Server::DrainPluginEvents() {
     return done;
 }
 
+namespace {
+std::string B64(const std::string& in) {
+    std::string o(4 * ((in.size() + 2) / 3) + 1, '\0');
+    int n = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(o.data()), reinterpret_cast<const unsigned char*>(in.data()),
+                            static_cast<int>(in.size()));
+    o.resize(n);
+    return o;
+}
+}  // namespace
+
+nlohmann::json Server::PluginHostCall(long long id, const std::string& method, const nlohmann::json& p) {
+    const std::string plugin = p.value("plugin", "");
+    auto entry = config::GetPath(deps_.config.raw, "plugins.entries." + plugin);
+    const bool allow_private = entry && entry->is_object() && entry->value("allowPrivateNetwork", false);
+    if (method == "media.fetch") {
+        std::size_t max = std::min<std::size_t>(p.value("maxBytes", std::size_t{20} << 20), std::size_t{64} << 20);
+        auto r = net::SafeFetch(p.value("url", ""), max, allow_private);
+        if (!r.ok) throw std::runtime_error("fetchRemoteMedia: " + r.error);
+        if (r.truncated) throw std::runtime_error("fetchRemoteMedia: response exceeds maxBytes");
+        std::string name = r.final_url.substr(r.final_url.find_last_of('/') + 1);
+        if (auto q = name.find('?'); q != std::string::npos) name.resize(q);
+        return {{"base64", B64(r.body)}, {"contentType", r.content_type}, {"fileName", name.empty() ? "download" : name},
+                {"finalUrl", r.final_url}, {"bytes", r.body.size()}};
+    }
+    if (method == "media.save") {
+        std::string data = media::Store::DecodeBase64(p.value("base64", ""));
+        std::string ct = p.value("contentType", std::string("application/octet-stream"));
+        std::string fn = p.value("fileName", std::string("plugin-media"));
+        if (fn.empty() || fn.find('/') != std::string::npos || fn.find("..") != std::string::npos) fn = "plugin-media";
+        std::lock_guard l(host_call_mu_);
+        auto a = deps_.media.Put(fn, ct, data);
+        Emit("media.saved", {{"id", a.id}, {"plugin", plugin}, {"bytes", a.bytes}});
+        return {{"id", a.id}, {"path", a.path.string()}, {"contentType", a.content_type}, {"bytes", a.bytes}};
+    }
+    if (method == "tts.synthesize") {
+        if (!deps_.tts) throw std::runtime_error("tts engine unavailable");
+        std::lock_guard l(host_call_mu_);
+        return deps_.tts->Speak(p.value("text", ""), p.value("voice", std::string()));
+    }
+    if (method == "stt.transcribe") {
+        auto r = voice::DefaultStt().Transcribe(media::Store::DecodeBase64(p.value("base64", "")), p.value("mime", std::string()),
+                                                p.value("fileName", std::string()), p.value("language", std::string()));
+        if (!r.value("ok", false)) throw std::runtime_error(r.value("error", std::string("transcription failed")));
+        return r;
+    }
+    if (method == "config.write") {
+        const auto cfg = p.value("config", nlohmann::json());
+        if (!cfg.is_object()) throw std::runtime_error("writeConfigFile: config must be an object");
+        auto rep = config::ValidateSchema(cfg);
+        if (!rep.errors.empty()) throw std::runtime_error("writeConfigFile rejected: " + rep.errors.front());
+        std::lock_guard l(host_call_mu_);
+        config::SaveRaw(config::DefaultPath(), cfg);
+        Emit("config.written", {{"plugin", plugin}});
+        return {{"ok", true}, {"path", config::DefaultPath().string()}, {"warnings", rep.warnings}};
+    }
+    if (method == "agent.reply") {
+        if (deps_.js_host && deps_.js_host->InflightMethod() != "drain_events")
+            throw std::runtime_error("dispatchReply* must be called from a channel gateway/background task, not inside a synchronous "
+                                     "plugin call (" + deps_.js_host->InflightMethod() + ")");
+        channels::InboundMessage m;
+        m.channel = p.value("channel", std::string("plugin"));
+        m.sender = p.value("from", std::string("unknown"));
+        m.text = p.value("text", "");
+        m.chat_type = p.value("chatType", std::string("direct"));
+        m.conversation_id = p.value("conversationId", "");
+        m.account_id = p.value("accountId", "") == "default" ? "" : p.value("accountId", "");
+        m.peer_id = m.sender;
+        m.session_key = p.value("sessionKey", m.channel + "-" + (m.conversation_id.empty() ? m.sender : m.conversation_id));
+        m.explicit_key = p.contains("sessionKey");
+        const std::size_t limit = std::clamp<std::size_t>(p.value("blockLimit", std::size_t{2000}), 16, 100000);
+        std::lock_guard l(host_threads_mu_);
+        host_threads_.emplace_back([this, id, m, limit] {
+            std::string reply;
+            std::string err;
+            try { reply = DeliverInbound(m); } catch (const std::exception& e) { err = e.what(); }
+            nlohmann::json blocks = nlohmann::json::array();
+            // paragraph-aware block chunking
+            std::size_t i = 0;
+            while (i < reply.size()) {
+                std::size_t n = std::min(limit, reply.size() - i);
+                if (i + n < reply.size()) {
+                    auto cut = reply.rfind("\n\n", i + n);
+                    if (cut != std::string::npos && cut > i) n = cut - i + 2;
+                }
+                blocks.push_back(reply.substr(i, n));
+                i += n;
+            }
+            if (deps_.js_host) deps_.js_host->SendHostReply(id, {{"text", reply}, {"blocks", blocks}}, err);
+        });
+        return {{"__deferred", true}};
+    }
+    throw std::runtime_error("unknown host call: " + method);
+}
+
 void Server::PluginEventPump() {
     while (!pump_stop_.load()) {
         try { (void)DrainPluginEvents(); } catch (const std::exception& e) { deps_.logs.Append("warn", std::string("plugin pump: ") + e.what()); }
@@ -422,6 +519,8 @@ void Server::PluginEventPump() {
 
 void Server::Run() {
     for (auto* a : deps_.adapters.List()) a->SetConfig(deps_.config.raw);
+    if (deps_.js_host)  // before channel gateways start: their startAccount may call api.runtime host calls
+        deps_.js_host->host_call = [this](long long id, const std::string& m, const nlohmann::json& p) { return PluginHostCall(id, m, p); };
     RefreshPluginExtensions();
     RefreshDiscordCommands();
     std::size_t nworkers = 8;
@@ -430,7 +529,9 @@ void Server::Run() {
     }
     StartWorkers(nworkers);
     pump_stop_ = false;
-    if (deps_.js_host) plugin_pump_ = std::thread([this] { PluginEventPump(); });
+    if (deps_.js_host) {
+        plugin_pump_ = std::thread([this] { PluginEventPump(); });
+    }
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
     int yes = 1;
@@ -469,6 +570,12 @@ void Server::Run() {
     StopWorkers();
     pump_stop_ = true;
     if (plugin_pump_.joinable()) plugin_pump_.join();
+    {
+        std::vector<std::thread> ts;
+        { std::lock_guard l(host_threads_mu_); ts.swap(host_threads_); }
+        for (auto& t : ts) if (t.joinable()) t.join();
+    }
+    if (deps_.js_host) deps_.js_host->host_call = nullptr;
     if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
     running_.store(false);
 }

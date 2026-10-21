@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.61.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.62.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.62.0-dev
+- 插件运行时补齐：回复分块派发、媒体抓取（SSRF 防护）/保存、TTS/STT 接口、writeConfigFile（校验 + 热重载）；`http_get` 改用同一 SSRF 防护。
 
 ### 1.61.0-dev
 - WhatsApp Web（Baileys 等价）：差距评估 `docs/whatsapp-web-gap.md`，以及第一批原语：Noise_XX 握手、帧封装、媒体加解密、二维码内容，均为离线自测；真实登录与 Signal 协议仍缺失。

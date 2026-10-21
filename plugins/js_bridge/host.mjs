@@ -139,6 +139,17 @@ function parseCliArgs(cmd, argv) {
 
 // api.runtime.* subset. Host side effects are queued and drained by the gateway (drain_events RPC):
 //   system.enqueueSystemEvent, channel.sendMessage (outbound), agent.dispatchInbound (agent turn).
+// Plugin → host reverse calls: {"hostCall":id,method,params} on stdout; host answers {"hostReply":id,result|error}.
+const pendingHost = new Map();
+let hostSeq = 0;
+function hostCall(rec, method, params) {
+  return new Promise((resolve, reject) => {
+    const id = ++hostSeq;
+    pendingHost.set(id, { resolve, reject });
+    process.stdout.write(JSON.stringify({ hostCall: id, method, params: { ...(params || {}), plugin: rec.id } }) + '\n');
+  });
+}
+
 function makeRuntime(rec) {
   const stateDir = () => process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), '.openclaw');
   const push = (e) => { events.push({ plugin: rec.id, at: Date.now(), ...e }); return { queued: true }; };
@@ -148,16 +159,59 @@ function makeRuntime(rec) {
   };
   return {
     version: '2026.10.5-cpp', host: 'openclaw-cpp',
-    config: { loadConfig: () => hostConfig, current: () => hostConfig },
+    config: {
+      loadConfig: () => hostConfig, current: () => hostConfig,
+      writeConfigFile: (cfg) => hostCall(rec, 'config.write', { config: cfg }),
+    },
     state: { resolveStateDir: stateDir, resolvePluginStateDir: () => { const d = path.join(stateDir(), 'plugins', rec.id); fs.mkdirSync(d, { recursive: true }); return d; } },
     logging: { getChildLogger: (opts) => child((opts && opts.name) || 'child'), shouldLogVerbose: () => !!process.env.OPENCLAW_VERBOSE },
     system: { enqueueSystemEvent: (text, opts) => push({ type: 'system', text: String(text), sessionKey: opts && opts.sessionKey }) },
     channel: {
       sendMessage: ({ channel, to, text, accountId }) => push({ type: 'outbound', channel, to, text: String(text ?? ''), accountId }),
+      reply: {
+        // Buffered block dispatcher: run the agent for an inbound message, then deliver the reply as blocks.
+        dispatchReplyWithBufferedBlockDispatcher: async ({ ctx = {}, dispatcherOptions = {} } = {}) => {
+          const d = dispatcherOptions;
+          try {
+            if (typeof d.onReplyStart === 'function') await d.onReplyStart();
+            const r = await hostCall(rec, 'agent.reply', {
+              channel: ctx.channel || ctx.Provider, from: ctx.from || ctx.From || ctx.SenderId, text: ctx.text ?? ctx.Body ?? '',
+              conversationId: ctx.conversationId || ctx.To, sessionKey: ctx.sessionKey || ctx.SessionKey, accountId: ctx.accountId || ctx.AccountId,
+              chatType: ctx.chatType || ctx.ChatType, blockLimit: d.blockLimit || 2000 });
+            const blocks = r.blocks || [];
+            for (let i = 0; i < blocks.length; i++)
+              await d.deliver({ text: blocks[i] }, { kind: i === blocks.length - 1 ? 'final' : 'block' });
+            if (typeof d.onIdle === 'function') await d.onIdle();
+            return { queuedFinal: blocks.length > 0, counts: { block: Math.max(0, blocks.length - 1), final: blocks.length ? 1 : 0 } };
+          } catch (e) {
+            if (typeof d.onError === 'function') { await d.onError(e, { kind: 'final' }); return { queuedFinal: false, counts: { block: 0, final: 0 } }; }
+            throw e;
+          }
+        },
+      },
       text: { chunkText: (t, limit = 2000) => { const out = []; for (let i = 0; i < t.length; i += limit) out.push(t.slice(i, i + limit)); return out; } },
     },
     agent: { dispatchInbound: (m) => push({ type: 'inbound', ...m }) },
-    media: { detectMime: (name) => ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', pdf: 'application/pdf', txt: 'text/plain' })[String(name).split('.').pop().toLowerCase()] || 'application/octet-stream' },
+    tts: {
+      textToSpeech: ({ text, voice } = {}) => hostCall(rec, 'tts.synthesize', { text: String(text ?? ''), voice }),
+    },
+    stt: {
+      transcribeAudioFile: async ({ filePath, buffer, mime, language } = {}) => {
+        const buf = buffer ? Buffer.from(buffer) : fs.readFileSync(filePath);
+        return hostCall(rec, 'stt.transcribe', { base64: buf.toString('base64'), mime, fileName: filePath ? path.basename(filePath) : undefined, language });
+      },
+    },
+    media: {
+      fetchRemoteMedia: async ({ url, maxBytes } = {}) => {
+        const r = await hostCall(rec, 'media.fetch', { url, maxBytes });
+        return { buffer: Buffer.from(r.base64 || '', 'base64'), contentType: r.contentType, fileName: r.fileName, url: r.finalUrl };
+      },
+      saveMediaBuffer: (buffer, contentType, _direction, maxBytes, fileName) => {
+        const buf = Buffer.from(buffer);
+        if (maxBytes && buf.length > maxBytes) return Promise.reject(new Error('media exceeds maxBytes'));
+        return hostCall(rec, 'media.save', { base64: buf.toString('base64'), contentType, fileName });
+      },
+      detectMime: (name) => ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', pdf: 'application/pdf', txt: 'text/plain' })[String(name).split('.').pop().toLowerCase()] || 'application/octet-stream' },
   };
 }
 
@@ -508,6 +562,11 @@ rl.on('line', (line) => {
   let req;
   try { req = JSON.parse(s); } catch (e) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: String(e) } }) + '\n');
+    return;
+  }
+  if (req && req.hostReply !== undefined) {  // answer to a plugin→host call: never queued behind the chain
+    const p = pendingHost.get(req.hostReply);
+    if (p) { pendingHost.delete(req.hostReply); req.error ? p.reject(new Error(String(req.error))) : p.resolve(req.result); }
     return;
   }
   chain = chain.then(() => handle(req));

@@ -7,6 +7,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -56,6 +57,13 @@ public:
     // Matching registered HTTP route ({path,match,auth,plugin}) or null.
     nlohmann::json MatchHttpRoute(const std::string& path) const;
     std::vector<std::string> InitList(const char* key) const;
+    // Plugin→host calls (`{"hostCall":id,method,params}` lines). Return a result object, or {"__deferred":true}
+    // and later call SendHostReply(id, result) from another thread. Runs while the host lock is held: must not
+    // call back into this JsHost synchronously.
+    std::function<nlohmann::json(long long id, const std::string& method, const nlohmann::json& params)> host_call;
+    // Method of the request currently waiting on the host (valid inside host_call only).
+    const std::string& InflightMethod() const { return inflight_; }
+    void SendHostReply(long long id, const nlohmann::json& result, const std::string& error = "");
     nlohmann::json LastInit() const { std::lock_guard l(mu_); return last_init_; }
 
     // In-process mock (no Node) — used when FORCE_MOCK or spawn fails in tests.
@@ -66,6 +74,7 @@ private:
     nlohmann::json MockHandle(const std::string& method, const nlohmann::json& params);
 
     mutable std::mutex mu_;
+    std::string inflight_;
     std::unique_ptr<mcp::StdioProcess> proc_;
     std::filesystem::path plugins_dir_;
     std::filesystem::path bridge_js_;

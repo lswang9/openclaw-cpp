@@ -149,6 +149,10 @@ private:
     std::thread plugin_pump_;
     std::atomic<bool> pump_stop_{false};
     void PluginEventPump();
+    nlohmann::json PluginHostCall(long long id, const std::string& method, const nlohmann::json& params);
+    std::mutex host_call_mu_;                  // media store / tts / config writes from plugins
+    std::mutex host_threads_mu_;
+    std::vector<std::thread> host_threads_;    // deferred agent.reply runs
     nlohmann::json HandlePluginEvent(const nlohmann::json& ev);
 public:
     // Drain + process queued plugin runtime events once (tests / pump). Returns processed events.
