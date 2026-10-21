@@ -45,6 +45,8 @@ nlohmann::json BuildSpecs(const std::vector<CommandDef>& defs) {
     }
     // Message context menu (right-click → Apps → "Ask OpenClaw"): type 3, no description/options.
     out.push_back({{"name", kAskMenu}, {"type", 3}});
+    // User context menu (right-click a member → Apps): type 2.
+    out.push_back({{"name", kUserMenu}, {"type", 2}});
     return out;
 }
 
@@ -75,7 +77,26 @@ std::string InteractionText(const nlohmann::json& in) {
         const auto author = m.value("author", nlohmann::json::object()).value("username", std::string("someone"));
         return "[Discord message from " + author + ", via \"" + d.value("name", std::string()) + "\"]\n" + m.value("content", std::string());
     }
-    if (d.value("type", 1) != 1) return "";  // USER menus not handled
+    if (d.value("type", 1) == 2) {  // USER context menu: target user (+ guild member) becomes the subject
+        const auto tid = d.value("target_id", std::string());
+        const auto res = d.value("resolved", nlohmann::json::object());
+        const auto users = res.value("users", nlohmann::json::object());
+        if (!users.contains(tid)) return "";
+        const auto& u = users[tid];
+        std::string who = u.value("global_name", nlohmann::json()).is_string() ? u["global_name"].get<std::string>() : u.value("username", std::string("someone"));
+        std::string extra = "username=" + u.value("username", std::string()) + ", id=" + tid;
+        if (u.value("bot", false)) extra += ", bot";
+        const auto members = res.value("members", nlohmann::json::object());
+        if (members.contains(tid)) {
+            const auto& m = members[tid];
+            if (m.contains("nick") && m["nick"].is_string()) extra += ", nick=" + m["nick"].get<std::string>();
+            if (m.contains("joined_at") && m["joined_at"].is_string()) extra += ", joined=" + m["joined_at"].get<std::string>();
+            if (m.contains("roles") && m["roles"].is_array()) extra += ", roles=" + std::to_string(m["roles"].size());
+        }
+        return "[Discord user context menu \"" + d.value("name", std::string()) + "\" on " + who + " (" + extra + ")]\n"
+               "Tell me what you know about this user from our conversations and memory.";
+    }
+    if (d.value("type", 1) != 1) return "";
     std::string text = "/" + d.value("name", "");
     if (text == "/") return "";
     CollectOptions(d.value("options", nlohmann::json::array()), text);

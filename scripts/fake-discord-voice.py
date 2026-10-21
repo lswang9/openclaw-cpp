@@ -100,6 +100,9 @@ def client(c):
         if f is None or f[0] == 8: break
         if f[0] != 1: continue
         m = json.loads(f[1]); op = m.get("op")
+        if op == 0 and os.environ.get("FAKE_DAVE_REQUIRED") == "1" and m["d"].get("max_dave_protocol_version", 0) < 1:
+            state["identify"] = m["d"]; dump()
+            c.sendall(b"\x88\x1e" + struct.pack(">H", 4017) + b"E2EE/DAVE protocol required"); break
         if op == 0:
             state["identify"] = m["d"]; seq += 1
             send(c, {"op": 2, "seq": seq, "d": {"ssrc": SSRC, "ip": "127.0.0.1", "port": UPORT, "modes": ["aead_aes256_gcm_rtpsize", "aead_xchacha20_poly1305_rtpsize"]}})

@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.92.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.93.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,10 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.93.0-dev.0-dev
+- Discord 用户右键菜单（USER 命令）已实现。
+- DAVE 评估：自 2026-03-01 起 Discord 语音（Stage 除外）强制端到端加密，本实现未支持 DAVE，真实语音频道无法加入；4017 关闭码现会明确报告。详见 docs/DAVE.md。
 
 ### 1.92.0-dev.0-dev
 - WebAuthn 注册证明校验：none / packed（自证明与 x5c）/ fido-u2f，可配置信任根与策略；tpm/安卓/苹果格式未实现。

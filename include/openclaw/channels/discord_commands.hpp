@@ -22,6 +22,7 @@ nlohmann::json BuildSpecs(const std::vector<CommandDef>& defs);
 // Interaction (type 2 APPLICATION_COMMAND) -> "/name opt1 opt2" text; "" if not a command.
 std::string InteractionText(const nlohmann::json& interaction);
 inline constexpr const char* kAskMenu = "Ask OpenClaw";
+inline constexpr const char* kUserMenu = "Ask OpenClaw about user";  // USER context menu (type 2), <=32 chars
 // APPLICATION_COMMAND_AUTOCOMPLETE (type 4): the focused option and its partial value.
 struct Focused { std::string command, option, value; };
 std::optional<Focused> FocusedOption(const nlohmann::json& interaction);

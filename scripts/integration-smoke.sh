@@ -143,7 +143,11 @@ echo "$AC" | python3 -c 'import json,sys; r=json.load(sys.stdin); r=r.get("resul
 CM=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/discord/inbound" -H 'Content-Type: application/json' \
   -d '{"type":2,"id":"3","token":"t","channel_id":"C8","guild_id":"G","member":{"user":{"id":"U8"}},"data":{"name":"Ask OpenClaw","type":3,"target_id":"M9","resolved":{"messages":{"M9":{"content":"what is 2+2","author":{"username":"zoe"}}}}}}')
 echo "$CM" | grep -q 'Discord message from zoe' || { echo "[smoke] discord message context menu failed: $CM" >&2; exit 1; }
-echo "[smoke] discord autocomplete (type 4 → 8 choices) + message context menu"
+echo "$DC" | grep -q '"name": *"Ask OpenClaw about user"' || { echo "[smoke] user context menu spec missing" >&2; exit 1; }
+UM=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/discord/inbound" -H 'Content-Type: application/json' \
+  -d '{"type":2,"id":"4","token":"t","channel_id":"C8","guild_id":"G","member":{"user":{"id":"U8"}},"data":{"name":"Ask OpenClaw about user","type":2,"target_id":"U5","resolved":{"users":{"U5":{"username":"kim"}},"members":{"U5":{"nick":"kimmy"}}}}}')
+echo "$UM" | grep -q 'nick=kimmy' || { echo "[smoke] discord user context menu failed: $UM" >&2; exit 1; }
+echo "[smoke] discord autocomplete (type 4 → 8 choices) + message + user context menus"
 
 echo "{ channels: { slack: { signingSecret: 'smoke-secret' } } }" > "$OPENCLAW_CONFIG_PATH"; sleep 1
 rpc '{"jsonrpc":"2.0","id":16,"method":"config.reload","params":{}}' >/dev/null

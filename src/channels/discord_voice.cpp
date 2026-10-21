@@ -281,6 +281,7 @@ nlohmann::json Play(const PlayRequest& rq) {
     auto send = [&](const nlohmann::json& j) { auto s = j.dump(); size_t n = 0; curl_ws_send(c, s.data(), s.size(), &n, 0, CURLWS_TEXT); };
     std::string acc;
     int seq_ack = -1;
+    int close_code = 0;
     auto recv_op = [&](int want, int timeout_ms) -> std::optional<nlohmann::json> {
         const auto t0 = std::chrono::steady_clock::now();
         char buf[65536];
@@ -289,6 +290,10 @@ nlohmann::json Play(const PlayRequest& rq) {
             auto r = curl_ws_recv(c, buf, sizeof buf, &n, &m);
             if (r == CURLE_AGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
             if (r != CURLE_OK) return std::nullopt;
+            if (m && (m->flags & CURLWS_CLOSE)) {
+                if (n >= 2) close_code = (static_cast<unsigned char>(buf[0]) << 8) | static_cast<unsigned char>(buf[1]);
+                return std::nullopt;
+            }
             acc.append(buf, n);
             if (m && m->bytesleft > 0) continue;
             nlohmann::json j;
@@ -299,7 +304,17 @@ nlohmann::json Play(const PlayRequest& rq) {
         }
         return std::nullopt;
     };
-    auto fail = [&](const std::string& e) { rep["error"] = e; curl_easy_cleanup(c); return rep; };
+    auto fail = [&](const std::string& e) {
+        rep["error"] = e;
+        if (close_code) rep["close_code"] = close_code;
+        if (close_code == 4017) {  // Discord: "E2EE/DAVE protocol required" — mandatory for non-stage calls since 2026-03-01
+            rep["error"] = "voice server requires DAVE end-to-end encryption (close 4017); openclaw-cpp advertises "
+                           "max_dave_protocol_version 0 and does not implement DAVE — see docs/DAVE.md";
+            rep["dave_required"] = true;
+        }
+        curl_easy_cleanup(c);
+        return rep;
+    };
     auto hello = recv_op(8, 5000);
     if (!hello) return fail("no Hello (op 8)");
     rep["heartbeat_interval"] = (*hello)["d"].value("heartbeat_interval", 0.0);
@@ -331,6 +346,7 @@ nlohmann::json Play(const PlayRequest& rq) {
     send({{"op", 1}, {"d", {{"protocol", "udp"}, {"data", {{"address", disc->ip}, {"port", disc->port}, {"mode", mode}}}}}});
     auto sd = recv_op(4, 5000);
     if (!sd) { close(fd); return fail("no Session Description (op 4)"); }
+    if ((*sd)["d"].value("dave_protocol_version", 0) > 0) { close(fd); close_code = 4017; return fail("dave"); }
     Bytes key;
     for (auto& v : (*sd)["d"].value("secret_key", nlohmann::json::array())) key.push_back(static_cast<std::uint8_t>(v.get<int>()));
     if (key.size() != 32) { close(fd); return fail("bad secret_key"); }

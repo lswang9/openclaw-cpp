@@ -102,7 +102,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.92.0-dev";
+constexpr const char* kVersion = "1.93.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1737,8 +1737,15 @@ int CmdSelfTest() {
     {
         namespace dcmd = channels::discord_commands;
         auto specs = dcmd::BuildSpecs({{"new", "New", false}, {"My Skill!", "d", true}, {"new", "dup", false}});
-        bool ok = specs.size() == 3 && specs[2]["type"] == 3 && specs[1]["name"] == "my-skill" && specs[1]["options"][0]["type"] == 3 &&
-                  !specs[0].contains("options");
+        bool ok = specs.size() == 4 && specs[2]["type"] == 3 && specs[3]["type"] == 2 && specs[3]["name"].get<std::string>().size() <= 32 &&
+                  specs[1]["name"] == "my-skill" && specs[1]["options"][0]["type"] == 3 && !specs[0].contains("options");
+        {
+            auto ut = dcmd::InteractionText({{"type", 2}, {"data", {{"type", 2}, {"name", dcmd::kUserMenu}, {"target_id", "U9"},
+                {"resolved", {{"users", {{"U9", {{"username", "ann"}, {"global_name", "Ann B"}}}}}, {"members", {{"U9", {{"nick", "annie"}, {"roles", {"r1", "r2"}}}}}}}}}}});
+            ok = ok && ut.find("Ann B") != std::string::npos && ut.find("nick=annie") != std::string::npos && ut.find("roles=2") != std::string::npos &&
+                 ut.find("id=U9") != std::string::npos;
+            ok = ok && dcmd::InteractionText({{"type", 2}, {"data", {{"type", 2}, {"name", dcmd::kUserMenu}, {"target_id", "X"}}}}).empty();
+        }
         ok = ok && dcmd::InteractionText({{"type", 2}, {"data", {{"name", "compact"}, {"options", {{{"name", "args"}, {"value", "focus on X"}}}}}}}) == "/compact focus on X";
         channels::DiscordAdapter da;
         std::string seen;
@@ -1754,7 +1761,7 @@ int CmdSelfTest() {
              logs.find("PATCH /webhooks/A1/tk2/messages/@original") != std::string::npos;
         da.SetCommandSpecs(specs);
         auto sync = da.SyncCommands();
-        ok = ok && sync["count"] == 3 && sync["mode"] == "recorded";
+        ok = ok && sync["count"] == 4 && sync["mode"] == "recorded";
         if (!ok) { std::cerr << "FAIL discord slash " << specs.dump() << http.dump() << gw.dump() << logs << seen << "\n"; ++failures; }
         else std::cerr << "PASS discord slash commands (specs, HTTP + gateway interactions, deferred ack, sync)\n";
     }

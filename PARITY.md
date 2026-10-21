@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.92.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.93.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -43,6 +43,9 @@
 - Voice replies beyond Telegram: **real** Discord voice messages (multipart, flags 8192 IS_VOICE_MESSAGE, duration from the Ogg granule, waveform), Slack (files.getUploadURLExternal → upload → completeUploadExternal), Feishu (tenant token → im/v1/files file_type=opus with duration → msg_type=audio), WhatsApp Cloud (/media → type=audio, voice=true). Streamed TTS output is transcoded to Ogg/Opus with ffmpeg when it isn't already (Discord falls back to a plain attachment without ffmpeg). Shared `messages.tts.auto` policy now applies to Discord/Slack/Feishu/WhatsApp inbound replies too; new RPC `channels.voice.send`. Fixed: TTS `body_prefix` put raw audio bytes into JSON (invalid UTF-8 crash on binary TTS). e2e-voice-channels.sh against fake platforms. Remaining: Discord waveform is a coarse byte envelope, not a decoded amplitude; no live platform runs.
 
 - WebAuthn attestation: **real** verification of `none`, `packed` (self attestation with the credential key; x5c basic: signature with x5c[0], v3 cert, subject C/O/OU="Authenticator Attestation"/CN, not-CA, non-critical id-fido-gen-ce-aaguid must equal authData AAGUID) and `fido-u2f` (P-256 cert, U2F verificationData). Chains x5c to `OPENCLAW_WEBAUTHN_TRUST_ANCHORS` (PEM) with OpenSSL. Policy `OPENCLAW_WEBAUTHN_ATTESTATION` = none (default, invalid statements still rejected; unsupported formats stored as "unverified") | required | trusted; options request `direct` attestation when not none. e2e-webauthn-attestation.sh (software authenticator with generated CA / rogue CA). Remaining: tpm, android-key, android-safetynet, apple formats; no FIDO MDS metadata lookup.
+
+- Discord user context menu: **real** — USER command (type 2) "Ask OpenClaw about user" registered next to the message menu; target user (global_name/username/id/bot) + guild member (nick/joined/roles) become the prompt. self-test + integration-smoke.
+- Discord DAVE: **assessment** in docs/DAVE.md. Since 2026-03-01 Discord voice requires DAVE (MLS + per-frame E2EE) outside Stage channels; we advertise max_dave_protocol_version 0, so **live Discord voice is blocked** (DMs/voice channels) — PARITY for Discord voice downgraded to *partial (offline real; live blocked by DAVE except Stage)*. Close 4017 / dave_protocol_version>0 now surface `dave_required` + `close_code` (e2e-discord-voice.sh). Implementing needs vendored libdave + mlspp (not on ConanCenter).
 
 ## 1.85 Discord autocomplete + message context menu
 - real: command specs mark the `args` option `autocomplete: true` and add a MESSAGE context-menu command "Ask OpenClaw" (type 3).

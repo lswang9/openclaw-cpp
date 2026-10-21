@@ -28,6 +28,13 @@ assert r["heartbeats"] >= 1
 print("frames", len(audio))
 PY
 printf '%s' "$R" | grep -Eq '"packets_sent": *[0-9]+' || fail "report"
+# DAVE-required voice server (close 4017): honest, specific failure instead of a generic timeout
+TD=$(mktemp -d)
+FAKE_DAVE_REQUIRED=1 python3 "$ROOT/scripts/fake-discord-voice.py" "$TD/report.json" > "$TD/port" 2>"$TD/fake.log" & FPD=$!
+for _ in $(seq 50); do [[ -s "$TD/port" ]] && break; sleep 0.1; done
+RD=$("$BIN" discord voice play --endpoint "ws://127.0.0.1:$(cat "$TD/port")/?v=8" --server G1 --user U1 --session S1 --token VT --ogg "$ROOT/scripts/fixtures/sine-0.5s.ogg" || true)
+kill $FPD 2>/dev/null || true
+printf '%s' "$RD" | grep -q '"dave_required": *true' && printf '%s' "$RD" | grep -Eq '"close_code": *4017' || fail "DAVE 4017 not surfaced: $RD"
 
 # Part 2: gateway-driven: main gateway op 4 → VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE → voice session; WAV input is
 # Opus-encoded with libopus; the fake's second speaker (U2, RTP with header extension) is received + decoded.
