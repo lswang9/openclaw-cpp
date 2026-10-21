@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <chrono>
 #include <filesystem>
 
@@ -82,6 +83,8 @@ struct ServerDeps {
     config::Snapshot config;
     auth::AuthConfig auth;
     std::string system_prompt = "You are OpenClaw (C++ rewrite). Be concise and helpful.";
+    // Hot-reload hook: re-scan skills (applying skills.entries) and return the rebuilt system prompt.
+    std::function<std::string()> rebuild_system_prompt;
 };
 
 class Server {

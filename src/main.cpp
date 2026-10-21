@@ -77,7 +77,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.38.0-dev";
+constexpr const char* kVersion = "1.39.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2126,7 +2126,33 @@ int CmdGateway(int argc, char** argv, int argi) {
         mr.finish_reason = "stop";
         mr.message.role = "assistant";
         mr.message.content = "mock-ok";
-        mock_prov->Enqueue(mr);
+        // OPENCLAW_MOCK_SCRIPT: JSON array of scripted completions for offline e2e tests
+        //   [{"content":"..."}, {"tool_calls":[{"name":"write","arguments":{...}}]}, ...]
+        const std::string script = EnvOr("OPENCLAW_MOCK_SCRIPT", "");
+        if (script.empty()) mock_prov->Enqueue(mr);
+        else {
+            std::ifstream in(script);
+            auto arr = nlohmann::json::parse(in);
+            int n = 0;
+            for (const auto& s : arr) {
+                agent::CompletionResult r; r.ok = true; r.message.role = "assistant";
+                r.message.content = s.value("content", "");
+                r.finish_reason = "stop";
+                if (s.contains("tool_calls")) {
+                    r.finish_reason = "tool_calls";
+                    r.message.tool_calls = nlohmann::json::array();
+                    for (const auto& tc : s["tool_calls"]) {
+                        agent::ToolCall c; c.id = "mock_" + std::to_string(++n); c.name = tc.value("name", "");
+                        c.arguments_json = tc.value("arguments", nlohmann::json::object()).dump();
+                        r.tool_calls.push_back(c);
+                        r.message.tool_calls.push_back({{"id", c.id}, {"type", "function"},
+                                                        {"function", {{"name", c.name}, {"arguments", c.arguments_json}}}});
+                    }
+                }
+                mock_prov->Enqueue(r);
+            }
+            std::cerr << "[gateway] mock script loaded: " << arr.size() << " completions\n";
+        }
     }
     router.Add("mock", mock_prov);
     router.SetDefault(EnvOr("OPENCLAW_DEFAULT_PROVIDER", "deepseek"));
@@ -2236,6 +2262,10 @@ int CmdGateway(int argc, char** argv, int argi) {
 
 
     deps.system_prompt = BuildAgentSystemPrompt(tools);
+    deps.rebuild_system_prompt = [&skills, &tools]() {
+        skills = LoadSkills();
+        return BuildAgentSystemPrompt(tools);
+    };
     gateway::Server server(opts, deps);
     g_gateway_server = &server;
     daemon::InstallStopSignals(GatewayStopSignal);

@@ -73,9 +73,10 @@ RPC_TOOLS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \
 echo "$RPC_TOOLS" | grep -q 'tools'
 
 rpc() { curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" -H 'Content-Type: application/json' -d "$1"; }
-echo "// hot reload test" > "$OPENCLAW_CONFIG_PATH.tmp"; echo "{ session: { reset: { mode: 'off' } }, }" >> "$OPENCLAW_CONFIG_PATH.tmp"
+echo "// hot reload test" > "$OPENCLAW_CONFIG_PATH.tmp"; echo "{ session: { reset: { mode: 'off' } }, skills: { entries: { 'hello-skill': { enabled: false } } }, }" >> "$OPENCLAW_CONFIG_PATH.tmp"
 mv "$OPENCLAW_CONFIG_PATH.tmp" "$OPENCLAW_CONFIG_PATH"
-rpc '{"jsonrpc":"2.0","id":9,"method":"config.reload","params":{}}' | tee /tmp/rl.out | grep -Eq "\"reloaded\": ?true" || { echo "[smoke] hot reload failed" >&2; exit 1; }
+RL=$(rpc '{"jsonrpc":"2.0","id":9,"method":"config.reload","params":{}}')
+echo "$RL" | grep -Eq '"reloaded": ?true' && echo "$RL" | grep -Eq '"systemPromptChanged": ?true' || { echo "[smoke] hot reload failed: $RL" >&2; exit 1; }
 sleep 1; echo "{ gateway: { port: 'nope' } }" > "$OPENCLAW_CONFIG_PATH"
 rpc '{"jsonrpc":"2.0","id":10,"method":"config.reload","params":{}}' | grep -q 'expected integer' || { echo "[smoke] invalid reload not rejected" >&2; exit 1; }
 rpc '{"jsonrpc":"2.0","id":11,"method":"tools.list","params":{}}' | grep -q tools
@@ -215,4 +216,5 @@ ls "$OPENCLAW_SESSION_DIR"/archive/smoke~3areset.*.jsonl >/dev/null || { echo "[
 if grep -q "\"role\":\"system\"" "$OPENCLAW_SESSION_DIR"/archive/*.jsonl; then echo "[smoke] system prompt persisted" >&2; exit 1; fi; echo "[smoke] jsonl transcript (no system prompt persisted) ok"
 "$BIN" skills list | grep -q "/hello_skill" && OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat "/hello_skill hi" >/dev/null && echo "[smoke] skill slash command ok" || { echo "[smoke] skill slash failed" >&2; exit 1; }
 "$BIN" tokenizer count "hello world" | grep -q "\"tokens\"" && "$BIN" tokenizer status | grep -q backend && echo "[smoke] tokenizer ok" || { echo "[smoke] tokenizer failed" >&2; exit 1; }
+OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-memory-flush.sh"
 echo "[smoke] ALL PASS"

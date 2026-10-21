@@ -1,6 +1,11 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.38.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.39.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.39.0-dev 新增
+
+- 热重载增强：配置变更后会重新扫描技能（含 `skills.entries`）并重建系统提示词；`channels.<id>` 配置变化时重启对应的运行中渠道；`plugins` 配置变化时重扫插件并重启 JS 插件宿主。`config.reload` 返回 `systemPromptChanged` / `channelsRestarted` / `pluginsRestarted`。
+- 新增端到端测试 `scripts/e2e-memory-flush.sh`（已并入 smoke）：用 `OPENCLAW_MOCK_SCRIPT` 脚本化的 mock 模型，通过真实网关验证“压缩前记忆落盘 → 摘要压缩”整条链路。
 
 ## 1.38.0-dev 新增
 

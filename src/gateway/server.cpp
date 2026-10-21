@@ -36,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.38.0-dev";
+constexpr const char* kVersion = "1.39.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -466,11 +466,43 @@ nlohmann::json Server::ReloadConfigNow() {
                    ((config::GetPath(lr.snap.raw, "gateway.host") || config::GetPath(lr.snap.raw, "gateway.bind")) &&
                     lr.snap.gateway_host != deps_.config.gateway_host);
     auto keep_host = deps_.config.gateway_host; auto keep_port = deps_.config.gateway_port;
+    const auto old_raw = deps_.config.raw;
     deps_.config = lr.snap;
     deps_.config.gateway_host = keep_host; deps_.config.gateway_port = keep_port;  // bind changes need restart
-    Emit("config.reload", {{"ok", true}, {"restartRequired", restart}, {"warnings", lr.warnings}});
+    // 1) skills + system prompt
+    bool prompt_changed = false;
+    if (deps_.rebuild_system_prompt) {
+        auto np = deps_.rebuild_system_prompt();
+        prompt_changed = np != deps_.system_prompt;
+        deps_.system_prompt = std::move(np);
+    }
+    // 2) restart running channel adapters whose channels.<id> subtree changed
+    nlohmann::json restarted = nlohmann::json::array();
+    auto sub = [](const nlohmann::json& raw, const std::string& p) { return config::GetPath(raw, p).value_or(nlohmann::json()); };
+    for (auto* a : deps_.adapters.List()) {
+        const auto id = a->Id();
+        if (!a->Enabled() || sub(old_raw, "channels." + id) == sub(deps_.config.raw, "channels." + id)) continue;
+        a->Stop();
+        a->Start([this](const channels::InboundMessage& m) { return DeliverInbound(m); });
+        restarted.push_back(id);
+    }
+    // 3) plugins: rescan registry; restart the JS host when the plugins subtree changed
+    bool plugins_restarted = false;
+    if (sub(old_raw, "plugins") != sub(deps_.config.raw, "plugins")) {
+        if (!deps_.plugins.Root().empty()) deps_.plugins.Scan(deps_.plugins.Root());
+        if (deps_.js_host && deps_.js_host->Running() && !deps_.plugins.Root().empty()) {
+            deps_.js_host->Stop();
+            deps_.js_host->Start(deps_.plugins.Root());
+            plugins_restarted = true;
+        }
+    }
+    Emit("config.reload", {{"ok", true}, {"restartRequired", restart}, {"warnings", lr.warnings},
+                           {"systemPromptChanged", prompt_changed}, {"channelsRestarted", restarted},
+                           {"pluginsRestarted", plugins_restarted}});
     deps_.logs.Append("info", std::string("config hot-reloaded") + (restart ? " (gateway bind change needs restart)" : ""));
-    return {{"reloaded", true}, {"restartRequired", restart}, {"warnings", lr.warnings}};
+    return {{"reloaded", true}, {"restartRequired", restart}, {"warnings", lr.warnings},
+            {"systemPromptChanged", prompt_changed}, {"channelsRestarted", restarted},
+            {"pluginsRestarted", plugins_restarted}, {"systemPromptChars", deps_.system_prompt.size()}};
 }
 
 void Server::MaybeReloadConfig() {
@@ -583,6 +615,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
                 agent::LoopOptions flo = MakeLoopOpts(deps_);
                 flo.cancel = &cancel_agents_;
                 auto fr = agent::RunAgentLoop(*cprov, deps_.tools, fm, flo);
+                deps_.logs.Append("info", "memory flush session=" + msg.session_key + " ok=" + (fr.ok ? "1" : "0"));
                 Emit("session.memoryFlush", {{"sessionKey", msg.session_key}, {"ok", fr.ok}, {"turns", fr.turns}});
             }
             auto cr = context::CompactWithSummary(*cprov, messages, pol.keep_recent);
