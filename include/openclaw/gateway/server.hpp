@@ -110,6 +110,9 @@ private:
     nlohmann::json DispatchRpc(const nlohmann::json& msg);
     nlohmann::json Stub(const std::string& method, const nlohmann::json& params);
     std::string DeliverInbound(const channels::InboundMessage& msg);
+    // Native + skill + plugin chat commands as {name, description} (for Discord slash sync, /help).
+    nlohmann::json CommandCatalog() const;
+    void RefreshDiscordCommands();
     void Emit(const std::string& event, const nlohmann::json& payload);
     void PersistAll() const;
     // Hot reload (gateway.reload.mode != off): re-read config when its mtime changes (checked ≤1/s).

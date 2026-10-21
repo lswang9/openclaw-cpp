@@ -27,6 +27,8 @@ public:
 protected:
     nlohmann::json HttpPostJson(const std::string& url, const nlohmann::json& body,
                                 const std::vector<std::string>& headers) const;
+    nlohmann::json HttpJson(const std::string& method, const std::string& url, const nlohmann::json& body,
+                            const std::vector<std::string>& headers) const;
     void Record(nlohmann::json e) { sent_.push_back(std::move(e)); }
 
 private:

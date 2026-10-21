@@ -44,6 +44,12 @@ nlohmann::json OutboundRecordAdapter::Status() const {
 
 nlohmann::json OutboundRecordAdapter::HttpPostJson(const std::string& url, const nlohmann::json& body,
                                                    const std::vector<std::string>& headers) const {
+    return HttpJson("POST", url, body, headers);
+}
+
+nlohmann::json OutboundRecordAdapter::HttpJson(const std::string& method, const std::string& url,
+                                               const nlohmann::json& body,
+                                               const std::vector<std::string>& headers) const {
     CURL* curl = curl_easy_init();
     if (!curl) return {{"ok", false}, {"error", "curl_easy_init failed"}};
     std::string response;
@@ -54,6 +60,7 @@ nlohmann::json OutboundRecordAdapter::HttpPostJson(const std::string& url, const
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+    if (method != "POST") curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);

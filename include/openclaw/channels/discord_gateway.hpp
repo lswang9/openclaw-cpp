@@ -3,6 +3,7 @@
 #include "openclaw/channels/adapter.hpp"
 
 #include <atomic>
+#include <functional>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -34,7 +35,11 @@ public:
     void Stop();
     bool Running() const { return running_.load(); }
 
+    using InteractionFn = std::function<nlohmann::json(const nlohmann::json&, const DeliverFn&)>;
+    void SetInteractionHandler(InteractionFn fn) { interaction_ = std::move(fn); }
+
 private:
+    InteractionFn interaction_;
     nlohmann::json HandleDispatch(const std::string& event, const nlohmann::json& data,
                                   const DeliverFn& deliver);
     bool ResolveGatewayUrl(std::string& out_url, std::string& err);

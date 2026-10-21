@@ -9,6 +9,7 @@
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
+#include "openclaw/channels/discord_commands.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/whatsapp.hpp"
 #include <thread>
@@ -36,7 +37,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.44.0-dev";
+constexpr const char* kVersion = "1.45.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -249,7 +250,32 @@ void Server::Stop() {
     if (listen_fd_ >= 0) shutdown(listen_fd_, SHUT_RDWR);
 }
 
+nlohmann::json Server::CommandCatalog() const {
+    nlohmann::json out = nlohmann::json::array();
+    for (auto& c : channels::discord_commands::NativeCommands())
+        out.push_back({{"name", c.name}, {"description", c.description}, {"source", "native"}, {"args", c.takes_args}});
+    for (auto& s : deps_.skills.List())
+        if (s.user_invocable && s.eligible && s.enabled)
+            out.push_back({{"name", skills::SlashName(s.name)}, {"description", s.description}, {"source", "skill"}, {"args", true}});
+    if (deps_.js_host) {
+        auto lc = deps_.js_host->ListCommands();
+        for (auto& c : lc.value("commands", nlohmann::json::array()))
+            if (c.is_object()) out.push_back({{"name", c.value("name", "")}, {"description", c.value("description", "")},
+                                              {"source", "plugin"}, {"args", c.value("acceptsArgs", true)}});
+    }
+    return out;
+}
+
+void Server::RefreshDiscordCommands() {
+    auto* dc = dynamic_cast<channels::DiscordAdapter*>(deps_.adapters.Get("discord"));
+    if (!dc) return;
+    std::vector<channels::discord_commands::CommandDef> defs;
+    for (auto& c : CommandCatalog()) defs.push_back({c.value("name", ""), c.value("description", ""), c.value("args", true)});
+    dc->SetCommandSpecs(channels::discord_commands::BuildSpecs(defs));
+}
+
 void Server::Run() {
+    RefreshDiscordCommands();
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
     int yes = 1;
@@ -487,6 +513,7 @@ nlohmann::json Server::ReloadConfigNow() {
         restarted.push_back(id);
     }
     // 3) plugins: rescan registry; restart the JS host when the plugins subtree changed
+    RefreshDiscordCommands();
     bool plugins_restarted = false;
     if (sub(old_raw, "plugins") != sub(deps_.config.raw, "plugins")) {
         if (!deps_.plugins.Root().empty()) deps_.plugins.Scan(deps_.plugins.Root());
@@ -591,6 +618,24 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
             return "🧹 Compacted session: ~" + std::to_string(cr.before_tokens) + " → ~" +
                    std::to_string(cr.after_tokens) + " tokens.";
         }
+    }
+    // Native chat commands (no model turn).
+    if (text_in == "/help" || text_in == "/commands") {
+        std::string h = "Commands:";
+        for (auto& c : CommandCatalog()) h += "\n/" + c.value("name", "") + " — " + c.value("description", "");
+        return h;
+    }
+    if (text_in == "/status") {
+        auto msgs = deps_.sessions.Load(msg.session_key);
+        return "Session " + msg.session_key + ": " + std::to_string(msgs.size()) + " messages, ~" +
+               std::to_string(context::EstimateTokens(msgs)) + " tokens.";
+    }
+    if (text_in == "/stop") return "No active run to stop.";
+    if (text_in == "/model" || text_in.rfind("/model ", 0) == 0) {
+        auto cur = config::GetPath(deps_.config.raw, "agents.defaults.model.primary").value_or(nlohmann::json(""));
+        std::string m = cur.is_string() ? cur.get<std::string>() : "";
+        if (m.empty()) if (const char* e = std::getenv("OPENCLAW_DEFAULT_PROVIDER")) m = e;
+        return "Current model: " + (m.empty() ? std::string("default") : m);
     }
     // Plugin commands (api.registerCommand) run before skills and bypass the model.
     if (deps_.js_host && !text_in.empty() && text_in[0] == '/') {
@@ -1810,7 +1855,16 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             return ok({{"ok", true}, {"handled", handled}, {"status", dc->Gateway().Status()},
                        {"impl", "real-sim"}});
         }
+        if (method == "discord.commands") {
+            RefreshDiscordCommands();
+            return ok({{"commands", dc->CommandSpecs()}});
+        }
+        if (method == "discord.commands.sync") {
+            RefreshDiscordCommands();
+            return ok(dc->SyncCommands());
+        }
         if (method == "discord.gateway.start") {
+            RefreshDiscordCommands();
             dc->Start(deliver);
             return ok({{"started", dc->Gateway().Running()},
                        {"status", dc->Status()},

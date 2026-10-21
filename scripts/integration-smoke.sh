@@ -102,6 +102,13 @@ echo "$SI" | grep -q 'clicked' || { echo "[smoke] slack block_actions failed: $S
 grep -q 'agent:main:slack:channel:C5' "$OPENCLAW_SESSION_DIR/sessions.json" || { echo "[smoke] slack interactive session missing" >&2; exit 1; }
 echo "[smoke] slack interactive block_actions -> agent turn"
 
+DC=$(rpc '{"jsonrpc":"2.0","id":13,"method":"discord.commands","params":{}}')
+echo "$DC" | grep -q '"name": *"status"' || { echo "[smoke] discord command specs missing native: $DC" >&2; exit 1; }
+DS=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/discord/inbound" -H 'Content-Type: application/json' \
+  -d '{"type":2,"id":"1","token":"t","channel_id":"C7","guild_id":"G","member":{"user":{"id":"U7"}},"data":{"name":"status"}}')
+echo "$DS" | grep -q 'Session agent:main:discord:channel:C7' || { echo "[smoke] discord /status failed: $DS" >&2; exit 1; }
+echo "[smoke] discord slash /status (no model turn) + command specs"
+
 echo "[smoke] POST /v1/rpc sessions.create"
 RPC_SESS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \
   -H 'Content-Type: application/json' \

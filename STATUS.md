@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.44.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.45.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -192,3 +192,6 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ### 1.44.0-dev
 - Slack 交互：回复中的按钮/下拉/模态指令转为 Block Kit；按钮点击、模态提交、快捷方式（HTTP 与 Socket Mode）进入智能体回合；模态按钮调用 views.open。签名校验与 response_url 尚未实现。
+
+### 1.45.0-dev
+- Discord 斜杠命令：由内置命令、技能命令与插件命令生成命令定义并同步到 Discord；HTTP 与 Gateway 交互均进入智能体管线（Gateway 先延迟应答再编辑原消息）。新增 /status、/help、/stop、/model 内置命令。Ed25519 签名校验尚缺。

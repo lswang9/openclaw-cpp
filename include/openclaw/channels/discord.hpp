@@ -15,6 +15,16 @@ public:
     void Start(DeliverFn deliver) override;
     void Stop() override;
 
+    // Slash commands. Specs are CHAT_INPUT JSON (discord_commands::BuildSpecs).
+    void SetCommandSpecs(nlohmann::json specs) { specs_ = std::move(specs); }
+    const nlohmann::json& CommandSpecs() const { return specs_; }
+    // PUT /applications/{app}/commands (or guilds/{g}/commands when DISCORD_GUILD_ID).
+    // Live when DISCORD_BOT_TOKEN + DISCORD_APPLICATION_ID; base via DISCORD_API_BASE; else recorded.
+    nlohmann::json SyncCommands();
+    // APPLICATION_COMMAND / component interaction. via_gateway → deferred ack (type 5) + PATCH @original.
+    nlohmann::json HandleInteraction(const nlohmann::json& in, const DeliverFn& deliver, bool via_gateway);
+    nlohmann::json Api(const std::string& method, const std::string& path, const nlohmann::json& body);
+
     DiscordGateway& Gateway() { return gateway_; }
     const DiscordGateway& Gateway() const { return gateway_; }
 
@@ -23,6 +33,7 @@ private:
     bool Verify(const nlohmann::json& body) const;
     static std::string ExtractText(const nlohmann::json& body);
     DiscordGateway gateway_;
+    nlohmann::json specs_ = nlohmann::json::array();
 };
 
 }  // namespace openclaw::channels

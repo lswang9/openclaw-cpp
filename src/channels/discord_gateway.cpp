@@ -82,6 +82,13 @@ nlohmann::json DiscordGateway::HandleDispatch(const std::string& event, const nl
         session_id_ = data.value("session_id", "");
         return {{"ready", true}, {"session_id", session_id_}};
     }
+    if (event == "INTERACTION_CREATE") {
+        if (!interaction_) return {{"ignored", true}, {"reason", "no interaction handler"}};
+        auto r = interaction_(data, deliver);
+        std::lock_guard lock(mu_);
+        ++delivered_;
+        return r;
+    }
     if (event == "MESSAGE_CREATE") {
         // Ignore bots (including self)
         if (data.contains("author") && data["author"].value("bot", false)) {

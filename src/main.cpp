@@ -42,6 +42,7 @@
 #include "openclaw/channels/feishu_ws.hpp"
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/slack_interactive.hpp"
+#include "openclaw/channels/discord_commands.hpp"
 #include "openclaw/channels/slack_socket.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/discord_gateway.hpp"
@@ -79,7 +80,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.44.0-dev";
+constexpr const char* kVersion = "1.45.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1655,6 +1656,31 @@ int CmdSelfTest() {
         ok = ok && seen.find("[Slack modal submitted] Feedback\n- name: Ann|C9") == 0 && sub.value("envelope_id", "") == "e1";
         if (!ok) { std::cerr << "FAIL slack interactive " << r.dump() << click.dump() << open.dump() << seen << "\n"; ++failures; }
         else std::cerr << "PASS slack interactive (buttons/select/modal blocks, block_actions, views.open, view_submission)\n";
+    }
+    // discord slash commands (1.45)
+    {
+        namespace dcmd = channels::discord_commands;
+        auto specs = dcmd::BuildSpecs({{"new", "New", false}, {"My Skill!", "d", true}, {"new", "dup", false}});
+        bool ok = specs.size() == 2 && specs[1]["name"] == "my-skill" && specs[1]["options"][0]["type"] == 3 &&
+                  !specs[0].contains("options");
+        ok = ok && dcmd::InteractionText({{"type", 2}, {"data", {{"name", "compact"}, {"options", {{{"name", "args"}, {"value", "focus on X"}}}}}}}) == "/compact focus on X";
+        channels::DiscordAdapter da;
+        std::string seen;
+        channels::DeliverFn d = [&](const channels::InboundMessage& m) { seen = m.text + "|" + m.chat_type; return std::string("done"); };
+        auto http = da.HandleHttpInbound({{"type", 2}, {"id", "i1"}, {"token", "tk"}, {"channel_id", "C1"}, {"guild_id", "G"},
+                                          {"member", {{"user", {{"id", "U1"}}}}}, {"data", {{"name", "status"}}}}, d);
+        ok = ok && seen == "/status|channel" && http["type"] == 4 && http["data"]["content"] == "done";
+        auto gw = da.Gateway().FeedPayload({{"op", 0}, {"t", "INTERACTION_CREATE"}, {"s", 3}, {"d", {{"type", 2}, {"id", "i2"}, {"token", "tk2"},
+                                            {"application_id", "A1"}, {"channel_id", "D1"}, {"user", {{"id", "U2"}}}, {"data", {{"name", "new"}}}}}}, d);
+        auto log = da.OutboundLog();
+        std::string logs = log.dump();
+        ok = ok && seen == "/new|direct" && logs.find("POST /interactions/i2/tk2/callback") != std::string::npos &&
+             logs.find("PATCH /webhooks/A1/tk2/messages/@original") != std::string::npos;
+        da.SetCommandSpecs(specs);
+        auto sync = da.SyncCommands();
+        ok = ok && sync["count"] == 2 && sync["mode"] == "recorded";
+        if (!ok) { std::cerr << "FAIL discord slash " << specs.dump() << http.dump() << gw.dump() << logs << seen << "\n"; ++failures; }
+        else std::cerr << "PASS discord slash commands (specs, HTTP + gateway interactions, deferred ack, sync)\n";
     }
     // canvas disk store + sim bridge
     try {
