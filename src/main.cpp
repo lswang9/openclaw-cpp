@@ -61,6 +61,7 @@
 #include "openclaw/context/compaction.hpp"
 #include "openclaw/tokenizer/bpe.hpp"
 #include "openclaw/tools/runenv.hpp"
+#include "openclaw/tools/exec.hpp"
 #include "openclaw/workspace/embeddings.hpp"
 #include "openclaw/workspace/workspace.hpp"
 #include "openclaw/mcp/stdio.hpp"
@@ -82,7 +83,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.47.0-dev";
+constexpr const char* kVersion = "1.48.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -286,21 +287,75 @@ int CmdSelfTest() {
         }
     }
 
-    // shell approval gate
+    // exec tool: policy, allowlist, approvals, sandbox (1.48)
     {
-        approvals::Store ap;
-        tools::RegistryOptions o; o.approvals = &ap; o.shell_requires_approval = true;
-        auto reg = tools::MakeDefaultRegistry(o);
-        auto pending = nlohmann::json::parse(reg.Invoke("shell", {{"command", "echo hi"}}));
-        if (!pending.value("needs_approval", false)) { std::cerr << "FAIL shell gate\n"; ++failures; }
-        else {
-            auto id = pending.value("approval_id", "");
-            ap.Resolve(id, true);
-            auto done = nlohmann::json::parse(reg.Invoke("shell", {{"command", "echo hi"}, {"approval_id", id}}));
-            if (!done.value("ok", false) || !done.value("mocked", false)) {
-                std::cerr << "FAIL shell approved " << done.dump() << "\n"; ++failures;
-            } else std::cerr << "PASS shell approval\n";
+        namespace ex = tools::exec;
+        const auto tmp = std::filesystem::temp_directory_path() / ("oc-exec-test-" + std::to_string(getpid()));
+        std::filesystem::create_directories(tmp / "ws");
+        setenv("OPENCLAW_EXEC_APPROVALS_PATH", (tmp / "approvals.json").c_str(), 1);
+        bool ok = true;
+        std::string why;
+        auto chk = [&](bool c, const std::string& w) { if (!c) { ok = false; why += w + "; "; } };
+        auto def = ex::ResolvePolicy(nlohmann::json::object(), {{"version", 1}}, "main", "agent:main:main");
+        chk(def.host == "gateway" && def.security == "full" && def.ask == "off" && def.ask_fallback == "deny", "defaults");
+        auto askp = ex::ResolvePolicy({{"tools", {{"exec", {{"mode", "ask"}}}}}}, {{"defaults", {{"security", "deny"}}}}, "main", "");
+        chk(askp.security == "deny" && askp.ask == "on-miss", "stricter-of");
+        auto pc = ex::Parse("FOO=1 echo 'a b' && ls -la | wc -l > out.txt 2>&1", tmp.string());
+        chk(pc.segments.size() == 3 && pc.segments[0].argv.size() == 2 && pc.segments[0].argv[1] == "a b" &&
+            pc.segments[2].argv.size() == 2 && pc.segments[1].via_path, "parse");
+        chk(ex::Parse("echo $(id)", tmp.string()).complex, "complex");
+        chk(ex::GlobMatch("/usr/**/bin/rg", "/usr/local/x/bin/rg") && !ex::GlobMatch("/usr/*/rg", "/usr/a/b/rg"), "glob");
+        chk(ex::IsInlineEval({"python3.11", "-c", "print(1)"}) && !ex::IsInlineEval({"python3", "x.py"}), "inline");
+        ex::Policy al; al.safe_bins = {"wc"}; al.security = "allowlist"; al.ask = "on-miss"; al.allowlist.push_back({"", "echo", "", "", ""});
+        al.allowlist.push_back({"", "ls", "^-la$", "", ""});
+        chk(ex::Evaluate(al, ex::Parse("echo hi; ls -la", tmp.string()), tmp.string()).verdict == "allow", "allowlist hit");
+        chk(ex::Evaluate(al, ex::Parse("ls -R", tmp.string()), tmp.string()).verdict == "ask", "argPattern miss→ask");
+        chk(ex::Evaluate(al, ex::Parse("echo hi | wc -l", tmp.string()), tmp.string()).verdict == "allow", "safe bin");
+        al.strict_inline_eval = true; al.allowlist.push_back({"", "python3", "", "", ""});
+        chk(ex::Evaluate(al, ex::Parse("python3 -c 'print(1)'", tmp.string()), tmp.string()).verdict == "ask", "strict inline");
+        // real run, default policy
+        auto r1 = ex::Run({{"command", "echo real-exec && pwd"}}, nlohmann::json::object(), tmp / "ws");
+        chk(r1.value("status", "") == "completed" && r1.value("output", "").find("real-exec") != std::string::npos &&
+            r1.value("output", "").find("/ws") != std::string::npos, "real run " + r1.dump());
+        chk(ex::Run({{"command", "echo x"}, {"env", {{"LD_PRELOAD", "x"}}}}, nlohmann::json::object(), tmp / "ws").value("status", "") == "failed", "env guard");
+        // ask without UI → askFallback deny
+        nlohmann::json askcfg = {{"tools", {{"exec", {{"mode", "ask"}, {"approvalTimeoutMs", 5000}}}}}};
+        auto& broker = ex::ApprovalBroker::Global();
+        auto saved_ui = broker.has_ui;
+        broker.has_ui = [] { return false; };
+        auto r2 = ex::Run({{"command", "echo needs-approval"}}, askcfg, tmp / "ws");
+        chk(r2.value("status", "") == "denied" && r2.value("askFallback", "") == "deny", "fallback deny " + r2.dump());
+        // ask with UI → allow-always persists → next run allowed by allowlist
+        broker.has_ui = [] { return true; };
+        std::thread resolver([&] {
+            for (int i = 0; i < 200; ++i) {
+                auto p = broker.Pending();
+                if (!p.empty()) { broker.Resolve(p[0].value("id", ""), "allow-always"); return; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+        auto r3 = ex::Run({{"command", "echo needs-approval"}}, askcfg, tmp / "ws");
+        resolver.join();
+        chk(r3.value("status", "") == "completed" && r3.value("approvalDecision", "") == "allow-always" && r3.value("persisted", false), "approve " + r3.dump());
+        auto r4 = ex::Run({{"command", "echo needs-approval"}}, askcfg, tmp / "ws");
+        chk(r4.value("status", "") == "completed" && !r4.contains("approvalId") && r4["decision"].value("verdict", "") == "allow", "allow-always reuse " + r4.dump());
+        auto r5 = ex::Run({{"command", "echo other-args"}}, askcfg, tmp / "ws");
+        chk(r5.value("status", "") == "denied" || r5.contains("approvalId") || r5.value("askFallback", "") != "", "exact argv binding");
+        broker.has_ui = saved_ui;
+        // sandbox (bwrap/docker when available)
+        auto sbp = ex::ResolvePolicy({{"agents", {{"defaults", {{"sandbox", {{"mode", "non-main"}}}}}}}}, {{"version", 1}}, "main", "agent:main:slack:dm:u");
+        chk(sbp.host == "sandbox", "non-main sandbox host");
+        chk(ex::ResolvePolicy({{"agents", {{"defaults", {{"sandbox", {{"mode", "non-main"}}}}}}}}, {{"version", 1}}, "main", "agent:main:main").host == "gateway", "main on gateway");
+        if (sbp.sandbox_backend == "bwrap") {
+            nlohmann::json sbcfg = {{"agents", {{"defaults", {{"sandbox", {{"mode", "all"}, {"backend", "bwrap"}}}}}}}};
+            auto r6 = ex::Run({{"command", "echo inbox > f.txt && cat f.txt && (touch /usr/oc-x 2>/dev/null && echo WROTE || echo RO)"}}, sbcfg, tmp / "ws");
+            chk(r6.value("status", "") == "completed" && r6.value("output", "").find("inbox") != std::string::npos &&
+                r6.value("output", "").find("RO") != std::string::npos && r6.value("sandbox", "") == "bwrap", "bwrap sandbox " + r6.dump());
         }
+        unsetenv("OPENCLAW_EXEC_APPROVALS_PATH");
+        std::filesystem::remove_all(tmp);
+        if (!ok) { std::cerr << "FAIL exec policy/approvals: " << why << "\n"; ++failures; }
+        else std::cerr << "PASS exec tool (real by default, policy stricter-of, allowlist/argPattern/safeBins, inline-eval, approvals + allow-always, sandbox)\n";
     }
 
     // event bus
@@ -2823,6 +2878,53 @@ int main(int argc, char** argv) {
         if (cmd == "gateway") return CmdGateway(argc, argv, 2);
         if (cmd == "chat") return CmdChat(argc, argv, 2);
         if (cmd == "plugins") return CmdPlugins(argc, argv);
+        if (cmd == "approvals" || cmd == "exec-policy") {
+            namespace ex = openclaw::tools::exec;
+            namespace config = openclaw::config;
+            const std::string sub = argc > 2 ? argv[2] : (cmd == "approvals" ? "get" : "show");
+            auto path = ex::DefaultApprovalsPath();
+            auto doc = ex::LoadApprovals(path);
+            auto cfg = config::Load(config::DefaultPath()).snap.raw;
+            if (sub == "get" || sub == "show") {
+                std::string agent = "main";
+                for (int i = 3; i + 1 < argc; ++i) if (std::string(argv[i]) == "--agent") agent = argv[i + 1];
+                auto p = ex::ResolvePolicy(cfg, doc, agent, "agent:" + agent + ":main");
+                nlohmann::json allow = nlohmann::json::array();
+                for (auto& e : p.allowlist) allow.push_back({{"pattern", e.pattern}, {"argPattern", e.arg_pattern}, {"source", e.source}});
+                std::cout << nlohmann::json{{"path", path.string()}, {"file", doc},
+                                            {"effective", {{"agent", agent}, {"host", p.host}, {"security", p.security}, {"ask", p.ask},
+                                                           {"askFallback", p.ask_fallback}, {"allowlist", allow},
+                                                           {"sandboxBackend", p.sandbox_backend}}}}.dump(2) << "\n";
+                return 0;
+            }
+            if (sub == "set") {
+                std::string text;
+                std::string file;
+                for (int i = 3; i + 1 < argc; ++i) if (std::string(argv[i]) == "--file") file = argv[i + 1];
+                if (file.empty()) { std::ostringstream ss; ss << std::cin.rdbuf(); text = ss.str(); }
+                else { std::ifstream in(file); std::ostringstream ss; ss << in.rdbuf(); text = ss.str(); }
+                auto j = config::ParseJson5(text);
+                if (!j.is_object()) { std::cerr << "approvals set: expected a JSON object\n"; return 2; }
+                ex::SaveApprovals(path, j);
+                std::cout << "saved " << path.string() << "\n";
+                return 0;
+            }
+            if (sub == "preset" && argc > 3) {
+                const std::string name = argv[3];
+                nlohmann::json d;
+                if (name == "yolo") d = {{"security", "full"}, {"ask", "off"}, {"askFallback", "full"}};
+                else if (name == "cautious") d = {{"security", "allowlist"}, {"ask", "on-miss"}, {"askFallback", "deny"}};
+                else if (name == "deny-all") d = {{"security", "deny"}, {"ask", "off"}, {"askFallback", "deny"}};
+                else { std::cerr << "presets: yolo | cautious | deny-all\n"; return 2; }
+                doc["version"] = 1;
+                doc["defaults"] = d;
+                ex::SaveApprovals(path, doc);
+                std::cout << "applied preset " << name << " to " << path.string() << "\n";
+                return 0;
+            }
+            std::cerr << "usage: approvals get|set [--file f] | exec-policy show|preset <yolo|cautious|deny-all>\n";
+            return 2;
+        }
         if (cmd == "-h" || cmd == "--help" || cmd == "help") { PrintUsage(); return 0; }
         if (cmd == "-V" || cmd == "-v" || cmd == "--version" || cmd == "version") {
             std::cout << "openclaw-cpp " << kVersion << " (align OpenClaw 2026.10.5)\n";

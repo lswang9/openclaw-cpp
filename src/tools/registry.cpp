@@ -1,3 +1,5 @@
+#include "openclaw/agent/routing.hpp"
+#include "openclaw/tools/exec.hpp"
 #include "openclaw/workspace/workspace.hpp"
 #include <memory>
 #include <filesystem>
@@ -178,60 +180,42 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
                     return ws->MemoryAppend(a.value("key", "") + ": " + a.value("value", "")).dump(); }});
 
     if (opts.enable_shell) {
-        if (const char* env = std::getenv("OPENCLAW_SHELL_REQUIRE_APPROVAL"); env && std::string(env) == "0") {
-            opts.shell_requires_approval = false;
-        }
-        ToolSpec shell;
-        shell.name = "shell";
-        shell.description =
-            "Run a shell command in the agent workspace (real when OPENCLAW_EXEC_MODE=real, otherwise mocked). "
-            "Requires approval when gated.";
-        shell.requires_approval = opts.shell_requires_approval;
-        shell.parameters = {
+        // Upstream `exec` tool (+ legacy `shell` alias): real execution by default, governed by
+        // tools.exec policy, the exec approvals document and the sandbox settings.
+        const std::string ws_root = opts.workspace_root;
+        auto handler = [ws_root](const nlohmann::json& args) -> std::string {
+            auto cfg = config::Load(config::DefaultPath()).snap.raw;
+            std::filesystem::path ws = ws_root.empty() ? workspace::Workspace::DefaultRoot() : std::filesystem::path(ws_root);
+            const auto& ctx = exec::CurrentContext();
+            auto agents = agent::routing::ListAgents(cfg);
+            if (auto* ad = agent::routing::FindAgent(agents, ctx.agent_id); ad && !ad->workspace.empty()) ws = ad->workspace;
+            nlohmann::json a = args;
+            if (a.contains("timeout_ms") && !a.contains("timeout")) a["timeout"] = std::max(1, a.value("timeout_ms", 1000) / 1000);
+            return exec::Run(a, cfg, ws).dump();
+        };
+        nlohmann::json params = {
             {"type", "object"},
             {"properties",
-             {{"command", {{"type", "string"}}},
-              {"approval_id", {{"type", "string"}, {"description", "Approved approval id"}}}}},
+             {{"command", {{"type", "string"}, {"description", "Shell command to run"}}},
+              {"workdir", {{"type", "string"}, {"description", "Working directory (relative to the agent workspace)"}}},
+              {"env", {{"type", "object"}, {"description", "Extra environment variables"}}},
+              {"timeout", {{"type", "integer"}, {"description", "Timeout in seconds (default tools.exec.timeoutSec, 1800)"}}},
+              {"host", {{"type", "string"}, {"enum", {"auto", "sandbox", "gateway"}}}},
+              {"ask", {{"type", "string"}, {"enum", {"off", "on-miss", "always"}}, {"description", "Can only harden the configured ask policy"}}}}},
             {"required", nlohmann::json::array({"command"})},
         };
-        auto* appr = opts.approvals;
-        bool need = opts.shell_requires_approval;
-        shell.handler = [appr, need](const nlohmann::json& args) -> std::string {
-            const std::string cmd = args.value("command", "");
-            if (need) {
-                if (!appr) {
-                    return nlohmann::json{{"error", "approvals store required for shell"},
-                                          {"needs_approval", true}}.dump();
-                }
-                const std::string approval_id = args.value("approval_id", "");
-                if (approval_id.empty()) {
-                    auto id = appr->Create("exec", "shell: " + cmd);
-                    return nlohmann::json{{"needs_approval", true},
-                                          {"approval_id", id},
-                                          {"status", "pending"},
-                                          {"command", cmd}}.dump();
-                }
-                auto info = appr->GetJson(approval_id);
-                if (info.value("status", "") != "approved") {
-                    return nlohmann::json{{"error", "approval not approved"},
-                                          {"approval", info}}.dump();
-                }
-            }
-            if (LookupEnv("OPENCLAW_EXEC_MODE") == "real") {
-                auto ws = workspace::Workspace::DefaultRoot();
-                std::filesystem::create_directories(ws);
-                int timeout = args.value("timeout_ms", 60000);
-                auto pr = RunProcess(cmd, ws.string(), std::clamp(timeout, 100, 600000));
-                return nlohmann::json{{"ok", pr.exit_code == 0 && !pr.timed_out}, {"exit_code", pr.exit_code},
-                                      {"timed_out", pr.timed_out}, {"output", pr.out}, {"truncated", pr.truncated},
-                                      {"cwd", ws.string()}}.dump();
-            }
-            // Mock execution (safe default; set OPENCLAW_EXEC_MODE=real to run via /bin/sh in the workspace).
-            return nlohmann::json{{"ok", true},
-                                 {"mocked", true},
-                                 {"command", cmd},
-                                 {"stdout", "mock: executed (no real shell)"}}.dump();
-        };
+        ToolSpec ex;
+        ex.name = "exec";
+        ex.description = "Run a shell command (sandbox or gateway host). Subject to exec approvals policy "
+                         "(tools.exec.mode/security/ask, allowlist, askFallback).";
+        ex.parameters = params;
+        ex.handler = handler;
+        r.Register(std::move(ex));
+        ToolSpec shell;
+        shell.name = "shell";
+        shell.description = "Alias of exec (legacy name).";
+        shell.parameters = params;
+        shell.handler = handler;
         r.Register(std::move(shell));
     }
 

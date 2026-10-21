@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.47.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.48.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -59,3 +59,11 @@
 - real: agents.list (id, name, default, workspace, model string|{primary}, identity.name, systemPrompt) + bindings[{agentId, match:{channel, accountId, peer:{kind,id}, guildId, teamId}}]; most-specific wins (peer > guild > team > account > channel), first listed on ties; unknown agentIds ignored; missing accountId only matches the default account.
 - real: inbound session keys use the routed agent (`agent:<id>:...`); per-agent system prompt (agent workspace bootstrap files + identity/systemPrompt, cached, cleared on reload) and per-agent model route via the provider router; `agents.list` / `agents.route` RPC.
 - real-sim: all agents share one session store directory and one tool registry/memory index (upstream isolates ~/.openclaw/agents/<id>/{sessions,agent}); per-agent tool allow/deny and sandbox settings not applied.
+
+## 1.48 exec tool: real by default + approvals/sandbox semantics
+- real: `exec` tool (legacy `shell` alias) runs for real by default (gateway host, security=full, ask=off — upstream gateway defaults); params command/workdir/env/timeout/host/ask; host env overrides of PATH/LD_*/DYLD_*/NODE_OPTIONS rejected. OPENCLAW_EXEC_MODE=mock keeps a mock for tests.
+- real: policy = stricter of config (tools.exec.mode deny|allowlist|ask|auto|full or security/ask, per-agent agents.list[].tools.exec) and the approvals document (defaults + agents.<id>: security/ask/askFallback/allowlist); askFallback deny|allowlist|full when no approval UI.
+- real: allowlist per agent — resolved-path globs (`**`), bare names only via PATH, argPattern (ECMAScript), every shell segment (&&, ||, ;, |) must match; $(…)/backticks/heredocs never allowlisted; safe bins (stdin-only) ; strictInlineEval (python -c, node -e, …).
+- real: approval flow — exec.approval.requested event + prompt posted to the originating chat; resolve via `exec.approval.resolve` RPC, WS, or chat `/approve <id> allow-once|allow-always|deny` (requester or tools.exec.approvers only); allow-always persists exact-argv + cwd-bound entries; timeout → askFallback. Gateway HTTP now serves each client on its own thread so approvals can arrive mid-run.
+- real: sandbox host — agents.defaults.sandbox.mode off|non-main|all (per-agent override) picks host; docker backend (`docker run --network none -v ws:/workspace`) or bwrap (read-only root, writable workspace, no network) when docker is absent; `openclaw-cpp approvals get|set`, `exec-policy show|preset yolo|cautious|deny-all`.
+- real-sim: approvals document is JSON at $OPENCLAW_STATE_DIR|$OPENCLAW_DATA_DIR/exec-approvals.json (upstream moved to the shared SQLite state row); bwrap is a local substitute for upstream's docker sandbox (docker path untested here — no docker on the box); no node host, no background/yieldMs + process tool, no executable content-hash binding, no auto reviewer for mode=auto (treated as ask).

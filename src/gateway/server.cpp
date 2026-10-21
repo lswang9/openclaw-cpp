@@ -12,6 +12,7 @@
 #include "openclaw/channels/discord_commands.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
 #include "openclaw/agent/routing.hpp"
+#include "openclaw/tools/exec.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/whatsapp.hpp"
 #include <thread>
@@ -39,7 +40,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.47.0-dev";
+constexpr const char* kVersion = "1.48.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -256,6 +257,24 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
 Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {
     std::error_code ec;
     cfg_mtime_ = std::filesystem::last_write_time(config::DefaultPath(), ec);
+    auto& broker = tools::exec::ApprovalBroker::Global();
+    broker.has_ui = [this] {
+        { std::lock_guard lock(ws_mu_); if (!ws_clients_.empty()) return true; }
+        const auto& ctx = tools::exec::CurrentContext();
+        return !ctx.channel.empty() && deps_.adapters.Get(ctx.channel) != nullptr;  // chat /approve surface
+    };
+    broker.on_requested = [this](const nlohmann::json& r) {
+        Emit("exec.approval.requested", r);
+        const auto& ctx = tools::exec::CurrentContext();
+        if (ctx.channel.empty()) return;
+        if (auto* out = dynamic_cast<channels::OutboundRecordAdapter*>(deps_.adapters.Get(ctx.channel))) {
+            const std::string id = r.value("id", "");
+            out->SendText(ctx.chat_id, "🔐 Exec approval required (" + id + "):\n" + r.value("command", "") + "\ncwd: " +
+                                           r.value("cwd", "") + "\nReply /approve " + id + " allow-once|allow-always|deny",
+                          {{"via", "exec-approval"}});
+        }
+    };
+    broker.on_resolved = [this](const nlohmann::json& r) { Emit("exec.approval.resolved", r); };
 }
 Server::~Server() { Stop(); if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; } }
 void Server::Stop() {
@@ -368,12 +387,18 @@ void Server::Run() {
         if (client < 0) { if (!running_.load()) break; continue; }
         { char ipbuf[INET_ADDRSTRLEN] = {0}; inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf));
           auth::DeviceLinkStore::SetThreadClientIp(ipbuf); }
-        bool should_close = true;
-        try { should_close = HandleClient(client); } catch (const std::exception& e) {
-            if (opts_.verbose) std::cerr << "[gateway] " << e.what() << '\n';
-            should_close = true;
-        }
-        if (should_close) close(client);
+        std::string ip;
+        { char ipbuf[INET_ADDRSTRLEN] = {0}; inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf)); ip = ipbuf; }
+        // Each HTTP client on its own thread so a run waiting on an exec approval can't block /approve or RPCs.
+        std::thread([this, client, ip] {
+            auth::DeviceLinkStore::SetThreadClientIp(ip);
+            bool should_close = true;
+            try { should_close = HandleClient(client); } catch (const std::exception& e) {
+                if (opts_.verbose) std::cerr << "[gateway] " << e.what() << '\n';
+                should_close = true;
+            }
+            if (should_close) close(client);
+        }).detach();
     }
     if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
     running_.store(false);
@@ -665,6 +690,33 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         }
     }
     std::string text_in = msg.text;
+    if (text_in.rfind("/approve", 0) == 0) {
+        std::istringstream is(text_in.substr(8));
+        std::string id, decision;
+        is >> id >> decision;
+        if (id.empty()) {
+            auto p = tools::exec::ApprovalBroker::Global().Pending();
+            std::string out = p.empty() ? "No pending exec approvals." : "Pending exec approvals:";
+            for (auto& r : p) out += "\n" + r.value("id", "") + ": " + r.value("command", "");
+            return out;
+        }
+        if (decision.empty()) decision = "allow-once";
+        {
+            // Only configured approvers (tools.exec.approvers) or, by default, the requester on the same channel.
+            auto req = tools::exec::ApprovalBroker::Global().Get(id);
+            auto approvers = config::GetPath(deps_.config.raw, "tools.exec.approvers");
+            bool allowed = false;
+            if (approvers && approvers->is_array()) {
+                for (auto& a : *approvers)
+                    if (a.is_string() && (a == msg.sender || a == msg.channel + ":" + msg.sender)) allowed = true;
+            } else if (!req.is_null()) {
+                allowed = req.value("requester", "") == msg.sender && req.value("channel", "") == msg.channel;
+            }
+            if (!allowed) return "❌ Not authorized to resolve exec approval " + id + ".";
+        }
+        bool ok = tools::exec::ApprovalBroker::Global().Resolve(id, decision);
+        return ok ? "✅ Exec approval " + id + " resolved: " + decision : "❌ Unknown or already resolved approval: " + id;
+    }
     {
         std::string rest;
         if (session::ParseResetCommand(text_in, rest)) {
@@ -807,6 +859,8 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     agent::LoopResult result;
     {
         skills::ScopedEnv skill_env(skills::SkillEnvOverrides(deps_.skills.List(), skill_entries));
+        tools::exec::ScopedRunContext exec_ctx({agent_id, msg.session_key, msg.channel,
+                                                msg.conversation_id.empty() ? msg.sender : msg.conversation_id, msg.sender});
         result = agent::RunAgentLoop(*prov, deps_.tools, assembled, lopts);
     }
     for (const auto& w : result.warnings) {
@@ -901,7 +955,7 @@ bool DeviceRoleForbidden(const std::string& m) {
 
 // Operators may administer pairing but not read/write secrets or rewrite config.
 bool OperatorRoleForbidden(const std::string& m) {
-    return m.rfind("secrets.", 0) == 0 || m == "config.set" || m == "config.patch" || m == "config.apply" ||
+    return m.rfind("secrets.", 0) == 0 || m == "exec.approvals.set" || m == "config.set" || m == "config.patch" || m == "config.apply" ||
            m.rfind("update.", 0) == 0 || m == "gateway.restart" || m == "gateway.stop" || m == "shutdown";
 }
 }  // namespace
@@ -1583,6 +1637,31 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             return ok({{"agents", deps_.config.raw["agents_list"]}});
         }
         return ok({{"agents", nlohmann::json::array({{{"id", "main"}, {"model", deps_.config.deepseek_model}}})}});
+    }
+    if (method == "exec.approvals.list" || method == "exec.approval.list") {
+        return ok({{"pending", tools::exec::ApprovalBroker::Global().Pending()}});
+    }
+    if (method == "exec.approval.resolve") {
+        const auto id = params.value("id", "");
+        const auto decision = params.value("decision", "deny");
+        if (!tools::exec::ApprovalBroker::Global().Resolve(id, decision)) return err("unknown or already resolved approval: " + id);
+        return ok({{"id", id}, {"decision", decision}, {"resolved", true}});
+    }
+    if (method == "exec.approvals.get") {
+        auto p = tools::exec::DefaultApprovalsPath();
+        auto doc = tools::exec::LoadApprovals(p);
+        const auto aid = params.value("agentId", agent::routing::DefaultAgentId(deps_.config.raw));
+        auto pol = tools::exec::ResolvePolicy(deps_.config.raw, doc, aid, "agent:" + aid + ":main");
+        return ok({{"path", p.string()}, {"file", doc},
+                   {"effective", {{"agentId", aid}, {"host", pol.host}, {"security", pol.security}, {"ask", pol.ask},
+                                  {"askFallback", pol.ask_fallback}, {"allowlist", pol.allowlist.size()},
+                                  {"sandboxBackend", pol.sandbox_backend}}}});
+    }
+    if (method == "exec.approvals.set") {
+        if (!params.contains("file") || !params["file"].is_object()) return err("missing file object");
+        auto p = tools::exec::DefaultApprovalsPath();
+        tools::exec::SaveApprovals(p, params["file"]);
+        return ok({{"path", p.string()}, {"saved", true}});
     }
     if (method == "agents.route") {
         agent::routing::RouteInput ri{params.value("channel", ""), params.value("accountId", ""), params.value("peerKind", "direct"),

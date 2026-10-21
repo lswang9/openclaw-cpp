@@ -214,7 +214,7 @@ async function loadPluginDir(dir) {
   } catch (e) {
     rec.status = 'error';
     rec.error = String(e && e.message ? e.message : e);
-    process.stderr.write(`js_bridge: plugin ${rec.id} failed: ${rec.error}\n`);
+    if (!/needs Node >= 22\.6/.test(rec.error) || process.env.OPENCLAW_PLUGIN_DEBUG) process.stderr.write(`js_bridge: plugin ${rec.id} failed: ${rec.error}\n`);
   }
 }
 
