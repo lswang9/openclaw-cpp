@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.89.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.90.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -37,6 +37,8 @@
 - Feishu long connection: **real** reconnect/backoff per larksuite SDK ClientConfig (ReconnectCount / ReconnectInterval / ReconnectNonce from the endpoint and from pong; first retry rand(0,nonce), endpoint re-resolved every time); **real** gzip payload_encoding inflate (zlib); **real** card.action.trigger (type=card frames, v1 and v2 bodies) answered with base64 card JSON (toast + markdown card holding the agent reply). Covered by e2e-feishu-ws.sh against a fake server (gzip card frame, server drop, reconnect). Remaining: url.preview callbacks not answered; never run against live Feishu.
 
 - Local GGUF embeddings: **real** llama.cpp inference (Conan llama-cpp/b6565, CPU, OpenMP) for memorySearch provider `gguf`: tokenize → decode/encode with embeddings → model pooling (mean fallback) → L2. scripts/e2e-gguf-llama.sh downloads all-MiniLM-L6-v2 Q4_K_M (~21 MB, cached) at test time and asserts a zero-word-overlap semantic hit; SKIPs honestly when offline or built without llama.cpp. OPENCLAW_GGUF_HASH_FALLBACK=1 keeps the old hashed path (header-only stub files). Remaining: no GPU offload, single 512-token context (longer chunks truncated), no batching across texts.
+
+- ACP client (acpx): **real** `terminal` client capability (terminal/create|output|wait_for_exit|kill|release; cwd confined to the session root, env, outputByteLimit tail-truncation at char boundary, process-group kill, all terminals reaped at end). Off by default; CLI `--terminal`, RPC/tool callers need `acp.agents.<id>.allowTerminal=true`. **real** multi-turn (`--then` / `turns`: several session/prompt in one session, per-turn text + stopReason). **real** session resume via session/load (`--session` / `session_id`, only when the agent advertises loadSession). **real** login: auth_required (-32000) → `authenticate{methodId}` (`--auth <id>|auto`, or `acp.agents.<id>.authMethod`) → retry. All covered by e2e-acpx.sh against a fake agent. Remaining: interactive/browser-based agent login flows (the agent's own OAuth) are the agent's business; no live Codex/Claude/Gemini runs.
 
 ## 1.85 Discord autocomplete + message context menu
 - real: command specs mark the `args` option `autocomplete: true` and add a MESSAGE context-menu command "Ask OpenClaw" (type 3).

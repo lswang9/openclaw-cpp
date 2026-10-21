@@ -19,6 +19,16 @@ struct RunSpec {
     bool fs_write = false;
     int timeout_ms = 300000;
     std::vector<std::string> env;       // extra KEY=VALUE
+    // Client "terminal" capability (terminal/create|output|wait_for_exit|kill|release). Off by default; commands
+    // run with cwd confined to the session root, output capped by outputByteLimit (default 1 MiB).
+    bool terminal = false;
+    // Further turns sent as additional session/prompt calls in the same session (multi-turn).
+    std::vector<nlohmann::json> more_turns;
+    // Resume: session/load when the agent advertises loadSession, else error.
+    std::string load_session_id;
+    // Agents that require login: when session/new fails with auth_required (-32000) or authMethods are advertised
+    // and this is set, call authenticate{methodId} then retry. "auto" picks the first advertised method.
+    std::string auth_method;
 };
 
 // Resolve agent id → argv from config `acp.agents.<id>.command` (string or array) / `.args`, else built-in presets.
@@ -30,6 +40,7 @@ nlohmann::json Presets();
 nlohmann::json Run(const RunSpec& spec);
 // RPC/tool entry: {agent, prompt (string | ContentBlocks), audio_path?, cwd?, permission?, fs_write?, timeout_ms?}.
 // Only configured/preset agent ids are runnable (no raw argv from RPC/tool callers).
-nlohmann::json RunFromParams(const nlohmann::json& config, const nlohmann::json& params);
+// trusted_cli: the local CLI may enable terminal per call; RPC/tool callers need acp.agents.<id>.allowTerminal=true.
+nlohmann::json RunFromParams(const nlohmann::json& config, const nlohmann::json& params, bool trusted_cli = false);
 
 }  // namespace openclaw::acp::acpx

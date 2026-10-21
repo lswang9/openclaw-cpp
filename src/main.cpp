@@ -102,7 +102,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.89.0-dev";
+constexpr const char* kVersion = "1.90.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3683,7 +3683,7 @@ int main(int argc, char** argv) {
         if (cmd == "mcp-mock-server") return CmdMcpMockServer();
         if (cmd == "acp-stdio") return CmdAcpStdio();
         if (cmd == "acp" && argc > 2 && std::string(argv[2]) == "run") {
-            // openclaw-cpp acp run --agent ID [--cwd DIR] [--permission P] [--fs-write] [--audio FILE] PROMPT...
+            // openclaw-cpp acp run --agent ID [--cwd DIR] [--permission P] [--fs-write] [--terminal] [--session ID] [--auth METHOD|auto] [--then NEXT]... [--audio FILE] PROMPT...
             nlohmann::json p{{"agent", ""}};
             std::string prompt;
             for (int i = 3; i < argc; ++i) {
@@ -3694,12 +3694,16 @@ int main(int argc, char** argv) {
                 else if (a == "--audio" && i + 1 < argc) p["audio_path"] = argv[++i];
                 else if (a == "--timeout-ms" && i + 1 < argc) p["timeout_ms"] = std::atoi(argv[++i]);
                 else if (a == "--fs-write") p["fs_write"] = true;
+                else if (a == "--terminal") p["terminal"] = true;
+                else if (a == "--session" && i + 1 < argc) p["session_id"] = argv[++i];
+                else if (a == "--auth" && i + 1 < argc) p["auth_method"] = argv[++i];
+                else if (a == "--then" && i + 1 < argc) p["turns"].push_back(argv[++i]);
                 else if (a == "--updates") p["include_updates"] = true;
                 else prompt += (prompt.empty() ? "" : " ") + a;
             }
             if (!prompt.empty()) p["prompt"] = prompt;
             auto cfgl = openclaw::config::Load(openclaw::config::DefaultPath());
-            auto r = openclaw::acp::acpx::RunFromParams(cfgl.snap.raw, p);
+            auto r = openclaw::acp::acpx::RunFromParams(cfgl.snap.raw, p, /*trusted_cli=*/true);
             std::cout << r.dump(2) << "\n";
             return r.value("ok", false) ? 0 : 1;
         }

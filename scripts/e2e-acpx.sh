@@ -41,6 +41,32 @@ J 'assert "audio:audio/ogg" in r["text"] and r["audio"][0]["mode"]=="passthrough
 R=$("$BIN" acp run --agent openclaw --cwd "$T/ws" --updates --audio "$T/v.ogg" "hello") || fail "openclaw interop: $R"
 J 'assert r["ok"] and r["stopReason"]=="end_turn" and r["text"] and r["audio"][0]["mode"]=="passthrough", r
 assert "hello from voice tg" in json.dumps(r["updates"]), "agent-side transcript not in updates"' || fail "openclaw interop"
+# terminal capability (ACP terminal/*): off → agent sees no terminal; on → create/wait/output/kill/release, cwd-confined
+R=$("$BIN" acp run --agent fake --cwd "$T/ws" "run tests") || fail "no-terminal run"
+J 'assert "no-terminal" in r["text"], r["text"]' || fail "terminal must be off by default"
+R=$("$BIN" acp run --agent fake --cwd "$T/ws" --terminal "run tests") || fail "terminal run: $R"
+J 'o=json.loads(r["text"])
+assert o["exit"]=={"exitCode":3,"signal":None}, o
+assert "out-bar" in o["output"] and "err" in o["output"], o
+assert o["cwd_escape"] is True and o["killed"]["signal"], o
+assert len(r["terminals"])==2, r["terminals"]' || fail "terminal assertions: $R"
+# RPC callers need allowTerminal in config
+R=$("$BIN" acp run --agent fake --cwd "$T/ws" "turn one" --then "turn two" --then "turn three") || fail "multi-turn: $R"
+J 'assert len(r["turns"])==3 and r["turns"][2]["text"].endswith("#3:turn three"), r["turns"]' || fail "multi-turn"
+# session/load across processes (agent persists its sessions)
+export FAKE_ACP_STATE="$T/acp-state.json"
+R=$("$BIN" acp run --agent fake --cwd "$T/ws" "turn a") || fail "state run"
+SID=$(J 'print(r["sessionId"])')
+R=$("$BIN" acp run --agent fake --cwd "$T/ws" --session "$SID" "turn b") || fail "load run: $R"
+J 'assert r["loaded"] and r["text"].endswith("#2:turn b"), r' || fail "session/load resume"
+unset FAKE_ACP_STATE
+# agent requiring login: auth_required without --auth; authenticate + retry with it
+R=$(FAKE_ACP_AUTH=1 "$BIN" acp run --agent fake --cwd "$T/ws" "turn x" || true)
+J 'assert r.get("auth_required") and r["authMethods"][0]["id"]=="fake-login", r' || fail "auth_required: $R"
+R=$(FAKE_ACP_AUTH=1 "$BIN" acp run --agent fake --cwd "$T/ws" --auth auto "turn x") || fail "auth run: $R"
+J 'assert r["ok"] and r["authenticated"]=="fake-login", r' || fail "authenticate"
+R=$(FAKE_ACP_AUTH=1 "$BIN" acp run --agent fake --cwd "$T/ws" --auth nope "turn x" || true)
+J 'assert not r["ok"] and "not advertised" in r["error"], r' || fail "unknown auth method"
 R=$("$BIN" acp run --agent nosuch "x" || true)
 printf '%s' "$R" | grep -q "unknown ACP agent" || fail "unknown agent"
 echo "[e2e-acpx] PASS"
