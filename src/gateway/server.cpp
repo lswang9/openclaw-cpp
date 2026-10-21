@@ -331,6 +331,7 @@ void Server::RefreshDiscordCommands() {
 
 void Server::RefreshPluginExtensions() {
     if (!deps_.js_host) return;
+    if (!plugin_channels_.empty()) (void)deps_.js_host->Rpc("channel_gateway_stop", nlohmann::json::object());
     for (auto& id : plugin_channels_) deps_.adapters.Remove(id);
     plugin_channels_.clear();
     auto lc = deps_.js_host->Rpc("list_channels", nlohmann::json::object());
@@ -340,6 +341,8 @@ void Server::RefreshPluginExtensions() {
         deps_.adapters.Add(std::make_unique<plugins::PluginChannelAdapter>(deps_.js_host, id, c.value("label", id)));
         deps_.channels.Register({id, "plugin channel: " + c.value("label", id), true});
         plugin_channels_.push_back(id);
+        // ChannelPlugin gateway.startAccount: long-lived plugin channel (messages arrive via drain_events).
+        if (c.value("gateway", false)) (void)deps_.js_host->Rpc("channel_gateway_start", {{"channel", id}});
     }
     if (deps_.router) {
         auto lp = deps_.js_host->Rpc("list_providers", nlohmann::json::object());
@@ -350,7 +353,64 @@ void Server::RefreshPluginExtensions() {
                                     ? p["models"][0].get<std::string>() : "default";
             deps_.router->Add(id, std::make_shared<plugins::PluginProvider>(deps_.js_host, id, model));
             plugin_providers_.insert(id);
+            // Provider catalog: each model is routable as "<provider>/<model>".
+            for (auto& m : p.value("models", nlohmann::json::array()))
+                if (m.is_string()) deps_.router->Add(id + "/" + m.get<std::string>(),
+                                                     std::make_shared<plugins::PluginProvider>(deps_.js_host, id, m.get<std::string>()));
         }
+    }
+}
+
+
+nlohmann::json Server::HandlePluginEvent(const nlohmann::json& ev) {
+    const auto type = ev.value("type", "");
+    nlohmann::json out{{"type", type}, {"plugin", ev.value("plugin", "")}};
+    if (type == "system") {
+        deps_.logs.Append("info", "plugin system event: " + ev.value("text", ""));
+        Emit("system.event", {{"text", ev.value("text", "")}, {"sessionKey", ev.value("sessionKey", "")}, {"plugin", ev.value("plugin", "")}});
+        out["ok"] = true;
+    } else if (type == "outbound") {
+        const auto ch = ev.value("channel", "");
+        auto* a = deps_.adapters.Get(ch);
+        if (auto* pc = dynamic_cast<plugins::PluginChannelAdapter*>(a)) out["result"] = pc->SendText(ev.value("to", ""), ev.value("text", ""));
+        else if (auto* ob = dynamic_cast<channels::OutboundRecordAdapter*>(a)) out["result"] = ob->SendText(ev.value("to", ""), ev.value("text", ""), {{"via", "plugin-runtime"}});
+        else out["error"] = "unknown channel: " + ch;
+    } else if (type == "inbound") {
+        channels::InboundMessage m;
+        m.channel = ev.value("channel", std::string("plugin"));
+        m.sender = ev.value("from", ev.value("sender", std::string("unknown")));
+        m.text = ev.value("text", "");
+        m.chat_type = ev.value("chatType", std::string("direct"));
+        m.conversation_id = ev.value("conversationId", "");
+        m.thread_id = ev.value("threadId", "");
+        m.account_id = ev.value("accountId", "") == "default" ? "" : ev.value("accountId", "");
+        m.peer_id = m.sender;
+        m.session_key = ev.value("sessionKey", m.channel + "-" + (m.conversation_id.empty() ? m.sender : m.conversation_id));
+        m.explicit_key = ev.contains("sessionKey");
+        auto reply = DeliverInbound(m);
+        out["reply"] = reply;
+        if (!reply.empty())
+            if (auto* pc = dynamic_cast<plugins::PluginChannelAdapter*>(deps_.adapters.Get(m.channel)))
+                out["sent"] = pc->SendText(m.conversation_id.empty() ? m.sender : m.conversation_id, reply);
+    } else if (type == "channel.status") {
+        Emit("channel.status", ev);
+        out["ok"] = true;
+    }
+    return out;
+}
+
+nlohmann::json Server::DrainPluginEvents() {
+    nlohmann::json done = nlohmann::json::array();
+    if (!deps_.js_host || !deps_.js_host->Running()) return done;
+    auto r = deps_.js_host->Rpc("drain_events", nlohmann::json::object());
+    for (auto& ev : r.value("events", nlohmann::json::array())) done.push_back(HandlePluginEvent(ev));
+    return done;
+}
+
+void Server::PluginEventPump() {
+    while (!pump_stop_.load()) {
+        try { (void)DrainPluginEvents(); } catch (const std::exception& e) { deps_.logs.Append("warn", std::string("plugin pump: ") + e.what()); }
+        for (int i = 0; i < 4 && !pump_stop_.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
@@ -363,6 +423,8 @@ void Server::Run() {
         int v = std::atoi(e); if (v >= 1 && v <= 64) nworkers = static_cast<std::size_t>(v);
     }
     StartWorkers(nworkers);
+    pump_stop_ = false;
+    if (deps_.js_host) plugin_pump_ = std::thread([this] { PluginEventPump(); });
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
     int yes = 1;
@@ -399,6 +461,8 @@ void Server::Run() {
         EnqueueClient(client, std::move(ip));
     }
     StopWorkers();
+    pump_stop_ = true;
+    if (plugin_pump_.joinable()) plugin_pump_.join();
     if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
     running_.store(false);
 }
@@ -1742,8 +1806,22 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         if (reply.rfind("error:", 0) == 0) return err(reply.substr(6));
         return ok({{"sessionKey", session_key}, {"text", reply}});
     }
+    if (method == "plugins.providers" || method == "plugins.channels") {
+        if (!deps_.js_host) return ok({{"providers", nlohmann::json::array()}, {"channels", nlohmann::json::array()}});
+        return ok(deps_.js_host->Rpc(method == "plugins.providers" ? "list_providers" : "list_channels", params));
+    }
+    if (method == "plugins.events.drain") {
+        if (deps_lock.owns_lock()) deps_lock.unlock();
+        return ok({{"processed", DrainPluginEvents()}});
+    }
     if (method == "chat.abort") {
-        return ok({{"aborted", true}, {"note", "no active run to abort in single-threaded stub"}});
+        const std::string key = params.value("sessionKey", params.value("key", std::string()));
+        std::vector<std::string> hit;
+        {
+            std::lock_guard lock(session_ctrl_mu_);
+            for (auto& [k, f] : session_cancel_) if (key.empty() || k == key) { f->store(true); hit.push_back(k); }
+        }
+        return ok({{"aborted", !hit.empty()}, {"sessions", hit}});
     }
 
     if (method == "config.get") return ok(deps_.config.ToJson());

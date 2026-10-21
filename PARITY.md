@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.55.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.56.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -85,6 +85,13 @@
 - real: tools.allow / tools.deny / tools.profile (`minimal|coding|messaging|full`) from global `tools.*`, then `agents.defaults.tools`, then `agents.list[]|entries.<id>.tools` — deny wins; profile supplies a base allow set (coding includes exec/read/write/edit/http_get/browser_*).
 - real: per-agent sandbox object (mode/backend/…) still flows into exec ResolvePolicy; agent Pool rebuilds tool registries on config reload and after JS plugin host restart (re-RegisterTools into the shared base).
 - real-sim: skills library and JS plugin host remain process-global (not per-agent); MCP tool list is shared then filtered by allow/deny.
+
+## 1.56 Plugin contracts: api.runtime, ChannelPlugin gateway/accounts, provider catalog
+- real: `api.runtime` subset — `config.loadConfig/current`, `state.resolveStateDir/resolvePluginStateDir`, `logging.getChildLogger`, `system.enqueueSystemEvent`, `channel.sendMessage` + `channel.text.chunkText`, `agent.dispatchInbound`, `media.detectMime`. Host side effects are queued in the Node host and drained by a gateway pump (`drain_events`, ~200 ms) → system events / outbound sends / agent turns.
+- real: ChannelPlugin surface — `meta`, `capabilities`, `config.listAccountIds/resolveAccount`, `gateway.startAccount(ctx{accountId, account, cfg, abortSignal, onMessage, setStatus, log})` / `stopAccount`, `outbound.sendText` + `sendMedia`, HTTP `inbound.parse`. Gateway starts every account on load and aborts on plugin refresh/shutdown; inbound → agent → `outbound.sendText`.
+- real: provider plugins — `models` + `catalog.run()` (models merged, cached, `refresh`), `auth[]` descriptors listed; each catalog model routable as `<provider>/<model>` (router exact match first). RPC `plugins.providers`, `plugins.channels`, `plugins.events.drain`; `chat.abort` now aborts active session runs.
+- real: `scripts/e2e-plugin-contracts.sh` (smoke, installed plugin, offline).
+- real-sim / missing: runtime is a subset (no runtime.tts/stt, media fetch/store, reply dispatcher with typing/blocks, pairing/directory/actions/threading adapters, `config.writeConfigFile`); provider `auth` methods are listed but OAuth/API-key flows are not run; pump processes inbound sequentially.
 
 ## 1.55 plugins install / uninstall / update
 - real: `openclaw-cpp plugins install <dir|.tgz|npm-spec> [--force] [--link] [--no-deps]` → `$OPENCLAW_EXTENSIONS_DIR|~/.openclaw/extensions/<id>` (id from openclaw.plugin.json, else package.json name; requires openclaw.plugin.json or package.json#openclaw). npm specs go through `npm pack` (so registry, `file:`, git specs work when npm can reach them); deps installed with `npm install --omit=dev --ignore-scripts` only when the package has dependencies and no node_modules. Staged copy + atomic rename; symlinks escaping the archive rejected.

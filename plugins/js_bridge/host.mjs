@@ -8,7 +8,7 @@
  *     --experimental-strip-types when available, else the `typescript` package if resolvable)
  *   - legacy openclaw-cpp `plugin.json` + `module.exports = { tools: [...] }`
  *
- * Plugin API subset: api.id/name/config/pluginConfig/logger/runtime/resolvePath,
+ * Plugin API subset: api.id/name/config/pluginConfig/logger/resolvePath, api.runtime.{config,state,logging,system,channel,agent,media},
  *   registerTool(tool|factory), registerCommand, on(hook)/registerHook, registerGatewayMethod, registerService.
  * RPC: initialize, list_plugins, list_tools, call_tool, list_commands, run_command, emit_hook,
  *      list_gateway_methods, gateway_method, shutdown, ping
@@ -36,6 +36,9 @@ const providers = new Map();    // id -> {plugin, p}
 const httpRoutes = [];          // {plugin, path, match, auth, handler}
 const cliCommands = new Map();  // top-level name -> {plugin, cmd}
 let hostConfig = {};
+const events = [];            // queued host-side effects drained by the gateway (drain_events)
+const channelRuns = new Map();  // `${channel}:${account}` -> {abort, promise}
+const catalogCache = new Map(); // provider id -> resolved catalog
 let loadSeq = 0;
 
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
@@ -133,6 +136,38 @@ function parseCliArgs(cmd, argv) {
   return { opts, pos };
 }
 
+
+// api.runtime.* subset. Host side effects are queued and drained by the gateway (drain_events RPC):
+//   system.enqueueSystemEvent, channel.sendMessage (outbound), agent.dispatchInbound (agent turn).
+function makeRuntime(rec) {
+  const stateDir = () => process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), '.openclaw');
+  const push = (e) => { events.push({ plugin: rec.id, at: Date.now(), ...e }); return { queued: true }; };
+  const child = (name) => {
+    const log = (lvl) => (...a) => process.stderr.write(`[plugin:${rec.id}:${name}] ${lvl}: ${a.map(String).join(' ')}\n`);
+    return { info: log('info'), warn: log('warn'), error: log('error'), debug: log('debug') };
+  };
+  return {
+    version: '2026.10.5-cpp', host: 'openclaw-cpp',
+    config: { loadConfig: () => hostConfig, current: () => hostConfig },
+    state: { resolveStateDir: stateDir, resolvePluginStateDir: () => { const d = path.join(stateDir(), 'plugins', rec.id); fs.mkdirSync(d, { recursive: true }); return d; } },
+    logging: { getChildLogger: (opts) => child((opts && opts.name) || 'child'), shouldLogVerbose: () => !!process.env.OPENCLAW_VERBOSE },
+    system: { enqueueSystemEvent: (text, opts) => push({ type: 'system', text: String(text), sessionKey: opts && opts.sessionKey }) },
+    channel: {
+      sendMessage: ({ channel, to, text, accountId }) => push({ type: 'outbound', channel, to, text: String(text ?? ''), accountId }),
+      text: { chunkText: (t, limit = 2000) => { const out = []; for (let i = 0; i < t.length; i += limit) out.push(t.slice(i, i + limit)); return out; } },
+    },
+    agent: { dispatchInbound: (m) => push({ type: 'inbound', ...m }) },
+    media: { detectMime: (name) => ({ png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', pdf: 'application/pdf', txt: 'text/plain' })[String(name).split('.').pop().toLowerCase()] || 'application/octet-stream' },
+  };
+}
+
+function channelAccounts(ch) {
+  try {
+    if (ch.config && typeof ch.config.listAccountIds === 'function') { const ids = ch.config.listAccountIds(hostConfig); if (Array.isArray(ids) && ids.length) return ids; }
+  } catch {}
+  return ['default'];
+}
+
 function makeApi(rec) {
   const entryCfg = ((hostConfig.plugins || {}).entries || {})[rec.id] || {};
   const log = (lvl) => (...a) => process.stderr.write(`[plugin:${rec.id}] ${lvl}: ${a.map(String).join(' ')}\n`);
@@ -142,7 +177,7 @@ function makeApi(rec) {
     config: hostConfig,
     pluginConfig: entryCfg.config || {},
     logger: { info: log('info'), warn: log('warn'), error: log('error'), debug: log('debug') },
-    runtime: { version: '2026.10.5-cpp', host: 'openclaw-cpp' },
+    runtime: makeRuntime(rec),
     resolvePath: (p) => (p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : path.resolve(rec.path, p)),
     registerTool(tool, opts) {
       const list = typeof tool === 'function' ? [].concat(tool({ config: hostConfig, pluginConfig: api.pluginConfig }) || []) : [tool];
@@ -359,8 +394,55 @@ async function handle(req) {
       }
       case 'list_channels':
         return respond(id, { channels: [...channels.entries()].map(([cid, v]) => ({ id: cid, plugin: v.plugin,
-          label: (v.ch.meta && v.ch.meta.label) || cid, outbound: !!(v.ch.outbound && v.ch.outbound.sendText),
-          inbound: !!(v.ch.inbound && typeof v.ch.inbound.parse === 'function') })) });
+          label: (v.ch.meta && v.ch.meta.label) || cid, meta: v.ch.meta || {}, capabilities: v.ch.capabilities || {},
+          outbound: !!(v.ch.outbound && v.ch.outbound.sendText), media: !!(v.ch.outbound && v.ch.outbound.sendMedia),
+          inbound: !!(v.ch.inbound && typeof v.ch.inbound.parse === 'function'),
+          gateway: !!(v.ch.gateway && typeof v.ch.gateway.startAccount === 'function'),
+          accounts: channelAccounts(v.ch), running: [...channelRuns.keys()].filter((k) => k.startsWith(cid + ':')).map((k) => k.slice(cid.length + 1)) })) });
+      case 'channel_gateway_start': {
+        const ent = channels.get(params.channel);
+        if (!ent || !ent.ch.gateway || typeof ent.ch.gateway.startAccount !== 'function')
+          return respond(id, null, { code: -32601, message: 'channel has no gateway.startAccount: ' + params.channel });
+        const started = [];
+        for (const accountId of (params.accountId ? [params.accountId] : channelAccounts(ent.ch))) {
+          const key = `${params.channel}:${accountId}`;
+          if (channelRuns.has(key)) continue;
+          const ac = new AbortController();
+          let account = {};
+          try { if (ent.ch.config && ent.ch.config.resolveAccount) account = ent.ch.config.resolveAccount(hostConfig, accountId) || {}; } catch {}
+          const emit = (m) => events.push({ plugin: ent.plugin, type: 'inbound', channel: params.channel, accountId, at: Date.now(), ...m });
+          const ctx = { accountId, account, cfg: hostConfig, abortSignal: ac.signal, log: makeRuntime({ id: ent.plugin }).logging.getChildLogger({ name: params.channel }),
+                        onMessage: emit, emit, setStatus: (st) => events.push({ type: 'channel.status', channel: params.channel, accountId, status: st }) };
+          const promise = Promise.resolve().then(() => ent.ch.gateway.startAccount(ctx)).catch((e) =>
+            events.push({ type: 'channel.status', channel: params.channel, accountId, status: { error: String(e) } }));
+          channelRuns.set(key, { abort: ac, promise });
+          started.push(accountId);
+        }
+        return respond(id, { ok: true, started });
+      }
+      case 'channel_gateway_stop': {
+        const stopped = [];
+        for (const [key, run] of [...channelRuns.entries()]) {
+          if (params.channel && !key.startsWith(params.channel + ':')) continue;
+          run.abort.abort();
+          const [cid, acc] = [key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1)];
+          const ent = channels.get(cid);
+          try { if (ent && ent.ch.gateway && ent.ch.gateway.stopAccount) await ent.ch.gateway.stopAccount({ accountId: acc, cfg: hostConfig }); } catch {}
+          channelRuns.delete(key); stopped.push(key);
+        }
+        return respond(id, { ok: true, stopped });
+      }
+      case 'channel_send_media': {
+        const ent = channels.get(params.channel);
+        if (!ent || !ent.ch.outbound || typeof ent.ch.outbound.sendMedia !== 'function')
+          return respond(id, null, { code: -32601, message: 'channel has no outbound.sendMedia: ' + params.channel });
+        const r = await ent.ch.outbound.sendMedia({ to: params.to, text: params.text || '', mediaUrl: params.mediaUrl, cfg: hostConfig, accountId: params.accountId });
+        return respond(id, { ok: true, result: r ?? null });
+      }
+      case 'drain_events': {
+        const out = events.splice(0, events.length);
+        return respond(id, { events: out });
+      }
       case 'channel_send': {
         const ent = channels.get(params.channel);
         if (!ent || !ent.ch.outbound || typeof ent.ch.outbound.sendText !== 'function')
@@ -376,9 +458,26 @@ async function handle(req) {
         const list = r == null ? [] : [].concat(r);
         return respond(id, { messages: list.filter((m) => m && typeof m.text === 'string') });
       }
-      case 'list_providers':
-        return respond(id, { providers: [...providers.entries()].map(([pid, v]) => ({ id: pid, plugin: v.plugin,
-          label: v.p.label || pid, models: v.p.models || [], chat: typeof v.p.complete === 'function' })) });
+      case 'list_providers': {
+        const out = [];
+        for (const [pid, v] of providers.entries()) {
+          let models = (v.p.models || []).map((m) => (typeof m === 'string' ? { id: m } : m)).filter((m) => m && m.id);
+          let catalog = null;
+          if (v.p.catalog && typeof v.p.catalog.run === 'function') {
+            try {
+              if (!catalogCache.has(pid) || params.refresh) catalogCache.set(pid, await v.p.catalog.run({ config: hostConfig, env: process.env }));
+              catalog = catalogCache.get(pid);
+              const pm = catalog && catalog.provider && Array.isArray(catalog.provider.models) ? catalog.provider.models : (catalog && catalog.models) || [];
+              for (const m of pm) { const mm = typeof m === 'string' ? { id: m } : m; if (mm && mm.id && !models.find((x) => x.id === mm.id)) models.push(mm); }
+            } catch (e) { catalog = { error: String(e) }; }
+          }
+          out.push({ id: pid, plugin: v.plugin, label: v.p.label || pid, docsPath: v.p.docsPath,
+            auth: (v.p.auth || []).map((a) => ({ id: a.id, label: a.label, kind: a.kind })),
+            models: models.map((m) => m.id), modelInfo: models, catalog: catalog && catalog.error ? { error: catalog.error } : (catalog ? { ok: true } : null),
+            chat: typeof v.p.complete === 'function' });
+        }
+        return respond(id, { providers: out });
+      }
       case 'provider_complete': {
         const ent = providers.get(params.provider);
         if (!ent || typeof ent.p.complete !== 'function')
@@ -388,6 +487,7 @@ async function handle(req) {
         return respond(id, { content: (r && r.content) || '', tool_calls: (r && r.tool_calls) || [] });
       }
       case 'shutdown': {
+        for (const run of channelRuns.values()) { try { run.abort.abort(); } catch {} }
         for (const { svc } of services) { try { if (typeof svc.stop === 'function') await svc.stop(); } catch {} }
         respond(id, { ok: true });
         process.exit(0);

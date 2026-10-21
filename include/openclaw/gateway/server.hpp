@@ -1,6 +1,7 @@
 #pragma once
 #include <condition_variable>
 #include <queue>
+#include <thread>
 #include <map>
 #include <functional>
 #include <chrono>
@@ -145,6 +146,14 @@ private:
     std::unique_lock<std::mutex> LockDeps() const;
     std::vector<std::string> plugin_channels_;
     std::set<std::string> plugin_providers_;
+    std::thread plugin_pump_;
+    std::atomic<bool> pump_stop_{false};
+    void PluginEventPump();
+    nlohmann::json HandlePluginEvent(const nlohmann::json& ev);
+public:
+    // Drain + process queued plugin runtime events once (tests / pump). Returns processed events.
+    nlohmann::json DrainPluginEvents();
+private:
     mutable std::mutex deps_mu_;  // exclusive: reload vs request handlers that touch deps
     std::mutex reload_mu_;
     // Bounded worker pool for HTTP clients (unbounded detach OOMed under reload hammers).

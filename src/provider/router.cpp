@@ -26,6 +26,7 @@ Provider* Router::Resolve(const std::string& route) const {
         auto it = providers_.find(default_);
         return it == providers_.end() ? nullptr : it->second.get();
     }
+    if (auto exact = providers_.find(route); exact != providers_.end()) return exact->second.get();  // "plugin/model"
     auto slash = route.find('/');
     const std::string name = slash == std::string::npos ? route : route.substr(0, slash);
     auto it = providers_.find(name);
