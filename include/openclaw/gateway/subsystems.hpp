@@ -46,6 +46,9 @@ std::optional<nlohmann::json> RunTurnOnPlacedWorker(ServerDeps& d, const std::fi
 // Upstream agent tools that read gateway state: sessions_list, sessions_history, session_status, agents_list, nodes.
 // In-process RPC used by agent tools that wrap gateway methods (returns the response frame {ok,payload,error}).
 // True while a suspension is draining/ready: new agent runs are refused.
+// Attach grants: session key for a live attach token (empty = invalid); MCP JSON-RPC over HTTP.
+std::string AttachGrantSession(const std::string& token);
+nlohmann::json HandleMcpHttp(const nlohmann::json& req, const std::string& session_key);
 bool GatewayAdmissionClosed(std::string* why);
 void SetGatewayEmitter(std::function<void(const std::string&, const nlohmann::json&)> fn);
 void GatewayEmit(const std::string& event, const nlohmann::json& payload);

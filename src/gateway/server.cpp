@@ -55,7 +55,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.119.0-dev";
+constexpr const char* kVersion = "1.120.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1533,6 +1533,12 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         auto route = deps_.js_host->MatchHttpRoute(path);
         if (!route.is_null() && route.value("auth", "gateway") == "plugin") public_ok = true;
     }
+    std::string mcp_session;
+    if (!public_ok && method == "POST" && path == "/mcp") {
+        auto a = HeaderValue(req, "Authorization");
+        if (a.rfind("Bearer ", 0) == 0) mcp_session = AttachGrantSession(a.substr(7));
+        if (!mcp_session.empty()) public_ok = true;
+    }
     if (public_ok) g_rpc_role = g_rpc_role_pending_device ? "device" : "admin";
     g_rpc_role_pending_device = false;
     if (!public_ok) {
@@ -1869,6 +1875,17 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         for (const auto& m : deps_.sessions.Load(id)) msgs.push_back(m.ToJson());
         send(HttpResponse(200, "OK",
             nlohmann::json{{"id", id}, {"messages", msgs}, {"impl", "real"}}.dump(2)));
+        return;
+    }
+    if (method == "POST" && path == "/mcp") {
+        nlohmann::json body;
+        try { body = nlohmann::json::parse(BodyOf(req)); } catch (...) {
+            send(HttpResponse(400, "Bad Request", nlohmann::json{{"jsonrpc", "2.0"}, {"id", nullptr}, {"error", {{"code", -32700}, {"message", "parse error"}}}}.dump())); return; }
+        const auto key = mcp_session.empty() ? std::string("agent:main:main") : mcp_session;
+        if (body.is_array()) { nlohmann::json out = nlohmann::json::array(); for (auto& r : body) if (r.contains("id")) out.push_back(HandleMcpHttp(r, key));
+            send(HttpResponse(200, "OK", out.dump())); return; }
+        if (!body.contains("id")) { send(HttpResponse(202, "Accepted", "")); return; }
+        send(HttpResponse(200, "OK", HandleMcpHttp(body, key).dump()));
         return;
     }
     if (method == "POST" && path == "/v1/rpc") {
@@ -3008,7 +3025,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         // Subsystem handlers that call back into RPCs (GatewayRpc) must not run under the deps lock.
         static const std::set<std::string> reentrant{"taskSuggestions.accept", "sessions.patchMany", "wake", "node.invoke.progress", "mentions.list",
                                                      "message.action", "worktrees.create", "talk.speak", "talk.session.appendAudio", "talk.session.steer",
-                                                     "talk.session.submitToolResult", "talk.client.steer", "talk.client.toolCall", "talk.client.transcript", "mcp.app.mention", "sessions.catalog.continue", "sessions.catalog.startTerminal", "sessions.providerReview.continue", "openclaw.setup.activate", "openclaw.chat", "openclaw.approval.list", "wizard.next", "wizard.start", "gateway.suspend.prepare", "gateway.suspend.status", "users.authConnect.answer"};
+                                                     "talk.session.submitToolResult", "talk.client.steer", "talk.client.toolCall", "talk.client.transcript", "mcp.app.mention", "sessions.catalog.continue", "sessions.catalog.startTerminal", "sessions.providerReview.continue", "openclaw.setup.activate", "openclaw.chat", "openclaw.approval.list", "wizard.next", "wizard.start", "gateway.suspend.prepare", "gateway.suspend.status", "users.authConnect.answer", "board.event", "board.prompt.authorize", "conversations.send", "conversations.turn", "conversations.turn.cancel", "transcripts.summarize", "session.discussion.open", "session.discussion.info", "nativeHook.invoke", "device.scopes.waitUpgrade", "device.scopes.requestUpgrade", "chat.metadata.changed", "migrations.memory.apply", "migrations.memory.plan", "web.login.start", "web.login.wait", "worker.desktop.launch", "worker.desktop.observe", "ui.command", "attach.grant", "controlUi.sessionPullRequests.subscribe"};
         if (reentrant.count(method) && deps_lock.owns_lock()) deps_lock.unlock();
         auto extra = TryExtraDispatch(deps_, method, params);
         if (extra.handled) {

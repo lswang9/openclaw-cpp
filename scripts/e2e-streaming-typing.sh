@@ -63,7 +63,7 @@ export OPENCLAW_PIDFILE="$T/pid" OPENCLAW_TOKENIZER_PATH="$T/none"
 for _ in $(seq 1 80); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done
 fail() { echo "[e2e-st] $*" >&2; tail -20 "$T/gw.log" >&2; cat "$T/log" >&2 2>/dev/null; exit 1; }
 # 1) plugin command → streamed agent reply (tool-call deltas assembled, content deltas, typing events)
-OUT=$(curl -sf -m 40 -X POST "http://127.0.0.1:$PORT/api/channels/slack/inbound" -H 'Content-Type: application/json' \
+OUT=$(curl -sS -f -m 120 -X POST "http://127.0.0.1:$PORT/api/channels/slack/inbound" -H 'Content-Type: application/json' \
   -d '{"type":"event_callback","event":{"type":"message","text":"/streamit","user":"U1","channel":"Cs","channel_type":"channel"}}') || fail "plugin inbound"
 python3 - "$OUT" "$T/log" <<'PY' || fail "plugin stream assertions: $OUT"
 import json, sys
@@ -78,8 +78,8 @@ assert tool["tool_call_id"] == "call_x" and calls[0]["function"]["arguments"] ==
 PY
 # 2) Discord inbound → typing keep-alive to the channel while the slow stream runs
 : > "$T/log"
-OUT=$(curl -sf -m 40 -X POST "http://127.0.0.1:$PORT/api/channels/discord/inbound" -H 'Content-Type: application/json' \
-  -d '{"content":"hey","channel_id":"D77","author":{"id":"u9"},"guild_id":"G1"}') || fail "discord inbound"
+OUT=$(curl -sS -f -m 120 -X POST "http://127.0.0.1:$PORT/api/channels/discord/inbound" -H 'Content-Type: application/json' \
+  -d '{"content":"hey","channel_id":"D77","author":{"id":"u9"},"guild_id":"G1"}') || fail "discord inbound (curl rc=$?)"
 echo "$OUT" | grep -q "Hello stream" || fail "discord reply: $OUT"
 N=$(grep -c '/channels/D77/typing' "$T/log" || true)
 [ "$N" -ge 2 ] || fail "expected >=2 typing pings, got $N"

@@ -32,6 +32,8 @@ export default function register(api) {
   api.on('session_end', () => { stats.sessionEnd++; });
 
   api.registerGatewayMethod('sample.status', ({ respond }) => respond(true, { ok: true, plugin: api.id, ...stats }));
+  api.registerGatewayMethod('sample.loginWithQrStart', ({ respond }) => respond(true, { qrDataUrl: 'data:image/png;base64,iVBORw0KGgo=', message: 'scan with sample app' }));
+  api.registerGatewayMethod('sample.loginWithQrWait', ({ respond }) => respond(true, { connected: true, message: 'linked' }));
 
   api.registerHttpRoute({
     path: '/plugins/sample/hello',

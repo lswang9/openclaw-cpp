@@ -35,6 +35,8 @@ public:
     static std::string MethodScope(const std::string& method);  // the operator.* scope a method needs
     std::vector<std::string> TokenScopes(const std::string& token) const;
     nlohmann::json Deny(const std::string& id_or_code);
+    // Revoke the device's live tokens and mint a replacement with role/scopes (scopes empty = keep).
+    nlohmann::json Rotate(const std::string& device, const std::string& role, const nlohmann::json& scopes);
     nlohmann::json Claim(const std::string& link_id, const std::string& poll_secret);
     nlohmann::json Verify(const std::string& token) const;
     bool IsValidToken(const std::string& token) const;

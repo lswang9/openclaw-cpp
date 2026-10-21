@@ -52,6 +52,15 @@ class H(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "repos":
             full = f"{parts[1]}/{parts[2]}"
             return self.send(200, repo_json(full)) if full in REPOS else self.send(404, {"message": "Not Found"})
+        if len(parts) == 5 and parts[0] == "repos" and parts[3] in ("pulls", "issues") and parts[4].isdigit():
+            num = int(parts[4]); full = f"{parts[1]}/{parts[2]}"
+            if full not in REPOS: return self.send(404, {"message": "Not Found"})
+            j = {"number": num, "title": f"Fake {parts[3][:-1]} #{num}", "state": "open", "user": {"login": "octo"}, "body": "fake body",
+                 "labels": [{"name": "bug"}], "html_url": f"https://github.com/{full}/{'pull' if parts[3] == 'pulls' else 'issues'}/{num}"}
+            if parts[3] == "pulls": j.update({"head": {"ref": "feat"}, "base": {"ref": "main"}, "merged": False, "draft": False})
+            return self.send(200, j)
+        if len(parts) == 6 and parts[0] == "repos" and parts[3] == "commits" and parts[5] == "check-runs":
+            return self.send(200, {"total_count": 2, "check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}, {"name": "test", "status": "in_progress", "conclusion": None}]})
         if len(parts) == 4 and parts[0] == "repos" and parts[3] == "pulls":
             head = q.get("head", [""])[0]
             return self.send(200, [pr for pr in PULLS if f"{pr['owner']}:{pr['head']}" == head and pr["state"] == "open"])

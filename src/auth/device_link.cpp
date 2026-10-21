@@ -576,4 +576,23 @@ nlohmann::json DeviceLinkStore::Revoke(const std::string& k) {
     return {{"ok", false}, {"error", "token not found"}};
 }
 
+nlohmann::json DeviceLinkStore::Rotate(const std::string& dev, const std::string& role, const nlohmann::json& scopes) {
+    if (!ValidRole(role)) return {{"ok", false}, {"error", "invalid role (device|operator)"}};
+    if (!scopes.is_array()) return {{"ok", false}, {"error", "scopes must be an array"}};
+    for (auto& s : scopes) if (!s.is_string() || !ValidScope(s.get<std::string>())) return {{"ok", false}, {"error", "invalid scope " + s.dump()}};
+    std::lock_guard lock(mu_);
+    nlohmann::json* cur = nullptr;
+    for (auto& t : data_["tokens"]) if (!t.value("revoked", false) && (S(t, "id") == dev || S(t, "link_id") == dev || S(t, "device_name") == dev)) cur = &t;
+    if (!cur) return {{"ok", false}, {"error", "no active token for device " + dev}};
+    auto old = *cur;
+    (*cur)["revoked"] = true; (*cur)["revoked_ms"] = NowMs(); (*cur)["rotated"] = true;
+    auto token = "ocd_" + RandHex(24);
+    nlohmann::json t{{"id", "tok-" + RandHex(6)}, {"link_id", old.value("link_id", "")}, {"device_name", old.value("device_name", nlohmann::json(dev))},
+                     {"token_sha256", Sha256Hex(token)}, {"created_ms", NowMs()}, {"revoked", false}, {"role", role}, {"rotated_from", old["id"]}};
+    if (!scopes.empty()) t["scopes"] = scopes; else if (old.contains("scopes")) t["scopes"] = old["scopes"];
+    data_["tokens"].push_back(t);
+    Save();
+    return {{"ok", true}, {"token", token}, {"tokenId", t["id"]}, {"role", role}, {"scopes", t.value("scopes", nlohmann::json::array())}, {"rotatedFrom", old["id"]}};
+}
+
 }  // namespace openclaw::auth

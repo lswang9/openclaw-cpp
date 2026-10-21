@@ -1,3 +1,7 @@
+#include "openclaw/channels/waweb/noise.hpp"
+#include "openclaw/desktop/desktop.hpp"
+#include "openclaw/clawhub/client.hpp"
+#include "openclaw/net/safe_fetch.hpp"
 #include <openssl/ecdsa.h>
 #include <openssl/param_build.h>
 #include <openssl/core_names.h>
@@ -3134,6 +3138,360 @@ ExtraResult ToolsGitHub(ServerDeps& d, const fs::path& root, const std::string& 
     return r;
 }
 
+
+// ---------------------------------------------------------------- attach grants + gateway MCP server (POST /mcp, streamable-HTTP JSON responses)
+struct AttachGrant { std::string sessionKey; long long expires = 0; };
+std::mutex g_attach_mu; std::map<std::string, AttachGrant> g_attach;
+std::string AttachGrantSession(const std::string& token) {
+    std::lock_guard<std::mutex> l(g_attach_mu);
+    auto it = g_attach.find(token); if (it == g_attach.end()) return {};
+    if (it->second.expires < NowMs()) { g_attach.erase(it); return {}; }
+    return it->second.sessionKey;
+}
+json HandleMcpHttp(const json& req, const std::string& session_key) {
+    const auto id = req.contains("id") ? req["id"] : json(nullptr);
+    const auto m = req.value("method", std::string());
+    auto res = [&](json r) { return json{{"jsonrpc", "2.0"}, {"id", id}, {"result", r}}; };
+    auto err = [&](int c, const std::string& msg) { return json{{"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", c}, {"message", msg}}}}; };
+    if (m == "initialize") return res({{"protocolVersion", req.value("params", json::object()).value("protocolVersion", std::string("2025-06-18"))},
+                                       {"capabilities", {{"tools", {{"listChanged", false}}}}}, {"serverInfo", {{"name", "openclaw-gateway"}, {"version", "cpp"}}},
+                                       {"instructions", "Tools run inside OpenClaw session " + session_key}});
+    if (m == "ping") return res(json::object());
+    if (m == "tools/list") {
+        json tools = json::array();
+        if (g_tool_deps) for (auto& n : g_tool_deps->tools.Names()) { auto* s = g_tool_deps->tools.Get(n); if (!s) continue;
+            tools.push_back({{"name", n}, {"description", s->description}, {"inputSchema", s->parameters.is_object() ? s->parameters : json{{"type", "object"}}}}); }
+        return res({{"tools", tools}});
+    }
+    if (m == "tools/call") {
+        const auto pr = req.value("params", json::object());
+        auto r = GatewayRpc("tools.invoke", {{"name", pr.value("name", std::string())}, {"args", pr.value("arguments", json::object())}, {"sessionKey", session_key}});
+        if (!r.value("ok", false)) return res({{"content", json::array({{{"type", "text"}, {"text", r.value("error", json("tool failed")).dump()}}})}, {"isError", true}});
+        auto out = r["payload"].value("result", r["payload"]);
+        return res({{"content", json::array({{{"type", "text"}, {"text", out.is_string() ? out.get<std::string>() : out.dump()}}})}, {"isError", false}});
+    }
+    return err(-32601, "method not found: " + m);
+}
+ExtraResult Attach(ServerDeps& d, const std::string& m, const json& p) {
+    if (m == "attach.revoke") {
+        const auto tok = p.value("token", std::string()); if (tok.empty()) return Fail("token is required");
+        std::lock_guard<std::mutex> l(g_attach_mu); return Ok({{"revoked", g_attach.erase(tok) > 0}});
+    }
+    auto key = p.value("sessionKey", std::string("main"));
+    const auto agent = p.value("agentId", std::string("main"));
+    if (key.rfind("agent:", 0) != 0) key = "agent:" + agent + ":" + key;
+    const long long ttl = std::clamp<long long>(p.value("ttlMs", 3600000LL), 1000, 24LL * 3600000);
+    unsigned char rb[24]; RAND_bytes(rb, 24); std::string tok = "oca_"; static const char* hx = "0123456789abcdef"; for (auto b : rb) { tok.push_back(hx[b >> 4]); tok.push_back(hx[b & 15]); }
+    { std::lock_guard<std::mutex> l(g_attach_mu); g_attach[tok] = {key, NowMs() + ttl}; }
+    const auto host = d.config.gateway_host.empty() || d.config.gateway_host == "0.0.0.0" ? std::string("127.0.0.1") : d.config.gateway_host;
+    const auto url = "http://" + host + ":" + std::to_string(d.config.gateway_port) + "/mcp";
+    return Ok({{"sessionKey", key}, {"token", tok}, {"expiresAtMs", NowMs() + ttl},
+               {"mcpConfig", {{"type", "http"}, {"url", url}, {"headers", {{"Authorization", "Bearer ${OPENCLAW_MCP_TOKEN}"}}}}}, {"env", {{"OPENCLAW_MCP_TOKEN", tok}}}});
+}
+
+// ---------------------------------------------------------------- board widgets (put → grant → app view ticket → events / prompt authorization)
+ExtraResult BoardWidgets(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    std::unique_lock<std::mutex> l(g_mu);
+    auto db = ReadJsonFile(MetaPath(root, "board-widgets"), json{{"widgets", json::object()}, {"tickets", json::object()}, {"events", json::array()}});
+    auto save = [&] { WriteJsonFile(MetaPath(root, "board-widgets"), db); };
+    auto wkey = [&] { return str("sessionKey") + "\n" + str("name"); };
+    if (m == "board.widget.put") {
+        if (str("sessionKey").empty() || str("name").empty() || !p.contains("content")) return Fail("sessionKey, name and content are required");
+        auto& w = db["widgets"][wkey()]; const int rev = w.is_object() ? w.value("revision", 0) + 1 : 1;
+        const auto kind = p["content"].is_object() ? p["content"].value("kind", p["content"].value("type", std::string("markdown"))) : std::string("markdown");
+        const bool needs_grant = kind == "html" || kind == "app" || kind == "mcp-app";
+        const auto inst = Rid("wi");
+        w = {{"sessionKey", str("sessionKey")}, {"name", str("name")}, {"title", str("title").empty() ? str("name") : str("title")}, {"content", p["content"]},
+             {"presentation", p.value("presentation", json(nullptr))}, {"placement", p.value("placement", json(nullptr))}, {"revision", rev}, {"instanceId", inst},
+             {"grant", needs_grant ? "pending" : "not_required"}, {"updatedAtMs", NowMs()}};
+        save(); l.unlock(); GatewayEmit("board.changed", {{"sessionKey", str("sessionKey")}, {"widget", str("name")}, {"revision", rev}});
+        return Ok({{"name", str("name")}, {"revision", rev}, {"instanceId", inst}, {"grant", needs_grant ? "pending" : "not_required"}});
+    }
+    if (m == "board.widget.grant" || m == "board.widget.appView") {
+        if (!db["widgets"].contains(wkey())) return Fail("unknown widget");
+        auto& w = db["widgets"][wkey()];
+        if (p.value("revision", 0) != w["revision"].get<int>() || str("instanceId") != w.value("instanceId", std::string())) return Fail("widget changed; reload the board");
+        if (m == "board.widget.grant") {
+            if (str("decision") != "granted" && str("decision") != "rejected") return Fail("decision must be granted or rejected");
+            w["grant"] = str("decision"); w["grantedBy"] = t_principal; save(); return Ok({{"name", str("name")}, {"grant", w["grant"]}});
+        }
+        if (w["grant"] == "pending" || w["grant"] == "rejected") return Fail("widget app view is not granted");
+        const auto vid = Rid("bview"); const long long exp = NowMs() + 10 * 60 * 1000;
+        db["tickets"][vid] = {{"sessionKey", w["sessionKey"]}, {"name", w["name"]}, {"revision", w["revision"]}, {"expiresAtMs", exp}};
+        save(); return Ok({{"viewId", vid}, {"expiresAtMs", exp}});
+    }
+    // ticket-bound calls from a rendered widget
+    json ticket = p.contains("ticket") ? p["ticket"] : json(nullptr);
+    const auto tid = ticket.is_string() ? ticket.get<std::string>() : ticket.is_object() ? ticket.value("viewId", ticket.value("id", std::string())) : std::string();
+    if (!db["tickets"].contains(tid) || db["tickets"][tid].value("expiresAtMs", 0LL) < NowMs()) return Fail("board view ticket expired or unknown");
+    auto tk = db["tickets"][tid];
+    if (m == "board.prompt.authorize") return Ok({{"authorized", true}, {"sessionKey", tk["sessionKey"]}, {"widget", tk["name"]}, {"expiresAtMs", tk["expiresAtMs"]}});
+    if (m == "board.event") {
+        json ev{{"ticket", tid}, {"widget", tk["name"]}, {"sessionKey", tk["sessionKey"]}, {"event", p.value("event", p.value("name", json("event")))}, {"payload", p.value("payload", p.value("data", json(nullptr)))}, {"at", NowMs()}};
+        db["events"].push_back(ev); while (db["events"].size() > 500) db["events"].erase(0);
+        save(); l.unlock();
+        GatewayEmit("board.event", ev);
+        if (p.value("prompt", false) || p.contains("message")) GatewayRpc("chat.inject", {{"sessionKey", tk["sessionKey"]}, {"message", "[board " + tk["name"].get<std::string>() + "] " + p.value("message", ev["event"].dump())}});
+        return Ok({{"accepted", true}});
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------- control UI helpers: link/GitHub previews, PR checks
+ExtraResult ControlUi(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    std::string api; try { api = GitHubApiBase(d.config.raw); } catch (const std::exception& e) { if (m != "controlUi.linkPreview") return Fail(e.what()); }
+    auto gh = [&](const std::string& path) -> json { auto r = GitHubRequest(api + path, "GET", GitHubToken()); if (r.status != 200) return nullptr; try { return json::parse(r.body); } catch (...) { return nullptr; } };
+    if (m == "controlUi.linkPreview") {
+        const auto url = str("url"); if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return Fail("url must be http(s)");
+        auto f = net::SafeFetch(url, 512 * 1024, std::getenv("OPENCLAW_LINK_PREVIEW_ALLOW_PRIVATE") != nullptr, 10);
+        if (!f.ok) return Fail("preview fetch failed: " + f.error);
+        auto meta = [&](const std::string& prop) -> std::string {
+            std::regex re("<meta[^>]+(?:property|name)=[\"']" + prop + "[\"'][^>]*content=[\"']([^\"']*)[\"']", std::regex::icase); std::smatch mm;
+            return std::regex_search(f.body, mm, re) ? mm[1].str() : std::string(); };
+        std::smatch tm; std::string title = meta("og:title");
+        if (title.empty() && std::regex_search(f.body, tm, std::regex("<title[^>]*>([^<]*)</title>", std::regex::icase))) title = Trim(tm[1].str());
+        std::string desc = meta("og:description"); if (desc.empty()) desc = meta("description");
+        return Ok({{"url", url}, {"status", f.status}, {"title", title}, {"description", desc}, {"image", meta("og:image")}, {"siteName", meta("og:site_name")}});
+    }
+    auto parse = [&](std::string& owner, std::string& repo, std::string& kind, int& num) {
+        owner = str("owner"); repo = str("repo"); num = p.value("number", 0); kind = str("kind");
+        std::smatch mm; const auto url = str("url");
+        if (std::regex_search(url, mm, std::regex(R"(github\.com/([^/]+)/([^/]+)(?:/(pull|issues)/(\d+))?)"))) { owner = mm[1]; repo = mm[2]; if (mm[3].matched) { kind = mm[3] == "pull" ? "pull" : "issue"; num = std::stoi(mm[4]); } }
+        if (repo.size() > 4 && repo.substr(repo.size() - 4) == ".git") repo.resize(repo.size() - 4);
+    };
+    if (m == "controlUi.githubPreview" || m == "controlUi.githubDetail") {
+        std::string o, r, k; int n = 0; parse(o, r, k, n);
+        if (o.empty() || r.empty()) return Fail("a github.com URL or owner/repo is required");
+        if (n == 0) { auto j = gh("/repos/" + o + "/" + r); if (j.is_null()) return Fail("repository not found or not accessible");
+            return Ok({{"kind", "repository"}, {"fullName", j.value("full_name", o + "/" + r)}, {"description", j.value("description", json(nullptr))}, {"private", j.value("private", false)}, {"defaultBranch", j.value("default_branch", "")}}); }
+        auto j = gh("/repos/" + o + "/" + r + (k == "pull" ? "/pulls/" : "/issues/") + std::to_string(n));
+        if (j.is_null()) return Fail("not found or not accessible");
+        json out{{"kind", k.empty() ? "issue" : k}, {"repository", o + "/" + r}, {"number", n}, {"title", j.value("title", "")}, {"state", j.value("state", "")},
+                 {"author", j.contains("user") ? j["user"].value("login", "") : ""}, {"url", j.value("html_url", "")}};
+        if (m == "controlUi.githubDetail") { out["body"] = j.value("body", json(nullptr)); out["labels"] = json::array(); for (auto& lb : j.value("labels", json::array())) out["labels"].push_back(lb.value("name", ""));
+            if (k == "pull") { out["head"] = j.value("head", json::object()).value("ref", ""); out["base"] = j.value("base", json::object()).value("ref", ""); out["merged"] = j.value("merged", false); out["draft"] = j.value("draft", false); } }
+        return Ok(out);
+    }
+    if (m == "controlUi.sessionPullRequests.checks" || m == "controlUi.sessionPullRequests.subscribe") {
+        const auto key = str("sessionKey"); if (key.empty()) return Fail("sessionKey is required");
+        json prs = json::array();
+        { std::lock_guard<std::mutex> l(g_mu); auto db = ReadJsonFile(PubPath(root), json{{"requests", json::object()}});
+          for (auto& [id, rec] : db["requests"].items()) if (rec.value("sessionKey", "") == key && rec.contains("effect")) prs.push_back({{"requestId", id}, {"url", rec["effect"].value("url", "")}, {"headCommit", rec["effect"].value("headCommit", "")}, {"repository", rec.value("repository", "")}}); }
+        if (m == "controlUi.sessionPullRequests.subscribe") {
+            std::lock_guard<std::mutex> l(g_mu); auto sub = ReadJsonFile(MetaPath(root, "pr-subscriptions"), json::object()); sub[key] = {{"since", NowMs()}, {"by", t_principal}};
+            WriteJsonFile(MetaPath(root, "pr-subscriptions"), sub); return Ok({{"subscribed", true}, {"pullRequests", prs.size()}});
+        }
+        for (auto& pr : prs) {
+            std::smatch mm; const auto u = pr["url"].get<std::string>(); std::string repo = pr["repository"];
+            if (repo.empty() && std::regex_search(u, mm, std::regex(R"(github\.com/([^/]+/[^/]+)/pull/)"))) repo = mm[1];
+            auto j = repo.empty() || pr["headCommit"] == "" ? json(nullptr) : gh("/repos/" + repo + "/commits/" + pr["headCommit"].get<std::string>() + "/check-runs");
+            json runs = json::array(); std::string overall = j.is_null() ? "unknown" : "success";
+            if (!j.is_null()) for (auto& c : j.value("check_runs", json::array())) { runs.push_back({{"name", c.value("name", "")}, {"status", c.value("status", "")}, {"conclusion", c.value("conclusion", json(nullptr))}});
+                if (c.value("status", "") != "completed") overall = overall == "failure" ? overall : "pending"; else if (c.value("conclusion", json("")).is_string() && c["conclusion"] != "success" && c["conclusion"] != "skipped" && c["conclusion"] != "neutral") overall = "failure"; }
+            pr["checks"] = runs; pr["state"] = overall;
+        }
+        return Ok({{"sessionKey", key}, {"pullRequests", prs}});
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------- misc singles: conversations, web.login, worker.desktop, catalog, discussion, ui.command, config.openFile,
+// artifacts.download, transcripts.summarize, chat.metadata.changed, nativeHook.invoke, claws, device scopes/token, memory migrations
+std::string ShaHex256(const std::string& s) { unsigned char h[32]; SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), h); static const char* x = "0123456789abcdef"; std::string o; for (auto b : h) { o.push_back(x[b >> 4]); o.push_back(x[b & 15]); } return o; }
+ExtraResult Singles(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    std::error_code ec;
+    if (m == "conversations.send" || m == "conversations.turn") {
+        const auto key = str("sessionKey").empty() ? (str("conversationId").empty() ? str("key") : str("conversationId")) : str("sessionKey");
+        const auto msg = str("message").empty() ? str("text") : str("message");
+        if (key.empty() || msg.empty()) return Fail("sessionKey and message are required");
+        if (m == "conversations.send") { auto r = GatewayRpc("chat.inject", {{"sessionKey", key}, {"message", msg}}); return r.value("ok", false) ? Ok({{"sent", true}, {"sessionKey", key}}) : Fail("send failed"); }
+        const auto tid = Rid("turn");
+        { std::lock_guard<std::mutex> l(g_mu); auto db = ReadJsonFile(MetaPath(root, "conversation-turns"), json::object()); db[tid] = {{"sessionKey", key}, {"status", "running"}, {"startedAt", NowMs()}}; WriteJsonFile(MetaPath(root, "conversation-turns"), db); }
+        auto r = GatewayRpc("chat.send", {{"sessionKey", key}, {"message", msg}});
+        std::lock_guard<std::mutex> l(g_mu); auto db = ReadJsonFile(MetaPath(root, "conversation-turns"), json::object());
+        const bool cancelled = db[tid].value("status", "") == "cancelled";
+        db[tid]["status"] = cancelled ? "cancelled" : r.value("ok", false) ? "completed" : "failed"; db[tid]["endedAt"] = NowMs(); WriteJsonFile(MetaPath(root, "conversation-turns"), db);
+        if (!r.value("ok", false)) return Fail("turn failed");
+        return Ok({{"turnId", tid}, {"status", db[tid]["status"]}, {"reply", cancelled ? json(nullptr) : json(r["payload"].value("text", ""))}});
+    }
+    if (m == "conversations.turn.cancel") {
+        std::lock_guard<std::mutex> l(g_mu); auto db = ReadJsonFile(MetaPath(root, "conversation-turns"), json::object());
+        if (!db.contains(str("turnId"))) return Fail("unknown turn");
+        auto& t = db[str("turnId")]; if (t["status"] != "running") return Ok({{"cancelled", false}, {"status", t["status"]}});
+        t["status"] = "cancelled"; WriteJsonFile(MetaPath(root, "conversation-turns"), db); return Ok({{"cancelled", true}});
+    }
+    if (m == "web.login.start" || m == "web.login.wait") {
+        const auto ch = str("channel").empty() ? std::string("whatsapp") : str("channel");
+        const auto pm = ch + (m == "web.login.start" ? ".loginWithQrStart" : ".loginWithQrWait");
+        if (!d.js_host || !d.js_host->HasGatewayMethod(pm)) return Fail("no loaded channel plugin provides QR login for " + ch + " (install the " + ch + " channel plugin)");
+        json args = p; args.erase("channel");
+        auto r = d.js_host->CallGatewayMethod(pm, args);
+        if (!r.value("ok", true) || r.contains("error")) return Fail(r.value("error", json("login failed")).dump());
+        return Ok(r.contains("payload") ? r["payload"] : r);
+    }
+    if (m == "worker.desktop.launch" || m == "worker.desktop.observe") {
+        if (str("environmentId").empty()) return Fail("environmentId is required");
+        auto& dc = desktop::Default();
+        if (!dc.Available()) return Fail("no desktop is available in environment " + str("environmentId") + " (needs an X display)");
+        if (m == "worker.desktop.launch") { auto r = dc.Launch({{"app", str("app")}}); if (!r.value("ok", true)) return Fail(r.value("error", std::string("launch failed"))); return Ok({{"app", str("app")}, {"status", "ready"}, {"detail", r}}); }
+        return Ok(dc.Observe(p));
+    }
+    if (m == "catalog.browse" || m == "catalog.searchKeywords") {
+        const auto q = str("query").empty() ? (m == "catalog.browse" ? std::string("") : str("q")) : str("query");
+        if (m == "catalog.searchKeywords" && Trim(q).empty()) return Fail("query is required");
+        auto r = clawhub::Search(q.empty() ? std::string("*") : q, std::clamp(p.value("limit", 20), 1, 100));
+        if (!r.value("ok", false)) return Fail("ClawHub catalog unavailable: " + r.value("error", std::string("request failed")));
+        if (m == "catalog.searchKeywords") { std::set<std::string> kw; for (auto& x : r["results"]) { for (auto& t : x.value("tags", json::array())) if (t.is_string()) kw.insert(t); auto s = x.value("slug", std::string()); if (!s.empty()) kw.insert(s); }
+            json o = json::array(); for (auto& k : kw) o.push_back(k); return Ok({{"keywords", o}, {"registry", r["registry"]}}); }
+        json items = json::array(); for (auto& x : r["results"]) { json i = x; i["kind"] = "skill"; items.push_back(i); }
+        return Ok({{"items", items}, {"registry", r["registry"]}});
+    }
+    if (m == "session.discussion.info" || m == "session.discussion.open") {
+        const auto key = str("sessionKey"); if (key.empty()) return Fail("sessionKey is required");
+        const auto dk = key + ":discussion";
+        if (m == "session.discussion.open" && !d.sessions.Exists(dk)) {
+            if (!d.sessions.Exists(key)) return Fail("session not found");
+            auto ms = d.sessions.Load(key); std::string ctx; for (size_t i = ms.size() > 6 ? ms.size() - 6 : 0; i < ms.size(); ++i) if (ms[i].role == "user" || ms[i].role == "assistant") ctx += ms[i].role + ": " + Utf8Cut(ms[i].content, 300) + "\n";
+            agent::Message s; s.role = "system"; s.content = "Side discussion about session " + key + ". Recent context:\n" + ctx; d.sessions.Save(dk, {s});
+        }
+        const bool open = d.sessions.Exists(dk);
+        return Ok({{"sessionKey", key}, {"state", open ? "open" : "none"}, {"discussionSessionKey", open ? json(dk) : json(nullptr)}, {"messages", open ? d.sessions.Load(dk).size() : 0}});
+    }
+    if (m == "ui.command") {
+        if (!p.contains("command") || !p["command"].is_object()) return Fail("command object is required");
+        GatewayEmit("ui.command", {{"command", p["command"]}, {"sessionKey", p.value("sessionKey", json(nullptr))}, {"from", t_principal}});
+        return Ok({{"ok", true}});
+    }
+    if (m == "config.openFile") {
+        const auto path = config::DefaultPath();
+        if (!fs::exists(path, ec)) return Ok({{"ok", false}, {"path", path.string()}, {"error", "config file does not exist yet"}});
+        if (const char* cmd = std::getenv("OPENCLAW_REVEAL_CMD")) { auto r = Run({cmd, path.string()}, {}); if (r.code != 0) return Ok({{"ok", false}, {"path", path.string()}, {"error", Trim(r.err)}}); }
+        return Ok({{"ok", true}, {"path", path.string()}});
+    }
+    if (m == "artifacts.download") {
+        auto a = d.media.GetJson(str("artifactId")); if (!a.value("ok", true) || !a.contains("path")) return Fail("artifact not found");
+        json summary = a; summary.erase("path");
+        if (str("transport") == "http") return Ok({{"artifact", summary}, {"url", "/v1/media/" + str("artifactId")}});
+        const auto bytes = ReadAll(a["path"].get<std::string>());
+        if (bytes.size() > 16 * 1024 * 1024) return Ok({{"artifact", summary}, {"unsupported", "too large for inline download; use transport=http"}});
+        return Ok({{"artifact", summary}, {"encoding", "base64"}, {"data", channels::waweb::Base64(channels::waweb::Bytes(bytes.begin(), bytes.end()))}});
+    }
+    if (m == "transcripts.summarize") {
+        const auto sel = p.value("selector", json::object()); const auto key = sel.value("sessionKey", sel.value("id", std::string()));
+        if (key.empty() || !d.sessions.Exists(key)) return Fail("transcript not found");
+        if (!d.router) return Fail("no model provider configured");
+        std::string tr; for (auto& x : d.sessions.Load(key)) if (x.role == "user" || x.role == "assistant") tr += x.role + ": " + Utf8Cut(x.content, 2000) + "\n";
+        agent::Message s; s.role = "system"; s.content = "Summarize the transcript. Reply as JSON {\"overview\":string,\"decisions\":[string],\"actionItems\":[string]}.";
+        agent::Message u; u.role = "user"; u.content = Utf8Cut(tr, 60000);
+        auto r = d.router->Complete({s, u}, json::array()); if (!r.ok) return Fail("summary model call failed: " + r.error);
+        json sum; try { auto txt = r.message.content; auto a = txt.find('{'), b = txt.rfind('}'); sum = json::parse(txt.substr(a, b - a + 1)); } catch (...) { sum = {{"overview", r.message.content}, {"decisions", json::array()}, {"actionItems", json::array()}}; }
+        sum["generatedAt"] = std::to_string(NowMs());
+        { std::lock_guard<std::mutex> l(g_mu); auto db = ReadJsonFile(MetaPath(root, "transcript-summaries"), json::object()); db[key] = sum; WriteJsonFile(MetaPath(root, "transcript-summaries"), db); }
+        return Ok({{"sessionKey", key}, {"summary", sum}});
+    }
+    if (m == "chat.metadata.changed") {
+        const auto key = str("sessionKey"); if (key.empty()) return Fail("sessionKey is required");
+        auto meta = ReadJsonFile(MetaPath(root, "session-meta"), json::object()).value("sessions", json::object()).value(key, json::object());
+        GatewayEmit("chat.metadata.changed", {{"sessionKey", key}, {"metadata", meta}});
+        return Ok({{"sessionKey", key}, {"metadata", meta}});
+    }
+    if (m == "nativeHook.invoke") {
+        auto relays = ReadJsonFile(MetaPath(root, "native-hook-relays"), json::object());
+        const auto rid = str("relayId");
+        if (!relays.contains(rid)) return Fail("unknown native hook relay: " + rid);
+        if (p.value("generation", -1) != relays[rid].value("generation", 0)) return Fail("stale native hook relay generation");
+        if (str("provider") != relays[rid].value("provider", str("provider"))) return Fail("relay provider mismatch");
+        json ev{{"relayId", rid}, {"provider", str("provider")}, {"event", p.value("event", json(nullptr))}, {"payload", p.value("rawPayload", json(nullptr))}, {"sessionKey", relays[rid].value("sessionKey", json(nullptr))}};
+        GatewayEmit("nativeHook.event", ev);
+        if (relays[rid].contains("sessionKey") && p.value("event", json("")).is_string()) GatewayRpc("chat.inject", {{"sessionKey", relays[rid]["sessionKey"]}, {"message", "[" + str("provider") + " hook] " + p["event"].get<std::string>()}});
+        return Ok({{"delivered", true}});
+    }
+    if (m == "claws.monitors" || m == "claws.packages.remove") {
+        std::lock_guard<std::mutex> l(g_mu); auto st = ClawStateRead(root);
+        if (m == "claws.monitors") { json out = json::array(); for (auto& [a, ins] : st["installs"].items()) for (auto& mo : ins.value("monitors", json::array())) { json e = mo; e["agentId"] = a; out.push_back(e); }
+            return Ok({{"monitors", out}}); }
+        const auto agent = str("agentId"), pkg = str("packageId").empty() ? str("package") : str("packageId");
+        if (!st["installs"].contains(agent)) return Fail("no claw install for agent " + agent);
+        auto& pk = st["installs"][agent]["packages"]; if (!pk.is_array()) return Fail("package not installed: " + pkg);
+        json keep = json::array(); json removed = nullptr;
+        for (auto& x : pk) { if (x.value("id", x.value("name", std::string())) == pkg && removed.is_null()) removed = x; else keep.push_back(x); }
+        if (removed.is_null()) return Fail("package not installed: " + pkg);
+        const auto ws = WorkspaceOf(d, agent); if (removed.contains("path")) { fs::path pp = removed["path"].get<std::string>(); auto rel = fs::relative(pp, ws, ec);
+            if (!ec && !rel.empty() && rel.string().rfind("..", 0) != 0) fs::remove_all(pp, ec); }
+        pk = keep; WriteJsonFile(ClawStatePath(root), st);
+        return Ok({{"removed", true}, {"package", removed}});
+    }
+    if (m == "device.token.rotate") {
+        if (str("deviceId").empty() || str("role").empty()) return Fail("deviceId and role are required");
+        if (!d.device_links) return Fail("device links are not enabled");
+        auto r = d.device_links->Rotate(str("deviceId"), str("role"), p.value("scopes", json::array()));
+        if (!r.value("ok", false)) return Fail(r.value("error", std::string("rotate failed")));
+        if (t_principal != "device:" + str("deviceId")) { r.erase("token"); r["tokenDelivery"] = "withheld"; } else r["tokenDelivery"] = "response";
+        return Ok(r);
+    }
+    if (m == "device.scopes.requestUpgrade" || m == "device.scopes.waitUpgrade") {
+        std::unique_lock<std::mutex> l(g_mu); auto db = ReadJsonFile(MetaPath(root, "scope-upgrades"), json::object());
+        if (m == "device.scopes.requestUpgrade") {
+            if (!str("requestId").empty() && !str("decision").empty()) {  // operator decision
+                if (!t_full_write) return Fail("deciding a scope upgrade needs operator write");
+                if (!db.contains(str("requestId"))) return Fail("unknown upgrade request");
+                auto& rq = db[str("requestId")]; if (rq["status"] != "pending") return Fail("request is " + rq["status"].get<std::string>());
+                rq["status"] = str("decision") == "approve" || str("decision") == "approved" ? "approved" : "denied"; rq["decidedBy"] = t_principal;
+                if (rq["status"] == "approved" && d.device_links) d.device_links->Rotate(rq["deviceId"].get<std::string>(), rq.value("role", std::string("device")), rq["scopes"]);
+                WriteJsonFile(MetaPath(root, "scope-upgrades"), db); return Ok(rq);
+            }
+            const auto scopes = p.value("scopes", json::array()); if (!scopes.is_array() || scopes.empty()) return Fail("scopes are required");
+            for (auto& s : scopes) if (!s.is_string() || !auth::DeviceLinkStore::ValidScope(s.get<std::string>())) return Fail("invalid scope " + s.dump());
+            const auto id = Rid("scopeup");
+            db[id] = {{"requestId", id}, {"deviceId", str("deviceId").empty() ? t_principal : str("deviceId")}, {"role", str("role").empty() ? std::string("device") : str("role")}, {"scopes", scopes}, {"status", "pending"}, {"createdAt", NowMs()}, {"reason", str("reason")}};
+            WriteJsonFile(MetaPath(root, "scope-upgrades"), db); l.unlock();
+            GatewayEmit("device.scopes.upgradeRequested", {{"requestId", id}, {"scopes", scopes}});
+            return Ok({{"requestId", id}, {"status", "pending"}});
+        }
+        const auto id = str("requestId"); if (!db.contains(id)) return Fail("unknown upgrade request");
+        const long long until = NowMs() + std::clamp(p.value("timeoutMs", 0), 0, 120000);
+        l.unlock();
+        for (;;) { auto cur = ReadJsonFile(MetaPath(root, "scope-upgrades"), json::object()).value(id, json::object());
+            if (cur.value("status", "") != "pending" || NowMs() >= until) return Ok({{"requestId", id}, {"status", cur.value("status", "pending")}});
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+    }
+    if (m == "migrations.memory.plan" || m == "migrations.memory.apply") {
+        const auto agent = str("agentId"); if (agent.empty()) return Fail("agentId is required");
+        const auto ws = WorkspaceOf(d, agent); const char* hm = std::getenv("HOME"); const fs::path home = hm ? hm : "/";
+        struct Src { const char* provider; fs::path path; };
+        std::vector<Src> srcs = {{"claude-code", home / ".claude" / "CLAUDE.md"}, {"claude-code", ws / "CLAUDE.md"}, {"codex", home / ".codex" / "AGENTS.md"}, {"codex", ws / "AGENTS.md"},
+                                 {"cursor", ws / ".cursorrules"}, {"gemini", home / ".gemini" / "GEMINI.md"}, {"gemini", ws / "GEMINI.md"}};
+        std::map<std::string, json> provs;
+        for (auto& s : srcs) { if (!fs::is_regular_file(s.path, ec)) continue; const auto body = ReadAll(s.path);
+            const auto iid = ShaHex256(s.path.string()).substr(0, 16); const auto dest = ws / "memory" / "imported" / (std::string(s.provider) + "-" + s.path.filename().string() + "-" + iid.substr(0, 6) + ".md");
+            const bool exists = fs::exists(dest, ec);
+            provs[s.provider]["items"].push_back({{"id", iid}, {"source", s.path.string()}, {"target", fs::relative(dest, ws, ec).string()}, {"bytes", body.size()}, {"sha256", ShaHex256(body)},
+                                                 {"action", exists && !p.value("overwrite", false) ? "skip-existing" : exists ? "overwrite" : "create"}}); }
+        json plan = json::array();
+        for (auto& [k, v] : provs) { json pv{{"providerId", k}, {"items", v["items"]}}; pv["planFingerprint"] = ShaHex256(v["items"].dump()); plan.push_back(pv); }
+        if (m == "migrations.memory.plan") return Ok({{"agentId", agent}, {"workspace", ws.string()}, {"providers", plan}});
+        if (str("idempotencyKey").empty()) return Fail("idempotencyKey is required");
+        std::lock_guard<std::mutex> l(g_mu); auto led = ReadJsonFile(MetaPath(root, "memory-migrations"), json::object());
+        if (led.contains(str("idempotencyKey"))) return Ok(led[str("idempotencyKey")]);
+        json pv; for (auto& x : plan) if (x["providerId"] == str("providerId")) pv = x;
+        if (pv.is_null()) return Fail("unknown provider: " + str("providerId"));
+        if (pv["planFingerprint"] != p.value("planFingerprint", json(""))) return Fail("plan changed; re-run migrations.memory.plan");
+        json applied = json::array(), skipped = json::array();
+        for (auto& want : p.value("itemIds", json::array())) { json it; for (auto& x : pv["items"]) if (x["id"] == want) it = x;
+            if (it.is_null()) return Fail("unknown item " + want.dump());
+            if (it["action"] == "skip-existing") { skipped.push_back(want); continue; }
+            const auto dest = ws / it["target"].get<std::string>(); fs::create_directories(dest.parent_path(), ec);
+            std::ofstream(dest) << "<!-- imported from " << it["source"].get<std::string>() << " -->\n" << ReadAll(it["source"].get<std::string>()); applied.push_back(want); }
+        json out{{"agentId", agent}, {"providerId", str("providerId")}, {"applied", applied}, {"skipped", skipped}};
+        led[str("idempotencyKey")] = out; WriteJsonFile(MetaPath(root, "memory-migrations"), led);
+        return Ok(out);
+    }
+    return {};
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
@@ -3160,6 +3518,14 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
         if (method.rfind("push.", 0) == 0 && method != "push.list" && method != "push.status") { auto r = Push(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("users.authConnect.", 0) == 0) { auto r = AuthConnect(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("tools.github.", 0) == 0) { auto r = ToolsGitHub(deps, root, method, params); if (r.handled) return r; }
+        if (method == "attach.grant" || method == "attach.revoke") { auto r = Attach(deps, method, params); if (r.handled) return r; }
+        if (method.rfind("board.widget.", 0) == 0 || method == "board.event" || method == "board.prompt.authorize") { auto r = BoardWidgets(deps, root, method, params); if (r.handled) return r; }
+        if (method.rfind("controlUi.", 0) == 0) { auto r = ControlUi(deps, root, method, params); if (r.handled) return r; }
+        { static const std::set<std::string> sg{"conversations.send", "conversations.turn", "conversations.turn.cancel", "web.login.start", "web.login.wait", "worker.desktop.launch",
+              "worker.desktop.observe", "catalog.browse", "catalog.searchKeywords", "session.discussion.info", "session.discussion.open", "ui.command", "config.openFile",
+              "artifacts.download", "transcripts.summarize", "chat.metadata.changed", "nativeHook.invoke", "claws.monitors", "claws.packages.remove", "device.token.rotate",
+              "device.scopes.requestUpgrade", "device.scopes.waitUpgrade", "migrations.memory.plan", "migrations.memory.apply"};
+          if (sg.count(method)) { auto r = Singles(deps, root, method, params); if (r.handled) return r; } }
         if (method.rfind("talk.", 0) == 0) { auto r = Talk(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("mcp.app.", 0) == 0 && method != "mcp.app.listTools" && method != "mcp.app.callTool" && method != "mcp.app.listResources" &&
             method != "mcp.app.listResourceTemplates" && method != "mcp.app.readResource") { auto r = McpApp(deps, root, method, params); if (r.handled) return r; }
