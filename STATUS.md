@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.99.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.100.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.100.0-dev 新增
+
+- 6 个 RPC 桩全部换成真实实现（src/gateway/subsystems.cpp）：`sessions.companion.ask/state/reset` 只读旁聊（内存保留 ≤24 轮，不写会话）；`sessions.dispatch/move/reclaim` 持久化 worker placement 台账（设备 worker 来自节点注册表，离线→failed→recoverToGateway 恢复；**没有远端 worker 运行时**，只是台账）；`claws.removalJournal` begin/rollback（绑定配置/状态/cron 路径、文件物理身份、配置/安装/journal 摘要、lease 归属），CLI `claws removal-journal`；`projects.searchRemote` GitHub 搜索（精确、affiliated、全局，60 秒缓存）；`sessions.github.publish/confirm`（私有 index 快照 → 提交 → 推送 `openclaw/<session>` 分支 → 建/复用 PR，幂等键、personal 确认）。离线测试：e2e-session-subsystems.sh、e2e-github.sh（假 GitHub + 本地 bare 仓库）。PARITY.md 补齐 1.95–1.99。
 
 ## 1.99.0-dev 新增
 

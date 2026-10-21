@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.99.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.100.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -69,6 +69,7 @@ set(OPENCLAW_SOURCES
   src/gateway/methods.cpp
   src/gateway/catalog_generated.cpp
   src/gateway/extra.cpp
+  src/gateway/subsystems.cpp
   src/config/config.cpp
   src/config/validate.cpp
   src/channels/registry.cpp
@@ -108,6 +109,7 @@ set(OPENCLAW_SOURCES
 )
 
 add_executable(openclaw-cpp ${OPENCLAW_SOURCES})
+target_compile_definitions(openclaw-cpp PRIVATE PROJECT_VERSION_STR="${PROJECT_VERSION}")
 target_include_directories(openclaw-cpp PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src/gateway)

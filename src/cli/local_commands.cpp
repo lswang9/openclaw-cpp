@@ -1,5 +1,6 @@
 // Upstream v2026.10.5 local commands (see include/openclaw/cli/local_commands.hpp).
 #include "openclaw/cli/local_commands.hpp"
+#include "openclaw/gateway/subsystems.hpp"
 
 #include "openclaw/config/config.hpp"
 
@@ -868,10 +869,47 @@ std::string CompletionScript(const std::string& shell, const std::string& bin) {
     return o.str();
 }
 
+// `claws removal-journal begin|rollback`: the CLI side of upstream's clawRemovalJournalGateway. It computes the
+// gateway binding, physical state identity, config digest and expected install/journal digests locally, then
+// calls claws.removalJournal. --stale-journal deliberately sends an outdated journal digest (test hook).
+int CmdClawsRemovalJournal(int argc, char** argv) {
+    if (argc < 4 || std::string(argv[2]) != "removal-journal") { std::cerr << "usage: openclaw-cpp claws removal-journal begin|rollback --agent ID --operation ID --owner ID [--json]\n"; return 2; }
+    const std::string phase = argv[3];
+    if (phase != "begin" && phase != "rollback") { std::cerr << "phase must be begin or rollback\n"; return 2; }
+    std::string agent, op, owner, url; bool as_json = false, stale = false;
+    for (int i = 4; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+        if (a == "--agent") agent = next(); else if (a == "--operation") op = next(); else if (a == "--owner") owner = next();
+        else if (a == "--url") url = next(); else if (a == "--json") as_json = true; else if (a == "--stale-journal") stale = true;
+        else { std::cerr << "unknown option '" << a << "'\n"; return 2; }
+    }
+    if (agent.empty() || op.empty() || owner.empty()) { std::cerr << "--agent, --operation and --owner are required\n"; return 2; }
+    const auto c = LoadCfg();
+    const fs::path data = [] { const char* e = std::getenv("OPENCLAW_DATA_DIR"); return e && *e ? fs::path(e) : Home() / ".openclaw-cpp" / "data"; }();
+    auto st = gateway::ClawStateRead(data);
+    const json install = st["installs"].contains(agent) ? st["installs"][agent] : json(nullptr);
+    json journal = st["journals"].contains(agent) ? st["journals"][agent] : json(nullptr);
+    if (stale) journal = json{{"agentId", agent}, {"operationId", "stale"}};
+    json req{{"phase", phase}, {"agentId", agent}, {"operationId", op}, {"binding", gateway::ClawRemovalBinding(data)},
+             {"sourceIdentity", gateway::ClawStateIdentity(data)}, {"lease", {{"scope", "core:agent-deletion"}, {"key", agent}, {"owner", owner}}},
+             {"expectedInstallDigest", gateway::ClawDigest(install)}, {"expectedJournalDigest", gateway::ClawDigest(journal)},
+             {"configDigest", gateway::ClawDigest(c.raw)}};
+    std::string err;
+    const char* tok = std::getenv("OPENCLAW_GATEWAY_TOKEN");
+    auto r = Rpc(GatewayBase(c.raw, url), tok ? tok : "", "claws.removalJournal", req, 600, &err);
+    if (!err.empty()) { std::cerr << "claws.removalJournal: " << err << "\n"; return 1; }
+    if (as_json) std::cout << r.dump() << "\n";
+    else if (r.value("journal", json()).is_null()) std::cout << "deletion journal for " << agent << " rolled back\n";
+    else std::cout << "deletion journal begun for " << agent << " (operation " << op << ")\n";
+    return 0;
+}
+
 int MaybeLocalCommand(int argc, char** argv) {
     if (argc < 2) return -1;
     const std::string cmd = argv[1];
     if (cmd == "completion") return CmdCompletion(argc, argv);
+    if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "removal-journal") return CmdClawsRemovalJournal(argc, argv);
     if (cmd == "onboard") return CmdOnboard(argc, argv, 2);
     if (cmd == "configure") return CmdConfigure(argc, argv);
     if (cmd == "migrate") return CmdMigrate(argc, argv);

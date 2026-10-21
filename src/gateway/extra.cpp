@@ -4,6 +4,7 @@
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/acp/session.hpp"
 #include "openclaw/gateway/extra.hpp"
+#include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/agent/types.hpp"
 #include "openclaw/gateway/methods.hpp"
 #include "openclaw/config/config.hpp"
@@ -154,13 +155,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         r.payload = Real({{"cancelled", true}, {"note", "no device-flow in progress is tracked server-side"}});
         return r;
     }
-    if (method == "sessions.reclaim" || method == "sessions.companion.reset" || method == "projects.searchRemote" ||
-        method == "sessions.github.publish" || method == "sessions.github.confirm" || method == "claws.removalJournal") {
-        r.handled = true;
-        r.payload = Honest(method, params, {{"reason", method == "claws.removalJournal" ? "no claws removals recorded" : "feature not implemented in C++ runtime"}});
-        if (method == "claws.removalJournal") r.payload["entries"] = nlohmann::json::array();
-        return r;
-    }
+    if (auto sub = TrySubsystemDispatch(deps, DataRoot(deps), method, params); sub.handled) return sub;
 
     // ---- device link / pairing codes (disk-backed; token issued once) ----
     if (starts("pairing.link.") || starts("pairing.token.") || method == "pairing.status") {
