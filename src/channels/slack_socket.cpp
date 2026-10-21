@@ -49,8 +49,7 @@ nlohmann::json SlackSocketMode::Status() const {
             {"force_mock", ForceMock()},
             {"last_error", last_error_},
             {"impl", (mode_ == "live") ? "real" : (mode_ == "mock" ? "real-sim" : "honest")},
-            {"gaps", nlohmann::json::array({"no interactive block actions UI",
-                                            "no disconnect auto-reconnect backoff UI",
+            {"gaps", nlohmann::json::array({                                            "no disconnect auto-reconnect backoff UI",
                                             "no app-level rate limit handling",
                                             "slash response_url optional"})}};
 }
@@ -149,7 +148,8 @@ nlohmann::json SlackSocketMode::FeedEnvelope(const nlohmann::json& envelope, con
         last_error_ = "server disconnect: " + envelope.value("reason", envelope.dump());
         return nlohmann::json::object();
     } else if (typ == "interactive") {
-        route = {{"ignored", true}, {"reason", "interactive not fully handled"}};
+        route = interactive_ ? interactive_(envelope.value("payload", nlohmann::json::object()), deliver)
+                             : nlohmann::json{{"ignored", true}, {"reason", "no interactive handler"}};
     } else {
         route = {{"ignored", true}, {"reason", "unknown type"}, {"type", typ}};
     }

@@ -119,7 +119,12 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
         const auto token = Env("SLACK_BOT_TOKEN");
         if (!token.empty() && !chat_id.empty()) {
             http_result = HttpPostJson("https://slack.com/api/chat.postMessage",
-                                       {{"channel", chat_id}, {"text", text}},
+                                       [&] {
+                                           nlohmann::json b{{"channel", chat_id}, {"text", text}};
+                                           if (extra.is_object() && extra.contains("blocks")) b["blocks"] = extra["blocks"];
+                                           if (extra.is_object() && extra.contains("thread_ts")) b["thread_ts"] = extra["thread_ts"];
+                                           return b;
+                                       }(),
                                        {"Authorization: Bearer " + token});
             entry["mode"] = "live_http";
             bool ok_http = http_result.value("http", 0) >= 200 && http_result.value("http", 0) < 300;

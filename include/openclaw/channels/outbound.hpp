@@ -24,14 +24,17 @@ public:
     nlohmann::json OutboundLog() const;
     void ClearLog();
 
+protected:
+    nlohmann::json HttpPostJson(const std::string& url, const nlohmann::json& body,
+                                const std::vector<std::string>& headers) const;
+    void Record(nlohmann::json e) { sent_.push_back(std::move(e)); }
+
 private:
     std::string id_;
     std::string todo_;
     std::string webhook_path_;
     bool enabled_ = false;
     std::vector<nlohmann::json> sent_;
-    nlohmann::json HttpPostJson(const std::string& url, const nlohmann::json& body,
-                                const std::vector<std::string>& headers) const;
 };
 
 }  // namespace openclaw::channels

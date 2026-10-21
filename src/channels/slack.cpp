@@ -1,4 +1,5 @@
 #include "openclaw/channels/slack.hpp"
+#include "openclaw/channels/slack_interactive.hpp"
 #include <cstdlib>
 
 namespace openclaw::channels {
@@ -14,6 +15,7 @@ SlackAdapter::SlackAdapter()
                             "Slack Events API + Socket Mode + chat.postMessage when SLACK_BOT_TOKEN set",
                             "/api/chat.postMessage") {
     SetEnabled(true);
+    socket_.SetInteractiveHandler([this](const nlohmann::json& p, const DeliverFn& d) { return HandleInteractive(p, d); });
 }
 
 bool SlackAdapter::Verify(const nlohmann::json& body) const {
@@ -53,6 +55,8 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
                 {"mode", "url_verification"}};
     }
 
+    if (nlohmann::json ip; slack_interactive::ExtractPayload(body, &ip)) return HandleInteractive(ip, deliver);
+
     std::string text;
     std::string sender = "slack";
     std::string session = "slack-default";
@@ -84,13 +88,56 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
     msg.conversation_id = conv; msg.thread_id = thread;
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
+    auto rendered = slack_interactive::RenderReply(reply);
+    if (rendered.contains("blocks")) reply = rendered.value("text", reply);
     return {{"ok", true},
+            {"message", rendered},
             {"channel", "slack"},
             {"session_key", msg.session_key},
             {"sender", msg.sender},
             {"reply", reply},
             {"inbound_total", inbound_},
             {"impl", "real"}};
+}
+
+nlohmann::json SlackAdapter::CallApi(const std::string& method, const nlohmann::json& body) {
+    nlohmann::json entry{{"api", method}, {"body", body}, {"mode", "recorded"}};
+    const auto token = Env("SLACK_BOT_TOKEN");
+    if (!token.empty()) {
+        auto base = Env("SLACK_API_BASE");
+        if (base.empty()) base = "https://slack.com/api";
+        auto r = HttpPostJson(base + "/" + method, body, {"Authorization: Bearer " + token});
+        entry["mode"] = "live_http";
+        entry["http"] = r;
+        entry["delivered"] = r.value("http", 0) == 200 && r.contains("json") && r["json"].is_object() &&
+                             r["json"].value("ok", false);
+    }
+    Record(entry);
+    return entry;
+}
+
+nlohmann::json SlackAdapter::HandleInteractive(const nlohmann::json& payload, const DeliverFn& deliver) {
+    auto it = slack_interactive::Parse(payload);
+    nlohmann::json out{{"ok", true}, {"channel", "slack"}, {"interactive", it.kind}, {"impl", "real"}};
+    if (!it.api_call.is_null()) out["api"] = CallApi(it.api_call["method"], it.api_call["body"]);
+    if (it.inbound) {
+        ++inbound_;
+        std::string reply = deliver ? deliver(*it.inbound) : "";
+        auto rendered = slack_interactive::RenderReply(reply);
+        out["session_key"] = it.inbound->session_key;
+        out["inbound_text"] = it.inbound->text;
+        out["reply"] = rendered.value("text", reply);
+        out["message"] = rendered;
+        if (!reply.empty() && !it.inbound->conversation_id.empty()) {
+            nlohmann::json extra{{"via", "slack-interactive"}};
+            if (rendered.contains("blocks")) extra["blocks"] = rendered["blocks"];
+            if (!it.inbound->thread_id.empty()) extra["thread_ts"] = it.inbound->thread_id;
+            out["posted"] = SendText(it.inbound->conversation_id, rendered.value("text", reply), extra);
+        }
+    }
+    if (it.ack_clear_errors) out["response_action"] = "clear";
+    if (!it.inbound && it.api_call.is_null()) out["ignored"] = true;
+    return out;
 }
 
 }  // namespace openclaw::channels

@@ -16,6 +16,12 @@ public:
     void Start(DeliverFn deliver) override;
     void Stop() override;
 
+    // Slack Web API call (views.open, chat.postMessage, ...). Live when SLACK_BOT_TOKEN set
+    // (base overridable via SLACK_API_BASE for tests); always recorded in the outbound log.
+    nlohmann::json CallApi(const std::string& method, const nlohmann::json& body);
+    // Handle an interactive payload (block_actions / view_submission / shortcut).
+    nlohmann::json HandleInteractive(const nlohmann::json& payload, const DeliverFn& deliver);
+
     SlackSocketMode& Socket() { return socket_; }
     const SlackSocketMode& Socket() const { return socket_; }
 

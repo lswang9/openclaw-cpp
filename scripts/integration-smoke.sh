@@ -96,6 +96,12 @@ if command -v node >/dev/null 2>&1 && [ -z "${OPENCLAW_JS_FORCE_MOCK:-}" ]; then
   echo "[smoke] upstream JS plugin: gateway method + /ping command"
 fi
 
+SI=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/json' \
+  -d '{"payload":"{\"type\":\"block_actions\",\"user\":{\"id\":\"U5\"},\"channel\":{\"id\":\"C5\"},\"actions\":[{\"action_id\":\"openclaw_btn_0\",\"value\":\"approve\",\"text\":{\"text\":\"Approve\"}}]}"}')
+echo "$SI" | grep -q 'clicked' || { echo "[smoke] slack block_actions failed: $SI" >&2; exit 1; }
+grep -q 'agent:main:slack:channel:C5' "$OPENCLAW_SESSION_DIR/sessions.json" || { echo "[smoke] slack interactive session missing" >&2; exit 1; }
+echo "[smoke] slack interactive block_actions -> agent turn"
+
 echo "[smoke] POST /v1/rpc sessions.create"
 RPC_SESS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \
   -H 'Content-Type: application/json' \

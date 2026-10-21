@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.43.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.44.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -34,3 +34,9 @@
 - real: api.registerTool (execute/handler, factory), registerCommand (gateway runs before skills, no model turn), api.on hooks: message_received, before_agent_start (prependContext/systemPrompt), message_sending (content rewrite / cancel), agent_end; registerGatewayMethod (DispatchRpc fallback); registerService (start/stop).
 - real-sim: TypeScript entries load only on Node >= 22.6 (--experimental-strip-types, auto-detected) or with the `typescript` package installed; box Node 20 has neither, so tests use an .mjs sample.
 - missing: registerChannel / registerProvider / registerHttpRoute (warn only), before_tool_call / after_tool_call / session hooks, plugin CLI commands, npm install of plugins.
+
+## 1.44 Slack interactive
+- real: reply directives `[[buttons: L|v,...]]`, `[[select: P|a,b]]`, `[[modal: Title|F1,F2]]` → Block Kit (section + actions); plain text keeps a fallback.
+- real: block_actions (button/static_select), view_submission, shortcut/message_action over HTTP (`payload` form field or JSON) and Socket Mode `interactive` envelopes → agent turn with upstream-style session key; reply posted with blocks/thread_ts via chat.postMessage.
+- real: modal button → views.open with plain_text_input per field (live when SLACK_BOT_TOKEN, SLACK_API_BASE overridable; recorded otherwise).
+- real-sim: no live Slack test (no creds); response_url replies and Slack request signing (X-Slack-Signature) still missing.

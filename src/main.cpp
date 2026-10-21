@@ -41,6 +41,7 @@
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/feishu_ws.hpp"
 #include "openclaw/channels/slack.hpp"
+#include "openclaw/channels/slack_interactive.hpp"
 #include "openclaw/channels/slack_socket.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/discord_gateway.hpp"
@@ -78,7 +79,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.43.0-dev";
+constexpr const char* kVersion = "1.44.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1632,6 +1633,29 @@ int CmdSelfTest() {
         else std::cerr << "PASS embedding provider interface + persisted vector index/cache + remote fallback\n";
     } catch (const std::exception& e) { std::cerr << "FAIL embeddings exception: " << e.what() << "\n"; ++failures; }
 
+    // slack interactive (1.44)
+    {
+        namespace si = channels::slack_interactive;
+        auto r = si::RenderReply("Pick one [[buttons: Yes|y, No|n]] [[modal: Feedback|Name, Comment]]");
+        bool ok = r.value("text", "") == "Pick one" && r["blocks"].size() == 2 &&
+                  r["blocks"][1]["elements"].size() == 3 && r["blocks"][1]["elements"][1]["value"] == "n";
+        channels::SlackAdapter sa;
+        std::string seen;
+        channels::DeliverFn d = [&](const channels::InboundMessage& m) { seen = m.text + "|" + m.conversation_id; return std::string("ok [[buttons: Again|again]]"); };
+        auto click = sa.HandleHttpInbound({{"payload", nlohmann::json{{"type", "block_actions"}, {"user", {{"id", "U1"}}}, {"channel", {{"id", "C9"}}},
+            {"actions", {{{"action_id", "openclaw_btn_0"}, {"value", "y"}, {"text", {{"text", "Yes"}}}}}}}.dump()}}, d);
+        ok = ok && seen.find("clicked \"Yes\" (value: y") != std::string::npos && seen.find("|C9") != std::string::npos &&
+             click["message"]["blocks"].size() == 2 && click["reply"] == "ok";
+        auto open = sa.HandleHttpInbound({{"type", "block_actions"}, {"trigger_id", "T1"}, {"user", {{"id", "U1"}}}, {"channel", {{"id", "C9"}}},
+            {"actions", {r["blocks"][1]["elements"][2]}}}, d);
+        ok = ok && open["api"]["api"] == "views.open" && open["api"]["body"]["trigger_id"] == "T1" &&
+             open["api"]["body"]["view"]["blocks"].size() == 2;
+        auto sub = sa.Socket().FeedEnvelope({{"type", "interactive"}, {"envelope_id", "e1"}, {"payload", {{"type", "view_submission"}, {"user", {{"id", "U1"}}},
+            {"view", {{"private_metadata", open["api"]["body"]["view"]["private_metadata"]}, {"state", {{"values", {{"name", {{"value", {{"value", "Ann"}}}}}}}}}}}}}}, d);
+        ok = ok && seen.find("[Slack modal submitted] Feedback\n- name: Ann|C9") == 0 && sub.value("envelope_id", "") == "e1";
+        if (!ok) { std::cerr << "FAIL slack interactive " << r.dump() << click.dump() << open.dump() << seen << "\n"; ++failures; }
+        else std::cerr << "PASS slack interactive (buttons/select/modal blocks, block_actions, views.open, view_submission)\n";
+    }
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";

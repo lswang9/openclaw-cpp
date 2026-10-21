@@ -37,7 +37,11 @@ public:
 
     bool Running() const { return running_.load(); }
 
+    using InteractiveFn = std::function<nlohmann::json(const nlohmann::json&, const DeliverFn&)>;
+    void SetInteractiveHandler(InteractiveFn fn) { interactive_ = std::move(fn); }
+
 private:
+    InteractiveFn interactive_;
     nlohmann::json HandleEventsApi(const nlohmann::json& payload, const DeliverFn& deliver);
     nlohmann::json HandleSlash(const nlohmann::json& payload, const DeliverFn& deliver);
     bool OpenConnectionUrl(std::string& out_url, std::string& err);
