@@ -141,15 +141,65 @@ nlohmann::json DeviceLinkStore::List() const {
     return {{"ok", true}, {"impl", "real"}, {"links", links}, {"tokens", toks}, {"path", path_.string()}};
 }
 
-nlohmann::json DeviceLinkStore::Approve(const std::string& k, const std::string& role_in) {
+bool DeviceLinkStore::ValidScope(const std::string& s) {
+    static const char* k[] = {"operator.read", "operator.write", "operator.approvals", "operator.pairing", "operator.admin"};
+    for (auto* x : k) if (s == x) return true;
+    return s.rfind("rpc:", 0) == 0 && s.size() > 4 && s.size() < 128;
+}
+
+std::string DeviceLinkStore::MethodScope(const std::string& m) {
+    auto starts = [&](const char* p) { return m.rfind(p, 0) == 0; };
+    if (starts("config.") || starts("secrets.") || starts("plugins.install") || starts("plugins.uninstall") || starts("update.") ||
+        m == "gateway.restart" || m == "gateway.stop" || m == "shutdown" || starts("acp.auth.") || starts("auth."))
+        return "operator.admin";
+    if (starts("exec.approval") || starts("approvals.")) return "operator.approvals";
+    if (starts("pairing.") || starts("device.") || starts("node.pair") || starts("channels.pairing.")) return "operator.pairing";
+    if (m == "health" || m == "status") return "operator.read";
+    const auto dot = m.rfind('.');
+    const std::string last = dot == std::string::npos ? m : m.substr(dot + 1);
+    static const char* reads[] = {"status", "list", "get", "history", "search", "show", "describe", "tail", "info", "usage",
+                                  "preview", "metrics", "catalog", "commands", "state", "tree", "windows", "presets", "verify"};
+    for (auto* r : reads) if (last == r) return "operator.read";
+    if (starts("logs.") || starts("models.") || starts("tools.catalog")) return "operator.read";
+    return "operator.write";
+}
+
+bool DeviceLinkStore::ScopeAllows(const std::vector<std::string>& scopes, const std::string& m) {
+    if (scopes.empty()) return true;
+    const auto need = MethodScope(m);
+    for (const auto& s : scopes) {
+        if (s == "operator.admin" || s == need) return true;
+        if (s == "operator.write" && need == "operator.read") return true;  // write implies read
+        if (s.rfind("rpc:", 0) == 0 && m.rfind(s.substr(4), 0) == 0 && need != "operator.admin") return true;
+    }
+    return false;
+}
+
+std::vector<std::string> DeviceLinkStore::TokenScopes(const std::string& token) const {
+    std::vector<std::string> out;
+    if (token.rfind("ocd_", 0) != 0) return out;
+    std::lock_guard lock(mu_);
+    const auto h = Sha256Hex(token);
+    for (const auto& t : data_["tokens"])
+        if (S(t, "token_sha256") == h && t.contains("scopes") && t["scopes"].is_array())
+            for (auto& x : t["scopes"]) out.push_back(x.get<std::string>());
+    return out;
+}
+
+nlohmann::json DeviceLinkStore::Approve(const std::string& k, const std::string& role_in, const nlohmann::json& scopes) {
     const std::string role = role_in.empty() ? "device" : role_in;
     if (!ValidRole(role)) return {{"ok", false}, {"error", "invalid role (device|operator)"}};
+    if (!scopes.is_array()) return {{"ok", false}, {"error", "scopes must be an array"}};
+    for (auto& s : scopes)
+        if (!s.is_string() || !ValidScope(s.get<std::string>()))
+            return {{"ok", false}, {"error", "invalid scope " + s.dump() + " (operator.read|write|approvals|pairing|admin or rpc:<prefix>)"}};
     std::lock_guard lock(mu_);
     ExpireLocked();
     auto* l = FindLink(k);
     if (!l) return {{"ok", false}, {"error", "not found"}};
     if (S(*l, "state") != "pending") return {{"ok", false}, {"error", "not pending"}, {"state", (*l)["state"]}};
     (*l)["state"] = "approved"; (*l)["decided_ms"] = NowMs(); (*l)["role"] = role;
+    if (!scopes.empty()) (*l)["scopes"] = scopes;
     Save();
     return {{"ok", true}, {"impl", "real"}, {"link", Public(*l)}};
 }
@@ -257,9 +307,11 @@ DeviceLinkStore::SessionInfo DeviceLinkStore::SessionLookup(const std::string& s
             return {};
         }
         for (auto& t : data_["tokens"])
-            if (S(t, "token_sha256") == cred && !t.value("revoked", false))
-                return {t.contains("role") && t["role"].is_string() ? t["role"].get<std::string>() : "device",
-                        S(s, "csrf")};
+            if (S(t, "token_sha256") == cred && !t.value("revoked", false)) {
+                SessionInfo si{t.contains("role") && t["role"].is_string() ? t["role"].get<std::string>() : "device", S(s, "csrf")};
+                if (t.contains("scopes") && t["scopes"].is_array()) for (auto& x : t["scopes"]) si.scopes.push_back(x.get<std::string>());
+                return si;
+            }
         return {};
     }
     return {};
@@ -299,10 +351,12 @@ nlohmann::json DeviceLinkStore::Claim(const std::string& id, const std::string& 
     nlohmann::json t{{"id", "tok-" + RandHex(6)}, {"link_id", S(*l, "id")}, {"device_name", (*l)["device_name"]},
                      {"token_sha256", Sha256Hex(token)}, {"created_ms", NowMs()}, {"revoked", false},
                      {"role", l->contains("role") ? (*l)["role"] : nlohmann::json("device")}};
+    if (l->contains("scopes")) t["scopes"] = (*l)["scopes"];
     data_["tokens"].push_back(t);
     (*l)["state"] = "claimed"; (*l)["token_id"] = t["id"];
     Save();
     return {{"ok", true}, {"impl", "real"}, {"token", token}, {"token_id", t["id"]}, {"role", t["role"]},
+            {"scopes", t.value("scopes", nlohmann::json::array())},
             {"note", "token shown once; only SHA-256 persisted"}};
 }
 

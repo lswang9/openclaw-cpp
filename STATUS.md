@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.82.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.83.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.83.0-dev
+- 设备令牌细粒度 scope：approve 时可指定 operator.read/write/approvals/pairing/admin 或 rpc:<前缀>，RPC 与 HTTP 均强制，403 返回所需 scope。
 
 ### 1.82.0-dev
 - 飞书长连接：实现 pbbp2 二进制帧（ping/pong、ClientConfig、分片重组、ACK），端点发现按 SDK 方式；长连接收到的消息会通过 im/v1/messages 回复。

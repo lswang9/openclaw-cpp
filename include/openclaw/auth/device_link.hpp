@@ -19,7 +19,15 @@ public:
     nlohmann::json Status(const std::string& link_id) const;
     nlohmann::json List() const;                          // no secrets
     // role: "device" (default, least privilege) or "operator" (may administer pairing).
-    nlohmann::json Approve(const std::string& id_or_code, const std::string& role = "device");
+    // scopes (optional, 1.83): restrict the token further. operator.read | operator.write | operator.approvals |
+    // operator.pairing | operator.admin, or "rpc:<method-prefix>" for single RPC families. Empty = role default.
+    nlohmann::json Approve(const std::string& id_or_code, const std::string& role = "device",
+                           const nlohmann::json& scopes = nlohmann::json::array());
+    static bool ValidScope(const std::string& s);
+    // Scope check for one RPC method (scopes empty = unrestricted beyond the role).
+    static bool ScopeAllows(const std::vector<std::string>& scopes, const std::string& method);
+    static std::string MethodScope(const std::string& method);  // the operator.* scope a method needs
+    std::vector<std::string> TokenScopes(const std::string& token) const;
     nlohmann::json Deny(const std::string& id_or_code);
     nlohmann::json Claim(const std::string& link_id, const std::string& poll_secret);
     nlohmann::json Verify(const std::string& token) const;
@@ -31,7 +39,7 @@ public:
     static bool ValidRole(const std::string& role) { return role == "device" || role == "operator"; }
     // Browser sessions (1.25): cookie carries a random session id; only SHA-256(sid) + SHA-256(token) persisted.
     // Session role is re-derived from the backing credential on every request (revocation ends the session).
-    struct SessionInfo { std::string role; std::string csrf; std::string oidc_sub, refresh_token; bool recheck_due = false; };
+    struct SessionInfo { std::string role; std::string csrf; std::string oidc_sub, refresh_token; bool recheck_due = false; std::vector<std::string> scopes; };
     // Returns {sid, csrf}; credential_sha256 = SHA-256 of the gateway token or ocd_ token used at login.
     std::pair<std::string, std::string> CreateSession(const std::string& credential_sha256, bool is_gateway_token);
     // gateway_token_sha256: current gateway token hash ("" if none). Empty role = invalid/expired/revoked.

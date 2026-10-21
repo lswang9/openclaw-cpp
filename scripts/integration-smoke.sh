@@ -209,7 +209,7 @@ newtok() { # $1=name $2=role -> prints token
   l=$(printf '%s' "$s" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["link"]["id"])')
   p=$(printf '%s' "$s" | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["poll_secret"])')
   curl -sf -X POST "$U2/v1/rpc" -H 'Authorization: Bearer smoke-gw-token' -H 'Content-Type: application/json' \
-    -d "{\"method\":\"pairing.link.approve\",\"params\":{\"id\":\"$l\",\"role\":\"$2\"}}" >/dev/null
+    -d "{\"method\":\"pairing.link.approve\",\"params\":{\"id\":\"$l\",\"role\":\"$2\",\"scopes\":${3:-[]}}}" >/dev/null
   curl -sf -X POST "$U2/v1/rpc" -H 'Content-Type: application/json' \
     -d "{\"method\":\"pairing.link.claim\",\"params\":{\"id\":\"$l\",\"poll_secret\":\"$p\"}}" \
     | python3 -c 'import sys,json;print(json.load(sys.stdin)["payload"]["token"])'
@@ -223,6 +223,17 @@ rpcas "$DTOK" '{"method":"tools.list","params":{}}' | grep -q '"ok": *true\|"ok"
 [[ $(code -H "Authorization: Bearer $DTOK" "$U2/v1/config") == 403 ]] || fail2 "device /v1/config 403"
 rpcas "$OTOK" '{"method":"pairing.link.list","params":{}}' | grep -q '"links"' || fail2 "operator list allowed"
 rpcas "$OTOK" '{"method":"secrets.list","params":{}}' | grep -q 'forbidden: operator' || fail2 "operator secrets forbidden"
+echo "[smoke] fine-grained token scopes (operator.read, rpc:canvas.)"
+RTOK=$(newtok ro operator '["operator.read"]'); CTOK=$(newtok cv device '["rpc:canvas."]')
+rpcas "$RTOK" '{"method":"sessions.list","params":{}}' | grep -q '"ok": *true\|"ok":true' || fail2 "read scope: sessions.list"
+rpcas "$RTOK" '{"method":"pairing.link.list","params":{}}' | grep -q 'required_scope' || fail2 "read scope must not list pairing"
+rpcas "$RTOK" '{"method":"chat.send","params":{"text":"x"}}' | grep -q '"required_scope": *"operator.write"' || fail2 "read scope must not chat.send"
+[[ $(code -H "Authorization: Bearer $RTOK" "$U2/v1/status") == 200 ]] || fail2 "read scope GET"
+[[ $(code -X POST -H "Authorization: Bearer $RTOK" -H 'Content-Type: application/json' -d '{"messages":[]}' "$U2/v1/chat/completions") == 403 ]] || fail2 "read scope POST completions 403"
+rpcas "$CTOK" '{"method":"canvas.list","params":{}}' | grep -q 'required_scope' && fail2 "rpc:canvas. must allow canvas.list"
+rpcas "$CTOK" '{"method":"tools.list","params":{}}' | grep -q 'required_scope' || fail2 "rpc:canvas. must deny tools.list"
+curl -s -X POST "$U2/v1/rpc" -H 'Authorization: Bearer smoke-gw-token' -H 'Content-Type: application/json' \
+  -d '{"method":"pairing.link.approve","params":{"id":"nope","scopes":["root"]}}' | grep -q 'invalid scope' || fail2 "invalid scope rejected"
 [[ $(code "$U2/pairing") == 302 ]] || fail2 "/pairing without auth should redirect"
 [[ $(code "$U2/login") == 200 ]] || fail2 "/login public"
 [[ $(code -X POST "$U2/login" -H 'Content-Type: application/json' -d '{"token":"nope"}') == 401 ]] || fail2 "bad login 401"

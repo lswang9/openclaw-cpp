@@ -49,7 +49,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.82.0-dev";
+constexpr const char* kVersion = "1.83.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1341,6 +1341,7 @@ namespace {
 // Role of the caller for the current client thread (each connection runs on its own thread).
 // admin = gateway token / auth off / in-process; operator|device = ocd_ device token role.
 thread_local std::string g_rpc_role = "admin";
+thread_local std::vector<std::string> g_rpc_scopes;  // ocd_ token scopes (empty = role default)
 thread_local bool g_rpc_role_pending_device = false;
 // Set by AuthRole: true when the only valid credential was the oc_session cookie (CSRF check required).
 thread_local bool g_auth_via_cookie = false;
@@ -1407,6 +1408,7 @@ bool OperatorRoleForbidden(const std::string& m) {
 std::string Server::AuthRole(const std::string& req) const {
     g_auth_via_cookie = false;
     g_session_csrf.clear();
+    g_rpc_scopes.clear();
     if (!deps_.auth.require_auth) return "admin";
     const auto authz = HeaderValue(req, "Authorization");
     const auto xtok = HeaderValue(req, "X-OpenClaw-Token");
@@ -1414,7 +1416,7 @@ std::string Server::AuthRole(const std::string& req) const {
     if (deps_.device_links) {
         for (const auto& tok : {BearerOf(authz), xtok}) {
             auto role = deps_.device_links->TokenRole(tok);
-            if (!role.empty()) return role;
+            if (!role.empty()) { g_rpc_scopes = deps_.device_links->TokenScopes(tok); return role; }
         }
         const auto sid = CookieValue(req, "oc_session");
         if (!sid.empty()) {
@@ -1428,7 +1430,7 @@ std::string Server::AuthRole(const std::string& req) const {
                 if (!rr.role.empty()) s.role = rr.role;
                 deps_.device_links->UpdateIdentitySession(sid, s.role, rr.refresh_token);
             }
-            if (!s.role.empty()) { g_auth_via_cookie = true; g_session_csrf = s.csrf; return s.role; }
+            if (!s.role.empty()) { g_auth_via_cookie = true; g_session_csrf = s.csrf; g_rpc_scopes = s.scopes; return s.role; }
         }
     }
     return {};
@@ -1453,6 +1455,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
 
     // Auth (health exempt)
     g_rpc_role = "admin";
+    g_rpc_scopes.clear();
     g_rpc_role_pending_device = false;
     bool public_ok = (path == "/health" || path == "/healthz");
     // Unpaired devices may start/claim/poll a link without a token (operator approval still required).
@@ -1494,6 +1497,17 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             (g_session_csrf.empty() || HeaderValue(req, "X-CSRF-Token") != g_session_csrf)) {
             send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", "csrf: missing or bad X-CSRF-Token"}}.dump()));
             return;
+        }
+        // Scoped tokens on non-RPC HTTP routes: GET/HEAD = operator.read, other verbs = operator.write,
+        // /v1/config = operator.admin. RPC (POST /v1/rpc and WS) is checked per method in DispatchRpc.
+        if (!g_rpc_scopes.empty() && path != "/v1/rpc" && HeaderValue(req, "Upgrade").empty()) {
+            const std::string need = path.rfind("/v1/config", 0) == 0 ? "config.get"
+                                   : (method == "GET" || method == "HEAD") ? "http.get" : "http.post";
+            if (!auth::DeviceLinkStore::ScopeAllows(g_rpc_scopes, need)) {
+                send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", "forbidden: token scopes do not allow " + method + " " + path},
+                                                                   {"required_scope", auth::DeviceLinkStore::MethodScope(need)}}.dump()));
+                return;
+            }
         }
     }
 
@@ -2033,6 +2047,12 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     if (g_rpc_role == "device" && DeviceRoleForbidden(method)) {
         nlohmann::json r{{"type", "res"}, {"ok", false}, {"error", "forbidden: device role cannot call " + method},
                          {"role", "device"}, {"code", 403}};
+        if (!id.is_null()) r["id"] = id;
+        return r;
+    }
+    if (!g_rpc_scopes.empty() && !auth::DeviceLinkStore::ScopeAllows(g_rpc_scopes, method)) {
+        nlohmann::json r{{"type", "res"}, {"ok", false}, {"error", "forbidden: token scopes do not allow " + method},
+                         {"required_scope", auth::DeviceLinkStore::MethodScope(method)}, {"scopes", g_rpc_scopes}, {"code", 403}};
         if (!id.is_null()) r["id"] = id;
         return r;
     }
