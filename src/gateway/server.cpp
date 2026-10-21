@@ -265,6 +265,12 @@ Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), de
         const auto& ctx = tools::exec::CurrentContext();
         return !ctx.channel.empty() && deps_.adapters.Get(ctx.channel) != nullptr;  // chat /approve surface
     };
+    broker.auto_review = [this](const nlohmann::json& req) {
+        provider::Provider* p = deps_.router ? static_cast<provider::Provider*>(deps_.router) : &deps_.provider;
+        nlohmann::json v = tools::exec::ReviewWithProvider(*p, req, req.value("onError", "escalate"));
+        Emit("exec.autoreview", {{"command", req.value("command", "")}, {"verdict", v}});
+        return v;
+    };
     broker.on_requested = [this](const nlohmann::json& r) {
         Emit("exec.approval.requested", r);
         const auto& ctx = tools::exec::CurrentContext();

@@ -4,6 +4,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
+#include <cctype>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -86,7 +90,7 @@ ProcessResult RunProcess(const std::string& cmd, const std::string& cwd, int tim
     return r;
 }
 
-BackgroundHandle StartBackground(const std::string& cmd, const std::string& cwd) {
+BackgroundHandle StartBackground(const std::string& cmd, const std::string& cwd, bool pty) {
     BackgroundHandle h;
     std::vector<std::string> envs;
     for (char** e = environ; e && *e; ++e) {
@@ -104,6 +108,35 @@ BackgroundHandle StartBackground(const std::string& cmd, const std::string& cwd)
     envp.push_back(nullptr);
     std::string sh = "/bin/sh", dash_c = "-c", c = cmd;
     char* argv[] = {sh.data(), dash_c.data(), c.data(), nullptr};
+    if (pty) {
+        int master = posix_openpt(O_RDWR | O_NOCTTY);
+        if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0) { if (master >= 0) close(master); return h; }
+        const char* sn = ptsname(master);
+        std::string slave_name = sn ? sn : "";
+        if (slave_name.empty()) { close(master); return h; }
+        pid_t pid = fork();
+        if (pid < 0) { close(master); return h; }
+        if (pid == 0) {
+            setsid();
+            int slave = open(slave_name.c_str(), O_RDWR);
+            if (slave < 0) _exit(126);
+            ioctl(slave, TIOCSCTTY, 0);
+            struct winsize ws{24, 80, 0, 0};
+            ioctl(slave, TIOCSWINSZ, &ws);
+            dup2(slave, 0); dup2(slave, 1); dup2(slave, 2);
+            if (slave > 2) close(slave);
+            close(master);
+            if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
+            execve("/bin/sh", argv, envp.data());
+            _exit(127);
+        }
+        fcntl(master, F_SETFL, fcntl(master, F_GETFL) | O_NONBLOCK);
+        h.pid = pid;
+        h.read_fd = master;
+        h.write_fd = dup(master);
+        h.pty = true;
+        return h;
+    }
     int fds[2];
     if (pipe(fds) != 0) return h;
     pid_t pid = fork();
@@ -208,6 +241,28 @@ ProcessResult CollectBackground(BackgroundHandle& h, int timeout_ms, std::size_t
 
 void KillBackground(BackgroundHandle& h) {
     if (h.pid > 0) kill(-h.pid, SIGTERM);
+}
+
+std::string KeysToBytes(const std::vector<std::string>& keys) {
+    static const std::map<std::string, std::string> named = {
+        {"Enter", "\r"}, {"Return", "\r"}, {"Tab", "\t"}, {"Escape", "\x1b"}, {"Esc", "\x1b"}, {"Space", " "},
+        {"BSpace", "\x7f"}, {"Backspace", "\x7f"}, {"Up", "\x1b[A"}, {"Down", "\x1b[B"}, {"Right", "\x1b[C"},
+        {"Left", "\x1b[D"}, {"Home", "\x1b[H"}, {"End", "\x1b[F"}, {"PageUp", "\x1b[5~"}, {"PageDown", "\x1b[6~"},
+        {"Delete", "\x1b[3~"}, {"Insert", "\x1b[2~"}, {"F1", "\x1bOP"}, {"F2", "\x1bOQ"}, {"F3", "\x1bOR"}, {"F4", "\x1bOS"},
+        {"F5", "\x1b[15~"}, {"F6", "\x1b[17~"}, {"F7", "\x1b[18~"}, {"F8", "\x1b[19~"}, {"F9", "\x1b[20~"},
+        {"F10", "\x1b[21~"}, {"F11", "\x1b[23~"}, {"F12", "\x1b[24~"}};
+    std::string out;
+    for (const auto& k : keys) {
+        if (auto it = named.find(k); it != named.end()) { out += it->second; continue; }
+        if (k.size() == 3 && (k[0] == 'C' || k[0] == 'c') && k[1] == '-') {
+            char ch = static_cast<char>(std::tolower(static_cast<unsigned char>(k[2])));
+            if (ch >= 'a' && ch <= 'z') { out += static_cast<char>(ch - 'a' + 1); continue; }
+            if (ch == '[') { out += '\x1b'; continue; }
+        }
+        if (k.size() >= 3 && (k[0] == 'M' || k[0] == 'm') && k[1] == '-') { out += '\x1b'; out += k.substr(2); continue; }
+        out += k;
+    }
+    return out;
 }
 
 }  // namespace openclaw::tools

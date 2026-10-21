@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.56.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.57.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,10 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.57.0-dev
+- exec `mode=auto`：allowlist 未命中时先交给模型审查（经 provider 接口，mock 测试），允许/拒绝/升级到人工；高风险自动升级。
+- exec `pty:true` 伪终端 + process `write/send-keys/submit/paste`。
 
 ### 1.43.0-dev
 - JS/TS 插件宿主支持上游插件 API：registerTool/registerCommand/钩子(message_received、before_agent_start、message_sending、agent_end)/registerGatewayMethod/registerService；按配置启用/允许/拒绝。

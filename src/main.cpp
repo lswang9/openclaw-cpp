@@ -87,7 +87,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.56.0-dev";
+constexpr const char* kVersion = "1.57.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2277,6 +2277,42 @@ int CmdSelfTest() {
         auto r2 = agent::RunAgentLoop(mock, empty_tools, {{.role="user",.content="h"}}, o);
         if (!r2.ok) { std::cerr << "FAIL loop ok after cancel test\n"; ++failures; }
         else std::cerr << "PASS agent loop after cancel reset\n";
+    }
+
+    {  // 1.57: exec mode=auto reviewer (mock provider) + PTY send-keys
+        provider::MockProvider rv;
+        auto say = [&](const std::string& c) { agent::CompletionResult x; x.ok = true; x.finish_reason = "stop";
+                                                 x.message.role = "assistant"; x.message.content = c; rv.Enqueue(x); };
+        say(R"({"decision":"allow","risk":"low","reason":"read-only"})");
+        say(R"(sure! {"decision":"allow","risk":"high"})");
+        say("I think it's fine");
+        say(R"({"decision":"deny","risk":"high","reason":"rm -rf"})");
+        nlohmann::json req{{"command", "ls"}, {"cwd", "/tmp"}};
+        auto a = tools::exec::ReviewWithProvider(rv, req);
+        auto b = tools::exec::ReviewWithProvider(rv, req);
+        auto c = tools::exec::ReviewWithProvider(rv, req, "deny");
+        auto d = tools::exec::ReviewWithProvider(rv, req);
+        bool ok = a["decision"] == "allow" && b["decision"] == "escalate" && c["decision"] == "deny" && d["decision"] == "deny" &&
+                  rv.LastMessages().size() == 2 && rv.LastMessages()[1].content.find("Command: ls") != std::string::npos;
+        if (!ok) { std::cerr << "FAIL exec auto reviewer " << a << b << c << d << "\n"; ++failures; }
+        else std::cerr << "PASS exec auto reviewer (provider verdicts, high-risk downgrade, malformed→escalate/deny)\n";
+        nlohmann::json pcfg = nlohmann::json::parse(R"({"tools":{"exec":{"mode":"auto"}}})");
+        auto pol = tools::exec::ResolvePolicy(pcfg, nlohmann::json::object(), "main", "agent:main:main");
+        if (!pol.auto_review || pol.ask != "on-miss") { std::cerr << "FAIL mode=auto policy\n"; ++failures; }
+        else std::cerr << "PASS mode=auto policy → allowlist+on-miss+reviewer\n";
+        bool keys = tools::KeysToBytes({"C-c", "Enter", "Up", "x"}) == std::string("\x03\r\x1b[A") + "x";
+        auto h = tools::StartBackground("read line; echo got:$line; tty >/dev/null && echo is-tty", "/tmp", true);
+        bool pty_ok = false;
+        if (h.pid > 0 && h.write_fd >= 0) {
+            std::string in = "hello" + tools::KeysToBytes({"Enter"});
+            (void)!::write(h.write_fd, in.data(), in.size());
+            auto r = tools::WaitBackground(h, 5000);
+            ::close(h.write_fd);
+            pty_ok = r.out.find("got:hello") != std::string::npos && r.out.find("is-tty") != std::string::npos;
+            if (!pty_ok) std::cerr << "pty out: " << r.out << "\n";
+        }
+        if (!keys || !pty_ok) { std::cerr << "FAIL pty/send-keys keys=" << keys << "\n"; ++failures; }
+        else std::cerr << "PASS PTY exec + send-keys (isatty, line input)\n";
     }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }

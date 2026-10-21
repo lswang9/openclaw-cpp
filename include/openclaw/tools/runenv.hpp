@@ -38,10 +38,14 @@ ProcessResult RunProcess(const std::string& cmd, const std::string& cwd, int tim
 // Detached process for exec background/yieldMs. Caller owns the handle; Wait fills result.
 struct BackgroundHandle {
     int pid = -1;
-    int read_fd = -1;  // stdout+stderr pipe (caller closes after Wait)
+    int read_fd = -1;  // stdout+stderr pipe (caller closes after Wait); PTY master when pty
+    int write_fd = -1; // stdin of the child (PTY master dup) — only when pty=true
+    bool pty = false;
 };
 // Fork+exec /bin/sh -c; returns handle with open read_fd. timeout applied in WaitBackground.
-BackgroundHandle StartBackground(const std::string& cmd, const std::string& cwd);
+BackgroundHandle StartBackground(const std::string& cmd, const std::string& cwd, bool pty = false);
+// Translate tmux-style key names (Enter, C-c, Up, Tab, Escape, BSpace, M-x, F1..F12) to bytes; unknown → literal.
+std::string KeysToBytes(const std::vector<std::string>& keys);
 // Drain output until EOF or timeout_ms; waitpid; close read_fd.
 ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out = 200 * 1024);
 // Like WaitBackground but on timeout leaves the process running (pid/read_fd stay set).

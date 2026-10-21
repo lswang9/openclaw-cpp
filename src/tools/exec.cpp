@@ -11,6 +11,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -273,6 +275,8 @@ struct BgSession {
     std::string live_out;
     std::mutex mu;
     BackgroundHandle handle;
+    int write_fd = -1;
+    bool pty = false;
     std::thread waiter;
 };
 std::mutex g_bg_mu;
@@ -288,6 +292,8 @@ std::string AdoptBgSession(const std::string& agent_id, const std::string& cmd, 
     s->cwd = cwd;
     s->handle = handle;
     s->pid = handle.pid;
+    s->write_fd = handle.write_fd;
+    s->pty = handle.pty;
     s->live_out = std::move(already_out);
     const int to_ms = timeout_sec <= 0 ? 86400000 : timeout_sec * 1000;
     s->waiter = std::thread([s, to_ms] {
@@ -304,6 +310,7 @@ std::string AdoptBgSession(const std::string& agent_id, const std::string& cmd, 
             r.error = rest.error;
             s->result = std::move(r);
             s->live_out = s->result.out;
+            if (s->write_fd >= 0) { close(s->write_fd); s->write_fd = -1; }
         }
         s->done.store(true);
     });
@@ -346,6 +353,13 @@ Policy ResolvePolicy(const nlohmann::json& raw, const nlohmann::json& doc, const
         else if (mode == "allowlist") { sec = "allowlist"; ask = "off"; }
         else if (mode == "ask" || mode == "auto") { sec = "allowlist"; ask = "on-miss"; }
         else if (mode == "full") { sec = "full"; ask = "off"; }
+        p.auto_review = mode == "auto";
+    }
+    if (ex.contains("autoReview") && ex["autoReview"].is_object()) {
+        const auto& ar = ex["autoReview"];
+        if (ar.contains("enabled") && ar["enabled"].is_boolean()) p.auto_review = ar["enabled"].get<bool>() && ask != "off";
+        p.auto_review_on_error = Str(ar, "onError", "escalate") == "deny" ? "deny" : "escalate";
+        p.auto_review_model = Str(ar, "model");
     }
     p.sources["config"] = {{"security", sec}, {"ask", ask}};
     p.strict_inline_eval = ex.value("strictInlineEval", false);
@@ -683,7 +697,21 @@ nlohmann::json Run(const nlohmann::json& args, const nlohmann::json& cfg_raw, co
             auto& broker = ApprovalBroker::Global();
             std::string decision;
             auto operands = SnapshotOperands(pc, cwd);
-            if (broker.has_ui && broker.has_ui()) {
+            bool reviewed = false;
+            if (pol.auto_review && pol.ask != "always") {
+                nlohmann::json req{{"kind", "exec"}, {"command", cmd}, {"cwd", cwd.string()}, {"agentId", ctx.agent_id},
+                                   {"sessionKey", ctx.session_key}, {"reason", d.reason}, {"inlineEval", d.inline_eval},
+                                   {"model", pol.auto_review_model}, {"onError", pol.auto_review_on_error}};
+                nlohmann::json rv = broker.auto_review ? broker.auto_review(req)
+                                                       : nlohmann::json{{"decision", pol.auto_review_on_error == "deny" ? "deny" : "escalate"},
+                                                                        {"reason", "no reviewer provider wired"}};
+                base["autoReview"] = rv;
+                const std::string rd = rv.value("decision", "escalate");
+                if (rd == "deny") return base.update({{"status", "denied"}, {"error", "exec denied by auto reviewer: " + rv.value("reason", "")}}), base;
+                if (rd == "allow") { decision = "allow-once"; reviewed = true; }
+            }
+            if (reviewed) {
+            } else if (broker.has_ui && broker.has_ui()) {
                 auto id = broker.Create({{"kind", "exec"}, {"command", cmd}, {"cwd", cwd.string()}, {"agentId", ctx.agent_id},
                                          {"sessionKey", ctx.session_key}, {"host", "gateway"},
                                          {"channel", ctx.channel}, {"requester", ctx.sender}, {"reason", d.reason},
@@ -727,12 +755,13 @@ nlohmann::json Run(const nlohmann::json& args, const nlohmann::json& cfg_raw, co
             }
         }
     }
+    const bool want_pty = args.value("pty", false);
     const bool force_bg = args.value("background", false);
-    const int yield_ms = args.value("yieldMs", 0);
+    const int yield_ms = args.value("yieldMs", want_pty && !force_bg ? 10000 : 0);
     const bool want_bg = force_bg || yield_ms > 0;
     ScopedRunEnv scoped(env);
     if (want_bg) {
-        auto h = StartBackground(run_cmd, cwd.string());
+        auto h = StartBackground(run_cmd, cwd.string(), want_pty && pol.host != "sandbox");
         if (h.pid < 0) return base.update({{"status", "failed"}, {"error", "failed to start process"}}), base;
         std::string early;
         if (!force_bg && yield_ms > 0) {
@@ -775,7 +804,7 @@ nlohmann::json ProcessTool(const nlohmann::json& args) {
             if (s->agent_id != ctx.agent_id && !ctx.agent_id.empty()) continue;
             std::lock_guard lk(s->mu);
             arr.push_back({{"sessionId", id}, {"command", s->command}, {"cwd", s->cwd}, {"pid", s->pid},
-                           {"done", s->done.load()}, {"status", s->done.load() ? (s->result.timed_out ? "timeout" : "exited") : "running"}});
+                           {"done", s->done.load()}, {"pty", s->pty}, {"status", s->done.load() ? (s->result.timed_out ? "timeout" : "exited") : "running"}});
         }
         return {{"sessions", arr}};
     }
@@ -795,6 +824,31 @@ nlohmann::json ProcessTool(const nlohmann::json& args) {
         s->killed.store(true);
         return {{"ok", true}, {"sessionId", sid}, {"killed", true}};
     }
+    if (action == "write" || action == "send-keys" || action == "submit" || action == "paste") {
+        std::string bytes;
+        if (action == "send-keys") {
+            std::vector<std::string> keys;
+            if (args.contains("keys") && args["keys"].is_array())
+                for (auto& k : args["keys"]) if (k.is_string()) keys.push_back(k);
+            if (args.contains("literal") && args["literal"].is_string()) bytes += args["literal"].get<std::string>();
+            bytes += KeysToBytes(keys);
+        } else {
+            bytes = args.value("data", args.value("text", std::string()));
+            if (action == "paste") bytes = "\x1b[200~" + bytes + "\x1b[201~";
+            if (action == "submit") bytes += "\r";
+        }
+        std::lock_guard lk(s->mu);
+        if (s->done.load() || s->write_fd < 0)
+            return {{"ok", false}, {"error", s->pty ? "session has exited" : "session has no stdin (start exec with pty:true)"}};
+        std::size_t off = 0;
+        while (off < bytes.size()) {
+            ssize_t n = ::write(s->write_fd, bytes.data() + off, bytes.size() - off);
+            if (n < 0) { if (errno == EAGAIN || errno == EINTR) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
+                         return {{"ok", false}, {"error", std::string("write failed: ") + std::strerror(errno)}}; }
+            off += static_cast<std::size_t>(n);
+        }
+        return {{"ok", true}, {"sessionId", sid}, {"bytes", bytes.size()}};
+    }
     if (action == "poll" || action == "log" || action == "status") {
         int wait_ms = args.value("timeout", 0);
         if (wait_ms > 0 && !s->done.load()) {
@@ -813,7 +867,42 @@ nlohmann::json ProcessTool(const nlohmann::json& args) {
         }
         return out;
     }
-    return {{"ok", false}, {"error", "unknown action (list|poll|log|kill)"}};
+    return {{"ok", false}, {"error", "unknown action (list|poll|log|write|send-keys|submit|paste|kill)"}};
+}
+
+nlohmann::json ReviewWithProvider(provider::Provider& prov, const nlohmann::json& request, const std::string& on_error) {
+    const std::string fallback = on_error == "deny" ? "deny" : "escalate";
+    std::vector<agent::Message> msgs;
+    agent::Message sys;
+    sys.role = "system";
+    sys.content =
+        "You are the OpenClaw exec auto-reviewer. Decide whether a shell command requested by an AI agent may run "
+        "without a human. Allow only clearly read-only or low-risk, workspace-scoped commands. Deny destructive, "
+        "exfiltrating, privilege-escalating or credential-reading commands. If unsure, escalate to a human. "
+        "Reply with ONLY a JSON object: {\"decision\":\"allow|deny|escalate\",\"risk\":\"low|medium|high\",\"reason\":\"...\"}";
+    agent::Message user;
+    user.role = "user";
+    user.content = "Command: " + request.value("command", "") + "\ncwd: " + request.value("cwd", "") +
+                   "\nagent: " + request.value("agentId", "") + "\npolicy reason: " + request.value("reason", "") +
+                   (request.value("inlineEval", false) ? "\nnote: inline interpreter eval detected" : "");
+    msgs.push_back(sys);
+    msgs.push_back(user);
+    agent::CompletionResult r;
+    try { r = prov.Complete(msgs, nlohmann::json::array()); }
+    catch (const std::exception& e) { return {{"decision", fallback}, {"reason", std::string("reviewer error: ") + e.what()}, {"reviewer", "provider"}}; }
+    if (!r.ok) return {{"decision", fallback}, {"reason", "reviewer call failed: " + r.error}, {"reviewer", "provider"}};
+    const std::string& t = r.message.content;
+    auto a = t.find('{'), b = t.rfind('}');
+    nlohmann::json v;
+    if (a != std::string::npos && b != std::string::npos && b > a) v = nlohmann::json::parse(t.substr(a, b - a + 1), nullptr, false);
+    if (!v.is_object() || !v.contains("decision") || !v["decision"].is_string())
+        return {{"decision", fallback}, {"reason", "reviewer reply was not a JSON verdict"}, {"raw", t.substr(0, 200)}, {"reviewer", "provider"}};
+    std::string dec = v["decision"];
+    std::string risk = v.value("risk", "");
+    if (dec != "allow" && dec != "deny") dec = "escalate";
+    if (dec == "allow" && risk == "high") dec = "escalate";
+    if (dec == "allow" && request.value("inlineEval", false) && risk != "low") dec = "escalate";
+    return {{"decision", dec}, {"risk", risk}, {"reason", v.value("reason", "")}, {"reviewer", "provider"}};
 }
 
 }  // namespace openclaw::tools::exec

@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.56.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.57.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,11 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.57 exec mode=auto reviewer + PTY/send-keys
+- real (mock-tested): `tools.exec.mode: "auto"` = allowlist + on-miss, but a miss first goes to a model reviewer through the provider interface (`ReviewWithProvider`, gateway router/default provider, no tools). Strict JSON verdict `allow|deny|escalate`; `allow` with `risk=high` (or inline-eval without `risk=low`) → escalate; malformed/failed reply → escalate (or deny with `autoReview.onError: "deny"`); escalate → normal human approval/askFallback. Event `exec.autoreview`. Operand SHA revalidation still applies.
+- real: `exec {pty:true}` runs in a pseudo-terminal (posix_openpt, setsid, controlling TTY, 80x24) as a background session; `process` actions `write`, `send-keys` (tmux-style names: Enter, C-x, M-x, arrows, F1–F12…), `submit`, `paste` (bracketed). Tests: self-test (reviewer verdicts, isatty + line input), `scripts/e2e-exec-auto.sh` (smoke).
+- real-sim / gaps: reviewer prompt is ours, not upstream's verbatim; `autoReview.model` is parsed but the reviewer uses the session's default route (no per-call model override); no live-LLM reviewer quality evaluation; PTY resize not exposed; sandbox host ignores pty.
 
 ## 1.43 JS/TS plugin host (upstream API)
 - real: host.mjs v2 discovers openclaw.plugin.json / package.json `openclaw.extensions` / legacy plugin.json across repo plugins/, ~/.openclaw/extensions, <workspace>/.openclaw/extensions, plugins.load.paths; honours plugins.enabled/allow/deny and entries.<id>.enabled/config (api.pluginConfig).

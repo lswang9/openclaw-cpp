@@ -2,6 +2,8 @@
 // Upstream-style `exec` tool: host selection (sandbox|gateway), exec policy (security/ask/askFallback,
 // tools.exec.mode), per-agent allowlists in an approvals document, strict inline-eval, safe bins,
 // approval broker (exec.approval.requested / exec.approval.resolve), allow-always persistence.
+#include "openclaw/provider/provider.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -33,6 +35,9 @@ struct Policy {
     bool sandbox_network = false;
     int timeout_sec = 1800;
     int approval_timeout_ms = 120000;
+    bool auto_review = false;                 // tools.exec.mode=auto → model reviewer before human escalation
+    std::string auto_review_on_error = "escalate";  // escalate | deny
+    std::string auto_review_model;            // tools.exec.autoReview.model (provider/model route)
     nlohmann::json sources = nlohmann::json::object();
 };
 
@@ -82,6 +87,8 @@ public:
     std::function<bool()> has_ui;
     std::function<void(const nlohmann::json&)> on_requested;
     std::function<void(const nlohmann::json&)> on_resolved;
+    // mode=auto reviewer (gateway wires it to the provider router). Returns {decision: allow|deny|escalate, reason, risk}.
+    std::function<nlohmann::json(const nlohmann::json& request)> auto_review;
 
     std::string Create(nlohmann::json request);
     // Blocks until resolved or timeout. Returns allow-once | allow-always | deny | timeout.
@@ -96,6 +103,10 @@ private:
     std::map<std::string, nlohmann::json> items_;
     int seq_ = 0;
 };
+
+// mode=auto reviewer against any Provider (no tools). Parses a strict JSON verdict; malformed/failed → escalate
+// (or deny when on_error=="deny"). allow with risk=high is downgraded to escalate.
+nlohmann::json ReviewWithProvider(provider::Provider& prov, const nlohmann::json& request, const std::string& on_error = "escalate");
 
 // Per-run context (thread-local) set by the gateway around agent runs.
 struct RunContext {

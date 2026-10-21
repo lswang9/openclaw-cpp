@@ -201,6 +201,7 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
               {"env", {{"type", "object"}, {"description", "Extra environment variables"}}},
               {"timeout", {{"type", "integer"}, {"description", "Timeout in seconds (default tools.exec.timeoutSec, 1800)"}}},
               {"yieldMs", {{"type", "integer"}, {"description", "Return running sessionId after this many ms if still running"}}},
+              {"pty", {{"type", "boolean"}, {"description", "Run in a pseudo-terminal (interactive CLIs); drive with process write/send-keys"}}},
               {"background", {{"type", "boolean"}, {"description", "Start immediately as a background process session"}}},
               {"host", {{"type", "string"}, {"enum", {"auto", "sandbox", "gateway"}}}},
               {"ask", {{"type", "string"}, {"enum", {"off", "on-miss", "always"}}, {"description", "Can only harden the configured ask policy"}}}}},
@@ -222,10 +223,12 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
 
         ToolSpec proc;
         proc.name = "process";
-        proc.description = "Manage background exec sessions: list|poll|log|kill (scoped per agent).";
+        proc.description = "Manage background exec sessions: list|poll|log|write|send-keys|submit|paste|kill (scoped per agent). send-keys takes tmux-style keys (Enter, C-c, Up, Tab, Escape).";
         proc.parameters = nlohmann::json{{"type", "object"},
             {"properties", {{"action", {{"type", "string"}}}, {"sessionId", {{"type", "string"}}},
-                            {"timeout", {{"type", "integer"}, {"description", "poll wait ms"}}}}},
+                            {"timeout", {{"type", "integer"}, {"description", "poll wait ms"}}},
+                            {"data", {{"type", "string"}}}, {"keys", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                            {"literal", {{"type", "string"}}}}},
             {"required", nlohmann::json::array({"action"})}};
         proc.handler = [](const nlohmann::json& a) { return exec::ProcessTool(a).dump(); };
         r.Register(std::move(proc));
