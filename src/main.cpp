@@ -1,3 +1,4 @@
+#include "openclaw/channels/discord_voice.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/auth/mfa.hpp"
@@ -98,7 +99,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.76.0-dev";
+constexpr const char* kVersion = "1.77.0-dev.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2509,6 +2510,23 @@ int CmdSelfTest() {
         } else std::cerr << "PASS waweb binary token dictionary v3 (Baileys fixtures byte-identical)\n";
     }
     {
+        namespace dv = openclaw::channels::discord_voice;
+        auto unhex2 = [](const std::string& h) { dv::Bytes o; for (std::size_t i = 0; i + 1 < h.size(); i += 2) o.push_back(static_cast<std::uint8_t>(std::stoi(h.substr(i, 2), nullptr, 16))); return o; };
+        dv::Bytes k; for (int i = 0; i < 32; ++i) k.push_back(static_cast<std::uint8_t>(i));
+        bool ok = dv::HChaCha20(k, unhex2("000000090000004a0000000031415927")) == unhex2("82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc");
+        dv::Bytes opus{1, 2, 3, 4, 5};
+        for (const char* mode : {"aead_aes256_gcm_rtpsize", "aead_xchacha20_poly1305_rtpsize"}) {
+            auto p = dv::EncryptRtp(mode, k, dv::RtpHeader(7, 960, 1234), opus, 42);
+            auto d = p ? dv::DecryptRtp(mode, k, *p) : std::nullopt;
+            auto t = p ? *p : dv::Bytes(); if (!t.empty()) t[2] ^= 1;  // header is AAD
+            ok = ok && d && *d == opus && !dv::DecryptRtp(mode, k, t) && p->size() == 12 + 5 + 16 + 4;
+        }
+        auto disc = dv::IpDiscoveryRequest(99);
+        ok = ok && disc.size() == 74 && disc[1] == 1 && disc[3] == 70 && disc[7] == 99;
+        if (!ok) { std::cerr << "FAIL discord voice crypto/framing\n"; ++failures; }
+        else std::cerr << "PASS discord voice HChaCha20 vector + rtpsize AEAD (GCM, XChaCha) + IP discovery framing\n";
+    }
+    {
         namespace sg = openclaw::channels::waweb::signal;
         namespace ww = openclaw::channels::waweb;
         auto alice = sg::NewIdentity(111), bob = sg::NewIdentity(222);
@@ -3527,6 +3545,24 @@ int main(int argc, char** argv) {
             if (sub == "verify" && rest.size() > 1) { std::string how; bool ok = st.Verify(rest[1], 0, &how); std::cout << nlohmann::json{{"ok", ok}, {"via", how}}.dump() << "\n"; return ok ? 0 : 1; }
             std::cout << nlohmann::json{{"enabled", st.Enabled()}, {"source", st.FromEnv() ? "env" : "file"}, {"recoveryRemaining", st.RecoveryRemaining()}, {"path", mf::UserPath(user)}, {"user", user}}.dump() << "\n";
             return 0;
+        }
+        if (cmd == "discord" && argc > 3 && std::string(argv[2]) == "voice" && std::string(argv[3]) == "play") {
+            namespace dv = openclaw::channels::discord_voice;
+            dv::PlayRequest rq;
+            std::string ogg;
+            for (int i = 4; i + 1 < argc; i += 2) {
+                std::string k = argv[i], v = argv[i + 1];
+                if (k == "--endpoint") rq.endpoint = v; else if (k == "--server") rq.server_id = v; else if (k == "--user") rq.user_id = v;
+                else if (k == "--session") rq.session_id = v; else if (k == "--token") rq.token = v; else if (k == "--ogg") ogg = v;
+            }
+            std::ifstream in(ogg, std::ios::binary);
+            dv::Bytes b((std::istreambuf_iterator<char>(in)), {});
+            std::string err;
+            rq.packets = dv::OggOpusPackets(b, &err);
+            if (rq.packets.empty()) { std::cerr << "ogg: " << err << "\n"; return 1; }
+            auto r = dv::Play(rq);
+            std::cout << r.dump(2) << "\n";
+            return r.value("ok", false) ? 0 : 1;
         }
         if (cmd == "cron-daemon") return CmdCronDaemon();
         if (cmd == "mcp-mock-server") return CmdMcpMockServer();
