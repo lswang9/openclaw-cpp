@@ -195,16 +195,6 @@ std::vector<std::pair<std::string, std::string>> SkillEnvOverrides(const std::ve
     return out;
 }
 
-ScopedEnv::ScopedEnv(const std::vector<std::pair<std::string, std::string>>& vars) {
-    for (const auto& [k, v] : vars) {
-        const char* cur = std::getenv(k.c_str());
-        if (cur && *cur) continue;
-        ::setenv(k.c_str(), v.c_str(), 1);
-        set_.push_back(k);
-    }
-}
-ScopedEnv::~ScopedEnv() { for (const auto& k : set_) ::unsetenv(k.c_str()); }
-
 std::string SlashName(const std::string& n) {
     std::string o;
     for (unsigned char c : n) {

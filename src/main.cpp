@@ -1,4 +1,5 @@
 #include <memory>
+#include <thread>
 #include "openclaw/agent/loop.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/channels/registry.hpp"
@@ -55,6 +56,7 @@
 #include "openclaw/context/system_prompt.hpp"
 #include "openclaw/context/compaction.hpp"
 #include "openclaw/tokenizer/bpe.hpp"
+#include "openclaw/tools/runenv.hpp"
 #include "openclaw/workspace/workspace.hpp"
 #include "openclaw/mcp/stdio.hpp"
 
@@ -75,7 +77,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.36.0-dev";
+constexpr const char* kVersion = "1.37.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1496,8 +1498,14 @@ int CmdSelfTest() {
         ok = ok && lib.Find("GitHub PR")->eligible && !lib.Find("off")->eligible;
         auto ov = skills::SkillEnvOverrides(lib.List(), entries);
         {
+            // per-run isolation: two concurrent "runs" see only their own overlay; process env untouched
+            std::string seen1, seen2;
+            std::thread t1([&] { skills::ScopedEnv se(ov); seen1 = tools::RunProcess("printf %s \"$OC_ST_GH_TOKEN\"", "/tmp", 5000).out; });
+            std::thread t2([&] { skills::ScopedEnv se({{"OC_ST_GH_TOKEN", "other"}}); seen2 = tools::RunProcess("printf %s \"$OC_ST_GH_TOKEN\"", "/tmp", 5000).out; });
+            t1.join(); t2.join();
+            ok = ok && seen1 == "tok123" && seen2 == "other";
             skills::ScopedEnv se(ov);
-            ok = ok && std::string(std::getenv("OC_ST_GH_TOKEN") ? std::getenv("OC_ST_GH_TOKEN") : "") == "tok123";
+            ok = ok && tools::LookupEnv("OC_ST_GH_TOKEN") == "tok123" && std::getenv("OC_ST_GH_TOKEN") == nullptr;
         }
         ok = ok && std::getenv("OC_ST_GH_TOKEN") == nullptr && skills::SlashName("GitHub PR") == "github_pr";
         auto c1 = skills::MatchSkillCommand(lib.List(), "/github_pr fix #12");

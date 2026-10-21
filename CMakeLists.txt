@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.36.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.37.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,6 +40,7 @@ set(OPENCLAW_SOURCES
   src/provider/openai_compat.cpp
   src/provider/router.cpp
   src/tools/registry.cpp
+  src/tools/runenv.cpp
   src/workspace/workspace.cpp
   src/context/system_prompt.cpp
   src/context/compaction.cpp

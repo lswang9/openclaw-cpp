@@ -1,5 +1,6 @@
 #pragma once
 
+#include "openclaw/tools/runenv.hpp"
 #include <nlohmann/json.hpp>
 
 #include <filesystem>
@@ -40,16 +41,8 @@ std::string SkillKey(const Skill& s);
 std::vector<std::pair<std::string, std::string>> SkillEnvOverrides(const std::vector<Skill>& skills,
                                                                    const nlohmann::json& entries);
 
-// RAII: set vars for the duration of a run, restoring previous state. Process-global (not per-thread).
-class ScopedEnv {
-public:
-    explicit ScopedEnv(const std::vector<std::pair<std::string, std::string>>& vars);
-    ~ScopedEnv();
-    ScopedEnv(const ScopedEnv&) = delete;
-    ScopedEnv& operator=(const ScopedEnv&) = delete;
-private:
-    std::vector<std::string> set_;
-};
+// Per-run (thread-local) env overlay; never mutates the process environment.
+using ScopedEnv = tools::ScopedRunEnv;
 
 // Slash command name for a skill: lowercase, [a-z0-9_], max 32 chars (upstream sanitisation).
 std::string SlashName(const std::string& skill_name);

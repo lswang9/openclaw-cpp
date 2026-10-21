@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <sstream>
 #include "openclaw/tools/registry.hpp"
+#include "openclaw/tools/runenv.hpp"
+#include <algorithm>
 #include "openclaw/approvals/store.hpp"
 #include "openclaw/browser/engine.hpp"
 #include <curl/curl.h>
@@ -160,7 +162,8 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
         ToolSpec shell;
         shell.name = "shell";
         shell.description =
-            "Mock shell tool (records command; does not exec by default). Requires approval when gated.";
+            "Run a shell command in the agent workspace (real when OPENCLAW_EXEC_MODE=real, otherwise mocked). "
+            "Requires approval when gated.";
         shell.requires_approval = opts.shell_requires_approval;
         shell.parameters = {
             {"type", "object"},
@@ -192,7 +195,16 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
                                           {"approval", info}}.dump();
                 }
             }
-            // Mock execution only (safe default).
+            if (LookupEnv("OPENCLAW_EXEC_MODE") == "real") {
+                auto ws = workspace::Workspace::DefaultRoot();
+                std::filesystem::create_directories(ws);
+                int timeout = args.value("timeout_ms", 60000);
+                auto pr = RunProcess(cmd, ws.string(), std::clamp(timeout, 100, 600000));
+                return nlohmann::json{{"ok", pr.exit_code == 0 && !pr.timed_out}, {"exit_code", pr.exit_code},
+                                      {"timed_out", pr.timed_out}, {"output", pr.out}, {"truncated", pr.truncated},
+                                      {"cwd", ws.string()}}.dump();
+            }
+            // Mock execution (safe default; set OPENCLAW_EXEC_MODE=real to run via /bin/sh in the workspace).
             return nlohmann::json{{"ok", true},
                                  {"mocked", true},
                                  {"command", cmd},
