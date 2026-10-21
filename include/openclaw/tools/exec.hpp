@@ -36,8 +36,11 @@ struct Policy {
     nlohmann::json sources = nlohmann::json::object();
 };
 
+// Legacy JSON path (OPENCLAW_EXEC_APPROVALS_PATH or …/exec-approvals.json). Prefer SqlitePath.
 std::filesystem::path DefaultApprovalsPath();
-nlohmann::json LoadApprovals(const std::filesystem::path& p);
+// Upstream: $OPENCLAW_STATE_DIR/state/openclaw.sqlite (row key exec_approvals_config).
+std::filesystem::path DefaultSqlitePath();
+nlohmann::json LoadApprovals(const std::filesystem::path& p = {});
 bool SaveApprovals(const std::filesystem::path& p, const nlohmann::json& doc);
 
 // Stricter of config (tools.exec.* / agents.list[].tools.exec) and the approvals document.
@@ -59,6 +62,9 @@ bool GlobMatch(const std::string& pattern, const std::string& text);  // *, **, 
 bool IsInlineEval(const std::vector<std::string>& argv);
 // All segments allowlisted (or safe bins). `cwd` binds allow-always entries.
 bool AllowlistHit(const Policy& p, const ParsedCommand& pc, const std::string& cwd);
+std::string FileSha256(const std::filesystem::path& path);
+nlohmann::json SnapshotOperands(const ParsedCommand& pc, const std::filesystem::path& cwd = {});
+std::string RevalidateOperands(const nlohmann::json& snap);
 
 struct Decision {
     std::string verdict;  // allow | deny | ask
@@ -108,8 +114,11 @@ private:
 };
 const RunContext& CurrentContext();
 
-// Execute the tool call. args: command, workdir, env{}, timeout (sec), host, ask, security.
-// cfg_raw: full config; workspace: agent workspace root.
+// Execute the tool call. args: command, workdir, env{}, timeout (sec), host, ask, security,
+// yieldMs, background. cfg_raw: full config; workspace: agent workspace root.
 nlohmann::json Run(const nlohmann::json& args, const nlohmann::json& cfg_raw, const std::filesystem::path& workspace);
+
+// Companion `process` tool: list|poll|log|kill background exec sessions (per agent).
+nlohmann::json ProcessTool(const nlohmann::json& args);
 
 }  // namespace openclaw::tools::exec

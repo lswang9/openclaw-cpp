@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.52.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.53.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,6 +10,7 @@ find_package(nlohmann_json REQUIRED)
 find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 set(OPENCLAW_SOURCES
   src/main.cpp
@@ -94,6 +95,7 @@ target_link_libraries(openclaw-cpp PRIVATE
   OpenSSL::SSL
   OpenSSL::Crypto
   Threads::Threads
+  SQLite::SQLite3
   ${CMAKE_DL_LIBS})
 
 # Sample native plugin (.so) — Linux

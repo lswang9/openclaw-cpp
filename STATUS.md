@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.52.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.53.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -216,6 +216,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ### 1.51.0-dev
 - 多智能体隔离：每个 agents.list 条目独立会话目录、工作区、记忆索引与工具集（allow/deny/profile）；main 在设置了 OPENCLAW_SESSION_DIR 时仍用该目录以保持兼容。技能库与 JS 插件宿主仍为进程级共享。
+
+### 1.53.0-dev
+- exec 审批改为 SQLite（`state/openclaw.sqlite#exec_approvals_config`），自动从旧 JSON 迁移；批准前后对可执行文件/脚本做 SHA-256 校验，变更则拒绝；支持 `yieldMs`/`background` + `process`（list/poll/log/kill）；有 docker 用 docker，否则 bwrap。`mode=auto` 仍无 LLM reviewer（等同 ask）。
 
 ### 1.52.0-dev
 - 热重载与并发 HTTP：`deps_mu_`（独占 `mutex`）串行化配置/工具换出与请求读路径；agent 循环在释锁后跑，避免与 reload 死锁。HTTP 改为有界工作线程池（默认 8，`OPENCLAW_GATEWAY_WORKERS`，队列满返回 503），取代原先无界 `detach` 在并发 reload 下 OOM。agent 工具注册为 `shared_ptr` 以便在途 run 在 rebuild 后仍持有旧 registry。`scripts/e2e-config-lock.sh`（已并入 smoke）并发 config.reload + inbound/tools.list。

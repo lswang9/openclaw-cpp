@@ -1,4 +1,10 @@
 #include "openclaw/tools/exec.hpp"
+#include <iomanip>
+#include <atomic>
+#include <thread>
+#include <memory>
+#include <openssl/sha.h>
+#include <sqlite3.h>
 
 #include "openclaw/tools/runenv.hpp"
 
@@ -85,7 +91,64 @@ fs::path DefaultApprovalsPath() {
     return fs::path(Home()) / ".openclaw" / "exec-approvals.json";
 }
 
-nlohmann::json LoadApprovals(const fs::path& p) {
+fs::path DefaultSqlitePath() {
+    if (const char* p = std::getenv("OPENCLAW_STATE_DB"); p && *p) return p;
+    fs::path root;
+    if (const char* d = std::getenv("OPENCLAW_STATE_DIR"); d && *d) root = d;
+    else if (const char* d = std::getenv("OPENCLAW_DATA_DIR"); d && *d) root = d;
+    else root = fs::path(Home()) / ".openclaw";
+    return root / "state" / "openclaw.sqlite";
+}
+
+namespace {
+constexpr const char* kApprovalsKey = "exec_approvals_config";
+std::mutex g_sqlite_mu;
+
+bool SqliteGet(const fs::path& db, const std::string& key, std::string* out) {
+    std::error_code ec;
+    fs::create_directories(db.parent_path(), ec);
+    sqlite3* conn = nullptr;
+    if (sqlite3_open(db.string().c_str(), &conn) != SQLITE_OK) return false;
+    sqlite3_exec(conn, "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);",
+                 nullptr, nullptr, nullptr);
+    sqlite3_stmt* st = nullptr;
+    bool ok = false;
+    if (sqlite3_prepare_v2(conn, "SELECT value FROM kv WHERE key=?1;", -1, &st, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char* t = sqlite3_column_text(st, 0);
+            if (t) { *out = reinterpret_cast<const char*>(t); ok = true; }
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(conn);
+    return ok;
+}
+
+bool SqliteSet(const fs::path& db, const std::string& key, const std::string& value) {
+    std::error_code ec;
+    fs::create_directories(db.parent_path(), ec);
+    sqlite3* conn = nullptr;
+    if (sqlite3_open(db.string().c_str(), &conn) != SQLITE_OK) return false;
+    sqlite3_exec(conn, "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);",
+                 nullptr, nullptr, nullptr);
+    sqlite3_stmt* st = nullptr;
+    bool ok = false;
+    if (sqlite3_prepare_v2(conn,
+            "INSERT INTO kv(key,value,updated_at) VALUES(?1,?2,?3) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;",
+            -1, &st, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, value.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 3, NowMs());
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(conn);
+    return ok;
+}
+
+nlohmann::json LoadJsonFile(const fs::path& p) {
     std::ifstream in(p);
     if (!in) return {{"version", 1}};
     try {
@@ -95,7 +158,7 @@ nlohmann::json LoadApprovals(const fs::path& p) {
     return {{"version", 1}};
 }
 
-bool SaveApprovals(const fs::path& p, const nlohmann::json& doc) {
+bool SaveJsonFile(const fs::path& p, const nlohmann::json& doc) {
     std::error_code ec;
     fs::create_directories(p.parent_path(), ec);
     auto tmp = p.string() + ".tmp";
@@ -106,7 +169,152 @@ bool SaveApprovals(const fs::path& p, const nlohmann::json& doc) {
     }
     fs::rename(tmp, p, ec);
     if (!ec) fs::permissions(p, fs::perms::owner_read | fs::perms::owner_write, ec);
-    return true;
+    return !ec;
+}
+}  // namespace
+
+nlohmann::json LoadApprovals(const fs::path& p_in) {
+    // Explicit JSON path (tests / OPENCLAW_EXEC_APPROVALS_PATH) bypasses SQLite.
+    if (!p_in.empty() || (std::getenv("OPENCLAW_EXEC_APPROVALS_PATH") && *std::getenv("OPENCLAW_EXEC_APPROVALS_PATH"))) {
+        const fs::path p = p_in.empty() ? DefaultApprovalsPath() : p_in;
+        return LoadJsonFile(p);
+    }
+    std::lock_guard lock(g_sqlite_mu);
+    const auto db = DefaultSqlitePath();
+    std::string raw;
+    if (SqliteGet(db, kApprovalsKey, &raw)) {
+        try {
+            auto j = nlohmann::json::parse(raw);
+            if (j.is_object()) return j;
+        } catch (...) {}
+    }
+    // Migrate legacy JSON once into SQLite.
+    const auto legacy = DefaultApprovalsPath();
+    auto doc = LoadJsonFile(legacy);
+    if (fs::exists(legacy)) {
+        SqliteSet(db, kApprovalsKey, doc.dump());
+        std::error_code ec;
+        fs::rename(legacy, legacy.string() + ".migrated", ec);
+    }
+    return doc;
+}
+
+bool SaveApprovals(const fs::path& p_in, const nlohmann::json& doc) {
+    if (!p_in.empty() || (std::getenv("OPENCLAW_EXEC_APPROVALS_PATH") && *std::getenv("OPENCLAW_EXEC_APPROVALS_PATH"))) {
+        const fs::path p = p_in.empty() ? DefaultApprovalsPath() : p_in;
+        return SaveJsonFile(p, doc);
+    }
+    std::lock_guard lock(g_sqlite_mu);
+    return SqliteSet(DefaultSqlitePath(), kApprovalsKey, doc.dump());
+}
+
+std::string FileSha256(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    SHA256_CTX ctx; SHA256_Init(&ctx);
+    char buf[8192];
+    while (in) {
+        in.read(buf, sizeof buf);
+        auto n = in.gcount();
+        if (n > 0) SHA256_Update(&ctx, buf, static_cast<size_t>(n));
+    }
+    unsigned char dig[SHA256_DIGEST_LENGTH];
+    SHA256_Final(dig, &ctx);
+    std::ostringstream os;
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i)
+        os << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(dig[i]);
+    return os.str();
+}
+
+nlohmann::json SnapshotOperands(const ParsedCommand& pc, const fs::path& cwd) {
+    nlohmann::json arr = nlohmann::json::array();
+    std::error_code ec;
+    auto add = [&](const fs::path& path, const std::string& role) {
+        if (path.empty()) return;
+        auto canon = fs::weakly_canonical(path, ec);
+        if (ec || !fs::is_regular_file(canon, ec)) return;
+        auto h = FileSha256(canon);
+        if (h.empty()) return;
+        arr.push_back({{"path", canon.string()}, {"sha256", h}, {"role", role}});
+    };
+    for (auto& s : pc.segments) {
+        if (!s.resolved.empty()) add(s.resolved, "executable");
+        for (std::size_t i = 1; i < s.argv.size(); ++i) {
+            const auto& a = s.argv[i];
+            if (a.empty() || a[0] == '-') continue;
+            fs::path cand = (a[0] == '/') ? fs::path(a) : (cwd.empty() ? fs::path(a) : cwd / a);
+            if (fs::is_regular_file(cand, ec)) add(cand, "operand");
+        }
+    }
+    return arr;
+}
+
+std::string RevalidateOperands(const nlohmann::json& snap) {
+    if (!snap.is_array()) return "";
+    for (auto& e : snap) {
+        if (!e.is_object()) continue;
+        const std::string path = e.value("path", "");
+        const std::string want = e.value("sha256", "");
+        if (path.empty() || want.empty()) continue;
+        auto got = FileSha256(path);
+        if (got.empty()) return "operand missing after approval: " + path;
+        if (got != want) return "operand changed after approval: " + path;
+    }
+    return "";
+}
+
+// ---------- background sessions (yieldMs / background) ----------
+struct BgSession {
+    std::string id, agent_id, command, cwd;
+    int pid = -1;
+    std::atomic<bool> done{false};
+    std::atomic<bool> killed{false};
+    ProcessResult result;
+    std::string live_out;
+    std::mutex mu;
+    BackgroundHandle handle;
+    std::thread waiter;
+};
+std::mutex g_bg_mu;
+std::map<std::string, std::shared_ptr<BgSession>> g_bg;
+
+std::string AdoptBgSession(const std::string& agent_id, const std::string& cmd, const std::string& cwd,
+                           BackgroundHandle handle, int timeout_sec, std::string already_out = {}) {
+    if (handle.pid < 0) return {};
+    auto s = std::make_shared<BgSession>();
+    s->id = "bg" + NewId().substr(0, 10);
+    s->agent_id = agent_id;
+    s->command = cmd;
+    s->cwd = cwd;
+    s->handle = handle;
+    s->pid = handle.pid;
+    s->live_out = std::move(already_out);
+    const int to_ms = timeout_sec <= 0 ? 86400000 : timeout_sec * 1000;
+    s->waiter = std::thread([s, to_ms] {
+        // Continue collecting until exit or overall timeout.
+        ProcessResult r;
+        r.out = s->live_out;
+        auto rest = WaitBackground(s->handle, to_ms, 200 * 1024);
+        {
+            std::lock_guard lock(s->mu);
+            r.out += rest.out;
+            r.exit_code = rest.exit_code;
+            r.timed_out = rest.timed_out;
+            r.truncated = rest.truncated || (r.out.size() >= 200 * 1024);
+            r.error = rest.error;
+            s->result = std::move(r);
+            s->live_out = s->result.out;
+        }
+        s->done.store(true);
+    });
+    s->waiter.detach();
+    std::lock_guard lock(g_bg_mu);
+    g_bg[s->id] = s;
+    return s->id;
+}
+std::string StartBgSession(const std::string& agent_id, const std::string& cmd, const std::string& cwd,
+                           const std::string& run_cmd, int timeout_sec) {
+    return AdoptBgSession(agent_id, cmd, cwd, StartBackground(run_cmd, cwd), timeout_sec);
 }
 
 // ---------- policy ----------
@@ -421,8 +629,7 @@ nlohmann::json Run(const nlohmann::json& args, const nlohmann::json& cfg_raw, co
     const std::string cmd = args.value("command", "");
     if (cmd.empty()) return {{"status", "failed"}, {"error", "missing command"}};
     const auto& ctx = CurrentContext();
-    const auto approvals_path = DefaultApprovalsPath();
-    auto doc = LoadApprovals(approvals_path);
+    auto doc = LoadApprovals({});
     auto pol = ResolvePolicy(cfg_raw, doc, ctx.agent_id, ctx.session_key, args.value("host", ""));
     // per-call ask/security can only harden
     if (auto a = args.value("ask", std::string()); !a.empty() && AskRank(a) > AskRank(pol.ask)) pol.ask = AskName(AskRank(a));
@@ -475,11 +682,12 @@ nlohmann::json Run(const nlohmann::json& args, const nlohmann::json& cfg_raw, co
         if (d.verdict == "ask") {
             auto& broker = ApprovalBroker::Global();
             std::string decision;
+            auto operands = SnapshotOperands(pc, cwd);
             if (broker.has_ui && broker.has_ui()) {
                 auto id = broker.Create({{"kind", "exec"}, {"command", cmd}, {"cwd", cwd.string()}, {"agentId", ctx.agent_id},
                                          {"sessionKey", ctx.session_key}, {"host", "gateway"},
                                          {"channel", ctx.channel}, {"requester", ctx.sender}, {"reason", d.reason},
-                                         {"allowAlways", !d.inline_eval}});
+                                         {"allowAlways", !d.inline_eval}, {"operands", operands}});
                 base["approvalId"] = id;
                 decision = broker.Wait(id, std::chrono::milliseconds(pol.approval_timeout_ms));
             } else {
@@ -495,22 +703,59 @@ nlohmann::json Run(const nlohmann::json& args, const nlohmann::json& cfg_raw, co
             }
             base["approvalDecision"] = decision;
             if (decision == "deny") return base.update({{"status", "denied"}, {"error", "exec denied by operator"}}), base;
+            if (auto err = RevalidateOperands(operands); !err.empty())
+                return base.update({{"status", "denied"}, {"error", err}}), base;
             if (decision == "allow-always" && !d.inline_eval && !pc.complex) {
-                auto& list = doc["agents"][ctx.agent_id]["allowlist"];
-                if (!list.is_array()) list = nlohmann::json::array();
-                for (auto& s : pc.segments) {
-                    std::string a;
-                    for (std::size_t i = 1; i < s.argv.size(); ++i) a += (i > 1 ? " " : "") + s.argv[i];
-                    list.push_back({{"id", NewId()}, {"pattern", s.resolved.empty() ? s.argv[0] : s.resolved},
-                                    {"argPattern", "^" + RegexEscape(a) + "$"}, {"source", "allow-always"},
-                                    {"cwd", cwd.string()}, {"lastUsedAt", NowMs()}, {"lastResolvedPath", s.resolved}});
+                // Mutable script operands: durable grant becomes one-shot (upstream byte-bound rule).
+                bool mutable_operand = false;
+                for (auto& e : operands) if (e.value("role", "") == "operand") mutable_operand = true;
+                if (mutable_operand) {
+                    base["allowAlwaysDowngraded"] = true;
+                } else {
+                    auto& list = doc["agents"][ctx.agent_id]["allowlist"];
+                    if (!list.is_array()) list = nlohmann::json::array();
+                    for (auto& seg : pc.segments) {
+                        std::string a;
+                        for (std::size_t i = 1; i < seg.argv.size(); ++i) a += (i > 1 ? " " : "") + seg.argv[i];
+                        list.push_back({{"id", NewId()}, {"pattern", seg.resolved.empty() ? seg.argv[0] : seg.resolved},
+                                        {"argPattern", "^" + RegexEscape(a) + "$"}, {"source", "allow-always"},
+                                        {"cwd", cwd.string()}, {"lastUsedAt", NowMs()}, {"lastResolvedPath", seg.resolved}});
+                    }
+                    SaveApprovals({}, doc);
+                    base["persisted"] = true;
                 }
-                SaveApprovals(approvals_path, doc);
-                base["persisted"] = true;
             }
         }
     }
+    const bool force_bg = args.value("background", false);
+    const int yield_ms = args.value("yieldMs", 0);
+    const bool want_bg = force_bg || yield_ms > 0;
     ScopedRunEnv scoped(env);
+    if (want_bg) {
+        auto h = StartBackground(run_cmd, cwd.string());
+        if (h.pid < 0) return base.update({{"status", "failed"}, {"error", "failed to start process"}}), base;
+        std::string early;
+        if (!force_bg && yield_ms > 0) {
+            auto pr = CollectBackground(h, yield_ms, 200 * 1024);
+            if (h.pid < 0) {  // finished within yield window
+                base["exitCode"] = pr.exit_code;
+                base["output"] = pr.out;
+                base["truncated"] = pr.truncated;
+                base["status"] = pr.exit_code == 0 ? "completed" : "failed";
+                if (!pr.error.empty()) base["error"] = pr.error;
+                return base;
+            }
+            early = pr.out;
+        }
+        auto sid = AdoptBgSession(ctx.agent_id, cmd, cwd.string(), h, timeout_sec, early);
+        if (sid.empty()) return base.update({{"status", "failed"}, {"error", "failed to track background process"}}), base;
+        int pid = -1;
+        { std::lock_guard lock(g_bg_mu); pid = g_bg[sid]->pid; }
+        base.update({{"status", "running"}, {"sessionId", sid}, {"pid", pid},
+                     {"background", true}, {"output", early},
+                     {"note", "use process tool (poll/log/kill) with sessionId"}});
+        return base;
+    }
     auto pr = RunProcess(run_cmd, cwd.string(), timeout_sec * 1000, 200 * 1024);
     base["exitCode"] = pr.exit_code;
     base["output"] = pr.out;
@@ -518,6 +763,57 @@ nlohmann::json Run(const nlohmann::json& args, const nlohmann::json& cfg_raw, co
     base["status"] = pr.timed_out ? "timeout" : (pr.exit_code == 0 ? "completed" : "failed");
     if (!pr.error.empty()) base["error"] = pr.error;
     return base;
+}
+
+nlohmann::json ProcessTool(const nlohmann::json& args) {
+    const std::string action = args.value("action", "list");
+    const auto& ctx = CurrentContext();
+    if (action == "list") {
+        nlohmann::json arr = nlohmann::json::array();
+        std::lock_guard lock(g_bg_mu);
+        for (auto& [id, s] : g_bg) {
+            if (s->agent_id != ctx.agent_id && !ctx.agent_id.empty()) continue;
+            std::lock_guard lk(s->mu);
+            arr.push_back({{"sessionId", id}, {"command", s->command}, {"cwd", s->cwd}, {"pid", s->pid},
+                           {"done", s->done.load()}, {"status", s->done.load() ? (s->result.timed_out ? "timeout" : "exited") : "running"}});
+        }
+        return {{"sessions", arr}};
+    }
+    const std::string sid = args.value("sessionId", args.value("id", ""));
+    if (sid.empty()) return {{"ok", false}, {"error", "missing sessionId"}};
+    std::shared_ptr<BgSession> s;
+    {
+        std::lock_guard lock(g_bg_mu);
+        auto it = g_bg.find(sid);
+        if (it == g_bg.end()) return {{"ok", false}, {"error", "unknown sessionId"}};
+        if (!ctx.agent_id.empty() && it->second->agent_id != ctx.agent_id)
+            return {{"ok", false}, {"error", "session belongs to another agent"}};
+        s = it->second;
+    }
+    if (action == "kill") {
+        KillBackground(s->handle);
+        s->killed.store(true);
+        return {{"ok", true}, {"sessionId", sid}, {"killed", true}};
+    }
+    if (action == "poll" || action == "log" || action == "status") {
+        int wait_ms = args.value("timeout", 0);
+        if (wait_ms > 0 && !s->done.load()) {
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+            while (!s->done.load() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::lock_guard lk(s->mu);
+        nlohmann::json out{{"ok", true}, {"sessionId", sid}, {"done", s->done.load()}, {"pid", s->pid},
+                           {"output", s->done.load() ? s->result.out : s->live_out},
+                           {"status", s->done.load() ? (s->result.timed_out ? "timeout" : (s->result.exit_code == 0 ? "completed" : "failed")) : "running"}};
+        if (s->done.load()) {
+            out["exitCode"] = s->result.exit_code;
+            out["truncated"] = s->result.truncated;
+            if (!s->result.error.empty()) out["error"] = s->result.error;
+        }
+        return out;
+    }
+    return {{"ok", false}, {"error", "unknown action (list|poll|log|kill)"}};
 }
 
 }  // namespace openclaw::tools::exec

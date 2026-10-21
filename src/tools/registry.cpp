@@ -200,6 +200,8 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
               {"workdir", {{"type", "string"}, {"description", "Working directory (relative to the agent workspace)"}}},
               {"env", {{"type", "object"}, {"description", "Extra environment variables"}}},
               {"timeout", {{"type", "integer"}, {"description", "Timeout in seconds (default tools.exec.timeoutSec, 1800)"}}},
+              {"yieldMs", {{"type", "integer"}, {"description", "Return running sessionId after this many ms if still running"}}},
+              {"background", {{"type", "boolean"}, {"description", "Start immediately as a background process session"}}},
               {"host", {{"type", "string"}, {"enum", {"auto", "sandbox", "gateway"}}}},
               {"ask", {{"type", "string"}, {"enum", {"off", "on-miss", "always"}}, {"description", "Can only harden the configured ask policy"}}}}},
             {"required", nlohmann::json::array({"command"})},
@@ -217,6 +219,16 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
         shell.parameters = params;
         shell.handler = handler;
         r.Register(std::move(shell));
+
+        ToolSpec proc;
+        proc.name = "process";
+        proc.description = "Manage background exec sessions: list|poll|log|kill (scoped per agent).";
+        proc.parameters = nlohmann::json{{"type", "object"},
+            {"properties", {{"action", {{"type", "string"}}}, {"sessionId", {{"type", "string"}}},
+                            {"timeout", {{"type", "integer"}, {"description", "poll wait ms"}}}}},
+            {"required", nlohmann::json::array({"action"})}};
+        proc.handler = [](const nlohmann::json& a) { return exec::ProcessTool(a).dump(); };
+        r.Register(std::move(proc));
     }
 
 

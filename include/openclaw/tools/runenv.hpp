@@ -35,4 +35,17 @@ struct ProcessResult {
 ProcessResult RunProcess(const std::string& cmd, const std::string& cwd, int timeout_ms = 60000,
                          std::size_t max_out = 64 * 1024);
 
+// Detached process for exec background/yieldMs. Caller owns the handle; Wait fills result.
+struct BackgroundHandle {
+    int pid = -1;
+    int read_fd = -1;  // stdout+stderr pipe (caller closes after Wait)
+};
+// Fork+exec /bin/sh -c; returns handle with open read_fd. timeout applied in WaitBackground.
+BackgroundHandle StartBackground(const std::string& cmd, const std::string& cwd);
+// Drain output until EOF or timeout_ms; waitpid; close read_fd.
+ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out = 200 * 1024);
+// Like WaitBackground but on timeout leaves the process running (pid/read_fd stay set).
+ProcessResult CollectBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out = 200 * 1024);
+void KillBackground(BackgroundHandle& h);
+
 }  // namespace openclaw::tools

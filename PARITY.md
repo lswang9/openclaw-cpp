@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.52.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.53.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -66,7 +66,7 @@
 - real: allowlist per agent — resolved-path globs (`**`), bare names only via PATH, argPattern (ECMAScript), every shell segment (&&, ||, ;, |) must match; $(…)/backticks/heredocs never allowlisted; safe bins (stdin-only) ; strictInlineEval (python -c, node -e, …).
 - real: approval flow — exec.approval.requested event + prompt posted to the originating chat; resolve via `exec.approval.resolve` RPC, WS, or chat `/approve <id> allow-once|allow-always|deny` (requester or tools.exec.approvers only); allow-always persists exact-argv + cwd-bound entries; timeout → askFallback. Gateway HTTP now serves each client on its own thread so approvals can arrive mid-run.
 - real: sandbox host — agents.defaults.sandbox.mode off|non-main|all (per-agent override) picks host; docker backend (`docker run --network none -v ws:/workspace`) or bwrap (read-only root, writable workspace, no network) when docker is absent; `openclaw-cpp approvals get|set`, `exec-policy show|preset yolo|cautious|deny-all`.
-- real-sim: approvals document is JSON at $OPENCLAW_STATE_DIR|$OPENCLAW_DATA_DIR/exec-approvals.json (upstream moved to the shared SQLite state row); bwrap is a local substitute for upstream's docker sandbox (docker path untested here — no docker on the box); no node host, no background/yieldMs + process tool, no executable content-hash binding, no auto reviewer for mode=auto (treated as ask).
+- real-sim (superseded in part by 1.53): see 1.53 for SQLite store, binary-hash binding, background/process; bwrap remains the local substitute when docker is absent; no node host; no LLM auto-reviewer for mode=auto (still allowlist+on-miss like ask).
 
 ## 1.49 Hot-reload channel/plugin restart coverage
 - real: scripts/e2e-hot-reload-channels.sh (part of smoke) proves a reload restarts only adapters whose channels.<id> subtree changed, restarts nothing on unrelated edits, adapters keep serving afterwards, and a plugins.* change restarts the JS host with the **new** plugin config (bug fixed: the host previously restarted with the stale config) and re-registers plugin channels/providers.
@@ -85,6 +85,13 @@
 - real: tools.allow / tools.deny / tools.profile (`minimal|coding|messaging|full`) from global `tools.*`, then `agents.defaults.tools`, then `agents.list[]|entries.<id>.tools` — deny wins; profile supplies a base allow set (coding includes exec/read/write/edit/http_get/browser_*).
 - real: per-agent sandbox object (mode/backend/…) still flows into exec ResolvePolicy; agent Pool rebuilds tool registries on config reload and after JS plugin host restart (re-RegisterTools into the shared base).
 - real-sim: skills library and JS plugin host remain process-global (not per-agent); MCP tool list is shared then filtered by allow/deny.
+
+## 1.53 Exec: SQLite approvals, binary revalidation, background/process
+- real: approvals policy stored in `$OPENCLAW_STATE_DIR|$OPENCLAW_DATA_DIR/state/openclaw.sqlite` key `exec_approvals_config` (upstream locator); legacy `exec-approvals.json` migrated once to `.migrated`. `OPENCLAW_EXEC_APPROVALS_PATH` still forces JSON for tests.
+- real: before approval wait, snapshot SHA-256 of resolved executables + existing script/file operands; after allow-once/always, revalidate and deny with `operand changed after approval` if bytes differ. `allow-always` with mutable script operands is downgraded to one-shot.
+- real: `yieldMs` / `background` return `{status:running, sessionId}`; companion `process` tool (`list|poll|log|kill`) scoped per agent. Docker sandbox used when `docker` is on PATH, else bwrap (honest when neither available).
+- real: `scripts/e2e-exec-sqlite-bg.sh` (smoke) covers migrate + binary-change denial + background list.
+- real-sim / remaining: no LLM `tools.exec.reviewer` for mode=auto (auto ≡ ask = allowlist + on-miss); no PTY/send-keys/paste; no node host; WaitBackground overall timeout still SIGKILLs.
 
 ## 1.52 Config reload vs concurrent HTTP (exclusive lock + worker pool)
 - real: `Server` holds exclusive `deps_mu_` (`std::mutex`). Request handlers and `ReloadConfigNow` serialize on it for config/tools/sessions swaps; adapter Stop/Start and the agent model/tool loop run **after** releasing the lock so reload cannot deadlock against a long run. `config.reload` RPC is handled without holding the lock across adapters.
