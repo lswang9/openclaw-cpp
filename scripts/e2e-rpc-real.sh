@@ -49,10 +49,10 @@ err("node.event", {"event": "x"}, "requires a connected node")
 err("node.pair.remove", {"nodeId": "n1"}, "is connected")
 assert ok("node.pair.remove", {"nodeId": "node-stub"})["removed"] is True
 err("node.pair.approve", {"requestId": "nope"}, "unknown pairing request")
-# honest contract: an unimplemented upstream method is an error, never a fake success
-u = err("models.authLogin", {}, "not implemented in the C++ runtime")
+# every upstream method is implemented now (1.121): nothing left on the honest not-implemented list
 st = ok("methods.list", {})
-assert "models.authLogin" not in st["implemented"] and "agent" in st["implemented"], "implemented list excludes unimplemented"
+assert "models.authLogin" in st["implemented"] and "agent" in st["implemented"], "implemented list"
+assert not st.get("unimplemented"), st.get("unimplemented")
 print("ok")
 P
 for t in sessions_list sessions_history session_status agents_list nodes web_fetch; do
@@ -61,4 +61,4 @@ done
 curl -s "$URL" -H 'Content-Type: application/json' -d '{"id":1,"method":"tools.invoke","params":{"name":"agents_list","args":{}}}' | grep -q '"agents"' || fail "agents_list tool"
 curl -s "$URL" -H 'Content-Type: application/json' -d '{"id":1,"method":"tools.invoke","params":{"name":"nodes","args":{"action":"list"}}}' | grep -q '"nodes"' || fail "nodes tool"
 python3 "$ROOT/scripts/probe-unimplemented.py" "$URL" --check || fail "unimplemented list stale (run scripts/probe-unimplemented.py URL --write)"
-echo "[e2e-rpc-real] agent, sessions.describe, projects.*, node.event/pair.*, honest not-implemented + probe check: PASS"
+echo "[e2e-rpc-real] agent, sessions.describe, projects.*, node.event/pair.*, empty not-implemented list + probe check: PASS"

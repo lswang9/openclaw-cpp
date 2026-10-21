@@ -55,7 +55,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.120.0-dev";
+constexpr const char* kVersion = "1.121.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1529,6 +1529,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
     }
     if (path == "/login" || path == "/ui/login" || path == "/logout" || path == "/login/oidc" || path == "/login/oidc/callback" || path == "/login/methods" ||
         (method == "POST" && (path == "/login/webauthn/options" || path == "/login/webauthn"))) public_ok = true;
+    if (method == "GET" && path == "/oauth/callback") public_ok = true;  // the OAuth state value is the capability
     if (!public_ok && deps_.js_host) {
         auto route = deps_.js_host->MatchHttpRoute(path);
         if (!route.is_null() && route.value("auth", "gateway") == "plugin") public_ok = true;
@@ -1875,6 +1876,19 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         for (const auto& m : deps_.sessions.Load(id)) msgs.push_back(m.ToJson());
         send(HttpResponse(200, "OK",
             nlohmann::json{{"id", id}, {"messages", msgs}, {"impl", "real"}}.dump(2)));
+        return;
+    }
+    if (method == "GET" && path == "/oauth/callback") {
+        const auto q = req.substr(0, req.find("\r\n"));
+        auto qp = [&](const std::string& k) { std::smatch m; if (!std::regex_search(q, m, std::regex("[?&]" + k + "=([^& ]*)"))) return std::string(); return m[1].str(); };
+        auto line = q.substr(q.find(' ') + 1); line = line.substr(0, line.rfind(' '));
+        auto r = GatewayRpc("wizard.next", {{"oauthState", qp("state").empty() ? std::string("-") : qp("state")}, {"answer", line}});
+        std::string html;
+        if (!r.value("ok", false) && r.dump().find("unknown or finished sign-in") != std::string::npos) html = "<h1>Sign-in link expired</h1><p>Start sign-in again from OpenClaw.</p>";
+        else { const bool ok = r.value("ok", false) && r["payload"].value("status", "") == "done";
+            html = ok ? "<h1>Signed in</h1><p>You can close this tab and return to OpenClaw.</p>" : [&] { auto e = (r.contains("payload") ? r["payload"].value("error", nlohmann::json("")) : r.value("error", nlohmann::json(""))).dump(); std::string o;
+                for (char c : e) o += c == '<' ? "&lt;" : c == '>' ? "&gt;" : c == '&' ? "&amp;" : std::string(1, c); return "<h1>Sign-in failed</h1><p>" + o + "</p>"; }(); }
+        send(HttpResponse(200, "OK", html, "text/html; charset=utf-8"));
         return;
     }
     if (method == "POST" && path == "/mcp") {
@@ -3025,7 +3039,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         // Subsystem handlers that call back into RPCs (GatewayRpc) must not run under the deps lock.
         static const std::set<std::string> reentrant{"taskSuggestions.accept", "sessions.patchMany", "wake", "node.invoke.progress", "mentions.list",
                                                      "message.action", "worktrees.create", "talk.speak", "talk.session.appendAudio", "talk.session.steer",
-                                                     "talk.session.submitToolResult", "talk.client.steer", "talk.client.toolCall", "talk.client.transcript", "mcp.app.mention", "sessions.catalog.continue", "sessions.catalog.startTerminal", "sessions.providerReview.continue", "openclaw.setup.activate", "openclaw.chat", "openclaw.approval.list", "wizard.next", "wizard.start", "gateway.suspend.prepare", "gateway.suspend.status", "users.authConnect.answer", "board.event", "board.prompt.authorize", "conversations.send", "conversations.turn", "conversations.turn.cancel", "transcripts.summarize", "session.discussion.open", "session.discussion.info", "nativeHook.invoke", "device.scopes.waitUpgrade", "device.scopes.requestUpgrade", "chat.metadata.changed", "migrations.memory.apply", "migrations.memory.plan", "web.login.start", "web.login.wait", "worker.desktop.launch", "worker.desktop.observe", "ui.command", "attach.grant", "controlUi.sessionPullRequests.subscribe"};
+                                                     "talk.session.submitToolResult", "talk.client.steer", "talk.client.toolCall", "talk.client.transcript", "mcp.app.mention", "sessions.catalog.continue", "sessions.catalog.startTerminal", "sessions.providerReview.continue", "openclaw.setup.activate", "openclaw.chat", "openclaw.approval.list", "wizard.next", "wizard.start", "gateway.suspend.prepare", "gateway.suspend.status", "users.authConnect.answer", "mcp.authLogin", "models.authLogin", "board.event", "board.prompt.authorize", "conversations.send", "conversations.turn", "conversations.turn.cancel", "transcripts.summarize", "session.discussion.open", "session.discussion.info", "nativeHook.invoke", "device.scopes.waitUpgrade", "device.scopes.requestUpgrade", "chat.metadata.changed", "migrations.memory.apply", "migrations.memory.plan", "web.login.start", "web.login.wait", "worker.desktop.launch", "worker.desktop.observe", "ui.command", "attach.grant", "controlUi.sessionPullRequests.subscribe"};
         if (reentrant.count(method) && deps_lock.owns_lock()) deps_lock.unlock();
         auto extra = TryExtraDispatch(deps_, method, params);
         if (extra.handled) {

@@ -45,7 +45,7 @@ curl -sf -b "$T/cj" "$U/v1/whoami" | grep -q '"role":"admin"' || fail "whoami vi
 [[ $(login "$T/k1") == 200 ]] || fail "login again"
 cp "$T/cj" "$T/cj_alice"
 CID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["id"])' "$T/k1")
-curl -s -X POST "$U/v1/rpc" -H 'Authorization: Bearer gwtok' -H 'Content-Type: application/json' -d '{"method":"webauthn.list"}' | grep -q "$CID" || fail "webauthn.list"
+curl -s -X POST "$U/v1/rpc" -H 'Authorization: Bearer gwtok' -H 'Content-Type: application/json' -d '{"method":"webauthn.list"}' | grep -qF -- "$CID" || fail "webauthn.list"
 curl -s -X POST "$U/v1/rpc" -H 'Authorization: Bearer gwtok' -H 'Content-Type: application/json' -d "{\"method\":\"webauthn.remove\",\"params\":{\"id\":\"$CID\"}}" | grep -Eq '"removed": *true' || fail "remove"
 [[ $(code -b "$T/cj_alice" "$U/v1/whoami") == 401 ]] || fail "session must end when passkey removed"
 echo "[e2e-webauthn] PASS"

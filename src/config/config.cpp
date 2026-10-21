@@ -262,7 +262,7 @@ SchemaReport ValidateSchema(const nlohmann::json& raw) {
         "$schema", "meta", "auth", "env", "wizard", "diagnostics", "logging", "update", "browser", "ui", "models",
         "nodeHost", "agents", "tools", "bindings", "broadcast", "audio", "media", "messages", "commands", "approvals",
         "session", "cron", "hooks", "web", "channels", "discovery", "canvasHost", "talk", "gateway", "memory", "skills",
-        "plugins", "acp", "secrets",
+        "plugins", "acp", "secrets", "mcp",
         // openclaw-cpp extensions / gateway-managed state
         "session_dir", "align_target", "agents_list", "audit_log"};
     if (!raw.is_object()) { r.errors.push_back("<root>: must be an object"); return r; }

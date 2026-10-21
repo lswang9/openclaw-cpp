@@ -2467,6 +2467,81 @@ json SetupVerify(ServerDeps& d, const std::string& provider, const std::string& 
     auto r = d.router->CompleteRoute(model.empty() ? provider : provider + "/" + model, {u}, json::array());
     return {{"ok", r.ok}, {"provider", provider}, {"model", model}, {"latencyMs", NowMs() - t0}, {"error", r.ok ? json(nullptr) : json(r.error)}, {"sample", Utf8Cut(r.message.content, 80)}};
 }
+
+// ---------------------------------------------------------------- OAuth 2.1 authorization-code + PKCE (S256) for MCP servers and model providers
+namespace oauthflow {
+std::string B64Url(const unsigned char* d, size_t n) {
+    static const char* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"; std::string o; size_t i = 0;
+    for (; i + 2 < n; i += 3) { unsigned v = d[i] << 16 | d[i + 1] << 8 | d[i + 2]; o += a[v >> 18 & 63]; o += a[v >> 12 & 63]; o += a[v >> 6 & 63]; o += a[v & 63]; }
+    if (n - i == 1) { unsigned v = d[i] << 16; o += a[v >> 18 & 63]; o += a[v >> 12 & 63]; }
+    else if (n - i == 2) { unsigned v = d[i] << 16 | d[i + 1] << 8; o += a[v >> 18 & 63]; o += a[v >> 12 & 63]; o += a[v >> 6 & 63]; }
+    return o;
+}
+std::string RandUrl(size_t n) { std::vector<unsigned char> b(n); RAND_bytes(b.data(), static_cast<int>(n)); return B64Url(b.data(), n); }
+std::string Challenge(const std::string& verifier) { unsigned char h[32]; SHA256(reinterpret_cast<const unsigned char*>(verifier.data()), verifier.size(), h); return B64Url(h, 32); }
+std::string Origin(const std::string& url) { std::smatch m; return std::regex_search(url, m, std::regex(R"(^(https?://[^/]+))")) ? m[1].str() : std::string(); }
+json GetJson(const std::string& url) { auto r = GitHubRequest(url, "GET", ""); if (r.status != 200) return nullptr; try { return json::parse(r.body); } catch (...) { return nullptr; } }
+std::string QueryParam(const std::string& s, const std::string& k) {
+    std::smatch m; if (!std::regex_search(s, m, std::regex("(?:^|[?&#])" + k + "=([^&#]*)"))) return {};
+    std::string v = m[1], o; for (size_t i = 0; i < v.size(); ++i) { if (v[i] == '%' && i + 2 < v.size()) { o += static_cast<char>(std::stoi(v.substr(i + 1, 2), nullptr, 16)); i += 2; } else o += v[i] == '+' ? ' ' : v[i]; }
+    return o;
+}
+// Resolve endpoints: explicit oauth config wins; else RFC 9728 protected-resource → RFC 8414 metadata; dynamic client registration when no clientId.
+json Resolve(const json& oauth, const std::string& resource_url, const std::string& redirect) {
+    json o = oauth.is_object() ? oauth : json::object();
+    std::string authz = o.value("authorizationUrl", std::string()), token = o.value("tokenUrl", std::string()), reg, client = o.value("clientId", std::string());
+    if (authz.empty() || token.empty()) {
+        std::string issuer = o.value("issuer", std::string());
+        if (issuer.empty() && !resource_url.empty()) { auto pr = GetJson(Origin(resource_url) + "/.well-known/oauth-protected-resource");
+            if (pr.is_object() && pr.contains("authorization_servers") && !pr["authorization_servers"].empty()) issuer = pr["authorization_servers"][0]; else issuer = Origin(resource_url); }
+        if (issuer.empty()) throw std::runtime_error("no OAuth issuer configured");
+        auto md = GetJson(Origin(issuer) + "/.well-known/oauth-authorization-server");
+        if (!md.is_object()) md = GetJson(Origin(issuer) + "/.well-known/openid-configuration");
+        if (!md.is_object()) throw std::runtime_error("OAuth metadata discovery failed at " + issuer);
+        authz = md.value("authorization_endpoint", authz); token = md.value("token_endpoint", token); reg = md.value("registration_endpoint", std::string());
+    }
+    if (authz.empty() || token.empty()) throw std::runtime_error("OAuth endpoints are not configured");
+    std::string secret = o.value("clientSecret", std::string());
+    if (client.empty()) {
+        if (reg.empty()) throw std::runtime_error("no clientId configured and the server offers no dynamic client registration");
+        auto r = GitHubRequest(reg, "POST", "", json{{"client_name", "OpenClaw"}, {"redirect_uris", {redirect}}, {"grant_types", {"authorization_code", "refresh_token"}},
+                                                     {"response_types", {"code"}}, {"token_endpoint_auth_method", "none"}}.dump());
+        json j; try { j = json::parse(r.body); } catch (...) {}
+        if ((r.status != 200 && r.status != 201) || !j.contains("client_id")) throw std::runtime_error("dynamic client registration failed (HTTP " + std::to_string(r.status) + ")");
+        client = j["client_id"]; secret = j.value("client_secret", secret);
+    }
+    std::string scope; if (o.contains("scopes") && o["scopes"].is_array()) for (auto& s : o["scopes"]) scope += (scope.empty() ? "" : " ") + s.get<std::string>(); else scope = o.value("scope", std::string());
+    return {{"authorizationUrl", authz}, {"tokenUrl", token}, {"clientId", client}, {"clientSecret", secret}, {"scope", scope}};
+}
+json Begin(const json& ep, const std::string& redirect, const std::string& resource) {
+    const auto verifier = RandUrl(48), state = RandUrl(24);
+    std::string url = ep["authorizationUrl"].get<std::string>(); url += (url.find('?') == std::string::npos ? "?" : "&");
+    url += "response_type=code&client_id=" + UrlEncode(ep["clientId"]) + "&redirect_uri=" + UrlEncode(redirect) + "&state=" + state +
+           "&code_challenge=" + Challenge(verifier) + "&code_challenge_method=S256";
+    if (!ep["scope"].get<std::string>().empty()) url += "&scope=" + UrlEncode(ep["scope"]);
+    if (!resource.empty()) url += "&resource=" + UrlEncode(resource);
+    return {{"url", url}, {"state", state}, {"verifier", verifier}};
+}
+json Exchange(const json& ctx, const std::string& answer) {
+    std::string code = answer.find("code=") != std::string::npos ? QueryParam(answer, "code") : Trim(answer);
+    if (answer.find("error=") != std::string::npos) throw std::runtime_error("authorization denied: " + QueryParam(answer, "error"));
+    if (answer.find("state=") != std::string::npos && QueryParam(answer, "state") != ctx["state"].get<std::string>()) throw std::runtime_error("OAuth state mismatch");
+    if (code.empty()) throw std::runtime_error("no authorization code in the answer");
+    const auto& ep = ctx["endpoints"];
+    std::string form = "grant_type=authorization_code&code=" + UrlEncode(code) + "&redirect_uri=" + UrlEncode(ctx["redirectUri"]) + "&client_id=" + UrlEncode(ep["clientId"]) +
+                       "&code_verifier=" + UrlEncode(ctx["verifier"]);
+    if (!ep.value("clientSecret", std::string()).empty()) form += "&client_secret=" + UrlEncode(ep["clientSecret"]);
+    if (!ctx.value("resource", std::string()).empty()) form += "&resource=" + UrlEncode(ctx["resource"]);
+    auto r = FormPost(ep["tokenUrl"], form);
+    json j; try { j = json::parse(r.body); } catch (...) {}
+    if (r.status != 200 || !j.contains("access_token")) throw std::runtime_error("token exchange failed (HTTP " + std::to_string(r.status) + "): " + (j.contains("error") ? j["error"].dump() : r.error));
+    json tok{{"access_token", j["access_token"]}, {"token_type", j.value("token_type", "Bearer")}, {"obtainedAt", NowMs()}, {"tokenUrl", ep["tokenUrl"]}, {"clientId", ep["clientId"]}};
+    if (j.contains("refresh_token")) tok["refresh_token"] = j["refresh_token"];
+    if (j.contains("expires_in")) tok["expiresAt"] = NowMs() + j["expires_in"].get<long long>() * 1000;
+    if (j.contains("scope")) tok["scope"] = j["scope"];
+    return tok;
+}
+}  // namespace oauthflow
 std::mutex g_setup_mu;
 ExtraResult SystemAgent(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
     auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
@@ -2514,6 +2589,24 @@ ExtraResult SystemAgent(ServerDeps& d, const fs::path& root, const std::string& 
                 record_change("provider.auth", {{"provider", prov}, {"credentialsSaved", patch["models"]["providers"][prov].contains("apiKey")}});
                 w["result"] = {{"provider", prov}, {"saved", true}, {"restartRequired", !(d.router && d.router->Has(prov))}};
                 if (kind == "prepare") w["result"]["preparedModel"] = prov + (ctx.value("model", std::string()).empty() ? "" : "/" + ctx.value("model", std::string()));
+            } else if (kind == "mcp-oauth" || kind == "model-oauth") {
+                auto tok = oauthflow::Exchange(ctx, a.value("authorize", std::string()));
+                const auto name = ctx["target"].get<std::string>();
+                if (kind == "mcp-oauth") {
+                    std::lock_guard<std::mutex> l(g_mu); auto db = ReadJsonFile(MetaPath(root, "mcp-oauth-tokens"), json::object()); db[name] = tok; WriteJsonFile(MetaPath(root, "mcp-oauth-tokens"), db);
+                    // prove the credential works: MCP initialize against the server with the bearer token
+                    auto r = GitHubRequest(ctx["resource"], "POST", tok["access_token"], json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"},
+                                           {"params", {{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()}, {"clientInfo", {{"name", "openclaw"}, {"version", "cpp"}}}}}}.dump());
+                    record_change("mcp.oauth", {{"server", name}});
+                    w["result"] = {{"serverName", name}, {"authorized", true}, {"verified", r.status == 200}, {"httpStatus", r.status}};
+                } else {
+                    { std::lock_guard<std::mutex> l(g_mu); auto db = ReadJsonFile(MetaPath(root, "model-oauth-profiles"), json::object());
+                      db[name + ":oauth"] = tok; db[name + ":oauth"]["provider"] = name; db[name + ":oauth"]["agentId"] = ctx.value("agentId", "main"); WriteJsonFile(MetaPath(root, "model-oauth-profiles"), db); }
+                    auto r = GatewayRpc("config.patch", {{"models", {{"providers", {{name, {{"apiKey", tok["access_token"]}}}}}}}});
+                    if (!r.value("ok", false)) throw std::runtime_error("config save failed");
+                    record_change("provider.oauth", {{"provider", name}});
+                    w["result"] = {{"provider", name}, {"profileId", name + ":oauth"}, {"saved", true}, {"hasRefreshToken", tok.contains("refresh_token")}};
+                }
             } else if (kind == "activate") {
                 auto r = activate(ctx.value("provider", a.value("provider", std::string())), ctx.value("model", a.value("model", std::string())));
                 if (!r.ok) throw std::runtime_error(r.error);
@@ -2533,6 +2626,32 @@ ExtraResult SystemAgent(ServerDeps& d, const fs::path& root, const std::string& 
         return json::array({{{"id", "apiKey"}, {"type", "text"}, {"sensitive", true}, {"message", "API key for " + prov + (env.empty() ? "" : " (or set " + env + ")")}},
                             {{"id", "baseUrl"}, {"type", "text"}, {"optional", true}, {"message", "Custom base URL (blank for default)"}}});
     };
+    if (m == "mcp.authLogin" || m == "models.authLogin") {
+        if (!t_full_write) return Fail(m == "mcp.authLogin" ? "Connector sign-in requires an administrator connection." : "Provider login requires an administrator connection.");
+        if (str("sessionId").empty()) return Fail("sessionId is required");
+        if (wiz.contains(str("sessionId")) && wiz[str("sessionId")]["status"] == "running") return Fail("setup wizard session already running: " + str("sessionId"));
+        const auto host = d.config.gateway_host.empty() || d.config.gateway_host == "0.0.0.0" ? std::string("127.0.0.1") : d.config.gateway_host;
+        const auto redirect = "http://" + host + ":" + std::to_string(d.config.gateway_port) + "/oauth/callback";
+        std::string target, resource; json oauth;
+        if (m == "mcp.authLogin") {
+            target = str("serverName"); if (target.empty()) return Fail("serverName is required");
+            auto sv = config::GetPath(d.config.raw, "mcp.servers." + target);
+            if (!sv || !sv->is_object() || !sv->contains("url")) return Fail("This connector cannot use operator browser sign-in. Check its existing account settings.");
+            resource = (*sv)["url"]; oauth = sv->value("oauth", json::object());
+        } else {
+            const auto choice = str("authChoice"); if (choice.empty()) return Fail("authChoice is required");
+            target = choice.substr(0, choice.find_first_of(":/"));
+            auto pv = config::GetPath(d.config.raw, "models.providers." + target);
+            if (!pv || !pv->is_object() || !pv->contains("oauth")) return Fail("That provider login is no longer available. Refresh Models and choose an available sign-in option.");
+            oauth = (*pv)["oauth"];
+        }
+        json ep, b;
+        try { ep = oauthflow::Resolve(oauth, resource, redirect); b = oauthflow::Begin(ep, redirect, resource); } catch (const std::exception& e) { return Fail(std::string("sign-in could not start: ") + e.what()); }
+        json steps = json::array({{{"id", "authorize"}, {"type", "openUrl"}, {"url", b["url"]}, {"message", "Open the sign-in page. The gateway completes automatically at " + redirect + ", or paste the final redirected URL here."}}});
+        auto id = new_wizard(m == "mcp.authLogin" ? "mcp-oauth" : "model-oauth", steps,
+                             {{"target", target}, {"resource", resource}, {"redirectUri", redirect}, {"state", b["state"]}, {"verifier", b["verifier"]}, {"endpoints", ep}, {"agentId", str("agentId")}});
+        auto v = step_view(wiz[id]); v["step"].erase("sensitive"); return Ok(v);
+    }
     if (m == "wizard.start") {
         const auto mode = str("mode").empty() ? (str("flow").empty() ? std::string("onboard") : str("flow")) : str("mode");
         json steps = json::array({{{"id", "workspace"}, {"type", "text"}, {"optional", true}, {"message", "Workspace directory"}},
@@ -2554,7 +2673,11 @@ ExtraResult SystemAgent(ServerDeps& d, const fs::path& root, const std::string& 
         return Ok(step_view(wiz[id]));
     }
     if (m.rfind("wizard.", 0) == 0) {
-        const auto id = str("sessionId");
+        std::string id = str("sessionId");
+        if (id.empty() && !str("oauthState").empty()) {  // GET /oauth/callback: the state value names the running sign-in
+            for (auto& [k, w] : wiz.items()) if (w["status"] == "running" && w["context"].value("state", "") == str("oauthState")) id = k;
+            if (id.empty()) return Fail("unknown or finished sign-in");
+        }
         if (!wiz.contains(id)) return Fail("unknown wizard session: " + id);
         auto& w = wiz[id];
         if (m == "wizard.status") return Ok(step_view(w));
@@ -3031,11 +3154,27 @@ ExtraResult AuthConnect(ServerDeps& d, const fs::path& root, const std::string& 
     if (m == "users.authConnect.catalog") {
         json out = json::array();
         for (auto& h : kProviderHints) out.push_back({{"provider", h.provider}, {"methods", json::array({{{"id", "api-key"}, {"label", "API key"}, {"available", true}}})}});
+        if (auto pv = config::GetPath(d.config.raw, "models.providers"); pv && pv->is_object())
+            for (auto& [k, v] : pv->items()) if (v.is_object() && v.contains("oauth")) {
+                bool found = false; for (auto& o : out) if (o["provider"] == k) { o["methods"].push_back({{"id", "oauth"}, {"label", "Sign in"}, {"available", true}}); found = true; }
+                if (!found) out.push_back({{"provider", k}, {"methods", json::array({{{"id", "oauth"}, {"label", "Sign in"}, {"available", true}}})}}); }
         return Ok({{"providers", out}});
     }
     if (m == "users.authConnect.start") {
         if (str("provider").empty()) return Fail("provider is required");
         const auto meth = str("method").empty() ? std::string("api-key") : str("method");
+        if (meth == "oauth") {
+            auto pv = config::GetPath(d.config.raw, "models.providers." + str("provider"));
+            if (!pv || !pv->is_object() || !pv->contains("oauth")) return Fail("connect method oauth is not available for " + str("provider") + "; use api-key");
+            const auto host = d.config.gateway_host.empty() || d.config.gateway_host == "0.0.0.0" ? std::string("127.0.0.1") : d.config.gateway_host;
+            const auto redirect = str("redirectUri").empty() ? "http://" + host + ":" + std::to_string(d.config.gateway_port) + "/oauth/callback" : str("redirectUri");
+            json ep, b; try { ep = oauthflow::Resolve((*pv)["oauth"], "", redirect); b = oauthflow::Begin(ep, redirect, ""); } catch (const std::exception& e) { return Fail(std::string("sign-in could not start: ") + e.what()); }
+            const auto id = Rid("connect");
+            db[id] = {{"connectId", id}, {"provider", str("provider")}, {"method", meth}, {"owner", t_principal}, {"profileId", str("profileId").empty() ? t_principal : str("profileId")},
+                      {"status", "awaiting_input"}, {"step", {{"stepId", "authorize"}, {"kind", "redirect"}, {"url", b["url"]}, {"label", "Sign in to " + str("provider") + ", then paste the final redirected URL"}}},
+                      {"oauth", {{"state", b["state"]}, {"verifier", b["verifier"]}, {"redirectUri", redirect}, {"endpoints", ep}}}, {"expiresAtMs", NowMs() + 15 * 60 * 1000}};
+            save(); json o = db[id]; o.erase("owner"); o.erase("oauth"); return Ok(o);
+        }
         if (meth != "api-key") return Fail("connect method " + meth + " is not available for " + str("provider") + "; use api-key");
         const auto id = Rid("connect");
         db[id] = {{"connectId", id}, {"provider", str("provider")}, {"method", meth}, {"owner", t_principal}, {"profileId", str("profileId").empty() ? t_principal : str("profileId")},
@@ -3046,16 +3185,25 @@ ExtraResult AuthConnect(ServerDeps& d, const fs::path& root, const std::string& 
     if (!db.contains(id) || db[id].value("owner", "") != t_principal) return Fail("unknown connect session");
     auto& c = db[id];
     if (c.value("expiresAtMs", 0LL) < NowMs() && c["status"] == "awaiting_input") c["status"] = "expired";
-    auto view = [&] { json o = c; o.erase("owner"); return o; };
+    auto view = [&] { json o = c; o.erase("owner"); o.erase("oauth"); return o; };
     if (m == "users.authConnect.status") { save(); return Ok(view()); }
     if (m == "users.authConnect.cancel") { if (c["status"] == "awaiting_input") c["status"] = "cancelled"; save(); return Ok(view()); }
     if (m == "users.authConnect.answer") {
         if (c["status"] != "awaiting_input") return Fail("connect session is " + c["status"].get<std::string>());
         if (str("stepId") != c["step"].value("stepId", "")) return Fail("answer is for a different step");
-        const auto key = str("value"); if (Trim(key).size() < 8) return Fail("that does not look like an API key");
+        const auto key = str("value");
         const auto prov = c["provider"].get<std::string>(); const auto ap = prov + ":user-" + SafeName(c["profileId"].get<std::string>());
         auth::ProfileStore store(auth::DefaultProfilesPath("main"));
+        if (c.value("method", "") == "oauth") {
+            json tok; try { tok = oauthflow::Exchange(c["oauth"], key); } catch (const std::exception& e) { c["status"] = "failed"; c["error"] = e.what(); c.erase("step"); save(); return Ok(view()); }
+            json prof{{"type", "oauth"}, {"provider", prov}, {"access", tok["access_token"]}, {"owner", c["profileId"]}};
+            if (tok.contains("refresh_token")) prof["refresh"] = tok["refresh_token"]; if (tok.contains("expiresAt")) prof["expires"] = tok["expiresAt"];
+            if (!store.Upsert(ap, prof)) return Fail("could not save credentials");
+            c.erase("oauth");
+        } else {
+        if (Trim(key).size() < 8) return Fail("that does not look like an API key");
         if (!store.Upsert(ap, {{"type", "api_key"}, {"provider", prov}, {"key", Trim(key)}, {"owner", c["profileId"]}})) return Fail("could not save credentials");
+        }
         c["status"] = "connected"; c["authProfileId"] = ap; c.erase("step"); save();
         const auto prof = c["profileId"]; l.unlock();
         auto r = GatewayRpc("users.linkAuthProfile", {{"profileId", prof}, {"authProfileId", ap}});
@@ -3509,7 +3657,7 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
               "sessions.catalog.startTerminal", "sessions.files.reveal", "sessions.github.options", "sessions.github.status", "sessions.pluginPatch",
               "sessions.providerReview.continue", "sessions.recover"};
           if (sm.count(method)) { auto r = Sessions2(deps, root, method, params); if (r.handled) return r; } }
-        if (method.rfind("openclaw.", 0) == 0 || method.rfind("wizard.", 0) == 0) { auto r = SystemAgent(deps, root, method, params); if (r.handled) return r; }
+        if (method.rfind("openclaw.", 0) == 0 || method.rfind("wizard.", 0) == 0 || method == "mcp.authLogin" || method == "models.authLogin") { auto r = SystemAgent(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("portal.", 0) == 0) { auto r = Portals(deps, method, params); if (r.handled) return r; }
         if (method.rfind("doctor.memory.", 0) == 0 && method != "doctor.memory.status") { auto r = DoctorMemory(deps, method, params); if (r.handled) return r; }
         if (method.rfind("gateway.suspend.", 0) == 0 || method == "gateway.stop.request" || (method.rfind("diagnostics.", 0) == 0 &&
