@@ -39,7 +39,7 @@ public:
     static bool ValidRole(const std::string& role) { return role == "device" || role == "operator"; }
     // Browser sessions (1.25): cookie carries a random session id; only SHA-256(sid) + SHA-256(token) persisted.
     // Session role is re-derived from the backing credential on every request (revocation ends the session).
-    struct SessionInfo { std::string role; std::string csrf; std::string oidc_sub, refresh_token; bool recheck_due = false; std::vector<std::string> scopes; };
+    struct SessionInfo { std::string role; std::string csrf; std::string oidc_sub, refresh_token; bool recheck_due = false; std::vector<std::string> scopes; std::string webauthn_cred; };
     // Returns {sid, csrf}; credential_sha256 = SHA-256 of the gateway token or ocd_ token used at login.
     std::pair<std::string, std::string> CreateSession(const std::string& credential_sha256, bool is_gateway_token);
     // gateway_token_sha256: current gateway token hash ("" if none). Empty role = invalid/expired/revoked.
@@ -47,6 +47,8 @@ public:
     std::pair<std::string, std::string> CreateIdentitySession(const std::string& subject, const std::string& role,
                                                               const std::string& refresh_token = {});
     // After a successful refresh: new role/refresh token, next recheck scheduled (OPENCLAW_OIDC_RECHECK_SEC, default 3600).
+    // Passkey-backed session (1.84): valid while the credential stays registered (checked by the gateway).
+    std::pair<std::string, std::string> CreateWebAuthnSession(const std::string& credential_id, const std::string& role);
     void UpdateIdentitySession(const std::string& sid, const std::string& role, const std::string& refresh_token);
     SessionInfo SessionLookup(const std::string& sid, const std::string& gateway_token_sha256);
     void DeleteSession(const std::string& sid);

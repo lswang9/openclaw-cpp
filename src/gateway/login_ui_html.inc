@@ -16,6 +16,8 @@ button.sec{background:#2a3548}.muted{color:#8b9bb4;font-size:.8rem}#msg{min-heig
 <button type="submit">Log in</button> <button type="button" class="sec" id="out">Log out</button></form>
 <div id="msg"></div>
 <p id="sso" style="display:none"><a href="/login/oidc">Sign in with SSO (OIDC)</a></p>
+<p><button type="button" class="sec" id="pk" style="display:none">Sign in with a passkey</button>
+<button type="button" class="sec" id="pkreg">Register a passkey (while logged in)</button></p>
 <p class="muted">Pairing a new device? Start a link from the device; an operator approves it at /pairing.</p>
 </div>
 <script>
@@ -27,7 +29,22 @@ document.getElementById('f').onsubmit=async e=>{e.preventDefault();
  const j=await r.json().catch(()=>({}));
  if(r.ok&&j.ok){msg('Logged in as '+j.role+' — redirecting…');location.href=safeNext;}else msg('Login failed: '+(j.error||r.status)+(j.mfa_required?' — enter your authenticator code':''));};
 document.getElementById('out').onclick=async()=>{await fetch('/logout',{method:'POST'});msg('Logged out');};
-fetch('/login/methods').then(r=>r.json()).then(j=>{if(j.oidc)document.getElementById('sso').style.display='';}).catch(()=>{});
+fetch('/login/methods').then(r=>r.json()).then(j=>{if(j.oidc)document.getElementById('sso').style.display='';if(j.webauthn)document.getElementById('pk').style.display='';}).catch(()=>{});
+const b64u=b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const unb=s=>Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')+'==='.slice((s.length+3)%4)),c=>c.charCodeAt(0));
+const csrf=()=>(document.cookie.match(/(?:^|; )oc_csrf=([^;]*)/)||[])[1]||'';
+document.getElementById('pk').onclick=async()=>{try{
+ const o=await (await fetch('/login/webauthn/options',{method:'POST',body:'{}'})).json();
+ const c=await navigator.credentials.get({publicKey:{...o,challenge:unb(o.challenge),allowCredentials:o.allowCredentials.map(a=>({...a,id:unb(a.id)}))}});
+ const r=await fetch('/login/webauthn',{method:'POST',body:JSON.stringify({id:c.id,rawId:b64u(c.rawId),type:c.type,response:{clientDataJSON:b64u(c.response.clientDataJSON),authenticatorData:b64u(c.response.authenticatorData),signature:b64u(c.response.signature)}})});
+ const j=await r.json();if(r.ok){msg('Logged in as '+j.role+' with a passkey');location.href=safeNext;}else msg('Passkey login failed: '+j.error);}catch(e){msg('Passkey: '+e);}};
+document.getElementById('pkreg').onclick=async()=>{try{
+ const h={'X-CSRF-Token':decodeURIComponent(csrf())};
+ const o=await (await fetch('/login/webauthn/register/options',{method:'POST',headers:h,body:'{}'})).json();
+ if(!o.challenge){msg('Log in first: '+(o.error||''));return;}
+ const c=await navigator.credentials.create({publicKey:{...o,challenge:unb(o.challenge),user:{...o.user,id:unb(o.user.id)},excludeCredentials:o.excludeCredentials.map(a=>({...a,id:unb(a.id)}))}});
+ const r=await fetch('/login/webauthn/register',{method:'POST',headers:h,body:JSON.stringify({id:c.id,rawId:b64u(c.rawId),type:c.type,response:{clientDataJSON:b64u(c.response.clientDataJSON),attestationObject:b64u(c.response.attestationObject)}})});
+ const j=await r.json();msg(r.ok?'Passkey registered ('+j.role+')':'Register failed: '+j.error);}catch(e){msg('Passkey: '+e);}};
 fetch('/v1/whoami').then(r=>r.ok?r.json():null).then(j=>{if(j)msg('Current: '+j.role+(j.auth_required?'':' (auth off)'));}).catch(()=>{});
 </script></body></html>
 )HTML"

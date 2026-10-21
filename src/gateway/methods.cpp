@@ -150,6 +150,8 @@ std::vector<std::string> ImplementedMethods() {
         "acp.authenticate",
         "acp.agents.list",
         "acp.agents.run",
+        "webauthn.list",
+        "webauthn.remove",
         "acp.sessions.list",
         "acp.sessions.create",
         "acp.sessions.prompt",

@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.83.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.84.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.84.0-dev
+- WebAuthn 通行密钥：已登录主体可注册（继承其角色），随后可无密码登录；校验 challenge/origin/rpId/UP/签名/signCount；移除通行密钥即结束会话。登录页增加通行密钥按钮。
 
 ### 1.83.0-dev
 - 设备令牌细粒度 scope：approve 时可指定 operator.read/write/approvals/pairing/admin 或 rpc:<前缀>，RPC 与 HTTP 均强制，403 返回所需 scope。

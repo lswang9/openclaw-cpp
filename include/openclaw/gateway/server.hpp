@@ -1,4 +1,5 @@
 #pragma once
+#include "openclaw/auth/webauthn.hpp"
 #include "openclaw/canvas/a2ui.hpp"
 #include <condition_variable>
 #include <queue>
@@ -119,6 +120,7 @@ private:
     void HandleWebSocket(int client_fd, const std::string& req);
     void HandleChatCompletions(int client_fd, const nlohmann::json& body, bool stream);
     nlohmann::json DispatchRpc(const nlohmann::json& msg);
+    auth::webauthn::Store& WebAuthnStore() const;
     nlohmann::json Stub(const std::string& method, const nlohmann::json& params);
     std::string DeliverInbound(const channels::InboundMessage& msg);
     // Native + skill + plugin chat commands as {name, description} (for Discord slash sync, /help).

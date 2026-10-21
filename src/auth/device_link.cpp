@@ -150,7 +150,7 @@ bool DeviceLinkStore::ValidScope(const std::string& s) {
 std::string DeviceLinkStore::MethodScope(const std::string& m) {
     auto starts = [&](const char* p) { return m.rfind(p, 0) == 0; };
     if (starts("config.") || starts("secrets.") || starts("plugins.install") || starts("plugins.uninstall") || starts("update.") ||
-        m == "gateway.restart" || m == "gateway.stop" || m == "shutdown" || starts("acp.auth.") || starts("auth."))
+        m == "gateway.restart" || m == "gateway.stop" || m == "shutdown" || starts("acp.auth.") || starts("auth.") || starts("webauthn."))
         return "operator.admin";
     if (starts("exec.approval") || starts("approvals.")) return "operator.approvals";
     if (starts("pairing.") || starts("device.") || starts("node.pair") || starts("channels.pairing.")) return "operator.pairing";
@@ -268,6 +268,18 @@ void DeviceLinkStore::UpdateIdentitySession(const std::string& sid, const std::s
     Save();
 }
 
+std::pair<std::string, std::string> DeviceLinkStore::CreateWebAuthnSession(const std::string& cred, const std::string& role) {
+    std::lock_guard lock(mu_);
+    auto sid = "ocs_" + RandHex(24);
+    auto csrf = RandHex(16);
+    if (!data_.contains("sessions") || !data_["sessions"].is_array()) data_["sessions"] = nlohmann::json::array();
+    const auto now = NowMs();
+    data_["sessions"].push_back({{"sid_sha256", Sha256Hex(sid)}, {"csrf", csrf}, {"webauthn_cred", cred}, {"role", role}, {"created_ms", now},
+                                 {"expires_ms", now + (std::int64_t)EnvInt("OPENCLAW_WEBAUTHN_SESSION_TTL_SEC", 43200) * 1000}});
+    Save();
+    return {sid, csrf};
+}
+
 std::pair<std::string, std::string> DeviceLinkStore::CreateIdentitySession(const std::string& subject, const std::string& role,
                                                                            const std::string& rt) {
     std::lock_guard lock(mu_);
@@ -291,6 +303,12 @@ DeviceLinkStore::SessionInfo DeviceLinkStore::SessionLookup(const std::string& s
     for (auto& s : data_["sessions"]) {
         if (S(s, "sid_sha256") != h) continue;
         if (s.value("expires_ms", (std::int64_t)0) < NowMs()) return {};
+        if (s.contains("webauthn_cred")) {
+            const auto r = S(s, "role");
+            SessionInfo si{(r == "admin" || r == "operator" || r == "device") ? r : std::string(), S(s, "csrf")};
+            si.webauthn_cred = S(s, "webauthn_cred");
+            return si;
+        }
         if (s.contains("oidc_sub")) {
             const char* iss = std::getenv("OPENCLAW_OIDC_ISSUER");
             if (!iss || !*iss) return {};

@@ -1,3 +1,4 @@
+#include "openclaw/auth/webauthn.hpp"
 #include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/auth/oidc.hpp"
 #include "openclaw/auth/mfa.hpp"
@@ -49,7 +50,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.83.0-dev";
+constexpr const char* kVersion = "1.84.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1392,7 +1393,7 @@ bool DeviceRoleForbidden(const std::string& m) {
     if (starts("pairing.") || starts("channels.pairing.") || starts("device.pair") || starts("device.token") ||
         starts("node.pair") || starts("secrets.") || starts("config.") || starts("approvals.") ||
         starts("exec.approval") || starts("plugins.install") || starts("plugins.uninstall") ||
-        starts("update.") || m == "desktop.launch" || m == "acp.agents.run" || starts("discord.voice.") || m == "desktop.a11y.action" || starts("acp.auth.") || m == "gateway.restart" || m == "gateway.stop" ||
+        starts("update.") || m == "desktop.launch" || starts("webauthn.") || m == "acp.agents.run" || starts("discord.voice.") || m == "desktop.a11y.action" || starts("acp.auth.") || m == "gateway.restart" || m == "gateway.stop" ||
         m == "shutdown")
         return true;
     return false;
@@ -1404,6 +1405,17 @@ bool OperatorRoleForbidden(const std::string& m) {
            m.rfind("update.", 0) == 0 || m == "gateway.restart" || m == "gateway.stop" || m == "shutdown";
 }
 }  // namespace
+
+auth::webauthn::Store& Server::WebAuthnStore() const {
+    static auth::webauthn::Store* store = nullptr;
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        auto dir = deps_.device_links ? deps_.device_links->Path().parent_path()
+                                      : std::filesystem::path(std::getenv("OPENCLAW_SESSION_DIR") ? std::getenv("OPENCLAW_SESSION_DIR") : "/tmp/openclaw-cpp-sessions");
+        store = new auth::webauthn::Store(dir / "webauthn.json");
+    });
+    return *store;
+}
 
 std::string Server::AuthRole(const std::string& req) const {
     g_auth_via_cookie = false;
@@ -1423,6 +1435,10 @@ std::string Server::AuthRole(const std::string& req) const {
             const auto gw_sha = deps_.auth.gateway_token.empty()
                 ? std::string() : auth::DeviceLinkStore::Sha256Hex(deps_.auth.gateway_token);
             auto s = deps_.device_links->SessionLookup(sid, gw_sha);
+            if (!s.role.empty() && !s.webauthn_cred.empty() && !WebAuthnStore().Active(s.webauthn_cred)) {
+                deps_.device_links->DeleteSession(sid);  // passkey removed → session ends
+                return {};
+            }
             if (!s.role.empty() && !s.oidc_sub.empty() && s.recheck_due) {
                 // OIDC session re-validation via refresh grant; no refresh token or failure ends the session.
                 auto rr = auth::oidc::Refresh(auth::oidc::FromEnv(), s.refresh_token, s.oidc_sub);
@@ -1473,7 +1489,8 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             } catch (...) {}
         }
     }
-    if (path == "/login" || path == "/ui/login" || path == "/logout" || path == "/login/oidc" || path == "/login/oidc/callback" || path == "/login/methods") public_ok = true;
+    if (path == "/login" || path == "/ui/login" || path == "/logout" || path == "/login/oidc" || path == "/login/oidc/callback" || path == "/login/methods" ||
+        (method == "POST" && (path == "/login/webauthn/options" || path == "/login/webauthn"))) public_ok = true;
     if (!public_ok && deps_.js_host) {
         auto route = deps_.js_host->MatchHttpRoute(path);
         if (!route.is_null() && route.value("auth", "gateway") == "plugin") public_ok = true;
@@ -1584,7 +1601,46 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         return;
     }
     if (method == "GET" && path == "/login/methods") {
-        send(HttpResponse(200, "OK", nlohmann::json{{"token", true}, {"oidc", auth::oidc::FromEnv().Enabled()}, {"mfa", auth::mfa::Store().Enabled()}}.dump()));
+        send(HttpResponse(200, "OK", nlohmann::json{{"token", true}, {"oidc", auth::oidc::FromEnv().Enabled()}, {"mfa", auth::mfa::Store().Enabled()},
+                                                    {"webauthn", WebAuthnStore().Enabled()}}.dump()));
+        return;
+    }
+    if (method == "POST" && path.rfind("/login/webauthn", 0) == 0) {
+        const auto rp = auth::webauthn::RpFor(HeaderValue(req, "Host"));
+        nlohmann::json body;
+        try { auto b = BodyOf(req); body = b.empty() ? nlohmann::json::object() : nlohmann::json::parse(b); }
+        catch (...) { send(HttpResponse(400, "Bad Request", nlohmann::json{{"error", "bad json"}}.dump())); return; }
+        auto& wa = WebAuthnStore();
+        if (path == "/login/webauthn/register/options" || path == "/login/webauthn/register") {
+            // Reached only when authenticated (not in the public list). Scoped tokens cannot mint passkeys.
+            if (!g_rpc_scopes.empty() || !deps_.device_links) {
+                send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", "scoped tokens cannot register passkeys"}}.dump()));
+                return;
+            }
+            if (path == "/login/webauthn/register/options") {
+                send(HttpResponse(200, "OK", wa.BeginRegistration(rp, body.value("user", g_rpc_role), g_rpc_role).dump()));
+                return;
+            }
+            auto r = wa.FinishRegistration(rp, body);
+            if (r.value("ok", false)) Emit("auth.webauthn.registered", {{"credential_id", r["credential_id"]}, {"role", r["role"]}});
+            send(HttpResponse(r.value("ok", false) ? 200 : 400, r.value("ok", false) ? "OK" : "Bad Request", r.dump()));
+            return;
+        }
+        if (path == "/login/webauthn/options") {
+            if (!wa.Enabled()) { send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "no passkeys registered"}}.dump())); return; }
+            send(HttpResponse(200, "OK", wa.BeginAuthentication(rp).dump()));
+            return;
+        }
+        if (path == "/login/webauthn" && deps_.device_links) {
+            auto r = wa.FinishAuthentication(rp, body);
+            if (!r.value("ok", false)) { send(HttpResponse(401, "Unauthorized", r.dump())); return; }
+            auto [sid, csrf] = deps_.device_links->CreateWebAuthnSession(r["credential_id"], r["role"]);
+            send(HttpResponse(200, "OK", nlohmann::json{{"ok", true}, {"role", r["role"]}, {"user", r["user"]}, {"via", "webauthn"}}.dump(), "application/json",
+                              "Set-Cookie: oc_session=" + sid + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200\r\n"
+                              "Set-Cookie: oc_csrf=" + csrf + "; Path=/; SameSite=Strict; Max-Age=43200\r\n"));
+            return;
+        }
+        send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "unknown webauthn route"}}.dump()));
         return;
     }
     if (method == "GET" && (path == "/login/oidc" || path == "/login/oidc/callback")) {
@@ -2062,6 +2118,8 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         if (!id.is_null()) r["id"] = id;
         return r;
     }
+    if (method == "webauthn.list") return ok({{"credentials", WebAuthnStore().List()}});
+    if (method == "webauthn.remove") return ok(WebAuthnStore().Remove(params.value("id", std::string())));
     if (method == "health" || method == "status" || method == "gateway.status" || method == "system.info") {
         return ok({{"runtime", "running"}, {"version", kVersion}, {"align_target", kAlign},
                    {"tools", deps_.tools.Names()}, {"sessions", deps_.sessions.List()},
