@@ -1,4 +1,5 @@
 #include "openclaw/gateway/subsystems.hpp"
+#include "openclaw/gateway/node_hub.hpp"
 
 #include <curl/curl.h>
 #include <openssl/sha.h>
@@ -392,6 +393,7 @@ ExtraResult Placement(ServerDeps& d, const fs::path& root, const std::string& me
     }
     // sessions.reclaim
     const bool recover = p.contains("recoverToGateway");
+    if (recover && !p["recoverToGateway"].is_object()) return Fail("invalid params: recoverToGateway must be {expectedGeneration}");
     const int eg = recover ? p["recoverToGateway"].value("expectedGeneration", -1) : 0;
     return to_gateway(recover, eg);
 }
@@ -1072,6 +1074,87 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
         return Fail(method + " failed: " + e.what());
     }
     return {};
+}
+
+}  // namespace openclaw::gateway
+
+// ---------------------------------------------------------------- worker execution on node hosts
+namespace openclaw::gateway {
+namespace {
+using nlohmann::json;
+namespace fs = std::filesystem;
+}
+
+std::optional<json> RunTurnOnPlacedWorker(ServerDeps& d, const fs::path& root, const std::string& agent, const std::string& key,
+                                          const std::string& text, std::string* err) {
+    json rec;
+    {
+        std::lock_guard<std::mutex> l(g_mu);
+        auto db = ReadJsonFile(PlacementsPath(root), json::object());
+        const auto rk = agent + ":" + key;
+        if (!db.contains(rk) || db[rk].value("state", "") != "active" || !db[rk].contains("deviceId")) return std::nullopt;
+        rec = db[rk];
+    }
+    const auto device = rec["deviceId"].get<std::string>();
+    auto& hub = NodeHub::Global();
+    auto mark_failed = [&](const std::string& why) {
+        std::lock_guard<std::mutex> l(g_mu);
+        auto db = ReadJsonFile(PlacementsPath(root), json::object());
+        const auto rk = agent + ":" + key;
+        if (!db.contains(rk) || db[rk].value("generation", -1) != rec.value("generation", -2)) return;
+        const auto now = NowMs();
+        auto& cur = db[rk];
+        cur["state"] = "failed"; cur["recoveryError"] = why; cur["recoveryAction"] = "restart";
+        cur["terminalAtMs"] = now; cur["updatedAtMs"] = now; cur["stateChangedAtMs"] = now;
+        cur.erase("runner");
+        WriteJsonFile(PlacementsPath(root), db);
+        if (d.emit) d.emit("sessions.changed", {{"reason", "worker-failed"}, {"sessionKey", key}});
+    };
+    if (!hub.Connected(device) || !hub.HasCommand(device, "worker.launch.v1")) {
+        mark_failed("device worker is not connected");
+        *err = "session is placed on device worker " + device + ", which is not connected; reclaim or recover it to the gateway";
+        return json();
+    }
+    auto& store = SessionsOf(d, agent, key);
+    auto history = store.Load(key);
+    json hist = json::array();
+    for (auto& m : history) if (m.role == "user" || m.role == "assistant") hist.push_back({{"role", m.role}, {"content", m.content}});
+    const auto sid = SessionIdOf(store, key);
+    json descriptor{{"version", 1}, {"agentId", agent}, {"sessionKey", key}, {"sessionId", sid}, {"message", text},
+                    {"history", hist}, {"remoteWorkspaceDir", rec.value("remoteWorkspaceDir", "")}};
+    const std::string plan_hash = ShaHex(descriptor.dump());
+    const std::string launch = "launch-" + RandomHex(12), run = "run-" + RandomHex(12);
+    json launch_req{{"environmentSession", 1}, {"sessionKey", key}, {"idleRetention", true}, {"launchId", launch},
+                    {"gatewayNamespace", "default"}, {"expectedBundleHash", rec.value("workerBundleHash", WorkerBundleHash())},
+                    {"descriptor", descriptor}, {"placementGeneration", rec.value("generation", 0)},
+                    {"identity", {{"planHash", plan_hash}, {"environmentId", rec.value("environmentId", "")}, {"sessionId", sid},
+                                  {"ownerEpoch", rec.value("activeOwnerEpoch", 0)}, {"runId", run}}}};
+    auto r = hub.Invoke(device, "worker.launch.v1", launch_req, 30000);
+    if (!r.value("ok", false)) {
+        const auto msg = r["error"].value("message", std::string("launch failed"));
+        if (r["error"].value("code", "") == "UNAVAILABLE") mark_failed(msg);
+        *err = "worker launch on " + device + " failed: " + msg;
+        return json();
+    }
+    json receipt = r["payload"];
+    const auto deadline = NowMs() + 10 * 60 * 1000;
+    while (receipt.value("state", "") == "pending" || receipt.value("state", "") == "running") {
+        if (NowMs() > deadline) { (void)hub.Invoke(device, "worker.cancel.v1", {{"launchId", launch}}, 10000); *err = "worker run timed out"; return json(); }
+        auto s = hub.Invoke(device, "worker.status.v1", {{"launchId", launch}, {"waitMs", 20000}}, 25000);
+        if (!s.value("ok", false)) { mark_failed(s["error"].value("message", std::string("status failed"))); *err = "worker on " + device + " stopped answering"; return json(); }
+        receipt = s["payload"];
+    }
+    if (receipt.value("launchId", "") != launch || receipt.value("placementGeneration", -1) != rec.value("generation", 0)) {
+        *err = "worker returned a receipt for a different launch"; return json();
+    }
+    if (receipt.value("state", "") != "completed") { *err = "worker run " + receipt.value("state", std::string("failed")) + ": " + receipt.value("errorText", std::string()); return json(); }
+    json result;
+    try { result = json::parse(receipt.value("resultJson", std::string("{}"))); } catch (...) { *err = "worker result is not JSON"; return json(); }
+    store.Append(key, agent::Message{.role = "user", .content = text});
+    store.Append(key, agent::Message{.role = "assistant", .content = result.value("text", std::string())});
+    if (d.emit) d.emit("session.message", {{"sessionKey", key}, {"role", "assistant"}, {"worker", device}});
+    return json{{"sessionKey", key}, {"text", result.value("text", std::string())},
+                {"worker", {{"deviceId", device}, {"launchId", launch}, {"runId", run}, {"placementGeneration", rec.value("generation", 0)}}}};
 }
 
 }  // namespace openclaw::gateway

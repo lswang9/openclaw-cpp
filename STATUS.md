@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.104.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.105.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.105.0-dev 新增
+
+节点主机协议（role=node 连接、node.invoke/result）；已派发到设备的会话在节点 worker 上执行（worker.launch/status.v1），网关保留转录；新增 node run
 
 ## 1.104.0-dev 新增
 

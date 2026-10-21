@@ -4,6 +4,7 @@
 #include "openclaw/auth/mfa.hpp"
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/gateway/subsystems.hpp"
+#include "openclaw/gateway/node_hub.hpp"
 #include "openclaw/util.hpp"
 #include "openclaw/net/safe_fetch.hpp"
 #include <openssl/evp.h>
@@ -52,7 +53,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.104.0-dev";
+constexpr const char* kVersion = "1.105.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1357,6 +1358,7 @@ namespace {
 // admin = gateway token / auth off / in-process; operator|device = ocd_ device token role.
 thread_local std::string g_rpc_role = "admin";
 thread_local std::string g_rpc_principal = "operator";
+thread_local int g_ws_conn = -1;  // WebSocket connection fd of the current RPC (-1 = HTTP)
 thread_local std::vector<std::string> g_rpc_scopes;  // ocd_ token scopes (empty = role default)
 thread_local bool g_rpc_role_pending_device = false;
 // Set by AuthRole: true when the only valid credential was the oc_session cookie (CSRF check required).
@@ -2153,7 +2155,40 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
                    {"auth", deps_.auth.require_auth}});
     }
     if (method == "connect") {
+        if (params.is_object() && params.value("role", "") == "node") {
+            if (g_ws_conn < 0) return err("node connections require the gateway WebSocket");
+            const int fd = g_ws_conn;
+            std::string why;
+            auto id = NodeHub::Global().Attach(fd, params, [this, fd](const std::string& text) {
+                auto frame = WsFrameText(text);
+                std::lock_guard lock(ws_mu_);
+                return ::send(fd, frame.data(), frame.size(), MSG_NOSIGNAL) > 0;
+            }, &why);
+            if (id.empty()) return err("invalid node connect: " + why);
+            const auto info = NodeHub::Global().Describe(id);
+            deps_.nodes.Upsert({.id = id, .name = info.value("displayName", id), .kind = "node", .online = true});
+            Emit("node.connected", info);
+            return ok({{"protocol", 1}, {"server", "openclaw-cpp"}, {"version", kVersion}, {"role", "node"}, {"nodeId", id}});
+        }
         return ok({{"protocol", 1}, {"server", "openclaw-cpp"}, {"version", kVersion}});
+    }
+    if (method == "node.invoke.result") {
+        std::string why;
+        if (!NodeHub::Global().Result(g_ws_conn, params, &why)) return err(why);
+        return ok({{"ok", true}});
+    }
+    if (method == "node.invoke") {
+        const auto node_id = params.value("nodeId", std::string()), command = params.value("command", std::string());
+        if (node_id.empty() || command.empty()) return err("invalid params: nodeId and command required");
+        const int timeout = std::clamp(params.value("timeoutMs", 30000), 1, 600000);
+        if (deps_lock.owns_lock()) deps_lock.unlock();
+        auto r = NodeHub::Global().Invoke(node_id, command, params.value("params", nlohmann::json::object()), timeout, params.value("idempotencyKey", std::string()));
+        if (!r.value("ok", false)) {
+            nlohmann::json e{{"type", "res"}, {"ok", false}, {"error", r["error"].value("message", std::string("node invoke failed"))}, {"code", r["error"].value("code", std::string("UNAVAILABLE"))}};
+            if (!id.is_null()) e["id"] = id;
+            return e;
+        }
+        return ok({{"ok", true}, {"nodeId", node_id}, {"command", command}, {"payload", r["payload"]}, {"payloadJSON", r["payloadJSON"]}});
     }
     if (method == "methods.list") {
         return ok({{"methods", AdvertisedMethods()}, {"implemented", ImplementedMethods()}});
@@ -2248,6 +2283,12 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         im.sender = params.value("sender", "user");
         im.text = text;
         im.session_key = session_key;
+        if (method != "chat.inject" && method != "sessions.steer") {
+            std::string werr;
+            if (deps_lock.owns_lock()) deps_lock.unlock();  // a worker turn can take minutes
+            auto worker = RunTurnOnPlacedWorker(deps_, SubsystemDataRoot(deps_), params.value("agentId", std::string("main")), session_key, text, &werr);
+            if (worker) return werr.empty() ? ok(*worker) : err(werr);
+        }
         if (deps_lock.owns_lock()) deps_lock.unlock();  // DeliverInbound may reload then LockDeps
         auto reply = DeliverInbound(im);
         if (reply.rfind("error:", 0) == 0) return err(reply.substr(6));
@@ -2673,8 +2714,16 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
 
     // nodes
-    if (method == "node.list") return ok({{"nodes", deps_.nodes.ListJson()}});
-    if (method == "node.describe") return ok(deps_.nodes.Describe(params.value("id", params.value("nodeId", ""))));
+    if (method == "node.list") {
+        auto nodes = deps_.nodes.ListJson();
+        for (auto& n : nodes) if (auto d = NodeHub::Global().Describe(n.value("id", "")); !d.is_null()) { n["commands"] = d["commands"]; n["caps"] = d["caps"]; n["connected"] = true; }
+        return ok({{"nodes", nodes}});
+    }
+    if (method == "node.describe") {
+        const auto nid = params.value("id", params.value("nodeId", ""));
+        if (auto d = NodeHub::Global().Describe(nid); !d.is_null()) return ok(d);
+        return ok(deps_.nodes.Describe(nid));
+    }
     if (method == "node.rename") {
         auto id = params.value("id", "");
         auto name = params.value("name", "");
@@ -2924,19 +2973,53 @@ void Server::HandleWebSocket(int client_fd, const std::string& req) {
     }.dump();
     { auto frame = WsFrameText(hello); (void)::send(client_fd, frame.data(), frame.size(), 0); }
 
-    char buf[8192];
-    while (running_.load()) {
+    // Buffered frame reader: several frames per recv, frames split across recvs, 16/64-bit lengths, ping/close.
+    g_ws_conn = client_fd;
+    char buf[65536];
+    std::string acc;
+    bool open = true;
+    while (open && running_.load()) {
         ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
         if (n <= 0) break;
-        std::string raw(buf, static_cast<size_t>(n));
-        if (!raw.empty() && (static_cast<uint8_t>(raw[0]) & 0x0f) == 0x8) break;
-        std::string payload;
-        if (!ParseWsClientFrame(raw, payload)) continue;
-        nlohmann::json reply;
-        try { reply = DispatchRpc(nlohmann::json::parse(payload)); }
-        catch (...) { reply = {{"type", "res"}, {"ok", false}, {"error", "invalid JSON"}}; }
-        auto frame = WsFrameText(reply.dump());
-        if (::send(client_fd, frame.data(), frame.size(), 0) <= 0) break;
+        acc.append(buf, static_cast<size_t>(n));
+        if (acc.size() > (16u << 20)) break;
+        while (acc.size() >= 2) {
+            const auto b0 = static_cast<uint8_t>(acc[0]), b1 = static_cast<uint8_t>(acc[1]);
+            uint64_t len = b1 & 0x7f;
+            size_t off = 2;
+            if (len == 126) { if (acc.size() < 4) break; len = (static_cast<uint8_t>(acc[2]) << 8) | static_cast<uint8_t>(acc[3]); off = 4; }
+            else if (len == 127) { if (acc.size() < 10) break; len = 0; for (int i = 0; i < 8; ++i) len = (len << 8) | static_cast<uint8_t>(acc[2 + i]); off = 10; }
+            const bool masked = (b1 & 0x80) != 0;
+            const size_t total = off + (masked ? 4 : 0) + static_cast<size_t>(len);
+            if (len > (16u << 20)) { open = false; break; }
+            if (acc.size() < total) break;
+            std::string payload(static_cast<size_t>(len), '\0');
+            for (size_t i = 0; i < len; ++i) {
+                auto c = static_cast<uint8_t>(acc[off + (masked ? 4 : 0) + i]);
+                if (masked) c ^= static_cast<uint8_t>(acc[off + (i % 4)]);
+                payload[i] = static_cast<char>(c);
+            }
+            acc.erase(0, total);
+            const int opcode = b0 & 0x0f;
+            if (opcode == 0x8) { open = false; break; }
+            if (opcode == 0x9) {  // ping → pong
+                std::string pong; pong.push_back(static_cast<char>(0x8A)); pong.push_back(static_cast<char>(payload.size())); pong += payload.substr(0, 125);
+                std::lock_guard lock(ws_mu_); (void)::send(client_fd, pong.data(), pong.size(), MSG_NOSIGNAL);
+                continue;
+            }
+            if (opcode != 0x1) continue;
+            nlohmann::json reply;
+            try { reply = DispatchRpc(nlohmann::json::parse(payload)); }
+            catch (...) { reply = {{"type", "res"}, {"ok", false}, {"error", "invalid JSON"}}; }
+            auto frame = WsFrameText(reply.dump());
+            std::lock_guard lock(ws_mu_);
+            if (::send(client_fd, frame.data(), frame.size(), MSG_NOSIGNAL) <= 0) { open = false; break; }
+        }
+    }
+    g_ws_conn = -1;
+    if (auto gone = NodeHub::Global().Detach(client_fd); !gone.empty()) {
+        for (auto nd : deps_.nodes.List()) if (nd.id == gone) { nd.online = false; deps_.nodes.Upsert(nd); }
+        Emit("node.disconnected", {{"nodeId", gone}});
     }
 }
 

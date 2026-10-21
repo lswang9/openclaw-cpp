@@ -94,6 +94,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
+#include <regex>
+#include <condition_variable>
 #include <fstream>
 #include <iostream>
 #include <unistd.h>
@@ -105,7 +108,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.104.0-dev";
+constexpr const char* kVersion = "1.105.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2922,6 +2925,177 @@ int CmdChat(int argc, char** argv, int argi) {
 }
 
 
+// ---------------------------------------------------------------- `node run`: node host (worker supervisor)
+// Connects to the gateway WebSocket as role "node", answers node.invoke.request with node.invoke.result.
+// Commands: worker.launch.v1 / worker.status.v1 / worker.cancel.v1 (session turns run here with this host's
+// provider and tools, in the placement's remote workspace dir), plus ping.
+int CmdNodeRun(int argc, char** argv) {
+    using namespace openclaw;
+    std::string url = EnvOr("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:" + EnvOr("OPENCLAW_GATEWAY_PORT", "18789"));
+    std::string node_id, name, token = EnvOr("OPENCLAW_GATEWAY_TOKEN", "");
+    char host[256] = {};
+    ::gethostname(host, sizeof(host) - 1);
+    node_id = std::string("node-") + host;
+    for (int i = 3; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+        if (a == "--url") url = next(); else if (a == "--node-id") node_id = next(); else if (a == "--display-name") name = next();
+        else if (a == "--token") token = next();
+        else { std::cerr << "usage: openclaw-cpp node run [--url URL] [--node-id ID] [--display-name NAME] [--token TOKEN]\n"; return 2; }
+    }
+    if (name.empty()) name = node_id;
+    if (url.rfind("http://", 0) == 0) url = "ws://" + url.substr(7); else if (url.rfind("https://", 0) == 0) url = "wss://" + url.substr(8);
+    while (!url.empty() && url.back() == '/') url.pop_back();
+    if (url.size() > 3 && url.substr(url.size() - 7) == "/v1/rpc") url.resize(url.size() - 7);
+    url += "/";
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    CURL* c = curl_easy_init();
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_CONNECT_ONLY, 2L);
+    curl_slist* hdr = nullptr;
+    if (!token.empty()) hdr = curl_slist_append(hdr, ("Authorization: Bearer " + token).c_str());
+    if (hdr) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdr);
+    if (auto rc = curl_easy_perform(c); rc != CURLE_OK) { std::cerr << "node: connect " << url << ": " << curl_easy_strerror(rc) << "\n"; return 1; }
+    std::mutex send_mu;
+    auto send = [&](const nlohmann::json& j) {
+        const auto s = j.dump();
+        std::lock_guard l(send_mu);
+        size_t off = 0;
+        while (off < s.size()) {
+            size_t sent = 0;
+            auto rc = curl_ws_send(c, s.data() + off, s.size() - off, &sent, 0, off == 0 ? CURLWS_TEXT : CURLWS_TEXT | CURLWS_CONT);
+            if (rc == CURLE_AGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); continue; }
+            if (rc != CURLE_OK) return false;
+            off += sent;
+            if (sent == 0) break;
+        }
+        return true;
+    };
+    const std::vector<std::string> commands{"ping", "worker.launch.v1", "worker.status.v1", "worker.cancel.v1"};
+    send({{"type", "req"}, {"id", "connect"}, {"method", "connect"},
+          {"params", {{"role", "node"}, {"client", {{"id", node_id}, {"displayName", name}, {"platform", "linux"}, {"version", "openclaw-cpp"}}},
+                      {"caps", {"worker"}}, {"commands", commands}}}});
+    // ---- worker supervisor state
+    struct Launch { nlohmann::json receipt; bool cancelled = false; };
+    std::mutex wmu; std::condition_variable wcv;
+    std::map<std::string, Launch> launches;
+    std::mutex run_mu;  // one turn at a time (the turn chdir()s into its workspace)
+    static const std::regex hex64("^[a-f0-9]{64}$");
+    auto terminal = [](const nlohmann::json& r) { auto s = r.value("state", ""); return s == "completed" || s == "failed" || s == "cancelled" || s == "interrupted"; };
+    auto handle = [&](const nlohmann::json& req) -> nlohmann::json {  // returns payload or throws std::runtime_error("CODE: msg")
+        const auto cmd = req.value("command", "");
+        nlohmann::json p = nlohmann::json::object();
+        try { p = nlohmann::json::parse(req.value("paramsJSON", std::string("{}"))); } catch (...) { throw std::runtime_error("INVALID_REQUEST: paramsJSON malformed JSON"); }
+        if (cmd == "ping") return {{"pong", true}, {"nodeId", node_id}};
+        if (cmd == "worker.launch.v1") {
+            if (p.value("environmentSession", 0) != 1) throw std::runtime_error("INVALID_REQUEST: node worker environment lifetime support required");
+            const auto launch = p.value("launchId", "");
+            if (launch.empty() || !p.contains("descriptor") || !p["descriptor"].is_object()) throw std::runtime_error("INVALID_REQUEST: invalid worker launch descriptor");
+            if (!std::regex_match(p.value("expectedBundleHash", ""), hex64)) throw std::runtime_error("INVALID_REQUEST: expectedBundleHash must be 64 lowercase hexadecimal characters");
+            const auto& id = p.value("identity", nlohmann::json::object());
+            nlohmann::json receipt{{"launchId", launch}, {"planHash", id.value("planHash", "")}, {"environmentId", id.value("environmentId", "")},
+                                   {"sessionId", id.value("sessionId", "")}, {"ownerEpoch", id.value("ownerEpoch", 0)},
+                                   {"placementGeneration", p.value("placementGeneration", 0)}, {"runId", id.value("runId", "")}, {"state", "pending"}};
+            {
+                std::lock_guard l(wmu);
+                if (launches.count(launch)) return launches[launch].receipt;  // idempotent relaunch
+                launches[launch].receipt = receipt;
+            }
+            const auto desc = p["descriptor"];
+            std::thread([&, launch, desc] {
+                std::lock_guard run(run_mu);
+                { std::lock_guard l(wmu); if (launches[launch].cancelled) return; launches[launch].receipt["state"] = "running"; }
+                wcv.notify_all();
+                std::string text, error;
+                size_t hist_n = 0;
+                try {
+                    auto ws = desc.value("remoteWorkspaceDir", std::string("~/.openclaw/worker"));
+                    if (ws.rfind("~/", 0) == 0) ws = EnvOr("HOME", "/tmp") + ws.substr(1);
+                    std::error_code ec; std::filesystem::create_directories(ws, ec);
+                    const auto prev = std::filesystem::current_path(ec);
+                    std::filesystem::current_path(ws, ec);
+                    auto registry = tools::MakeDefaultRegistry();
+                    std::unique_ptr<provider::Provider> prov;
+                    if (EnvOr("OPENCLAW_DEFAULT_PROVIDER", "") == "mock") prov = std::make_unique<provider::MockProvider>();
+                    else prov = std::make_unique<provider::DeepSeekProvider>(EnvOr("DEEPSEEK_API_KEY", ""), EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"), EnvOr("DEEPSEEK_MODEL", "deepseek-chat"));
+                    std::vector<agent::Message> msgs{{.role = "system", .content = BuildAgentSystemPrompt(registry, ws)}};
+                    for (auto& m : desc.value("history", nlohmann::json::array())) msgs.push_back({.role = m.value("role", "user"), .content = m.value("content", "")});
+                    hist_n = msgs.size() - 1;
+                    msgs.push_back({.role = "user", .content = desc.value("message", "")});
+                    auto r = agent::RunAgentLoop(*prov, registry, msgs, {});
+                    std::filesystem::current_path(prev, ec);
+                    if (r.ok) text = r.final_text; else error = r.error;
+                } catch (const std::exception& e) { error = e.what(); }
+                std::cerr << "[node] launch " << launch << " session " << desc.value("sessionKey", "") << " history=" << hist_n << (error.empty() ? " ok" : " failed: " + error) << "\n";
+                {
+                    std::lock_guard l(wmu);
+                    auto& rec = launches[launch];
+                    if (rec.cancelled) return;
+                    if (error.empty()) { rec.receipt["state"] = "completed"; rec.receipt["resultJson"] = nlohmann::json{{"text", text}, {"historyMessages", hist_n}, {"worker", node_id}}.dump(); }
+                    else { rec.receipt["state"] = "failed"; rec.receipt["errorText"] = error.substr(0, 4096); }
+                }
+                wcv.notify_all();
+            }).detach();
+            std::lock_guard l(wmu);
+            return launches[launch].receipt;
+        }
+        if (cmd == "worker.status.v1" || cmd == "worker.cancel.v1") {
+            const auto launch = p.value("launchId", "");
+            std::unique_lock l(wmu);
+            if (!launches.count(launch)) throw std::runtime_error("NOT_FOUND: unknown launchId");
+            if (cmd == "worker.cancel.v1") {
+                auto& rec = launches[launch];
+                if (!terminal(rec.receipt)) { rec.cancelled = true; rec.receipt["state"] = "cancelled"; rec.receipt["errorText"] = "cancelled by gateway"; }
+                wcv.notify_all();
+                return rec.receipt;
+            }
+            const int wait = std::clamp(p.value("waitMs", 0), 0, 20000);
+            if (wait > 0) wcv.wait_for(l, std::chrono::milliseconds(wait), [&] { return terminal(launches[launch].receipt); });
+            return launches[launch].receipt;
+        }
+        throw std::runtime_error("INVALID_REQUEST: unsupported command " + cmd);
+    };
+    std::cerr << "[node] " << node_id << " connected to " << url << "\n";
+    std::string acc;
+    char buf[65536];
+    while (true) {
+        size_t nread = 0;
+        const curl_ws_frame* meta = nullptr;
+        CURLcode rc;
+        { std::lock_guard l(send_mu); rc = curl_ws_recv(c, buf, sizeof(buf), &nread, &meta); }
+        if (rc == CURLE_AGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
+        if (rc != CURLE_OK) { std::cerr << "[node] disconnected: " << curl_easy_strerror(rc) << "\n"; break; }
+        if (meta && (meta->flags & CURLWS_CLOSE)) break;
+        if (meta && (meta->flags & CURLWS_PING)) { size_t s = 0; std::lock_guard l(send_mu); (void)curl_ws_send(c, buf, nread, &s, 0, CURLWS_PONG); continue; }
+        acc.append(buf, nread);
+        if (meta && meta->bytesleft > 0) continue;
+        nlohmann::json msg;
+        try { msg = nlohmann::json::parse(acc); } catch (...) { acc.clear(); continue; }
+        acc.clear();
+        if (msg.value("type", "") == "res" && msg.value("id", nlohmann::json()) == "connect") {
+            if (!msg.value("ok", false)) { std::cerr << "[node] connect rejected: " << msg.dump() << "\n"; break; }
+            std::cerr << "[node] registered as " << msg["payload"].value("nodeId", node_id) << "\n";
+            continue;
+        }
+        if (msg.value("type", "") != "event" || msg.value("event", "") != "node.invoke.request") continue;
+        const auto req = msg["payload"];
+        if (req.value("nodeId", node_id) != node_id) continue;
+        std::thread([&, req] {
+            nlohmann::json res{{"id", req.value("id", "")}, {"nodeId", node_id}};
+            try { res["ok"] = true; res["payloadJSON"] = handle(req).dump(); }
+            catch (const std::exception& e) {
+                std::string m = e.what(), code = "UNAVAILABLE";
+                if (auto k = m.find(": "); k != std::string::npos && k < 24) { code = m.substr(0, k); m = m.substr(k + 2); }
+                res["ok"] = false; res["error"] = {{"code", code}, {"message", m}};
+            }
+            send({{"type", "req"}, {"id", "r-" + req.value("id", "")}, {"method", "node.invoke.result"}, {"params", res}});
+        }).detach();
+    }
+    curl_easy_cleanup(c);
+    if (hdr) curl_slist_free_all(hdr);
+    return 0;
+}
+
 openclaw::gateway::Server* g_gateway_server = nullptr;
 void GatewayStopSignal() {
     if (g_gateway_server) g_gateway_server->Stop();
@@ -3956,6 +4130,7 @@ int main(int argc, char** argv) {
             return r.value("ok", false) ? 0 : 1;
         }
         if (cmd == "gateway") return CmdGateway(argc, argv, 2);
+        if (cmd == "node" && argc >= 3 && std::string(argv[2]) == "run") return CmdNodeRun(argc, argv);
         if (cmd == "chat") return CmdChat(argc, argv, 2);
         if (cmd == "plugins") return CmdPlugins(argc, argv);
         if (cmd == "models") return CmdModels(argc, argv);

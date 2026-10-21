@@ -6,6 +6,7 @@
 //   projects.searchRemote                  GitHub repository search (exact, affiliated, global; 60 s cache)
 //   sessions.github.{publish,confirm}      commit session workspace → push branch → open pull request
 #include <filesystem>
+#include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -34,6 +35,12 @@ void RecordSessionParticipant(const std::filesystem::path& data_root, const std:
 // Lets in-process agent tools (github_publish) reach the subsystems; set by the Server constructor.
 void SetSubsystemContext(ServerDeps* deps, const std::filesystem::path& data_root);
 std::string AgentGitHubPublish(const nlohmann::json& args, const std::string& agent, const std::string& session_key);
+
+// Runs the turn on the session's device worker (node host) when the session placement is active there:
+// worker.launch.v1 → worker.status.v1 (long-poll) → receipt.resultJson; the transcript stays on the gateway.
+// nullopt = not placed (run locally). Empty json + *err = placed but the worker run failed.
+std::optional<nlohmann::json> RunTurnOnPlacedWorker(ServerDeps& d, const std::filesystem::path& data_root, const std::string& agent,
+                                                    const std::string& key, const std::string& text, std::string* err);
 
 // GitHub API base (gateway.github.apiBaseUrl / OPENCLAW_GITHUB_API_BASE_URL); https only unless loopback http.
 std::string GitHubApiBase(const nlohmann::json& raw_config);
