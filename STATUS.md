@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.67.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.68.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,11 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.68.0-dev
+- WA Web：WABinary 编解码与 Baileys 字节级兼容（令牌字典 v3，5 个 Baileys 生成的样例往返一致）。
+- WA Web：XEdDSA 证书链校验（根→中间→叶，序列号/静态公钥/有效期检查），离线自测。
+- 仍缺：zlib 压缩帧、真实服务器验证、Signal 协议、实时扫码登录（按要求保持缺失）。
 
 ### 1.67.0-dev
 - 逐 token 流式输出：OpenAI 兼容 / DeepSeek 走 SSE（包括分片的 tool_call 参数），有消费方时启用（WS 客户端、插件、或 `agents.defaults.streaming: true`）；插件可以收到 `onPartialReply` / `onTyping` 回调。

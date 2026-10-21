@@ -86,34 +86,47 @@ std::string QrPayload(const std::string& ref, const Bytes& noise_pub, const Byte
 
 // ---- Offline stubs / codecs toward a Baileys-equivalent client (no live socket) ----
 
-// ServerHello payload is a CertChain protobuf. We decode the outer shape and verify the leaf
-// signature against a caller-supplied root when provided; without a root we only structural-check.
+// ServerHello payload is a CertChain protobuf: {leaf=1, intermediate=2} of NoiseCertificate{details=1, signature=2}.
+struct CertDetails {
+    std::uint32_t serial = 0, issuer_serial = 0;
+    Bytes key;
+    std::uint64_t not_before = 0, not_after = 0;
+};
 struct CertChainInfo {
-    Bytes leaf_details;     // raw NoiseCertificate.details
+    Bytes leaf_details;
     Bytes leaf_signature;
     Bytes intermediate_details;
     Bytes intermediate_signature;
     bool structurally_ok = false;
     bool signature_checked = false;
     bool signature_valid = false;
+    std::string error;
+    CertDetails intermediate, leaf;
 };
-// Decode CertChain {leaf=1:{details=1,signature=2}, intermediate=2:{...}}. Empty optional on hard fail.
 std::optional<CertChainInfo> DecodeCertChain(const Bytes& payload);
-// Verify leaf_signature = Ed25519(intermediate_pub, leaf_details) when intermediate_details encodes a key;
-// if `wa_root_pub` (32 bytes) is set, also check intermediate against the WA root. Stub: returns structural
-// result and sets signature_checked=false when keys cannot be extracted (full X.509/Ed25519 path missing).
-CertChainInfo VerifyCertChain(const Bytes& payload, const Bytes& wa_root_pub = {});
+std::optional<CertDetails> DecodeCertDetails(const Bytes& raw);
+const Bytes& WaRootPublicKey();  // Curve25519 (Montgomery) WA noise root, issuer serial 0
+// Signal-style XEdDSA verify with a Montgomery public key (libsignal curve25519_verify semantics).
+bool VerifyXEdDsa(const Bytes& mont_pub, const Bytes& msg, const Bytes& sig64);
+// whatsmeow verifyServerCert equivalent: intermediate signed by root (XEdDSA), issuerSerial 0, leaf signed by the
+// intermediate key, leaf issuerSerial == intermediate serial, optional leaf key == decrypted server static, optional
+// validity window at now_s (unix seconds; 0 = skip). Empty root → WaRootPublicKey().
+CertChainInfo VerifyCertChain(const Bytes& payload, const Bytes& wa_root_pub = {}, const Bytes& server_static = {},
+                              std::uint64_t now_s = 0);
 
-// Minimal WABinary frame codec (token dictionary NOT included — tags are numeric / raw strings only).
-// Documented wire form: [list size][tag][attrs...][content]. Used for offline unit tests of the shape.
+// WABinary codec, wire-compatible with Baileys encodeBinaryNode/decodeDecompressedBinaryNode (token dictionary v3,
+// nibble/hex packing, JID_PAIR/AD_JID/FB_JID/INTEROP_JID). with_frame_flag adds/strips the leading flags byte;
+// zlib-compressed frames (flag & 2) are rejected (no zlib in the build).
 struct BinaryNode {
     std::string tag;
     std::vector<std::pair<std::string, std::string>> attrs;
-    Bytes content;                          // raw bytes content
+    Bytes content;                          // raw bytes (or UTF-8 when content_is_string)
     std::vector<BinaryNode> children;       // when content is a list
+    bool has_content = false;
+    bool content_is_string = false;
 };
-Bytes EncodeBinaryNode(const BinaryNode& n);
-std::optional<BinaryNode> DecodeBinaryNode(const Bytes& b);
+Bytes EncodeBinaryNode(const BinaryNode& n, bool with_frame_flag = true);
+std::optional<BinaryNode> DecodeBinaryNode(const Bytes& b, bool with_frame_flag = true, std::string* error = nullptr);
 
 // Signal protocol session stubs (X3DH / Double Ratchet). No cryptographic ratchet yet — stores identity
 // and records that a session was "established" for offline wiring tests.

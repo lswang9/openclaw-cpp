@@ -1,3 +1,4 @@
+#include <openssl/bn.h>
 #include <memory>
 #include <thread>
 #include "openclaw/agent/loop.hpp"
@@ -94,7 +95,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.67.0-dev";
+constexpr const char* kVersion = "1.68.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2442,7 +2443,7 @@ int CmdSelfTest() {
         leaf.insert(leaf.end(), fs.begin(), fs.end());
         ww::Bytes chain = field(1, leaf);
         auto ci = ww::DecodeCertChain(chain);
-        ww::BinaryNode node{"message", {{"to", "123@s.whatsapp.net"}}, ww::FromString("hi"), {}};
+        ww::BinaryNode node{"message", {{"to", "123@s.whatsapp.net"}}, ww::FromString("hi"), {}, true, false};
         auto enc = ww::EncodeBinaryNode(node);
         auto dec = ww::DecodeBinaryNode(enc);
         auto id = ww::GenerateSignalIdentity();
@@ -2457,6 +2458,77 @@ int CmdSelfTest() {
                    sess.established && pt && *pt == ww::FromString("ping");
         if (!wok) { std::cerr << "FAIL waweb stubs\n"; ++failures; }
         else std::cerr << "PASS waweb cert decode + binary node + signal stubs\n";
+    }
+    {
+        // WABinary v3 vs Baileys fixtures: decode → re-encode must be byte-identical.
+#include "openclaw/channels/waweb/wabinary_fixtures.inc"
+        namespace ww = openclaw::channels::waweb;
+        auto unhex = [](const std::string& h) { ww::Bytes o; for (std::size_t i = 0; i + 1 < h.size(); i += 2) o.push_back(static_cast<std::uint8_t>(std::stoi(h.substr(i, 2), nullptr, 16))); return o; };
+        int bad = 0;
+        for (auto& f : kBaileysFixtures) {
+            auto raw = unhex(f[0]);
+            std::string err;
+            auto n = ww::DecodeBinaryNode(raw, true, &err);
+            if (!n || n->tag != f[1] || ww::EncodeBinaryNode(*n) != raw) { ++bad; std::cerr << "  fixture " << f[1] << " err=" << err << "\n"; }
+        }
+        ww::BinaryNode m{"message", {{"to", "15551234567@s.whatsapp.net"}, {"id", "3EB0A1B2C3D4E5F6"}, {"type", "text"}}, {}, {}, false, false};
+        m.children.push_back({"body", {}, ww::FromString("hi"), {}, true, false});
+        auto rt = ww::DecodeBinaryNode(ww::EncodeBinaryNode(m));
+        if (bad || !rt || rt->attrs[0].second != "15551234567@s.whatsapp.net" || rt->children.size() != 1 || rt->children[0].content != ww::FromString("hi")) {
+            std::cerr << "FAIL waweb binary v3 baileys fixtures\n"; ++failures;
+        } else std::cerr << "PASS waweb binary token dictionary v3 (Baileys fixtures byte-identical)\n";
+    }
+    {
+        // XEdDSA cert chain: synthetic root/intermediate/leaf (Ed25519 keys with sign bit 0, converted to Montgomery).
+        namespace ww = openclaw::channels::waweb;
+        struct K { EVP_PKEY* k; ww::Bytes mont; };
+        auto mk = []() {
+            for (;;) {
+                EVP_PKEY* k = nullptr;
+                EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
+                EVP_PKEY_keygen_init(c); EVP_PKEY_keygen(c, &k); EVP_PKEY_CTX_free(c);
+                ww::Bytes ed(32); std::size_t l = 32; EVP_PKEY_get_raw_public_key(k, ed.data(), &l);
+                if (ed[31] & 0x80) { EVP_PKEY_free(k); continue; }
+                BN_CTX* bc = BN_CTX_new();
+                BIGNUM *p = BN_new(), *y = BN_lebin2bn(ed.data(), 32, nullptr), *one = BN_new(), *n = BN_new(), *d = BN_new(), *u = BN_new();
+                BN_set_word(p, 1); BN_lshift(p, p, 255); BN_sub_word(p, 19); BN_one(one);
+                BN_mod_add(n, one, y, p, bc); BN_mod_sub(d, one, y, p, bc);
+                BIGNUM* inv = BN_mod_inverse(nullptr, d, p, bc);
+                BN_mod_mul(u, n, inv, p, bc);
+                ww::Bytes mont(32); BN_bn2lebinpad(u, mont.data(), 32);
+                BN_free(p); BN_free(y); BN_free(one); BN_free(n); BN_free(d); BN_free(u); BN_free(inv); BN_CTX_free(bc);
+                return K{k, mont};
+            }
+        };
+        auto sign = [](EVP_PKEY* k, const ww::Bytes& m) {
+            ww::Bytes s(64); std::size_t l = 64; EVP_MD_CTX* c = EVP_MD_CTX_new();
+            EVP_DigestSignInit(c, nullptr, nullptr, nullptr, k); EVP_DigestSign(c, s.data(), &l, m.data(), m.size()); EVP_MD_CTX_free(c);
+            return s;
+        };
+        auto var = [](ww::Bytes& o, std::uint64_t v) { while (v >= 0x80) { o.push_back(static_cast<std::uint8_t>(v | 0x80)); v >>= 7; } o.push_back(static_cast<std::uint8_t>(v)); };
+        auto fld = [&](int n, const ww::Bytes& v) { ww::Bytes o; var(o, (std::uint64_t(n) << 3) | 2); var(o, v.size()); o.insert(o.end(), v.begin(), v.end()); return o; };
+        auto details = [&](std::uint32_t serial, std::uint32_t issuer, const ww::Bytes& key) {
+            ww::Bytes o; var(o, 1 << 3); var(o, serial); var(o, 2 << 3); var(o, issuer);
+            auto k = fld(3, key); o.insert(o.end(), k.begin(), k.end());
+            var(o, 4 << 3); var(o, 1000); var(o, 5 << 3); var(o, 4000000000ull); return o;
+        };
+        auto cert = [&](const ww::Bytes& d, const ww::Bytes& s) { auto o = fld(1, d); auto t = fld(2, s); o.insert(o.end(), t.begin(), t.end()); return o; };
+        K root = mk(), inter = mk();
+        ww::Bytes server_static(32, 0x42);
+        auto idet = details(7, 0, inter.mont), ldet = details(9, 7, server_static);
+        auto chain = fld(1, cert(ldet, sign(inter.k, ldet)));
+        auto ic = fld(2, cert(idet, sign(root.k, idet)));
+        chain.insert(chain.end(), ic.begin(), ic.end());
+        auto good = ww::VerifyCertChain(chain, root.mont, server_static, 1800000000);
+        auto wrong_root = ww::VerifyCertChain(chain, {}, server_static, 1800000000);  // real WA root must reject
+        auto wrong_static = ww::VerifyCertChain(chain, root.mont, ww::Bytes(32, 0x43), 1800000000);
+        auto tampered = chain; tampered[10] ^= 1;
+        auto bad_sig = ww::VerifyCertChain(tampered, root.mont, server_static, 0);
+        EVP_PKEY_free(root.k); EVP_PKEY_free(inter.k);
+        if (!good.signature_valid || good.leaf.serial != 9 || wrong_root.signature_valid || wrong_static.signature_valid || bad_sig.signature_valid ||
+            ww::WaRootPublicKey().size() != 32) {
+            std::cerr << "FAIL waweb xeddsa cert chain (" << good.error << ")\n"; ++failures;
+        } else std::cerr << "PASS waweb XEdDSA cert chain verify (root/intermediate/leaf, rejects wrong root/static/tamper)\n";
     }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }

@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.67.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.68.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,11 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.68 WA Web: WABinary token dictionary v3 + XEdDSA cert chain (offline)
+- real: `EncodeBinaryNode`/`DecodeBinaryNode` wire-compatible with Baileys (token dictionary v3 single/double-byte tables generated from Baileys constants.ts, MIT; nibble/hex packing; JID_PAIR/AD_JID/FB_JID/INTEROP_JID; LIST_8/16; BINARY_8/20/32; frame flag byte). Self-test decodes 5 Baileys-generated fixtures (scripts/fixtures/wabinary-baileys.json) and re-encodes byte-identically.
+- real: `VerifyXEdDsa` (libsignal curve25519_verify semantics via OpenSSL BN + Ed25519) and `VerifyCertChain` following whatsmeow verifyServerCert: intermediate signed by the WA root (`WaRootPublicKey`), issuerSerial 0, leaf signed by intermediate, serial linkage, leaf key == server static, validity window. Self-test uses a synthetic chain and checks rejects (real WA root, wrong static, tamper).
+- gaps: zlib-compressed frames rejected (no zlib linked); not tested against a real WA ServerHello (needs live socket); Signal/libsignal, ADV pairing, live QR login remain missing.
 
 ## 1.67 Token-level streaming + typing keep-alive
 - real: `Provider::CompleteStreaming(messages, tools, on_delta)`. A shared OpenAI-compatible SSE parser (`StreamChatCompletion`) handles content deltas, **tool_call deltas** (index/id/name/argument fragments concatenated), `finish_reason`, and servers that ignore `stream:true` (falls back to a plain completion object). DeepSeek and OpenAI-compat use it. Router and AuthRotating forward it, and rotation never happens after partial output. The default for other providers is non-streaming with a single delta. Mock streams word by word, with `delayMs` per script entry.
@@ -60,8 +65,8 @@
 - real: PTY `ResizePty` (TIOCSWINSZ) + process tool `resize` action (`pty_rows`/`pty_cols` on background sessions).
 - real: embedding providers `ollama` (`/api/embeddings`) and `gguf` (magic+version check, then LocalEmbedder neural stand-in). Offline: `scripts/e2e-embeddings-ollama-gguf.sh`.
 - real: memory SQLite **FTS5** (`chunk_fts` + `bm25()`); hybrid search can use FTS text scores when enabled.
-- real (offline stubs): WA Web `DecodeCertChain`/`VerifyCertChain` (structural), `EncodeBinaryNode`/`DecodeBinaryNode` (no token dict), Signal identity/X3DH/ratchet HKDF stubs — **not** interoperable with WhatsApp. Live Baileys login still missing (needs user phone; not requested).
-- gaps: TTS/STT still generic HTTP only (no OpenAI/ElevenLabs/Deepgram-specific clients offline). WA cert Ed25519 vs WA root, dictionary v3, real Signal/libsignal, and live QR login still missing. Token-level streaming (vs paragraph blocks) still missing.
+- real (offline stubs): WA Web `DecodeCertChain`/`VerifyCertChain` (structural), (superseded by 1.68: Baileys-compatible WABinary v3 + XEdDSA chain verify), Signal identity/X3DH/ratchet HKDF stubs — **not** interoperable with WhatsApp. Live Baileys login still missing (needs user phone; not requested).
+- gaps: TTS/STT still generic HTTP only (no OpenAI/ElevenLabs/Deepgram-specific clients offline). real Signal/libsignal, and live QR login still missing. Token-level streaming (vs paragraph blocks) still missing.
 
 ## 1.63 Provider auth: OAuth / API-key flows + auth profiles
 - real: `openclaw models auth login --provider <id> [--method <authId>]` runs the provider plugin's `auth[].run(ctx)`. The `ctx.prompter.text/confirm/select/note` and `ctx.openUrl` calls are host calls answered by the CLI on the terminal. Methods of kind `api_key`/`token` with no `run` get a built-in key prompt. The result's `profiles[]` go to `auth-profiles.json`, its `configPatch` is merge-patched into config (schema-validated), and `auth.profiles.<id> = {provider, mode}` is recorded. Also `models auth paste-token --provider <id> [--profile-id]`, `models auth list` (secrets masked), and `models auth remove <profileId>`.
@@ -80,7 +85,7 @@
 ## 1.61 WhatsApp Web (Baileys-equivalent): assessment + first primitives
 - assessment: `docs/whatsapp-web-gap.md` (layer-by-layer gap, ordered plan, what needs the user).
 - real (offline, in-process tested): `channels::waweb` — `Noise_XX_25519_AESGCM_SHA256` symmetric state with the WA prologue (`WA` 6 3), both handshake roles (client = Baileys side, server = test responder), Baileys ordering (ClientFinish framed before `FinishInit`), transport framing (intro header, 3-byte length, split/merged frames), minimal protobuf `HandshakeMessage` codec, RFC 5869 HKDF (test vector), WhatsApp media encryption (HKDF type keys, AES-256-CBC, HMAC-SHA256/10), and the pairing QR payload.
-- missing: live socket login, server CertChain verification, ClientPayload/WAProto, WABinary token dictionary, ADV pairing signatures, Signal (X3DH/Double Ratchet/SenderKeys), pre-key upload, app-state/history sync, media hosts, auth persistence. Not interoperability-tested with WhatsApp servers.
+- missing: live socket login, live ServerHello cert check (offline XEdDSA verify real since 1.68), ClientPayload/WAProto, zlib frames, ADV pairing signatures, Signal (X3DH/Double Ratchet/SenderKeys), pre-key upload, app-state/history sync, media hosts, auth persistence. Not interoperability-tested with WhatsApp servers.
 
 ## 1.60 Gemini + Voyage embedding providers
 - real (fake-server tested): `memorySearch.provider: "gemini"` — `POST {baseUrl}/models/{model}:batchEmbedContents` with `x-goog-api-key`, `taskType` `RETRIEVAL_DOCUMENT` for chunks / `RETRIEVAL_QUERY` for queries, optional `memorySearch.outputDimensionality`, batches of 100; default `gemini-embedding-001` on `generativelanguage.googleapis.com/v1beta`, key `remote.apiKey` → `GEMINI_API_KEY` → `GOOGLE_API_KEY`.

@@ -1,3 +1,7 @@
+#include <cstdlib>
+#include <iterator>
+#include <unordered_map>
+#include <openssl/bn.h>
 #include "openclaw/channels/waweb/noise.hpp"
 
 #include <openssl/evp.h>
@@ -386,105 +390,328 @@ std::optional<CertChainInfo> DecodeCertChain(const Bytes& payload) {
     return info;
 }
 
-CertChainInfo VerifyCertChain(const Bytes& payload, const Bytes& wa_root_pub) {
+namespace {
+// ---- XEdDSA verification (Signal curve25519_verify): Montgomery u → Edwards y=(u-1)/(u+1), sign bit from sig[63] ----
+bool XEdDsaVerify(const Bytes& mont_pub, const Bytes& msg, const Bytes& sig) {
+    if (mont_pub.size() != 32 || sig.size() != 64) return false;
+    BN_CTX* ctx = BN_CTX_new();
+    BIGNUM *p = BN_new(), *u = nullptr, *one = BN_new(), *num = BN_new(), *den = BN_new(), *inv = nullptr, *y = BN_new();
+    BN_set_word(p, 1); BN_lshift(p, p, 255); BN_sub_word(p, 19);
+    Bytes ub = mont_pub; ub[31] &= 0x7F;
+    u = BN_lebin2bn(ub.data(), 32, nullptr);
+    BN_one(one);
+    bool ok = BN_cmp(u, p) < 0;
+    if (ok) {
+        BN_mod_sub(num, u, one, p, ctx);
+        BN_mod_add(den, u, one, p, ctx);
+        inv = BN_mod_inverse(nullptr, den, p, ctx);
+        ok = inv != nullptr && BN_mod_mul(y, num, inv, p, ctx) == 1;
+    }
+    Bytes ed(32), s2 = sig;
+    if (ok) {
+        BN_bn2lebinpad(y, ed.data(), 32);
+        ed[31] = static_cast<std::uint8_t>((ed[31] & 0x7F) | (sig[63] & 0x80));
+        s2[63] &= 0x7F;
+    }
+    BN_free(p); BN_free(u); BN_free(one); BN_free(num); BN_free(den); BN_free(inv); BN_free(y); BN_CTX_free(ctx);
+    if (!ok) return false;
+    EVP_PKEY* k = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, ed.data(), 32);
+    if (!k) return false;
+    EVP_MD_CTX* m = EVP_MD_CTX_new();
+    bool v = EVP_DigestVerifyInit(m, nullptr, nullptr, nullptr, k) == 1 &&
+             EVP_DigestVerify(m, s2.data(), s2.size(), msg.data(), msg.size()) == 1;
+    EVP_MD_CTX_free(m);
+    EVP_PKEY_free(k);
+    return v;
+}
+
+}  // namespace
+
+const Bytes& WaRootPublicKey() {
+    // WhatsApp noise root (issuer serial 0); same constant as whatsmeow handshake.go WACertPubKey.
+    static const Bytes k{0x14, 0x23, 0x75, 0x57, 0x4d, 0x0a, 0x58, 0x71, 0x66, 0xaa, 0xe7, 0x1e, 0xbe, 0x51, 0x64, 0x37,
+                         0xc4, 0xa2, 0x8b, 0x73, 0xe3, 0x69, 0x5c, 0x6c, 0xe1, 0xf7, 0xf9, 0x54, 0x5d, 0xa8, 0xee, 0x6b};
+    return k;
+}
+
+bool VerifyXEdDsa(const Bytes& mont_pub, const Bytes& msg, const Bytes& sig) { return XEdDsaVerify(mont_pub, msg, sig); }
+
+std::optional<CertDetails> DecodeCertDetails(const Bytes& raw) {
+    // CertChain.NoiseCertificate.Details {serial=1 u32, issuerSerial=2 u32, key=3 bytes, notBefore=4 u64, notAfter=5 u64}
+    CertDetails d;
+    std::size_t i = 0;
+    auto varint = [&](std::uint64_t& v) {
+        v = 0;
+        for (int sh = 0; i < raw.size() && sh < 64; sh += 7) {
+            std::uint8_t c = raw[i++];
+            v |= std::uint64_t(c & 0x7F) << sh;
+            if (!(c & 0x80)) return true;
+        }
+        return false;
+    };
+    while (i < raw.size()) {
+        std::uint64_t key;
+        if (!varint(key)) return std::nullopt;
+        const int field = static_cast<int>(key >> 3), wt = static_cast<int>(key & 7);
+        if (wt == 0) {
+            std::uint64_t v;
+            if (!varint(v)) return std::nullopt;
+            if (field == 1) d.serial = static_cast<std::uint32_t>(v);
+            else if (field == 2) d.issuer_serial = static_cast<std::uint32_t>(v);
+            else if (field == 4) d.not_before = v;
+            else if (field == 5) d.not_after = v;
+        } else if (wt == 2) {
+            std::uint64_t n;
+            if (!varint(n) || i + n > raw.size()) return std::nullopt;
+            if (field == 3) d.key.assign(raw.begin() + static_cast<std::ptrdiff_t>(i), raw.begin() + static_cast<std::ptrdiff_t>(i + n));
+            i += n;
+        } else return std::nullopt;
+    }
+    return d;
+}
+
+CertChainInfo VerifyCertChain(const Bytes& payload, const Bytes& wa_root_pub, const Bytes& server_static, std::uint64_t now_s) {
     CertChainInfo info;
     auto d = DecodeCertChain(payload);
-    if (!d) return info;
+    if (!d) { info.error = "undecodable CertChain"; return info; }
     info = *d;
-    // Full Ed25519 verification of NoiseCertificate is not wired (needs XEdDSA). We expose the
-    // structural decode and record that a root was supplied for a future check.
-    if (!wa_root_pub.empty() && wa_root_pub.size() == 32 && !info.intermediate_details.empty()) {
-        info.signature_checked = false;  // stub: do not claim validity
-        info.signature_valid = false;
+    const Bytes& root = wa_root_pub.empty() ? WaRootPublicKey() : wa_root_pub;
+    auto fail = [&](const std::string& e) { info.signature_checked = true; info.signature_valid = false; info.error = e; return info; };
+    if (info.intermediate_details.empty() || info.intermediate_signature.size() != 64 || info.leaf_signature.size() != 64)
+        return fail("missing parts of noise certificate");
+    if (!XEdDsaVerify(root, info.intermediate_details, info.intermediate_signature)) return fail("intermediate signature invalid");
+    auto im = DecodeCertDetails(info.intermediate_details);
+    if (!im || im->issuer_serial != 0 || im->key.size() != 32) return fail("bad intermediate details");
+    if (!XEdDsaVerify(im->key, info.leaf_details, info.leaf_signature)) return fail("leaf signature invalid");
+    auto lf = DecodeCertDetails(info.leaf_details);
+    if (!lf || lf->issuer_serial != im->serial) return fail("leaf issuer serial mismatch");
+    if (!server_static.empty() && lf->key != server_static) return fail("cert key does not match server static");
+    if (now_s) {
+        for (auto* c : {&*im, &*lf})
+            if ((c->not_before && now_s < c->not_before) || (c->not_after && now_s > c->not_after)) return fail("certificate not within validity");
     }
+    info.signature_checked = true;
+    info.signature_valid = true;
+    info.intermediate = *im;
+    info.leaf = *lf;
     return info;
 }
 
+// ---- WABinary (Baileys-compatible, token dictionary v3) ----
 namespace {
-void PutByte(Bytes& o, std::uint8_t v) { o.push_back(v); }
-void PutInt20(Bytes& o, std::uint32_t n) {  // WA list size packing (simplified: always 3-byte)
-    PutByte(o, 248);  // LIST_8 replaced with fixed INT20-ish marker 248 / size
-    PutByte(o, static_cast<std::uint8_t>((n >> 16) & 0xff));
-    PutByte(o, static_cast<std::uint8_t>((n >> 8) & 0xff));
-    PutByte(o, static_cast<std::uint8_t>(n & 0xff));
+#include "openclaw/channels/waweb/wa_tokens.inc"
+enum : std::uint8_t {
+    LIST_EMPTY = 0, DICTIONARY_0 = 236, INTEROP_JID = 245, FB_JID = 246, AD_JID = 247, LIST_8 = 248, LIST_16 = 249,
+    JID_PAIR = 250, HEX_8 = 251, BINARY_8 = 252, BINARY_20 = 253, BINARY_32 = 254, NIBBLE_8 = 255
+};
+struct TokenRef { int dict; std::uint8_t index; };
+const std::unordered_map<std::string, TokenRef>& TokenMap() {
+    static const auto m = [] {
+        std::unordered_map<std::string, TokenRef> t;
+        for (std::size_t i = 0; i < std::size(kSingleByteTokens); ++i) t[kSingleByteTokens[i]] = {-1, static_cast<std::uint8_t>(i)};
+        for (int d = 0; d < 4; ++d)
+            for (std::size_t j = 0; j < kDoubleByteTokenCounts[d]; ++j) t[kDoubleByteTokens[d][j]] = {d, static_cast<std::uint8_t>(j)};
+        return t;
+    }();
+    return m;
 }
-void PutString(Bytes& o, const std::string& s) {
-    if (s.size() < 256) { PutByte(o, 252); PutByte(o, static_cast<std::uint8_t>(s.size())); }
-    else { PutByte(o, 253); PutByte(o, (s.size() >> 8) & 0xff); PutByte(o, s.size() & 0xff); }
-    o.insert(o.end(), s.begin(), s.end());
-}
+struct Enc {
+    Bytes& o;
+    void Byte(std::uint32_t v) { o.push_back(static_cast<std::uint8_t>(v & 0xff)); }
+    void Len(std::size_t n) {
+        if (n >= (1u << 20)) { Byte(BINARY_32); for (int s = 24; s >= 0; s -= 8) Byte(static_cast<std::uint32_t>(n >> s)); }
+        else if (n >= 256) { Byte(BINARY_20); Byte((n >> 16) & 0x0f); Byte(n >> 8); Byte(n); }
+        else { Byte(BINARY_8); Byte(static_cast<std::uint32_t>(n)); }
+    }
+    void Raw(const std::string& s) { Len(s.size()); o.insert(o.end(), s.begin(), s.end()); }
+    static bool IsNibble(const std::string& s) {
+        if (s.empty() || s.size() > 127) return false;
+        for (char c : s) if (!((c >= '0' && c <= '9') || c == '-' || c == '.')) return false;
+        return true;
+    }
+    static bool IsHex(const std::string& s) {
+        if (s.empty() || s.size() > 127) return false;
+        for (char c : s) if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) return false;
+        return true;
+    }
+    static int PackN(char c) { return c == '-' ? 10 : c == '.' ? 11 : c == 0 ? 15 : c - '0'; }
+    static int PackH(char c) { return c == 0 ? 15 : (c >= 'A' ? 10 + c - 'A' : c - '0'); }
+    void Packed(const std::string& s, bool nibble) {
+        Byte(nibble ? NIBBLE_8 : HEX_8);
+        std::uint32_t rl = static_cast<std::uint32_t>((s.size() + 1) / 2);
+        if (s.size() % 2) rl |= 128;
+        Byte(rl);
+        auto pk = [&](char a, char b) { return nibble ? (PackN(a) << 4) | PackN(b) : (PackH(a) << 4) | PackH(b); };
+        for (std::size_t i = 0; i + 1 < s.size(); i += 2) Byte(static_cast<std::uint32_t>(pk(s[i], s[i + 1])));
+        if (s.size() % 2) Byte(static_cast<std::uint32_t>(pk(s.back(), 0)));
+    }
+    void Str(const std::string& s) {
+        if (s.empty()) { Raw(s); return; }
+        auto& tm = TokenMap();
+        if (auto it = tm.find(s); it != tm.end()) {
+            if (it->second.dict >= 0) Byte(DICTIONARY_0 + it->second.dict);
+            Byte(it->second.index);
+            return;
+        }
+        if (IsNibble(s)) { Packed(s, true); return; }
+        if (IsHex(s)) { Packed(s, false); return; }
+        if (auto at = s.find('@'); at != std::string::npos) {
+            std::string server = s.substr(at + 1), uc = s.substr(0, at), user = uc, device;
+            if (auto c = uc.find(':'); c != std::string::npos) { user = uc.substr(0, c); device = uc.substr(c + 1); if (auto c2 = device.find(':'); c2 != std::string::npos) device.resize(c2); }
+            std::string agent;
+            if (auto u = user.find('_'); u != std::string::npos) { agent = user.substr(u + 1); user.resize(u); }
+            int domain = server == "lid" ? 1 : server == "hosted" ? 128 : server == "hosted.lid" ? 129 : (agent.empty() ? 0 : std::atoi(agent.c_str()));
+            if (!device.empty()) {
+                Byte(AD_JID); Byte(static_cast<std::uint32_t>(domain)); Byte(static_cast<std::uint32_t>(std::atoi(device.c_str())));
+                Str(user);
+            } else {
+                Byte(JID_PAIR);
+                if (user.empty()) Byte(LIST_EMPTY); else Str(user);
+                Str(server);
+            }
+            return;
+        }
+        Raw(s);
+    }
+    void ListStart(std::size_t n) {
+        if (n == 0) Byte(LIST_EMPTY);
+        else if (n < 256) { Byte(LIST_8); Byte(static_cast<std::uint32_t>(n)); }
+        else { Byte(LIST_16); Byte(static_cast<std::uint32_t>(n >> 8)); Byte(static_cast<std::uint32_t>(n)); }
+    }
+    void Node(const BinaryNode& n) {
+        const bool has_content = !n.children.empty() || n.has_content;
+        ListStart(2 * n.attrs.size() + 1 + (has_content ? 1 : 0));
+        Str(n.tag);
+        for (auto& [k, v] : n.attrs) { Str(k); Str(v); }
+        if (!n.children.empty()) { ListStart(n.children.size()); for (auto& c : n.children) Node(c); }
+        else if (n.has_content) {
+            if (n.content_is_string) Str(std::string(n.content.begin(), n.content.end()));
+            else { Len(n.content.size()); o.insert(o.end(), n.content.begin(), n.content.end()); }
+        }
+    }
+};
+struct Dec {
+    const Bytes& b;
+    std::size_t i = 0;
+    std::string err;
+    bool Need(std::size_t n) { if (i + n > b.size()) { err = "end of stream"; return false; } return true; }
+    std::uint32_t Byte() { return Need(1) ? b[i++] : 0; }
+    std::uint32_t Int(int n) { std::uint32_t v = 0; if (!Need(n)) return 0; for (int k = 0; k < n; ++k) v = (v << 8) | b[i++]; return v; }
+    std::string Chars(std::size_t n) { if (!Need(n)) return {}; std::string s(b.begin() + static_cast<std::ptrdiff_t>(i), b.begin() + static_cast<std::ptrdiff_t>(i + n)); i += n; return s; }
+    std::string Packed(std::uint32_t tag) {
+        std::uint32_t start = Byte();
+        std::string v;
+        for (std::uint32_t k = 0; k < (start & 127) && err.empty(); ++k) {
+            std::uint32_t c = Byte();
+            for (std::uint32_t nb : {(c & 0xf0) >> 4, c & 0x0f}) {
+                if (tag == NIBBLE_8) {
+                    if (nb <= 9) v += static_cast<char>('0' + nb);
+                    else if (nb == 10) v += '-';
+                    else if (nb == 11) v += '.';
+                    else if (nb == 15) v += '\0';
+                    else { err = "invalid nibble"; return v; }
+                } else v += static_cast<char>(nb < 10 ? '0' + nb : 'A' + nb - 10);
+            }
+        }
+        if (start >> 7) v.pop_back();
+        return v;
+    }
+    std::string Str(std::uint32_t tag) {
+        if (tag >= 1 && tag < std::size(kSingleByteTokens)) return kSingleByteTokens[tag];
+        if (tag >= DICTIONARY_0 && tag <= DICTIONARY_0 + 3) {
+            std::uint32_t idx = Byte(), d = tag - DICTIONARY_0;
+            if (idx >= kDoubleByteTokenCounts[d]) { err = "invalid double token"; return {}; }
+            return kDoubleByteTokens[d][idx];
+        }
+        switch (tag) {
+            case LIST_EMPTY: return {};
+            case BINARY_8: return Chars(Byte());
+            case BINARY_20: { std::uint32_t n = ((Byte() & 15) << 16); n += Byte() << 8; n += Byte(); return Chars(n); }
+            case BINARY_32: return Chars(Int(4));
+            case JID_PAIR: {
+                std::string u = Str(Byte()), s = Str(Byte());
+                if (s.empty()) { err = "invalid jid pair"; return {}; }
+                return u + "@" + s;
+            }
+            case AD_JID: {
+                std::uint32_t domain = Byte(), device = Byte();
+                std::string user = Str(Byte());
+                std::string server = domain == 1 ? "lid" : domain == 128 ? "hosted" : domain == 129 ? "hosted.lid" : "s.whatsapp.net";
+                return user + (device ? ":" + std::to_string(device) : std::string()) + "@" + server;
+            }
+            case FB_JID: { std::string u = Str(Byte()); std::uint32_t dev = Int(2); std::string s = Str(Byte()); return u + ":" + std::to_string(dev) + "@" + s; }
+            case INTEROP_JID: {
+                std::string u = Str(Byte()); std::uint32_t dev = Int(2), integ = Int(2);
+                std::string s = "interop";
+                if (i < b.size()) { auto save = i; auto e = err; s = Str(Byte()); if (!err.empty()) { i = save; err = e; s = "interop"; } }
+                return std::to_string(integ) + "-" + u + ":" + std::to_string(dev) + "@" + s;
+            }
+            case HEX_8: case NIBBLE_8: return Packed(tag);
+            default: err = "invalid string tag " + std::to_string(tag); return {};
+        }
+    }
+    std::size_t ListSize(std::uint32_t tag) {
+        if (tag == LIST_EMPTY) return 0;
+        if (tag == LIST_8) return Byte();
+        if (tag == LIST_16) return Int(2);
+        err = "invalid list tag " + std::to_string(tag);
+        return 0;
+    }
+    std::optional<BinaryNode> Node(int depth = 0) {
+        if (depth > 64) { err = "too deep"; return std::nullopt; }
+        std::size_t size = ListSize(Byte());
+        if (!err.empty() || size == 0) { if (err.empty()) err = "invalid node"; return std::nullopt; }
+        BinaryNode n;
+        n.tag = Str(Byte());
+        if (n.tag.empty() || !err.empty()) { if (err.empty()) err = "invalid node"; return std::nullopt; }
+        for (std::size_t a = 0; a < (size - 1) / 2 && err.empty(); ++a) {
+            std::string k = Str(Byte());
+            std::string v = Str(Byte());
+            n.attrs.emplace_back(k, v);
+        }
+        if (size % 2 == 0 && err.empty()) {
+            std::uint32_t tag = Byte();
+            if (tag == LIST_EMPTY || tag == LIST_8 || tag == LIST_16) {
+                std::size_t cnt = ListSize(tag);
+                for (std::size_t c = 0; c < cnt && err.empty(); ++c) {
+                    auto ch = Node(depth + 1);
+                    if (!ch) return std::nullopt;
+                    n.children.push_back(std::move(*ch));
+                }
+            } else {
+                n.has_content = true;
+                std::string s;
+                if (tag == BINARY_8) s = Chars(Byte());
+                else if (tag == BINARY_20) { std::uint32_t l = ((Byte() & 15) << 16); l += Byte() << 8; l += Byte(); s = Chars(l); }
+                else if (tag == BINARY_32) s = Chars(Int(4));
+                else { s = Str(tag); n.content_is_string = true; }
+                n.content.assign(s.begin(), s.end());
+            }
+        }
+        if (!err.empty()) return std::nullopt;
+        return n;
+    }
+};
 }  // namespace
 
-Bytes EncodeBinaryNode(const BinaryNode& n) {
-    // Simplified WABinary without token dictionary: LIST | tag | attrCount | attrs | content/children.
+Bytes EncodeBinaryNode(const BinaryNode& n, bool with_frame_flag) {
     Bytes o;
-    const std::size_t parts = 1 + 1 + n.attrs.size() * 2 + (n.children.empty() ? (n.content.empty() ? 0 : 1) : n.children.size());
-    PutInt20(o, static_cast<std::uint32_t>(parts));
-    PutString(o, n.tag);
-    PutByte(o, static_cast<std::uint8_t>(std::min<std::size_t>(n.attrs.size(), 255)));
-    for (auto& [k, v] : n.attrs) { PutString(o, k); PutString(o, v); }
-    if (!n.children.empty()) {
-        for (auto& ch : n.children) {
-            auto enc = EncodeBinaryNode(ch);
-            o.insert(o.end(), enc.begin(), enc.end());
-        }
-    } else if (!n.content.empty()) {
-        if (n.content.size() < 256) { PutByte(o, 252); PutByte(o, static_cast<std::uint8_t>(n.content.size())); }
-        else { PutByte(o, 253); PutByte(o, (n.content.size() >> 8) & 0xff); PutByte(o, n.content.size() & 0xff); }
-        o.insert(o.end(), n.content.begin(), n.content.end());
-    }
+    if (with_frame_flag) o.push_back(0);
+    Enc e{o};
+    e.Node(n);
     return o;
 }
 
-std::optional<BinaryNode> DecodeBinaryNode(const Bytes& b) {
-    std::size_t i = 0;
-    auto need = [&](std::size_t n) { return i + n <= b.size(); };
-    auto rdstr = [&](std::string& out) -> bool {
-        if (!need(1)) return false;
-        std::uint8_t t = b[i++];
-        std::size_t n = 0;
-        if (t == 252) { if (!need(1)) return false; n = b[i++]; }
-        else if (t == 253) { if (!need(2)) return false; n = (std::size_t(b[i]) << 8) | b[i + 1]; i += 2; }
-        else return false;
-        if (!need(n)) return false;
-        out.assign(reinterpret_cast<const char*>(&b[i]), n); i += n;
-        return true;
-    };
-    if (!need(4) || b[i] != 248) return std::nullopt;
-    i += 1;
-    std::uint32_t parts = (std::uint32_t(b[i]) << 16) | (std::uint32_t(b[i + 1]) << 8) | b[i + 2];
-    i += 3;
-    BinaryNode n;
-    if (!rdstr(n.tag)) return std::nullopt;
-    if (!need(1)) return std::nullopt;
-    std::uint8_t ac = b[i++];
-    for (std::uint8_t a = 0; a < ac; ++a) {
-        std::string k, v;
-        if (!rdstr(k) || !rdstr(v)) return std::nullopt;
-        n.attrs.emplace_back(k, v);
+std::optional<BinaryNode> DecodeBinaryNode(const Bytes& b, bool with_frame_flag, std::string* error) {
+    if (with_frame_flag) {
+        if (b.empty()) { if (error) *error = "empty"; return std::nullopt; }
+        if (b[0] & 2) { if (error) *error = "zlib-compressed frame not supported"; return std::nullopt; }
+        Bytes rest(b.begin() + 1, b.end());
+        return DecodeBinaryNode(rest, false, error);
     }
-    // Remaining bytes: either raw content or nested nodes (we try nested first if marker present).
-    while (i < b.size()) {
-        if (b[i] == 248) {
-            // nested — decode one child from remaining (size unknown; recursive consume via trial)
-            // For stub purposes, treat rest as opaque content if nested decode is ambiguous.
-            auto child = DecodeBinaryNode(Bytes(b.begin() + static_cast<std::ptrdiff_t>(i), b.end()));
-            if (!child) { n.content.assign(b.begin() + static_cast<std::ptrdiff_t>(i), b.end()); break; }
-            // We don't know child encoded size cheaply; re-encode to advance.
-            auto enc = EncodeBinaryNode(*child);
-            n.children.push_back(*child);
-            i += enc.size();
-        } else if (b[i] == 252 || b[i] == 253) {
-            std::string tmp;
-            std::size_t save = i;
-            if (!rdstr(tmp)) { i = save; n.content.assign(b.begin() + static_cast<std::ptrdiff_t>(i), b.end()); break; }
-            n.content.assign(tmp.begin(), tmp.end());
-        } else {
-            n.content.assign(b.begin() + static_cast<std::ptrdiff_t>(i), b.end());
-            break;
-        }
-    }
-    (void)parts;
+    Dec d{b};
+    auto n = d.Node();
+    if (!n && error) *error = d.err;
     return n;
 }
 
