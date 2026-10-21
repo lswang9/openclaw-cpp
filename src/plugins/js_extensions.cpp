@@ -1,3 +1,4 @@
+#include "openclaw/tools/exec.hpp"
 #include "openclaw/auth/profiles.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
 
@@ -51,7 +52,9 @@ agent::CompletionResult PluginProvider::Complete(const std::vector<agent::Messag
     // Credential from auth profiles (api_key or oauth; refresh oauth via the plugin before expiry).
     nlohmann::json auth = nullptr;
     {
-        auth::ProfileStore store;
+        const auto& rc = tools::exec::CurrentContext();
+        auth::ProfileStore store(auth::DefaultProfilesPath(rc.agent_id.empty() ? "main" : rc.agent_id));
+        if (!store.ForProvider(id_)) store = auth::ProfileStore(auth::DefaultProfilesPath("main"));
         if (auto pr = store.ForProvider(id_)) {
             auto cred = pr->second;
             if (auth::OAuthNeedsRefresh(cred)) {

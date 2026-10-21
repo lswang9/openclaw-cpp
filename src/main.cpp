@@ -38,6 +38,7 @@
 #include "openclaw/daemon/lifecycle.hpp"
 #include "openclaw/voice/tts.hpp"
 #include "openclaw/voice/stt.hpp"
+#include "openclaw/auth/keychain.hpp"
 #include "openclaw/sim/backend.hpp"
 #include "openclaw/sim/capture.hpp"
 #include "openclaw/sim/input.hpp"
@@ -93,7 +94,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.65.0-dev";
+constexpr const char* kVersion = "1.66.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2546,8 +2547,14 @@ int CmdModels(int argc, char** argv) {
         for (int i = 4; i + 1 < argc; ++i) if (name == argv[i]) return argv[i + 1];
         return "";
     };
-    if (sub != "auth") { std::cerr << "usage: models auth login|paste-token|list|remove ...\n"; return 2; }
-    auth::ProfileStore store;
+    if (sub != "auth") { std::cerr << "usage: models auth login|paste-token|list|remove|keychain ... [--agent <id>]\n"; return 2; }
+    std::string agent_flag;
+    for (int i = 3; i + 1 < argc; ++i) if (std::string(argv[i]) == "--agent") agent_flag = argv[i + 1];
+    auth::ProfileStore store(auth::DefaultProfilesPath(agent_flag.empty() ? "main" : agent_flag));
+    if (act == "keychain") {
+        std::cout << nlohmann::json{{"backend", auth::keychain::Backend()}, {"reason", auth::keychain::UnavailableReason()}}.dump(2) << "\n";
+        return 0;
+    }
     if (act == "list" || act.empty()) { std::cout << store.ListMasked().dump(2) << "\n"; return 0; }
     if (act == "remove" && argc > 4) {
         bool ok = store.Remove(argv[4]);

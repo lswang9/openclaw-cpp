@@ -1,6 +1,7 @@
 #include "openclaw/provider/auth_resolve.hpp"
 
 #include "openclaw/config/config.hpp"
+#include "openclaw/tools/exec.hpp"
 
 namespace openclaw::provider {
 
@@ -50,11 +51,20 @@ AuthRotatingProvider::AuthRotatingProvider(std::string provider_id, Factory fact
 
 agent::CompletionResult AuthRotatingProvider::Complete(const std::vector<agent::Message>& messages,
                                                        const nlohmann::json& tools) {
-    auth::ProfileStore store;
-    auto order = ProfileOrder(provider_id_, cfg_, store);
+    // Per-agent store (<state>/agents/<agent>/agent/auth-profiles.json); non-main agents fall back to main's
+    // profiles when their own store has none for this provider.
+    const std::string agent = tools::exec::CurrentContext().agent_id.empty() ? "main" : tools::exec::CurrentContext().agent_id;
     std::vector<ResolvedAuth> candidates;
-    for (auto& id : order) {
-        if (auto r = ResolveProfile(id, store)) candidates.push_back(*r);
+    for (const std::string& a : {agent, std::string("main")}) {
+        auth::ProfileStore store(auth::DefaultProfilesPath(a));
+        nlohmann::json cfg = cfg_;
+        // agents.list[id=a].auth.order overrides global auth.order
+        if (auto list = config::GetPath(cfg_, "agents.list"); list && list->is_array())
+            for (auto& ag : *list)
+                if (ag.is_object() && ag.value("id", "") == a && ag.contains("auth")) cfg["auth"] = ag["auth"];
+        for (auto& id : ProfileOrder(provider_id_, cfg, store))
+            if (auto r = ResolveProfile(id, store)) candidates.push_back(*r);
+        if (!candidates.empty() || a == "main") { last_agent_ = a; break; }
     }
     if (candidates.empty() && !env_fallback_.empty() && env_fallback_ != "missing") {
         candidates.push_back({"env", env_fallback_, "env"});

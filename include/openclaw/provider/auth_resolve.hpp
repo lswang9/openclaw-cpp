@@ -47,6 +47,9 @@ private:
     std::string env_fallback_;
     nlohmann::json cfg_ = nlohmann::json::object();
     std::string last_profile_;
+    std::string last_agent_;
+public:
+    std::string LastAgentStore() const { return last_agent_; }
 };
 
 }  // namespace openclaw::provider

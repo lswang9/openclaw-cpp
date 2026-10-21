@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.65.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.66.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,13 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.66 Per-agent auth profiles + OS keychain (libsecret)
+- real: built-in providers (`AuthRotatingProvider`) and plugin providers resolve credentials from the **running agent's** store, `<state>/agents/<agentId>/agent/auth-profiles.json`, using `agents.list[].auth.order` when set and global `auth.order` otherwise. If the agent's store has no profile for the provider, they fall back to `main`'s store. CLI: `models auth paste-token|list|remove … --agent <id>`.
+- real (Linux, when a Secret Service is reachable): profile secrets (`key`/`access`/`refresh`/`token`) are stored through **libsecret** (dlopen `libsecret-1.so.0`, schema `ai.openclaw.AuthProfile`, attributes profile+field scoped by store path). The JSON file keeps only `keychain:{backend:"libsecret",fields}`. Reads hydrate from the keychain, and `remove` clears the keychain entries. `models auth keychain` reports the backend and the reason when it is unavailable.
+- honest fallback: with no session bus, no libsecret, or a failed probe write, secrets stay in the 0600 JSON file (`secretBackend:"file"`). `OPENCLAW_KEYCHAIN=off` forces the file backend; smoke uses off by default.
+- tests: `scripts/e2e-auth-agents-keychain.sh` (smoke). The work agent is routed by a binding and uses its own key, while main uses main's key. The libsecret half runs gnome-keyring under `dbus-run-session` and verifies the secret is absent from the file. It reports SKIP when the keyring is unavailable.
+- gaps: no macOS Keychain or Windows Credential Manager. Existing plaintext profiles are not migrated automatically (re-paste to move them). A locked keyring that needs an interactive prompt makes the keychain unusable and the file backend is used instead.
 
 ## 1.65 Vendor-shaped TTS/STT clients (OpenAI / ElevenLabs / Deepgram)
 - real: `OPENCLAW_TTS_PROVIDER=openai|elevenlabs|deepgram|http`. OpenAI `POST /v1/audio/speech` `{model,input,voice,response_format}` Bearer. ElevenLabs `POST /v1/text-to-speech/{voice_id}` `{text,model_id}` `xi-api-key`. Deepgram `POST /v1/speak?model=aura-…` `{text}` `Authorization: Token`. Keys come from `OPENCLAW_TTS_API_KEY` or the vendor env (`OPENAI_API_KEY`/`ELEVENLABS_API_KEY`/`DEEPGRAM_API_KEY`), and the base URL defaults to the vendor host. `OPENCLAW_TTS_OUT_DIR` saves the audio, with the extension taken from the content type.
