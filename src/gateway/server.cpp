@@ -53,7 +53,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.109.0-dev";
+constexpr const char* kVersion = "1.110.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2994,6 +2994,10 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
 
     {
+        // Subsystem handlers that call back into RPCs (GatewayRpc) must not run under the deps lock.
+        static const std::set<std::string> reentrant{"taskSuggestions.accept", "sessions.patchMany", "wake", "node.invoke.progress", "mentions.list",
+                                                     "message.action", "worktrees.create"};
+        if (reentrant.count(method) && deps_lock.owns_lock()) deps_lock.unlock();
         auto extra = TryExtraDispatch(deps_, method, params);
         if (extra.handled) {
             if (!extra.ok) return err(extra.error);
@@ -3094,4 +3098,8 @@ void Server::HandleWebSocket(int client_fd, const std::string& req) {
     }
 }
 
+}  // namespace openclaw::gateway
+
+namespace openclaw::gateway {
+int GatewayConnId() { return g_ws_conn; }
 }  // namespace openclaw::gateway

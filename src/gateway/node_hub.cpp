@@ -103,6 +103,15 @@ json NodeHub::List() const {
     return out;
 }
 
+bool NodeHub::Notify(const std::string& node_id, const std::string& event, const json& payload) {
+    std::unique_lock l(g_mu);
+    const NodeConn* c = Find(node_id);
+    if (!c) return false;
+    auto send = c->send;
+    l.unlock();
+    return send(json{{"type", "event"}, {"event", event}, {"payload", payload}}.dump());
+}
+
 json NodeHub::Invoke(const std::string& node_id, const std::string& command, const json& params, int timeout_ms, const std::string& idem) {
     auto fail = [](const std::string& code, const std::string& msg) { return json{{"ok", false}, {"error", {{"code", code}, {"message", msg}}}}; };
     std::unique_lock l(g_mu);

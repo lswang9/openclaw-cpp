@@ -1,3 +1,5 @@
+#include <atomic>
+#include <unistd.h>
 #include <ctime>
 #include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/gateway/node_hub.hpp"
@@ -1398,6 +1400,228 @@ ExtraResult MessageAction(const fs::path& root, const json& p) {
     return Ok({{"ok", true}, {"result", rec}});
 }
 
+
+// ---------------------------------------------------------------- local-state groups: task suggestions, progress cards, cron scratch,
+// node pending queue, session metadata (groups, involvement, viewers, owner, visibility, share), misc reads.
+fs::path MetaPath(const fs::path& root, const char* n) { return root / (std::string(n) + ".json"); }
+std::string Rid(const char* pfx) { static std::atomic<int> n{0}; return std::string(pfx) + "-" + std::to_string(NowMs()) + "-" + std::to_string(++n); }
+ExtraResult LocalGroups(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto rpc_ok = [](const std::string& mm, const json& pp, json* out) { auto r = GatewayRpc(mm, pp); if (out) *out = r.value("payload", json()); return r.value("ok", false); };
+    std::unique_lock<std::mutex> l(g_mu);
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    // ---- task suggestions
+    if (m.rfind("taskSuggestions.", 0) == 0) {
+        auto db = ReadJsonFile(MetaPath(root, "task-suggestions"), json::object());
+        auto save = [&] { WriteJsonFile(MetaPath(root, "task-suggestions"), db); };
+        if (m == "taskSuggestions.list") {
+            json out = json::array();
+            for (auto& [k, v] : db.items()) if ((str("sessionKey").empty() || v["sessionKey"] == str("sessionKey")) && (str("agentId").empty() || v.value("agentId", "") == str("agentId"))) out.push_back(v);
+            return Ok({{"suggestions", out}});
+        }
+        if (m == "taskSuggestions.create") {
+            for (auto k : {"title", "prompt", "tldr", "cwd", "sessionKey"}) if (str(k).empty()) return Fail(std::string(k) + " is required");
+            if (str("title").size() > 60) return Fail("title must be ≤ 60 characters");
+            const auto id = Rid("task");
+            db[id] = {{"id", id}, {"title", str("title")}, {"prompt", str("prompt")}, {"tldr", str("tldr")}, {"cwd", str("cwd")}, {"sessionKey", str("sessionKey")}, {"createdAt", NowMs()}};
+            if (!str("agentId").empty()) db[id]["agentId"] = str("agentId");
+            save(); return Ok({{"taskId", id}, {"suggestion", db[id]}});
+        }
+        const auto id = str("taskId");
+        if (!db.contains(id)) return Fail("unknown task suggestion: " + id);
+        if (m == "taskSuggestions.dismiss") { db.erase(id); save(); return Ok({{"taskId", id}, {"resolution", "dismissed"}}); }
+        if (m == "taskSuggestions.accept") {
+            json s = db[id]; db.erase(id); save();  // claim atomically before starting work
+            const auto mode = p.value("mode", std::string("session"));
+            if (mode == "cloud") return Fail("cloud execution is not available in the C++ runtime");
+            const auto agent = s.value("agentId", std::string("main"));
+            const auto key = "agent:" + agent + ":task:" + id;
+            l.unlock();
+            if (mode == "worktree") {
+                json wt; if (!rpc_ok("worktrees.create", {{"repoRoot", p.value("cwd", s["cwd"].get<std::string>())}, {"name", id}}, &wt)) return Fail("worktree creation failed");
+            }
+            json out; if (!rpc_ok("chat.send", {{"sessionKey", key}, {"message", s["prompt"]}, {"agentId", agent}}, &out)) return Fail("starting the task failed");
+            return Ok({{"taskId", id}, {"key", key}});
+        }
+    }
+    // ---- progress cards
+    if (m.rfind("progressCard.", 0) == 0) {
+        auto db = ReadJsonFile(MetaPath(root, "progress-cards"), json::object());
+        const auto key = str("agentId").empty() ? str("sessionKey") : str("agentId") + "|" + str("sessionKey");
+        if (str("sessionKey").empty()) return Fail("sessionKey is required");
+        if (m == "progressCard.get" || m == "progressCard.refresh") return Ok({{"card", db.contains(key) ? db[key] : json(nullptr)}});
+        const int rev = db.contains(key) ? db[key].value("revision", 0) : 0;
+        if (p.contains("expectedRevision") && p["expectedRevision"].get<int>() != rev) return Fail("revision conflict: current revision is " + std::to_string(rev));
+        json card{{"sessionKey", str("sessionKey")}, {"revision", rev + 1}, {"updatedAt", NowMs()}};
+        if (p.contains("markdown")) { if (str("markdown").size() > 8192) return Fail("markdown exceeds 8192 bytes"); card["markdown"] = p["markdown"]; }
+        if (p.contains("plan")) { if (p["plan"].size() > 50) return Fail("plan exceeds 50 steps"); card["steps"] = p["plan"]; }
+        db[key] = card; WriteJsonFile(MetaPath(root, "progress-cards"), db);
+        return Ok({{"card", card}});
+    }
+    // ---- cron scratch (one shared scratchpad with optimistic revisions)
+    if (m == "cron.scratch.get" || m == "cron.scratch.set") {
+        auto db = ReadJsonFile(MetaPath(root, "cron-scratch"), json{{"content", ""}, {"revision", 0}});
+        if (m == "cron.scratch.get") return Ok({{"scratch", db["content"]}, {"currentRevision", db["revision"]}});
+        if (p.contains("expectedRevision") && p["expectedRevision"] != db["revision"]) return Fail("revision conflict: current revision is " + db["revision"].dump());
+        if (str("content").size() > 64 * 1024) return Fail("content too large");
+        db = {{"content", str("content")}, {"revision", db["revision"].get<int>() + 1}, {"updatedAt", NowMs()}};
+        WriteJsonFile(MetaPath(root, "cron-scratch"), db);
+        return Ok({{"currentRevision", db["revision"]}});
+    }
+    // ---- node pending work queue
+    if (m.rfind("node.pending.", 0) == 0) {
+        auto db = ReadJsonFile(MetaPath(root, "node-pending"), json::object());
+        auto save = [&] { WriteJsonFile(MetaPath(root, "node-pending"), db); };
+        const auto nid = str("nodeId").empty() ? NodeHub::Global().NodeOf(GatewayConnId()) : str("nodeId");
+        if (nid.empty()) return Fail("nodeId is required");
+        auto& q = db[nid]; if (!q.is_array()) q = json::array();
+        const auto now = NowMs();
+        json live = json::array(); for (auto& it : q) if (it.value("expiresAt", 0LL) == 0 || it["expiresAt"].get<long long>() > now) live.push_back(it); q = live;
+        if (m == "node.pending.enqueue") {
+            if (str("type").empty()) return Fail("type is required");
+            json it{{"id", Rid("pend")}, {"type", str("type")}, {"priority", p.value("priority", 0)}, {"payload", p.value("payload", json::object())}, {"createdAt", now}};
+            if (p.contains("expiresInMs")) it["expiresAt"] = now + p["expiresInMs"].get<long long>();
+            q.push_back(it); save();
+            if (p.value("wake", false)) NodeHub::Global().Notify(nid, "node.pending.wake", {{"nodeId", nid}});
+            return Ok({{"item", it}, {"queued", q.size()}});
+        }
+        if (m == "node.pending.pull" || m == "node.pending.drain") {
+            std::vector<json> v(q.begin(), q.end());
+            std::stable_sort(v.begin(), v.end(), [](const json& a, const json& b) { return a.value("priority", 0) > b.value("priority", 0); });
+            const size_t mx = std::clamp(p.value("maxItems", 50), 1, 500);
+            json out = json::array(); for (size_t i = 0; i < v.size() && i < mx; ++i) out.push_back(v[i]);
+            if (m == "node.pending.drain") { json rest = json::array(); for (size_t i = mx; i < v.size(); ++i) rest.push_back(v[i]); q = rest; }
+            save(); return Ok({{"items", out}});
+        }
+        if (m == "node.pending.ack") {
+            std::set<std::string> ids; for (auto& i : p.value("ids", json::array())) if (i.is_string()) ids.insert(i.get<std::string>());
+            json rest = json::array(); int acked = 0; for (auto& it : q) { if (ids.count(it["id"].get<std::string>())) ++acked; else rest.push_back(it); }
+            q = rest; save(); return Ok({{"acked", acked}});
+        }
+    }
+    // ---- node capability updates from a connected node
+    if (m == "node.skills.update" || m == "node.pluginTools.update" || m == "node.runnerInventory.update" || m == "node.pluginSurface.refresh" || m == "plugin.surface.refresh") {
+        const auto nid = str("nodeId").empty() ? NodeHub::Global().NodeOf(GatewayConnId()) : str("nodeId");
+        if (nid.empty() && m.rfind("node.", 0) == 0) return Fail("caller is not a connected node");
+        auto db = ReadJsonFile(MetaPath(root, "node-capabilities"), json::object());
+        const auto field = m.substr(m.find('.') + 1, m.rfind('.') - m.find('.') - 1);
+        db[nid.empty() ? "gateway" : nid][field] = p; db[nid.empty() ? "gateway" : nid]["updatedAt"] = NowMs();
+        WriteJsonFile(MetaPath(root, "node-capabilities"), db);
+        return Ok({{"ok", true}, {"nodeId", nid}, {"updated", field}});
+    }
+    if (m == "node.invoke.progress") {
+        if (str("invokeId").empty()) return Fail("invokeId is required");
+        l.unlock();
+        GatewayRpc("node.event", {{"event", "node.invoke.progress"}, {"payload", p}});
+        return Ok({{"ok", true}});
+    }
+    // ---- session metadata
+    auto meta = ReadJsonFile(MetaPath(root, "session-meta"), json{{"sessions", json::object()}, {"groups", json::object()}, {"defaults", json::object()}, {"observerVisible", true}});
+    auto save_meta = [&] { WriteJsonFile(MetaPath(root, "session-meta"), meta); };
+    auto skey = [&] { auto k = str("key").empty() ? str("sessionKey") : str("key"); return k; };
+    if (m == "sessions.groups.rename") {
+        if (str("name").empty() || str("to").empty()) return Fail("name and to are required");
+        auto& g = meta["groups"]; g[str("to")] = g.contains(str("name")) ? g[str("name")] : json::object(); g.erase(str("name"));
+        for (auto& [k, v] : meta["sessions"].items()) if (v.value("group", "") == str("name")) v["group"] = str("to");
+        save_meta(); return Ok({{"name", str("to")}, {"group", g[str("to")]}});
+    }
+    if (m == "sessions.groups.update") {
+        if (str("name").empty()) return Fail("name is required");
+        auto& g = meta["groups"][str("name")]; if (!g.is_object()) g = json::object();
+        for (auto k : {"cwd", "worktree"}) if (p.contains(k)) g[k] = p[k];
+        save_meta(); return Ok({{"name", str("name")}, {"group", g}});
+    }
+    if (m == "sessions.groups.defaults") { if (p.contains("defaults")) { meta["defaults"] = p["defaults"]; save_meta(); } return Ok({{"defaults", meta["defaults"]}}); }
+    if (m == "sessions.observer.visibility") { if (p.contains("visible")) { meta["observerVisible"] = p.value("visible", true); save_meta(); } return Ok({{"visible", meta["observerVisible"]}}); }
+    if (m == "sessions.setInvolvement" || m == "sessions.viewers.set" || m == "sessions.assignOwner" || m == "session.visibility.set" || m == "session.publicShare.set") {
+        const auto k = skey();
+        if (k.empty()) return Fail("key is required");
+        auto& s = meta["sessions"][k]; if (!s.is_object()) s = json::object();
+        if (m == "sessions.setInvolvement") s["hidden"] = p.value("hidden", false);
+        else if (m == "sessions.viewers.set") s["viewers"] = p.value("viewers", json::array());
+        else if (m == "sessions.assignOwner") s["owner"] = p.value("owner", json(nullptr));
+        else if (m == "session.visibility.set") { const auto v = str("visibility"); if (v != "private" && v != "team" && v != "public") return Fail("visibility must be private, team or public"); s["visibility"] = v; }
+        else { s["publicShare"] = p.value("enabled", false); if (s["publicShare"]) s["shareId"] = s.value("shareId", Rid("share")); else s.erase("shareId"); }
+        save_meta(); json o = s; o["key"] = k; return Ok(o);
+    }
+    if (m == "sessions.patchMany") {
+        auto targets = p.value("targets", json::array());
+        if (targets.empty() || targets.size() > 200) return Fail("targets must have 1..200 entries");
+        l.unlock();
+        json res = json::array();
+        for (auto& tg : targets) {
+            json pp = p.value("patch", json::object()); pp["key"] = tg.is_string() ? tg : tg.value("key", json(""));
+            auto r = GatewayRpc("sessions.patch", pp); res.push_back({{"key", pp["key"]}, {"ok", r.value("ok", false)}});
+        }
+        return Ok({{"results", res}});
+    }
+    l.unlock();
+    // ---- reads over existing state
+    if (m == "chat.message.get") {
+        const auto k = str("sessionKey");
+        auto& store = d.agent_pool ? d.agent_pool->Sessions(str("agentId").empty() ? std::string("main") : str("agentId")) : d.sessions;
+        if (k.empty() || !store.Exists(k)) return Fail("session not found");
+        auto msgs = store.Load(k);
+        size_t idx = 0; const auto mid = p.contains("messageId") ? (p["messageId"].is_number() ? p["messageId"].dump() : p["messageId"].get<std::string>()) : std::string();
+        try { idx = std::stoul(mid); } catch (...) { return Fail("messageId must be a message index"); }
+        if (idx >= msgs.size()) return Fail("message not found");
+        auto j = msgs[idx].ToJson(); const size_t mx = std::clamp(p.value("maxChars", 20000), 1, 200000);
+        if (j.contains("content") && j["content"].is_string() && j["content"].get<std::string>().size() > mx) { j["content"] = j["content"].get<std::string>().substr(0, mx); j["truncated"] = true; }
+        return Ok({{"message", j}, {"messageId", std::to_string(idx)}});
+    }
+    if (m == "chat.toolTitles") {
+        json titles = json::object();
+        for (auto& n : d.tools.Names()) { std::string t2 = n; std::replace(t2.begin(), t2.end(), '_', ' '); if (!t2.empty()) t2[0] = static_cast<char>(std::toupper(t2[0])); titles[n] = t2; }
+        return Ok({{"titles", titles}});
+    }
+    if (m == "mentions.list") {
+        json ul; GatewayRpc("users.mentionable", json::object()).value("payload", json::object()).swap(ul);
+        json out = json::array();
+        for (auto& u : ul.value("users", json::array())) out.push_back({{"kind", "user"}, {"id", u["id"]}, {"label", u["displayName"]}});
+        for (auto& a : agent::routing::ListAgents(d.config.raw)) out.push_back({{"kind", "agent"}, {"id", a.id}, {"label", a.name}});
+        return Ok({{"mentions", out}});
+    }
+    if (m == "sessions.diff") {
+        const auto ws = WorkspaceOf(d, str("agentId").empty() ? std::string("main") : str("agentId"));
+        std::vector<std::string> args{"git", "-C", ws.string(), "diff"};
+        if (!str("commit").empty()) { args.push_back(str("commit") + "^!"); } else if (p.value("scope", std::string()) == "staged") args.push_back("--cached");
+        auto r = Run(args, {});
+        if (r.code != 0) return Fail("workspace is not a git repository");
+        auto st = Run({"git", "-C", ws.string(), "diff", "--stat"}, {});
+        return Ok({{"diff", r.out.substr(0, 2000000)}, {"stat", Trim(st.out)}, {"truncated", r.out.size() > 2000000}});
+    }
+    if (m == "transcripts.export") {
+        const auto k = p.value("selector", json::object()).value("sessionKey", str("sessionKey"));
+        if (k.empty() || !d.sessions.Exists(k)) return Fail("session not found");
+        const auto fmt = p.value("format", std::string("markdown"));
+        auto msgs = d.sessions.Load(k);
+        if (fmt == "json") { json a = json::array(); for (auto& x : msgs) a.push_back(x.ToJson()); return Ok({{"format", "json"}, {"content", a.dump(2)}}); }
+        std::string md = "# Transcript " + k + "\n\n";
+        for (auto& x : msgs) if (x.role != "system") md += "**" + x.role + "**: " + x.content + "\n\n";
+        return Ok({{"format", "markdown"}, {"content", md}});
+    }
+    if (m == "gateway.identity.get") {
+        auto idf = root / "gateway-identity.json";
+        auto j = ReadJsonFile(idf, json::object());
+        if (!j.contains("gatewayId")) { std::lock_guard<std::mutex> l2(g_mu); j = {{"gatewayId", Rid("gw")}, {"createdAt", NowMs()}}; WriteJsonFile(idf, j); }
+        char host[256] = {0}; gethostname(host, sizeof host - 1);
+        j["hostname"] = host; j["runtime"] = "openclaw-cpp";
+        return Ok(j);
+    }
+    if (m == "wake") {
+        const auto mode = p.value("mode", std::string("now"));
+        if (mode != "now" && mode != "next-heartbeat") return Fail("mode must be now or next-heartbeat");
+        if (mode == "now" && !str("text").empty()) {
+            json out; auto r = GatewayRpc("chat.send", {{"sessionKey", str("sessionKey").empty() ? std::string("agent:main:main") : str("sessionKey")}, {"message", str("text")}, {"agentId", str("agentId").empty() ? std::string("main") : str("agentId")}});
+            return r.value("ok", false) ? Ok({{"ok", true}, {"mode", mode}, {"ran", true}}) : Fail("wake turn failed");
+        }
+        std::lock_guard<std::mutex> l2(g_mu);
+        auto q = ReadJsonFile(MetaPath(root, "wake-queue"), json::array()); q.push_back({{"text", str("text")}, {"at", NowMs()}, {"mode", mode}});
+        WriteJsonFile(MetaPath(root, "wake-queue"), q);
+        return Ok({{"ok", true}, {"mode", mode}, {"queued", true}});
+    }
+    return {};
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
@@ -1406,6 +1630,7 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
         if (method.rfind("users.", 0) == 0 && method.rfind("users.authConnect.", 0) != 0) { auto r = Users(deps, root, method, params); if (r.handled) return r; }
         if (method == "device.pair.rename") return DeviceRename(root, params);
         if (method == "message.action") return MessageAction(root, params);
+        { auto r = LocalGroups(deps, root, method, params); if (r.handled) return r; }
         if (method == "projects.list" || method == "projects.register" || method == "projects.add" || method == "projects.remove") return Projects(deps, root, method, params);
         if (method == "sessions.companion.ask" || method == "sessions.companion.state" || method == "sessions.companion.reset")
             return Companion(deps, method, params);

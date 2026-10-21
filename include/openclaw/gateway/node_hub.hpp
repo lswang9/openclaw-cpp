@@ -26,8 +26,12 @@ public:
     // Blocks until the node answers or timeout. On success returns {ok:true, payload, payloadJSON}; else {ok:false, error{code,message}}.
     nlohmann::json Invoke(const std::string& node_id, const std::string& command, const nlohmann::json& params,
                           int timeout_ms, const std::string& idempotency_key = {});
+    // Push an event frame to a connected node (false when not connected).
+    bool Notify(const std::string& node_id, const std::string& event, const nlohmann::json& payload);
     // Called for node.invoke.result arriving on connection `conn`.
     bool Result(int conn, const nlohmann::json& params, std::string* err);
 };
 
+// WebSocket connection id of the current RPC on this thread (-1 for HTTP).
+int GatewayConnId();
 }  // namespace openclaw::gateway
