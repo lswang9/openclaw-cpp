@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.71.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.72.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,10 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.72.0-dev
+- 桌面控制：真实启动应用（默认拒绝，需白名单）、窗口列表/聚焦/关闭、释放进程；AT-SPI 无障碍树与动作（点击、设文本）；e2e 在 Xvfb 下运行，已纳入 smoke。
+- 仍缺：Wayland/macOS/Windows、agent 工具封装。
 
 ### 1.71.0-dev
 - Canvas：A2UI v0.8 宿主，包括 JSONL 校验（拒绝 v0.9）、推送/重置/状态 RPC、服务端渲染常用组件与数据绑定、按钮 userAction 事件，以及 agent 工具 `canvas`；e2e 已纳入 smoke。

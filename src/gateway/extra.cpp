@@ -1,3 +1,4 @@
+#include "openclaw/desktop/desktop.hpp"
 #include "openclaw/acp/session.hpp"
 #include "openclaw/gateway/extra.hpp"
 #include "openclaw/agent/types.hpp"
@@ -1850,6 +1851,21 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
                 return r;
             }
             r.payload = tag_canvas(sim.CanvasView(params));
+            return r;
+        }
+        if (starts("desktop.") && desktop::Default().Available() && method != "desktop.sim.status") {
+            auto& dc = desktop::Default();
+            nlohmann::json out;
+            if (method == "desktop.launch") out = dc.Launch(params);
+            else if (method == "desktop.observe") out = dc.Observe(params);
+            else if (method == "desktop.release") out = dc.Release(params);
+            else if (method == "desktop.windows") out = dc.Windows();
+            else if (method == "desktop.focus") out = dc.Focus(params);
+            else if (method == "desktop.close") out = dc.Close(params);
+            else if (method == "desktop.a11y.tree") out = dc.A11yTree(params);
+            else if (method == "desktop.a11y.action") out = dc.A11yAction(params);
+            else out = dc.Status();
+            r.payload = Real(std::move(out));
             return r;
         }
         if (starts("desktop.")) {

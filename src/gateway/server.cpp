@@ -48,7 +48,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.71.0-dev";
+constexpr const char* kVersion = "1.72.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1381,7 +1381,7 @@ bool DeviceRoleForbidden(const std::string& m) {
     if (starts("pairing.") || starts("channels.pairing.") || starts("device.pair") || starts("device.token") ||
         starts("node.pair") || starts("secrets.") || starts("config.") || starts("approvals.") ||
         starts("exec.approval") || starts("plugins.install") || starts("plugins.uninstall") ||
-        starts("update.") || starts("acp.auth.") || m == "gateway.restart" || m == "gateway.stop" ||
+        starts("update.") || m == "desktop.launch" || m == "desktop.a11y.action" || starts("acp.auth.") || m == "gateway.restart" || m == "gateway.stop" ||
         m == "shutdown")
         return true;
     return false;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.71.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.72.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,6 +23,7 @@ set(OPENCLAW_SOURCES
   src/board/store.cpp
   src/canvas/store.cpp
   src/canvas/a2ui.cpp
+  src/desktop/desktop.cpp
   src/acp/wire.cpp
   src/sim/backend.cpp
   src/sim/capture.cpp
