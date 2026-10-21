@@ -2,6 +2,9 @@
 #include <iterator>
 #include <unordered_map>
 #include <openssl/bn.h>
+#ifdef OPENCLAW_HAVE_ZLIB
+#include <zlib.h>
+#endif
 #include "openclaw/channels/waweb/noise.hpp"
 
 #include <openssl/evp.h>
@@ -705,7 +708,30 @@ Bytes EncodeBinaryNode(const BinaryNode& n, bool with_frame_flag) {
 std::optional<BinaryNode> DecodeBinaryNode(const Bytes& b, bool with_frame_flag, std::string* error) {
     if (with_frame_flag) {
         if (b.empty()) { if (error) *error = "empty"; return std::nullopt; }
-        if (b[0] & 2) { if (error) *error = "zlib-compressed frame not supported"; return std::nullopt; }
+        if (b[0] & 2) {
+#ifdef OPENCLAW_HAVE_ZLIB
+            // Baileys decompressingIfRequired: zlib inflate of the remainder.
+            z_stream zs{};
+            if (inflateInit(&zs) != Z_OK) { if (error) *error = "inflateInit"; return std::nullopt; }
+            Bytes out(std::max<std::size_t>(b.size() * 4, 256));
+            zs.next_in = const_cast<Bytef*>(b.data() + 1);
+            zs.avail_in = static_cast<uInt>(b.size() - 1);
+            int rc;
+            do {
+                if (zs.total_out >= out.size()) { if (out.size() > (8u << 20)) { inflateEnd(&zs); if (error) *error = "frame too large"; return std::nullopt; } out.resize(out.size() * 2); }
+                zs.next_out = out.data() + zs.total_out;
+                zs.avail_out = static_cast<uInt>(out.size() - zs.total_out);
+                rc = inflate(&zs, Z_NO_FLUSH);
+            } while (rc == Z_OK);
+            const auto n = zs.total_out;
+            inflateEnd(&zs);
+            if (rc != Z_STREAM_END) { if (error) *error = "zlib inflate failed"; return std::nullopt; }
+            out.resize(n);
+            return DecodeBinaryNode(out, false, error);
+#else
+            if (error) *error = "zlib-compressed frame not supported (built without zlib)"; return std::nullopt;
+#endif
+        }
         Bytes rest(b.begin() + 1, b.end());
         return DecodeBinaryNode(rest, false, error);
     }

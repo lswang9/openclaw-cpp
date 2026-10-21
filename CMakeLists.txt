@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.74.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.75.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,7 @@ find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
+find_package(ZLIB QUIET)
 
 set(OPENCLAW_SOURCES
   src/main.cpp
@@ -75,6 +76,7 @@ set(OPENCLAW_SOURCES
   src/plugins/install.cpp
   src/clawhub/client.cpp
   src/channels/waweb/noise.cpp
+  src/channels/waweb/signal.cpp
   src/net/safe_fetch.cpp
   src/voice/stt.cpp
   src/auth/profiles.cpp
@@ -109,6 +111,14 @@ target_link_libraries(openclaw-cpp PRIVATE
   Threads::Threads
   SQLite::SQLite3
   ${CMAKE_DL_LIBS})
+if(ZLIB_FOUND)
+  target_link_libraries(openclaw-cpp PRIVATE ZLIB::ZLIB)
+  # Older local generator trees saw zlib only transitively (headers hidden); expose the package include dir.
+  if(DEFINED zlib_PACKAGE_FOLDER_RELEASE AND EXISTS "${zlib_PACKAGE_FOLDER_RELEASE}/include/zlib.h")
+    target_include_directories(openclaw-cpp PRIVATE "${zlib_PACKAGE_FOLDER_RELEASE}/include")
+  endif()
+  target_compile_definitions(openclaw-cpp PRIVATE OPENCLAW_HAVE_ZLIB=1)
+endif()
 
 # Sample native plugin (.so) — Linux
 add_library(openclaw_sample_echo SHARED plugins/sample_echo/plugin.c)

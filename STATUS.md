@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.74.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.75.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,10 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.75.0-dev
+- WA Web：支持 zlib 压缩帧；离线实现 Signal 协议（X3DH + 双棘轮，pkmsg/msg 格式、乱序、防重放），尚未与 libsignal 做字节级对拍。
+- 仍缺：XEdDSA 签名、群组 sender key、会话持久化、实时登录。
 
 ### 1.74.0-dev
 - OIDC：支持 ES256、按组映射角色、用刷新令牌定期重新校验（失败即结束会话）；MFA 改为按用户注册（`--user`）。

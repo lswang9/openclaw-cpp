@@ -4,7 +4,7 @@ from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 
 class OpenclawCppConan(ConanFile):
     name = "openclaw-cpp"
-    version = "1.74.0"
+    version = "1.75.0"
     package_type = "application"
     settings = "os", "compiler", "build_type", "arch"
     generators = "CMakeDeps", "CMakeToolchain"
@@ -12,6 +12,7 @@ class OpenclawCppConan(ConanFile):
     def requirements(self):
         self.requires("nlohmann_json/3.11.3")
         self.requires("libcurl/8.10.1")
+        self.requires("zlib/[>=1.2.11 <2]")  # WA Web compressed frames (also a libcurl dep)
 
     def configure(self):
         self.settings.compiler.cppstd = "20"

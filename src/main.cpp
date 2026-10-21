@@ -1,3 +1,4 @@
+#include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/auth/mfa.hpp"
 #include <openssl/bn.h>
@@ -97,7 +98,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.74.0-dev";
+constexpr const char* kVersion = "1.75.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2493,12 +2494,54 @@ int CmdSelfTest() {
             auto n = ww::DecodeBinaryNode(raw, true, &err);
             if (!n || n->tag != f[1] || ww::EncodeBinaryNode(*n) != raw) { ++bad; std::cerr << "  fixture " << f[1] << " err=" << err << "\n"; }
         }
+#ifdef OPENCLAW_HAVE_ZLIB
+        {   // Node zlib.deflateSync of the iq fixture body, flag byte 2 (Baileys compressed frame).
+            std::string zerr;
+            auto zn = ww::DecodeBinaryNode(unhex("02789cfbc129c9f1bf4dc8646b7ad77c164db17041660041b805e1"), true, &zerr);
+            if (!zn || zn->tag != "iq" || ww::EncodeBinaryNode(*zn) != unhex(kBaileysFixtures[0][0])) { ++bad; std::cerr << "  zlib frame err=" << zerr << "\n"; }
+        }
+#endif
         ww::BinaryNode m{"message", {{"to", "15551234567@s.whatsapp.net"}, {"id", "3EB0A1B2C3D4E5F6"}, {"type", "text"}}, {}, {}, false, false};
         m.children.push_back({"body", {}, ww::FromString("hi"), {}, true, false});
         auto rt = ww::DecodeBinaryNode(ww::EncodeBinaryNode(m));
         if (bad || !rt || rt->attrs[0].second != "15551234567@s.whatsapp.net" || rt->children.size() != 1 || rt->children[0].content != ww::FromString("hi")) {
             std::cerr << "FAIL waweb binary v3 baileys fixtures\n"; ++failures;
         } else std::cerr << "PASS waweb binary token dictionary v3 (Baileys fixtures byte-identical)\n";
+    }
+    {
+        namespace sg = openclaw::channels::waweb::signal;
+        namespace ww = openclaw::channels::waweb;
+        auto alice = sg::NewIdentity(111), bob = sg::NewIdentity(222);
+        std::string e;
+        auto bundle = bob.Bundle(1);
+        auto bad = bundle; bad.signed_prekey_sig = ww::Bytes(64, 1);
+        bool ok = !sg::InitiateOutgoing(alice, bad, &e) && e.find("signature") != std::string::npos;
+        auto as = sg::InitiateOutgoing(alice, bundle, &e);
+        std::optional<sg::Session> bs;
+        auto m1 = sg::Encrypt(*as, ww::FromString("hello bob")), m2 = sg::Encrypt(*as, ww::FromString("again"));
+        ok = ok && m1.type == "pkmsg" && m2.type == "pkmsg";
+        auto p1 = sg::DecryptPreKey(bob, bs, m1.body, &e);
+        auto p2 = sg::DecryptPreKey(bob, bs, m2.body, &e);
+        ok = ok && p1 && *p1 == ww::FromString("hello bob") && p2 && *p2 == ww::FromString("again") && !bob.prekeys.count(1);
+        auto r1 = sg::Encrypt(*bs, ww::FromString("hi alice"));
+        auto q1 = sg::Decrypt(*as, r1.body, &e);
+        ok = ok && r1.type == "msg" && q1 && *q1 == ww::FromString("hi alice");
+        auto a1 = sg::Encrypt(*as, ww::FromString("one")), a2 = sg::Encrypt(*as, ww::FromString("two")), a3 = sg::Encrypt(*as, ww::FromString("three"));
+        ok = ok && a1.type == "msg";
+        auto t = a1.body; t[t.size() - 1] ^= 1;
+        ok = ok && !sg::Decrypt(*bs, t, &e);  // bad mac, state untouched
+        auto o3 = sg::Decrypt(*bs, a3.body, &e), o1 = sg::Decrypt(*bs, a1.body, &e), o2 = sg::Decrypt(*bs, a2.body, &e);
+        ok = ok && o3 && *o3 == ww::FromString("three") && o1 && *o1 == ww::FromString("one") && o2 && *o2 == ww::FromString("two");
+        ok = ok && !sg::Decrypt(*bs, a2.body, &e);  // replay
+        for (int i = 0; i < 4 && ok; ++i) {  // ping-pong ratchet turns
+            auto x = sg::Encrypt(*bs, ww::FromString("b" + std::to_string(i)));
+            auto y = sg::Decrypt(*as, x.body, &e);
+            auto z = sg::Encrypt(*as, ww::FromString("a" + std::to_string(i)));
+            auto w = sg::Decrypt(*bs, z.body, &e);
+            ok = y && w && *w == ww::FromString("a" + std::to_string(i));
+        }
+        if (!ok) { std::cerr << "FAIL signal x3dh/double ratchet (" << e << ")\n"; ++failures; }
+        else std::cerr << "PASS signal X3DH + Double Ratchet (pkmsg, out-of-order, replay/mac reject, ratchet turns)\n";
     }
     {
         // XEdDSA cert chain: synthetic root/intermediate/leaf (Ed25519 keys with sign bit 0, converted to Montgomery).
