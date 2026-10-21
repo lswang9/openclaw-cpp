@@ -5,8 +5,14 @@
 #include <openssl/param_build.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/objects.h>
+#include <cstdlib>
 
 #include <chrono>
+#include <memory>
+#include <vector>
 #include <fstream>
 #include <sys/stat.h>
 
@@ -120,7 +126,7 @@ std::optional<nlohmann::json> CoseToKey(const nlohmann::json& m) {
     if (kty == 3 && alg == -257) return nlohmann::json{{"alg", -257}, {"n", B64UrlEncode(Bin(m["-1"]))}, {"e", B64UrlEncode(Bin(m["-2"]))}};
     return std::nullopt;
 }
-struct AuthData { std::string rp_hash; std::uint8_t flags = 0; std::uint32_t count = 0; std::string cred_id; nlohmann::json cose; };
+struct AuthData { std::string rp_hash; std::uint8_t flags = 0; std::uint32_t count = 0; std::string aaguid, cred_id; nlohmann::json cose; };
 std::optional<AuthData> ParseAuthData(const std::string& a, bool want_cred) {
     if (a.size() < 37) return std::nullopt;
     AuthData d;
@@ -131,6 +137,7 @@ std::optional<AuthData> ParseAuthData(const std::string& a, bool want_cred) {
         if (!(d.flags & 0x40) || a.size() < 55) return std::nullopt;
         const std::size_t len = (static_cast<std::uint8_t>(a[53]) << 8) | static_cast<std::uint8_t>(a[54]);
         if (len == 0 || len > 1023 || a.size() < 55 + len) return std::nullopt;
+        d.aaguid = a.substr(37, 16);
         d.cred_id = a.substr(55, len);
         std::size_t used = 0;
         auto cose = DecodeCbor(a.substr(55 + len), &used);
@@ -138,6 +145,103 @@ std::optional<AuthData> ParseAuthData(const std::string& a, bool want_cred) {
         d.cose = *cose;
     }
     return d;
+}
+std::string Policy() {
+    const char* p = std::getenv("OPENCLAW_WEBAUTHN_ATTESTATION");
+    std::string s = p && *p ? p : "none";
+    return (s == "required" || s == "trusted") ? s : "none";
+}
+struct X509Del { void operator()(X509* x) const { X509_free(x); } };
+using X509Ptr = std::unique_ptr<X509, X509Del>;
+X509Ptr ParseDer(const std::string& der) {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(der.data());
+    return X509Ptr(d2i_X509(nullptr, &p, static_cast<long>(der.size())));
+}
+bool VerifyWithPkey(EVP_PKEY* pk, bool sha256, const std::string& msg, const std::string& sig) {
+    EVP_MD_CTX* md = EVP_MD_CTX_new();
+    bool ok = EVP_DigestVerifyInit(md, nullptr, sha256 ? EVP_sha256() : nullptr, nullptr, pk) == 1 &&
+              EVP_DigestVerify(md, reinterpret_cast<const unsigned char*>(sig.data()), sig.size(),
+                               reinterpret_cast<const unsigned char*>(msg.data()), msg.size()) == 1;
+    EVP_MD_CTX_free(md);
+    return ok;
+}
+std::string SubjectField(X509* x, int nid) {
+    char buf[256] = {0};
+    if (X509_NAME_get_text_by_NID(X509_get_subject_name(x), nid, buf, sizeof buf) < 0) return {};
+    return buf;
+}
+// Chain x5c to OPENCLAW_WEBAUTHN_TRUST_ANCHORS (PEM bundle). "" = trusted, else the reason.
+std::string ChainToAnchors(const std::vector<X509Ptr>& chain) {
+    const char* f = std::getenv("OPENCLAW_WEBAUTHN_TRUST_ANCHORS");
+    if (!f || !*f) return "no trust anchors configured (OPENCLAW_WEBAUTHN_TRUST_ANCHORS)";
+    X509_STORE* st = X509_STORE_new();
+    if (X509_STORE_load_file(st, f) != 1) { X509_STORE_free(st); return "cannot load trust anchors"; }
+    STACK_OF(X509)* inter = sk_X509_new_null();
+    for (size_t i = 1; i < chain.size(); ++i) sk_X509_push(inter, chain[i].get());
+    X509_STORE_CTX* ctx = X509_STORE_CTX_new();
+    X509_STORE_CTX_init(ctx, st, chain[0].get(), inter);
+    const bool ok = X509_verify_cert(ctx) == 1;
+    std::string why = ok ? "" : X509_verify_cert_error_string(X509_STORE_CTX_get_error(ctx));
+    X509_STORE_CTX_free(ctx); sk_X509_free(inter); X509_STORE_free(st);
+    return why;
+}
+// WebAuthn §8: verify attStmt. Returns {ok, type: none|self|basic, trusted?, error?}.
+nlohmann::json VerifyAttestation(const nlohmann::json& att, const std::string& auth_data, const AuthData& ad,
+                                 const nlohmann::json& key, const std::string& client_hash) {
+    const auto fmt = att.value("fmt", std::string());
+    const auto stmt = att.value("attStmt", nlohmann::json::object());
+    auto bad = [&](const std::string& e) { return nlohmann::json{{"ok", false}, {"fmt", fmt}, {"error", "attestation (" + fmt + "): " + e}}; };
+    const std::string signed_data = auth_data + client_hash;
+    std::vector<X509Ptr> chain;
+    if (stmt.contains("x5c")) {
+        if (!stmt["x5c"].is_array() || stmt["x5c"].empty() || stmt["x5c"].size() > 8) return bad("x5c malformed");
+        for (auto& c : stmt["x5c"]) { auto x = ParseDer(Bin(c)); if (!x) return bad("x5c certificate unparsable"); chain.push_back(std::move(x)); }
+    }
+    if (fmt == "none") {
+        if (!stmt.empty()) return bad("attStmt must be empty");
+        return {{"ok", true}, {"fmt", fmt}, {"type", "none"}};
+    }
+    if (fmt == "packed") {
+        const int alg = stmt.value("alg", 0);
+        const auto sig = Bin(stmt.value("sig", nlohmann::json()));
+        if (sig.empty()) return bad("sig missing");
+        if (chain.empty()) {  // self attestation
+            if (alg != key.value("alg", 0)) return bad("self attestation alg differs from credential alg");
+            if (!VerifySig(key, signed_data, sig)) return bad("self attestation signature invalid");
+            return {{"ok", true}, {"fmt", fmt}, {"type", "self"}};
+        }
+        if (alg != -7 && alg != -257 && alg != -8) return bad("unsupported alg " + std::to_string(alg));
+        X509* leaf = chain[0].get();
+        if (!VerifyWithPkey(X509_get0_pubkey(leaf), alg != -8, signed_data, sig)) return bad("signature does not verify with x5c[0]");
+        if (X509_get_version(leaf) != 2) return bad("attestation certificate must be X.509 v3");
+        if (SubjectField(leaf, NID_organizationalUnitName) != "Authenticator Attestation") return bad("subject OU must be 'Authenticator Attestation'");
+        if (SubjectField(leaf, NID_countryName).empty() || SubjectField(leaf, NID_organizationName).empty() || SubjectField(leaf, NID_commonName).empty())
+            return bad("subject C/O/CN required");
+        if (X509_get_extension_flags(leaf) & EXFLAG_CA) return bad("attestation certificate must not be a CA");
+        ASN1_OBJECT* oid = OBJ_txt2obj("1.3.6.1.4.1.45724.1.1.4", 1);
+        const int idx = X509_get_ext_by_OBJ(leaf, oid, -1);
+        ASN1_OBJECT_free(oid);
+        if (idx >= 0) {  // id-fido-gen-ce-aaguid: OCTET STRING { OCTET STRING aaguid }
+            ASN1_OCTET_STRING* v = X509_EXTENSION_get_data(X509_get_ext(leaf, idx));
+            const std::string raw(reinterpret_cast<const char*>(ASN1_STRING_get0_data(v)), ASN1_STRING_length(v));
+            if (raw.size() != 18 || raw[0] != 0x04 || raw[1] != 16 || raw.substr(2) != ad.aaguid) return bad("aaguid extension does not match authData");
+            if (X509_EXTENSION_get_critical(X509_get_ext(leaf, idx))) return bad("aaguid extension must not be critical");
+        }
+        auto why = ChainToAnchors(chain);
+        return {{"ok", true}, {"fmt", fmt}, {"type", "basic"}, {"trusted", why.empty()}, {"trust_note", why}};
+    }
+    if (fmt == "fido-u2f") {
+        if (chain.size() != 1) return bad("x5c must hold exactly one certificate");
+        if (key.value("alg", 0) != -7) return bad("credential key must be ES256");
+        EVP_PKEY* pk = X509_get0_pubkey(chain[0].get());
+        if (!pk || EVP_PKEY_get_base_id(pk) != EVP_PKEY_EC) return bad("certificate key must be EC P-256");
+        const auto sig = Bin(stmt.value("sig", nlohmann::json()));
+        const std::string vd = std::string(1, '\0') + ad.rp_hash + client_hash + ad.cred_id + "\x04" + B64UrlDecode(key.value("x", "")) + B64UrlDecode(key.value("y", ""));
+        if (!VerifyWithPkey(pk, true, vd, sig)) return bad("signature invalid");
+        auto why = ChainToAnchors(chain);
+        return {{"ok", true}, {"fmt", fmt}, {"type", "basic"}, {"trusted", why.empty()}, {"trust_note", why}};
+    }
+    return {{"ok", false}, {"fmt", fmt}, {"unsupported", true}, {"error", "attestation format '" + fmt + "' not supported (none|packed|fido-u2f)"}};
 }
 }  // namespace
 
@@ -202,7 +306,7 @@ nlohmann::json Store::List() const {
     auto out = nlohmann::json::array();
     for (auto& c : data_["credentials"])
         out.push_back({{"id", c["id"]}, {"user", c["user"]}, {"role", c["role"]}, {"alg", c["key"]["alg"]}, {"sign_count", c["sign_count"]},
-                       {"created_ms", c["created_ms"]}, {"last_used_ms", c.value("last_used_ms", 0)}});
+                       {"created_ms", c["created_ms"]}, {"last_used_ms", c.value("last_used_ms", 0)}, {"attestation", c.value("attestation", nlohmann::json())}});
     return out;
 }
 nlohmann::json Store::Remove(const std::string& id) {
@@ -239,7 +343,7 @@ nlohmann::json Store::BeginRegistration(const Rp& rp, const std::string& user, c
             {"user", {{"id", uid}, {"name", user}, {"displayName", user}}},
             {"challenge", ch},
             {"pubKeyCredParams", nlohmann::json::array({{{"type", "public-key"}, {"alg", -7}}, {{"type", "public-key"}, {"alg", -8}}, {{"type", "public-key"}, {"alg", -257}}})},
-            {"timeout", 300000}, {"attestation", "none"}, {"excludeCredentials", exclude},
+            {"timeout", 300000}, {"attestation", Policy() == "none" ? "none" : "direct"}, {"excludeCredentials", exclude},
             {"authenticatorSelection", {{"residentKey", "preferred"}, {"userVerification", "preferred"}}}};
 }
 
@@ -267,10 +371,18 @@ nlohmann::json Store::FinishRegistration(const Rp& rp, const nlohmann::json& cre
     const auto id = B64UrlEncode(ad->cred_id);
     if (cred.contains("rawId") && B64UrlDecode(cred.value("rawId", std::string())) != ad->cred_id) return fail("rawId does not match authData");
     for (auto& c : data_["credentials"]) if (c.value("id", "") == id) return fail("credential already registered");
+    // Attestation: a statement that is present but does not verify is always rejected; policy decides what is enough.
+    auto av = VerifyAttestation(*att, Bin((*att)["authData"]), *ad, *key, Sha256(cdj));
+    const auto policy = Policy();
+    if (!av.value("ok", false) && !(av.value("unsupported", false) && policy == "none")) return fail(av.value("error", std::string("attestation invalid")));
+    if (policy == "required" && !(av.value("ok", false) && (av["type"] == "self" || av["type"] == "basic"))) return fail("attestation required (policy=required), got " + av.value("type", std::string("none")));
+    if (policy == "trusted" && !av.value("trusted", false)) return fail("trusted attestation required: " + av.value("trust_note", av.value("error", std::string("type ") + av.value("type", std::string("none")))));
+    nlohmann::json attestation{{"fmt", av.value("fmt", std::string())}, {"type", av.value("ok", false) ? av.value("type", std::string()) : std::string("unverified")}, {"trusted", av.value("trusted", false)}};
     data_["credentials"].push_back({{"id", id}, {"user", (*chal)["user"]}, {"role", (*chal)["role"]}, {"key", *key}, {"sign_count", ad->count},
-                                    {"uv", (ad->flags & 0x04) != 0}, {"fmt", att->value("fmt", std::string())}, {"created_ms", NowMs()}});
+                                    {"uv", (ad->flags & 0x04) != 0}, {"fmt", att->value("fmt", std::string())}, {"attestation", attestation},
+                                    {"aaguid", B64UrlEncode(ad->aaguid)}, {"created_ms", NowMs()}});
     Save();
-    return {{"ok", true}, {"credential_id", id}, {"user", (*chal)["user"]}, {"role", (*chal)["role"]}, {"alg", (*key)["alg"]}};
+    return {{"ok", true}, {"credential_id", id}, {"user", (*chal)["user"]}, {"role", (*chal)["role"]}, {"alg", (*key)["alg"]}, {"attestation", attestation}};
 }
 
 nlohmann::json Store::BeginAuthentication(const Rp& rp) {

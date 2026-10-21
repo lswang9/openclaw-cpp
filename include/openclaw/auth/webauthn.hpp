@@ -4,7 +4,10 @@
 // credential is stored with the registering principal's role (no escalation). Authentication: public assertion
 // options; the assertion is verified (type, single-use challenge, origin, rpIdHash, UP flag, signCount, ES256 /
 // EdDSA / RS256 signature over authData || SHA-256(clientDataJSON)) and yields a session with the stored role.
-// Attestation statements are not verified (RP requests attestation "none"), as most RPs do.
+// Attestation (1.92): fmt none / packed (self + x5c basic, cert requirements, aaguid ext) / fido-u2f are verified;
+// an invalid statement is always rejected. OPENCLAW_WEBAUTHN_ATTESTATION=none (default: accept none/unsupported
+// formats as unverified) | required (self or basic) | trusted (x5c chains to OPENCLAW_WEBAUTHN_TRUST_ANCHORS PEM).
+// tpm / android-key / apple / android-safetynet are not verified.
 #include <nlohmann/json.hpp>
 
 #include <cstdint>

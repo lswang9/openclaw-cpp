@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.91.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.92.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -41,6 +41,8 @@
 - ACP client (acpx): **real** `terminal` client capability (terminal/create|output|wait_for_exit|kill|release; cwd confined to the session root, env, outputByteLimit tail-truncation at char boundary, process-group kill, all terminals reaped at end). Off by default; CLI `--terminal`, RPC/tool callers need `acp.agents.<id>.allowTerminal=true`. **real** multi-turn (`--then` / `turns`: several session/prompt in one session, per-turn text + stopReason). **real** session resume via session/load (`--session` / `session_id`, only when the agent advertises loadSession). **real** login: auth_required (-32000) → `authenticate{methodId}` (`--auth <id>|auto`, or `acp.agents.<id>.authMethod`) → retry. All covered by e2e-acpx.sh against a fake agent. Remaining: interactive/browser-based agent login flows (the agent's own OAuth) are the agent's business; no live Codex/Claude/Gemini runs.
 
 - Voice replies beyond Telegram: **real** Discord voice messages (multipart, flags 8192 IS_VOICE_MESSAGE, duration from the Ogg granule, waveform), Slack (files.getUploadURLExternal → upload → completeUploadExternal), Feishu (tenant token → im/v1/files file_type=opus with duration → msg_type=audio), WhatsApp Cloud (/media → type=audio, voice=true). Streamed TTS output is transcoded to Ogg/Opus with ffmpeg when it isn't already (Discord falls back to a plain attachment without ffmpeg). Shared `messages.tts.auto` policy now applies to Discord/Slack/Feishu/WhatsApp inbound replies too; new RPC `channels.voice.send`. Fixed: TTS `body_prefix` put raw audio bytes into JSON (invalid UTF-8 crash on binary TTS). e2e-voice-channels.sh against fake platforms. Remaining: Discord waveform is a coarse byte envelope, not a decoded amplitude; no live platform runs.
+
+- WebAuthn attestation: **real** verification of `none`, `packed` (self attestation with the credential key; x5c basic: signature with x5c[0], v3 cert, subject C/O/OU="Authenticator Attestation"/CN, not-CA, non-critical id-fido-gen-ce-aaguid must equal authData AAGUID) and `fido-u2f` (P-256 cert, U2F verificationData). Chains x5c to `OPENCLAW_WEBAUTHN_TRUST_ANCHORS` (PEM) with OpenSSL. Policy `OPENCLAW_WEBAUTHN_ATTESTATION` = none (default, invalid statements still rejected; unsupported formats stored as "unverified") | required | trusted; options request `direct` attestation when not none. e2e-webauthn-attestation.sh (software authenticator with generated CA / rogue CA). Remaining: tpm, android-key, android-safetynet, apple formats; no FIDO MDS metadata lookup.
 
 ## 1.85 Discord autocomplete + message context menu
 - real: command specs mark the `args` option `autocomplete: true` and add a MESSAGE context-menu command "Ask OpenClaw" (type 3).
