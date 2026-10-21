@@ -1,3 +1,11 @@
+#ifdef OPENCLAW_HAVE_LLAMA
+#include <llama.h>
+#endif
+#include <mutex>
+#include <thread>
+#include <cstdlib>
+#include <cstdio>
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <sqlite3.h>
@@ -214,6 +222,80 @@ private:
     std::string base_, model_;
 };
 
+#ifdef OPENCLAW_HAVE_LLAMA
+// Real local inference via llama.cpp: load the GGUF, tokenize, decode/encode with embeddings on, pool per
+// sequence (model's pooling type; mean if none), L2-normalise. One context per embedder, serialised by a mutex.
+class LlamaEmbedder : public EmbeddingProvider {
+public:
+    explicit LlamaEmbedder(const fs::path& path) : model_name_(path.stem().string()) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+            llama_log_set([](ggml_log_level lvl, const char* msg, void*) {
+                if (lvl >= GGML_LOG_LEVEL_ERROR && std::getenv("OPENCLAW_LLAMA_LOG")) std::fputs(msg, stderr);
+            }, nullptr);
+            llama_backend_init();
+        });
+        auto mp = llama_model_default_params();
+        mp.n_gpu_layers = 0;
+        model_ = llama_model_load_from_file(path.string().c_str(), mp);
+        if (!model_) throw std::runtime_error("gguf: llama.cpp failed to load " + path.string());
+        auto cp = llama_context_default_params();
+        cp.embeddings = true;
+        cp.n_ctx = 512; cp.n_batch = 512; cp.n_ubatch = 512;
+        cp.n_threads = cp.n_threads_batch = std::max(1u, std::min(4u, std::thread::hardware_concurrency()));
+        ctx_ = llama_init_from_model(model_, cp);
+        if (!ctx_) { llama_model_free(model_); throw std::runtime_error("gguf: llama.cpp context init failed"); }
+        dims_ = llama_model_n_embd(model_);
+    }
+    ~LlamaEmbedder() override { if (ctx_) llama_free(ctx_); if (model_) llama_model_free(model_); }
+    std::string Id() const override { return "gguf"; }
+    std::string Model() const override { return model_name_ + "#llama" + std::to_string(dims_); }
+    std::vector<Vec> Embed(const std::vector<std::string>& texts) override {
+        std::lock_guard lock(mu_);
+        std::vector<Vec> out;
+        const auto* vocab = llama_model_get_vocab(model_);
+        const int n_ctx = static_cast<int>(llama_n_ctx(ctx_));
+        for (const auto& text : texts) {
+            std::vector<llama_token> toks(text.size() + 16);
+            int n = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()), toks.data(), static_cast<int32_t>(toks.size()), true, true);
+            if (n < 0) { toks.resize(-n); n = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()), toks.data(), static_cast<int32_t>(toks.size()), true, true); }
+            if (n <= 0) toks.assign(1, 0), n = 1;
+            n = std::min(n, n_ctx);
+            toks.resize(n);
+            llama_memory_clear(llama_get_memory(ctx_), true);
+            llama_batch b = llama_batch_init(n, 0, 1);
+            for (int i = 0; i < n; ++i) {
+                b.token[i] = toks[i]; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+            }
+            b.n_tokens = n;
+            int rc = llama_model_has_encoder(model_) && !llama_model_has_decoder(model_) ? llama_encode(ctx_, b) : llama_decode(ctx_, b);
+            if (rc != 0) { llama_batch_free(b); throw std::runtime_error("gguf: llama.cpp decode failed rc=" + std::to_string(rc)); }
+            Vec v(dims_, 0.0f);
+            if (llama_pooling_type(ctx_) != LLAMA_POOLING_TYPE_NONE) {
+                const float* e = llama_get_embeddings_seq(ctx_, 0);
+                if (!e) { llama_batch_free(b); throw std::runtime_error("gguf: no pooled embedding"); }
+                std::copy(e, e + dims_, v.begin());
+            } else {
+                for (int i = 0; i < n; ++i) {
+                    const float* e = llama_get_embeddings_ith(ctx_, i);
+                    if (e) for (int d = 0; d < dims_; ++d) v[d] += e[d] / n;
+                }
+            }
+            llama_batch_free(b);
+            Normalize(v);
+            out.push_back(std::move(v));
+        }
+        return out;
+    }
+private:
+    std::mutex mu_;
+    llama_model* model_ = nullptr;
+    llama_context* ctx_ = nullptr;
+    int dims_ = 0;
+    std::string model_name_;
+};
+#endif
+
 class GgufEmbedder : public EmbeddingProvider {
 public:
     GgufEmbedder(fs::path path, int dims) : path_(std::move(path)), dims_(dims > 0 ? dims : 512) {
@@ -223,19 +305,23 @@ public:
         in.read(magic, 4);
         if (in.gcount() != 4 || std::string(magic, 4) != "GGUF")
             throw std::runtime_error("gguf: bad magic (not a GGUF file): " + path_.string());
-        // version u32 little-endian — accept any ≥1
         std::uint32_t ver = 0;
         in.read(reinterpret_cast<char*>(&ver), 4);
         if (ver < 1 || ver > 3) throw std::runtime_error("gguf: unsupported version " + std::to_string(ver));
         model_ = path_.stem().string();
+#ifdef OPENCLAW_HAVE_LLAMA
+        // OPENCLAW_GGUF_HASH_FALLBACK=1 keeps the old hashed embedder (header-only stub files in tests).
+        if (!std::getenv("OPENCLAW_GGUF_HASH_FALLBACK")) { inner_ = std::make_shared<LlamaEmbedder>(path_); real_ = true; return; }
+#endif
         inner_ = MakeLocalEmbedder(dims_);
     }
     std::string Id() const override { return "gguf"; }
-    std::string Model() const override { return model_ + "#hash" + std::to_string(dims_); }
+    std::string Model() const override { return real_ ? inner_->Model() : model_ + "#hash" + std::to_string(dims_); }
     std::vector<Vec> Embed(const std::vector<std::string>& texts) override { return inner_->Embed(texts); }
 private:
     fs::path path_;
     int dims_;
+    bool real_ = false;
     std::string model_;
     std::shared_ptr<EmbeddingProvider> inner_;
 };

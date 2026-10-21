@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.88.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.89.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,7 @@ find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(ZLIB QUIET)
+find_package(llama-cpp QUIET)
 find_package(Opus QUIET)
 
 set(OPENCLAW_SOURCES
@@ -120,6 +121,15 @@ target_link_libraries(openclaw-cpp PRIVATE
 if(Opus_FOUND)
   target_link_libraries(openclaw-cpp PRIVATE Opus::opus)
   target_compile_definitions(openclaw-cpp PRIVATE OPENCLAW_HAVE_OPUS=1)
+endif()
+if(llama-cpp_FOUND)
+  target_link_libraries(openclaw-cpp PRIVATE llama-cpp::llama-cpp)
+  # conan llama-cpp builds ggml-cpu with OpenMP but does not propagate it.
+  find_package(OpenMP QUIET)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(openclaw-cpp PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+  target_compile_definitions(openclaw-cpp PRIVATE OPENCLAW_HAVE_LLAMA=1)
 endif()
 if(ZLIB_FOUND)
   target_link_libraries(openclaw-cpp PRIVATE ZLIB::ZLIB)

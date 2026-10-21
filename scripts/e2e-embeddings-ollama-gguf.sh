@@ -27,6 +27,7 @@ python3 "$T/srv.py" "$PORT" "$T/prompts.txt" & SRV=$!
 trap 'kill $SRV 2>/dev/null||true; rm -rf "$T"' EXIT
 sleep 0.4
 printf '# Prefs\nUser prefers dark roast coffee.\n\n# Infra\nDeploys on kubernetes clusters.\n' > "$T/ws/MEMORY.md"
+export OPENCLAW_GGUF_HASH_FALLBACK=1  # header-only stub; real llama.cpp inference is e2e-gguf-llama.sh
 python3 -c "open('$T/toy.gguf','wb').write(b'GGUF'+bytes([3,0,0,0])+b'\0'*64)"
 export OPENCLAW_WORKSPACE="$T/ws" OPENCLAW_DATA_DIR="$T/data"
 fail(){ echo "[e2e-og] $*" >&2; exit 1; }
