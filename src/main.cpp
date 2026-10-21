@@ -1,3 +1,4 @@
+#include "openclaw/cli/local_commands.hpp"
 #include <unordered_map>
 #include "openclaw/channels/feishu_frame.hpp"
 #include "openclaw/acp/acpx.hpp"
@@ -102,7 +103,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.95.0-dev";
+constexpr const char* kVersion = "1.96.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3788,6 +3789,21 @@ int main(int argc, char** argv) {
             // Never treat an unknown flag as a chat prompt (would call a live LLM).
             std::cerr << "unknown option: " << cmd << " (try --help)\n";
             return 2;
+        }
+        if (int rc = openclaw::cli::MaybeLocalCommand(argc, argv); rc != -1) {
+            if (rc != openclaw::cli::kDelegateChat) return rc;
+            // setup -m TEXT / bare setup / tui --local [--session K] [--message TEXT]: embedded agent turn.
+            std::string msg, sess;
+            for (int i = 2; i + 1 < argc; ++i) {
+                std::string x = argv[i];
+                if (x == "-m" || x == "--message") msg = argv[i + 1];
+                if (x == "--session") sess = argv[i + 1];
+            }
+            std::vector<std::string> av = {argv[0]};
+            if (!sess.empty()) { av.push_back("--session"); av.push_back(sess); }
+            if (!msg.empty()) av.push_back(msg);
+            std::vector<char*> pv; for (auto& s : av) pv.push_back(s.data());
+            return CmdChat(static_cast<int>(pv.size()), pv.data(), 1);
         }
         if (int rc = MaybeUpstreamGatewayCli(argc, argv); rc >= 0) return rc;
         if (int rc = MaybePluginCli(argc, argv); rc >= 0) return rc;

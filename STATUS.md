@@ -1,6 +1,16 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.95.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.96.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.96.0-dev 新增
+
+- 新增上游本地命令（参数按 v2026.10.5 commander 定义，未知参数报错）：
+  - `completion [-s bash|zsh|fish|powershell] [--write-state] [-i --install] [-y]`：补全脚本由上游命令树（自动从上游源码提取，`scripts/gen-cli-tree.py`）+ 本地命令生成。
+  - `setup --baseline [--workspace] [--skip-bootstrap] [--json]`：写入工作区/gateway.mode，并用上游模板生成 AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT/BOOTSTRAP.md；`setup -m 文本` 走一次代理；配置不完整时自动进入 onboard。`crestodian` 为其废弃别名。
+  - `onboard`：交互式（逐行读 stdin，可脚本化）或 `--non-interactive --accept-risk`，支持模型密钥/自定义 OpenAI 兼容端点、gateway 端口/绑定/令牌或密码、远程模式、频道、网页搜索、`--agent-name/--team`、`--reset --reset-scope`（移到 trash 而不是删除）、`--json` 摘要。不安装后台服务（如实提示）。
+  - `configure [--section workspace|model|web|gateway|daemon|channels|skills|health]...`：分节交互配置。
+  - `migrate list|plan|apply claude`：导入 CLAUDE.md→AGENTS.md/USER.md、技能、自定义命令→技能、MCP 服务器→mcp.servers（env 密钥默认不导入），hooks/权限只列为人工检查；冲突需 `--overwrite`（先备份），apply 前 tar 备份（`--no-backup` 需 `--force`）。hermes 未实现。
+  - `tui`：行模式聊天客户端（连网关 RPC，历史、/session /new /abort /status /exit），不是上游的全屏 TUI。
 
 ## 1.95.0-dev 新增
 
