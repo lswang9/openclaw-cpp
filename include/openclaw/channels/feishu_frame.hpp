@@ -32,7 +32,9 @@ std::string Encode(const Frame& f);
 std::optional<Frame> Decode(const std::string& bytes);
 Frame Ping(std::int32_t service_id);
 // Ack for a data frame: same frame, payload {"code":200,...}, header biz_rt.
-Frame Response(const Frame& in, int code, long long biz_rt_ms);
+Frame Response(const Frame& in, int code, long long biz_rt_ms, const std::string& data = {});
+// gzip-encoded payloads (payload_encoding/header "gzip"): inflate; nullopt on corrupt input or no zlib.
+std::optional<std::string> Gunzip(const std::string& in);
 
 // Multi-part payloads (sum > 1) are reassembled by message_id.
 class Reassembler {

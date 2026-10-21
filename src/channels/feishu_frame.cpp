@@ -1,3 +1,6 @@
+#ifdef OPENCLAW_HAVE_ZLIB
+#include <zlib.h>
+#endif
 #include "openclaw/channels/feishu_frame.hpp"
 
 namespace openclaw::channels::feishu_frame {
@@ -79,11 +82,43 @@ Frame Ping(std::int32_t service_id) {
     return f;
 }
 
-Frame Response(const Frame& in, int code, long long biz_rt_ms) {
+static std::string B64(const std::string& in) {
+    static const char* k = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o; int val = 0, bits = -6;
+    for (unsigned char c : in) { val = (val << 8) + c; bits += 8; while (bits >= 0) { o.push_back(k[(val >> bits) & 0x3F]); bits -= 6; } }
+    if (bits > -6) o.push_back(k[((val << 8) >> (bits + 8)) & 0x3F]);
+    while (o.size() % 4) o.push_back('=');
+    return o;
+}
+
+Frame Response(const Frame& in, int code, long long biz_rt_ms, const std::string& data) {
     Frame r = in;
     r.SetHeader("biz_rt", std::to_string(biz_rt_ms));
-    r.payload = "{\"code\":" + std::to_string(code) + ",\"headers\":null,\"data\":null}";
+    // Go SDK marshals Response{StatusCode,Headers,Data []byte}: Data is base64 in JSON.
+    r.payload = "{\"code\":" + std::to_string(code) + ",\"headers\":null,\"data\":" + (data.empty() ? std::string("null") : "\"" + B64(data) + "\"") + "}";
+    r.payload_encoding.clear();
     return r;
+}
+
+std::optional<std::string> Gunzip(const std::string& in) {
+#ifdef OPENCLAW_HAVE_ZLIB
+    z_stream zs{};
+    if (inflateInit2(&zs, 16 + MAX_WBITS) != Z_OK) return std::nullopt;
+    zs.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+    zs.avail_in = static_cast<uInt>(in.size());
+    std::string out; char buf[16384]; int rc;
+    do {
+        zs.next_out = reinterpret_cast<Bytef*>(buf); zs.avail_out = sizeof(buf);
+        rc = inflate(&zs, Z_NO_FLUSH);
+        if (rc != Z_OK && rc != Z_STREAM_END) { inflateEnd(&zs); return std::nullopt; }
+        out.append(buf, sizeof(buf) - zs.avail_out);
+        if (out.size() > (64u << 20)) { inflateEnd(&zs); return std::nullopt; }
+    } while (rc != Z_STREAM_END);
+    inflateEnd(&zs);
+    return out;
+#else
+    (void)in; return std::nullopt;
+#endif
 }
 
 std::optional<std::string> Reassembler::Add(const Frame& f) {

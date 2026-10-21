@@ -39,6 +39,13 @@ private:
     bool FetchTenantToken(std::string& out_token, std::string& err);
     bool ResolveWsUrl(const std::string& tenant_token, std::string& out_url, std::string& err);
     void LiveLoop(DeliverFn deliver);
+    // Card action callback (type=card frame or card.action.trigger): returns card-response JSON (toast + optional card).
+    nlohmann::json HandleCardAction(const nlohmann::json& body, const DeliverFn& deliver);
+public:
+    nlohmann::json CardActionForTest(const nlohmann::json& body, const DeliverFn& d) { return HandleCardAction(body, d); }
+private:
+    int reconnect_count_ = -1, reconnect_interval_s_ = 120, reconnect_nonce_s_ = 30;
+    std::uint64_t reconnects_ = 0, card_callbacks_ = 0, gzip_frames_ = 0;
     nlohmann::json SendReply(const std::string& tenant_token, const std::string& chat_id, const std::string& text);
     int ping_interval_s_ = 120;
     std::uint64_t pings_ = 0, binary_events_ = 0, replies_sent_ = 0;

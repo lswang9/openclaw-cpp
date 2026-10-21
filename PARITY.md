@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.87.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.88.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -33,6 +33,8 @@
 - RPC diff vs upstream 10.5 core table: 15 methods were missing, now present. **real**: device.pair.setupCode/setupStatus, gateway.restart.preflight (config parse check), chat.metadata, sessions.steer (inject), cron.status, plugins.controlUi.reload, *.github.authorize.cancel. **honest stub**: sessions.reclaim, sessions.companion.reset, projects.searchRemote, sessions.github.publish/confirm, claws.removalJournal (empty).
 
 - CLI vs upstream 10.5 top-level tree (core-command-descriptors + subcli-descriptors, ~66 commands): previously unknown words (e.g. `devices list`) fell through to a chat prompt. Now ~40 gateway-backed upstream commands (devices, nodes, sessions, logs, health, doctor, pairing, hooks, webhooks, secrets, security, system, users, worktrees, sandbox, agents, backup, usage, update, claws, automations, audit, transcripts, message, qr, daemon, exec-approvals, …) route to `/v1/rpc` (`<prefix>.<sub>`, key=value / --params / --json, OPENCLAW_GATEWAY_URL/TOKEN). **partial**: generic routing, not upstream's per-command flags/formatting; local-only commands (onboard, configure wizard, tui, setup, crestodian, migrate, completion) still missing.
+
+- Feishu long connection: **real** reconnect/backoff per larksuite SDK ClientConfig (ReconnectCount / ReconnectInterval / ReconnectNonce from the endpoint and from pong; first retry rand(0,nonce), endpoint re-resolved every time); **real** gzip payload_encoding inflate (zlib); **real** card.action.trigger (type=card frames, v1 and v2 bodies) answered with base64 card JSON (toast + markdown card holding the agent reply). Covered by e2e-feishu-ws.sh against a fake server (gzip card frame, server drop, reconnect). Remaining: url.preview callbacks not answered; never run against live Feishu.
 
 ## 1.85 Discord autocomplete + message context menu
 - real: command specs mark the `args` option `autocomplete: true` and add a MESSAGE context-menu command "Ask OpenClaw" (type 3).

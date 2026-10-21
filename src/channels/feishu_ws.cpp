@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include <random>
 #include "openclaw/channels/feishu_ws.hpp"
 #include "openclaw/channels/feishu_frame.hpp"
 
@@ -70,6 +72,10 @@ nlohmann::json FeishuLongConn::Status() const {
             {"binary_events", binary_events_},
             {"replies_sent", replies_sent_},
             {"ping_interval_s", ping_interval_s_},
+            {"reconnects", reconnects_},
+            {"reconnect", {{"count", reconnect_count_}, {"interval_s", reconnect_interval_s_}, {"nonce_s", reconnect_nonce_s_}}},
+            {"card_callbacks", card_callbacks_},
+            {"gzip_frames", gzip_frames_},
             {"app_id_set", !Env("FEISHU_APP_ID").empty()},
             {"app_secret_set", !Env("FEISHU_APP_SECRET").empty()},
             {"ws_url_override", !Env("FEISHU_WS_URL").empty()},
@@ -78,8 +84,7 @@ nlohmann::json FeishuLongConn::Status() const {
             {"last_error", last_error_},
             {"impl", (mode_ == "live") ? "real" : (mode_ == "mock" ? "real-sim" : "honest")},
             {"gaps", nlohmann::json::array(
-                         {"card.action / url.preview callbacks are routed as events, not answered with card JSON",
-                          "no automatic reconnect with ReconnectCount/ReconnectNonce backoff",
+                         {"url.preview callbacks not answered (card.action is)",
                           "enterprise self-built apps only (platform limit)",
                           "cluster mode — one of N clients receives each event",
                           "must ack/process within ~3s on live"})}};
@@ -297,7 +302,11 @@ bool FeishuLongConn::ResolveWsUrl(const std::string& /*tenant_token*/, std::stri
         out_url = data.value("URL", data.value("url", std::string()));
         if (data.contains("ClientConfig") && data["ClientConfig"].is_object()) {
             std::lock_guard lock(mu_);
-            ping_interval_s_ = data["ClientConfig"].value("PingInterval", ping_interval_s_);
+            const auto& cc = data["ClientConfig"];
+            ping_interval_s_ = cc.value("PingInterval", ping_interval_s_);
+            reconnect_count_ = cc.value("ReconnectCount", reconnect_count_);
+            reconnect_interval_s_ = cc.value("ReconnectInterval", reconnect_interval_s_);
+            reconnect_nonce_s_ = cc.value("ReconnectNonce", reconnect_nonce_s_);
         }
         if (out_url.empty()) { err = "no URL in endpoint response"; return false; }
         return true;
@@ -332,160 +341,195 @@ nlohmann::json FeishuLongConn::SendReply(const std::string& tenant_token, const 
     return {{"http", http}, {"ok", rc == CURLE_OK && http >= 200 && http < 300}};
 }
 
+nlohmann::json FeishuLongConn::HandleCardAction(const nlohmann::json& body, const DeliverFn& deliver) {
+    // v2 (card.action.trigger): {schema,header,event:{operator:{open_id},action:{value,tag,option?,form_value?},context:{open_chat_id,open_message_id}}}
+    // v1 (legacy card callback): {open_id, open_chat_id, action:{value,tag}}
+    const nlohmann::json& ev = body.contains("event") && body["event"].is_object() ? body["event"] : body;
+    nlohmann::json action = ev.value("action", nlohmann::json::object());
+    std::string open_id = ev.contains("operator") ? ev["operator"].value("open_id", std::string()) : ev.value("open_id", std::string());
+    std::string chat = ev.contains("context") ? ev["context"].value("open_chat_id", std::string()) : ev.value("open_chat_id", std::string());
+    std::string text;
+    if (action.contains("value")) {
+        const auto& v = action["value"];
+        if (v.is_string()) text = v.get<std::string>();
+        else if (v.is_object() && v.contains("text") && v["text"].is_string()) text = v["text"].get<std::string>();
+        else text = v.dump();
+    }
+    if (action.contains("option") && action["option"].is_string()) text += (text.empty() ? "" : " ") + action["option"].get<std::string>();
+    if (action.contains("form_value")) text += (text.empty() ? "" : " ") + action["form_value"].dump();
+    { std::lock_guard lock(mu_); ++card_callbacks_; }
+    std::string reply;
+    if (!text.empty() && deliver) {
+        InboundMessage msg;
+        msg.channel = "feishu";
+        msg.sender = open_id.empty() ? "feishu" : open_id;
+        msg.text = "[card action] " + text;
+        msg.session_key = chat.empty() ? "feishu-default" : "feishu-" + chat;
+        msg.conversation_id = chat;
+        reply = deliver(msg);
+        std::lock_guard lock(mu_);
+        ++delivered_;
+    }
+    nlohmann::json resp{{"toast", {{"type", "info"}, {"content", reply.empty() ? std::string("received") : reply.substr(0, 200)}}}};
+    if (!reply.empty())
+        resp["card"] = {{"type", "raw"},
+                        {"data", {{"schema", "2.0"}, {"body", {{"elements", nlohmann::json::array({{{"tag", "markdown"}, {"content", reply}}})}}}}}};
+    return resp;
+}
+
 void FeishuLongConn::LiveLoop(DeliverFn deliver) {
     std::string token, err;
+    auto set_err = [&](const std::string& m) { std::lock_guard lock(mu_); mode_ = "live-error"; last_error_ = m; };
     if (!FetchTenantToken(token, err)) {
+        set_err(err);
         std::lock_guard lock(mu_);
-        mode_ = "live-error";
-        last_error_ = err;
         tenant_token_hint_ = "unset";
         running_ = false;
         return;
     }
-    {
-        std::lock_guard lock(mu_);
-        tenant_token_hint_ = "set";
-    }
-    std::string ws_url;
-    if (!ResolveWsUrl(token, ws_url, err)) {
-        std::lock_guard lock(mu_);
-        mode_ = "live-error";
-        last_error_ = err;
-        running_ = false;
-        return;
-    }
-    {
-        std::lock_guard lock(mu_);
-        mode_ = "live";
-        last_error_.clear();
-    }
-
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        std::lock_guard lock(mu_);
-        mode_ = "live-error";
-        last_error_ = "curl_easy_init failed";
-        running_ = false;
-        return;
-    }
-    curl_easy_setopt(curl, CURLOPT_URL, ws_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
-    CURLcode rc = curl_easy_perform(curl);
-    if (rc != CURLE_OK) {
-        std::lock_guard lock(mu_);
-        mode_ = "live-error";
-        last_error_ = std::string("ws connect: ") + curl_easy_strerror(rc);
-        curl_easy_cleanup(curl);
-        running_ = false;
-        return;
-    }
-
-    auto send_json = [&](const nlohmann::json& j) {
-        auto s = j.dump();
-        size_t sent = 0;
-        (void)curl_ws_send(curl, s.data(), s.size(), &sent, 0, CURLWS_TEXT);
-    };
-
+    { std::lock_guard lock(mu_); tenant_token_hint_ = "set"; }
     namespace ff = feishu_frame;
-    std::int32_t service_id = 0;
-    if (auto q = ws_url.find("service_id="); q != std::string::npos) service_id = std::atoi(ws_url.c_str() + q + 11);
-    auto send_bin = [&](const ff::Frame& f) {
-        auto s = ff::Encode(f);
-        size_t sent = 0;
-        (void)curl_ws_send(curl, s.data(), s.size(), &sent, 0, CURLWS_BINARY);
+    // larksuite SDK reconnect policy: first retry after rand(0, ReconnectNonce)s, then every ReconnectInterval s,
+    // up to ReconnectCount attempts (-1 = forever). Server may update all three via endpoint ClientConfig / pong.
+    int attempt = 0;
+    std::mt19937 rng(std::random_device{}());
+    auto sleep_interruptible = [&](int ms) {
+        for (int w = 0; w < ms && !stop_.load(); w += 50) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     };
-    ff::Reassembler reasm;
-    std::string bin_acc;
-    auto next_ping = std::chrono::steady_clock::now();
-    auto last_ping = next_ping;
-    char buf[65536];
     while (!stop_.load()) {
-        if (std::chrono::steady_clock::now() >= next_ping) {
-            send_bin(ff::Ping(service_id));
-            last_ping = std::chrono::steady_clock::now();
-            int iv;
-            { std::lock_guard lock(mu_); iv = ping_interval_s_; ++pings_; }
-            next_ping = std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, iv));
-        }
-        size_t nread = 0;
-        const struct curl_ws_frame* meta = nullptr;
-        rc = curl_ws_recv(curl, buf, sizeof(buf), &nread, &meta);
-        if (rc == CURLE_AGAIN) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            continue;
-        }
-        if (rc != CURLE_OK) {
+        if (attempt > 0) {
+            int count, interval, nonce;
+            { std::lock_guard lock(mu_); count = reconnect_count_; interval = reconnect_interval_s_; nonce = reconnect_nonce_s_; mode_ = "reconnecting"; }
+            if (count >= 0 && attempt > count) { set_err("reconnect attempts exhausted (" + std::to_string(count) + "): " + last_error_); break; }
+            int ms = attempt == 1 ? std::uniform_int_distribution<int>(0, std::max(0, nonce) * 1000)(rng) : std::max(0, interval) * 1000;
+            sleep_interruptible(ms);
+            if (stop_.load()) break;
             std::lock_guard lock(mu_);
-            last_error_ = std::string("ws recv: ") + curl_easy_strerror(rc);
-            break;
+            ++reconnects_;
         }
-        if (meta && (meta->flags & CURLWS_CLOSE)) break;
-        if (meta && (meta->flags & CURLWS_PING)) {
+        ++attempt;
+        std::string ws_url;
+        if (!ResolveWsUrl(token, ws_url, err)) { set_err(err); continue; }
+        CURL* curl = curl_easy_init();
+        if (!curl) { set_err("curl_easy_init failed"); continue; }
+        curl_easy_setopt(curl, CURLOPT_URL, ws_url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
+        CURLcode rc = curl_easy_perform(curl);
+        if (rc != CURLE_OK) { set_err(std::string("ws connect: ") + curl_easy_strerror(rc)); curl_easy_cleanup(curl); continue; }
+        { std::lock_guard lock(mu_); mode_ = "live"; last_error_.clear(); }
+        attempt = 1;  // connected: next drop restarts the backoff schedule (nonce first)
+
+        auto send_json = [&](const nlohmann::json& j) {
+            auto s = j.dump();
             size_t sent = 0;
-            (void)curl_ws_send(curl, buf, nread, &sent, 0, CURLWS_PONG);
-            continue;
-        }
-        if (meta && (meta->flags & CURLWS_BINARY)) {
-            bin_acc.append(buf, nread);
-            if (meta->bytesleft > 0) continue;
-            auto fr = ff::Decode(bin_acc);
-            bin_acc.clear();
-            if (!fr) { std::lock_guard lock(mu_); last_error_ = "undecodable binary frame"; continue; }
-            const auto type = fr->Header("type");
-            if (fr->method == ff::kControl) {
-                if (type == "pong") {
-                    std::lock_guard lock(mu_);
-                    ++pongs_;
-                    try {
-                        auto cc = nlohmann::json::parse(fr->payload);
-                        ping_interval_s_ = std::max(1, cc.value("PingInterval", ping_interval_s_));
-                        next_ping = last_ping + std::chrono::seconds(ping_interval_s_);  // server-pushed ClientConfig
-                    } catch (...) {}
-                }
+            (void)curl_ws_send(curl, s.data(), s.size(), &sent, 0, CURLWS_TEXT);
+        };
+        std::int32_t service_id = 0;
+        if (auto q = ws_url.find("service_id="); q != std::string::npos) service_id = std::atoi(ws_url.c_str() + q + 11);
+        auto send_bin = [&](const ff::Frame& f) {
+            auto s = ff::Encode(f);
+            size_t sent = 0;
+            (void)curl_ws_send(curl, s.data(), s.size(), &sent, 0, CURLWS_BINARY);
+        };
+        ff::Reassembler reasm;
+        std::string bin_acc;
+        auto next_ping = std::chrono::steady_clock::now();
+        auto last_ping = next_ping;
+        char buf[65536];
+        while (!stop_.load()) {
+            if (std::chrono::steady_clock::now() >= next_ping) {
+                send_bin(ff::Ping(service_id));
+                last_ping = std::chrono::steady_clock::now();
+                int iv;
+                { std::lock_guard lock(mu_); iv = ping_interval_s_; ++pings_; }
+                next_ping = std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, iv));
+            }
+            size_t nread = 0;
+            const struct curl_ws_frame* meta = nullptr;
+            rc = curl_ws_recv(curl, buf, sizeof(buf), &nread, &meta);
+            if (rc == CURLE_AGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
+            if (rc != CURLE_OK) { std::lock_guard lock(mu_); last_error_ = std::string("ws recv: ") + curl_easy_strerror(rc); break; }
+            if (meta && (meta->flags & CURLWS_CLOSE)) { std::lock_guard lock(mu_); last_error_ = "server closed connection"; break; }
+            if (meta && (meta->flags & CURLWS_PING)) {
+                size_t sent = 0;
+                (void)curl_ws_send(curl, buf, nread, &sent, 0, CURLWS_PONG);
                 continue;
             }
-            auto full = reasm.Add(*fr);
-            if (!full) continue;
-            const auto t0 = std::chrono::steady_clock::now();
-            int code = 200;
-            try {
-                auto body = nlohmann::json::parse(*full);
-                auto route = HandleEventBody(body, deliver);
-                {
-                    std::lock_guard lock(mu_);
-                    ++binary_events_;
+            if (meta && (meta->flags & CURLWS_BINARY)) {
+                bin_acc.append(buf, nread);
+                if (meta->bytesleft > 0) continue;
+                auto fr = ff::Decode(bin_acc);
+                bin_acc.clear();
+                if (!fr) { std::lock_guard lock(mu_); last_error_ = "undecodable binary frame"; continue; }
+                const auto type = fr->Header("type");
+                if (fr->method == ff::kControl) {
+                    if (type == "pong") {
+                        std::lock_guard lock(mu_);
+                        ++pongs_;
+                        try {
+                            auto cc = nlohmann::json::parse(fr->payload);
+                            ping_interval_s_ = std::max(1, cc.value("PingInterval", ping_interval_s_));
+                            reconnect_count_ = cc.value("ReconnectCount", reconnect_count_);
+                            reconnect_interval_s_ = cc.value("ReconnectInterval", reconnect_interval_s_);
+                            reconnect_nonce_s_ = cc.value("ReconnectNonce", reconnect_nonce_s_);
+                            next_ping = last_ping + std::chrono::seconds(ping_interval_s_);  // server-pushed ClientConfig
+                        } catch (...) {}
+                    }
+                    continue;
                 }
-                const auto reply = route.value("reply", std::string());
-                std::string chat;
-                if (body.contains("event") && body["event"].contains("message")) chat = body["event"]["message"].value("chat_id", std::string());
-                if (!reply.empty() && !chat.empty()) {
-                    auto r = SendReply(token, chat, reply);
-                    std::lock_guard lock(mu_);
-                    if (r.value("ok", false)) ++replies_sent_; else last_error_ = "reply send failed: " + r.dump();
-                }
-            } catch (...) { code = 500; }
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-            send_bin(ff::Response(*fr, code, ms));
-            continue;
-        }
-        if (!meta || !(meta->flags & CURLWS_TEXT) || nread == 0) continue;
-        try {
-            auto payload = nlohmann::json::parse(std::string(buf, nread));
-            auto handled = FeedPayload(payload, deliver);
-            if (handled.contains("send") && handled["send"].is_array()) {
-                for (const auto& frame : handled["send"]) send_json(frame);
+                auto full = reasm.Add(*fr);
+                if (!full) continue;
+                const auto t0 = std::chrono::steady_clock::now();
+                int code = 200;
+                std::string data;
+                try {
+                    std::string raw = *full;
+                    if (fr->payload_encoding == "gzip" || fr->Header("payload_encoding") == "gzip" || fr->Header("compress") == "gzip") {
+                        auto z = ff::Gunzip(raw);
+                        if (!z) throw std::runtime_error("gzip inflate failed");
+                        raw = *z;
+                        std::lock_guard lock(mu_);
+                        ++gzip_frames_;
+                    }
+                    auto body = nlohmann::json::parse(raw);
+                    std::string et;
+                    if (body.contains("header") && body["header"].is_object()) et = body["header"].value("event_type", std::string());
+                    if (type == "card" || et == "card.action.trigger") {
+                        data = HandleCardAction(body, deliver).dump();
+                    } else {
+                        auto route = HandleEventBody(body, deliver);
+                        { std::lock_guard lock(mu_); ++binary_events_; }
+                        const auto reply = route.value("reply", std::string());
+                        std::string chat;
+                        if (body.contains("event") && body["event"].contains("message")) chat = body["event"]["message"].value("chat_id", std::string());
+                        if (!reply.empty() && !chat.empty()) {
+                            auto r = SendReply(token, chat, reply);
+                            std::lock_guard lock(mu_);
+                            if (r.value("ok", false)) ++replies_sent_; else last_error_ = "reply send failed: " + r.dump();
+                        }
+                    }
+                } catch (const std::exception& e) { code = 500; std::lock_guard lock(mu_); last_error_ = std::string("frame: ") + e.what(); }
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                send_bin(ff::Response(*fr, code, ms, data));
+                continue;
             }
-        } catch (...) {
-            // Non-JSON / proprietary binary — count as gap
-            std::lock_guard lock(mu_);
-            last_error_ = "non-JSON WS frame (proprietary SDK framing?)";
+            if (!meta || !(meta->flags & CURLWS_TEXT) || nread == 0) continue;
+            try {
+                auto payload = nlohmann::json::parse(std::string(buf, nread));
+                auto handled = FeedPayload(payload, deliver);
+                if (handled.contains("send") && handled["send"].is_array())
+                    for (const auto& frame : handled["send"]) send_json(frame);
+            } catch (...) {
+                std::lock_guard lock(mu_);
+                last_error_ = "non-JSON WS text frame";
+            }
         }
+        curl_easy_cleanup(curl);
     }
-    curl_easy_cleanup(curl);
     running_ = false;
     std::lock_guard lock(mu_);
-    if (mode_ == "live") mode_ = "idle";
+    if (mode_ == "live" || mode_ == "reconnecting") mode_ = "idle";
 }
 
 bool FeishuLongConn::Start(DeliverFn deliver) {

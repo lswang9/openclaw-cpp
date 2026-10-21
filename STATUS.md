@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.87.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.88.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.88.0-dev.0-dev
+- 飞书长连接：按 ClientConfig 自动重连退避、gzip 负载解压、卡片回调返回卡片 JSON（离线假服务器端到端测试通过；未连真实飞书）。
 
 ### 1.87.0-dev.0-dev
 - 对照上游 10.5 CLI 顶层命令：约 40 个依赖网关的命令改为经 /v1/rpc 转发（不再误当聊天提示）；交互式本地命令（onboard/tui/configure 等）仍缺。

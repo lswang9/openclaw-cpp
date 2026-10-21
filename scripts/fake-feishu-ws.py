@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fake Feishu open platform for e2e-feishu-ws.sh: tenant token, /callback/ws/endpoint, im/v1/messages, and a
 long-connection WebSocket speaking binary pbbp2.Frame protobuf (hand-encoded here, independent of the C++ codec)."""
-import base64, hashlib, json, os, socket, struct, sys, threading, time
+import base64, gzip, hashlib, json, os, socket, struct, sys, threading, time
 REPORT = sys.argv[1]
-state = {"pings": [], "acks": [], "replies": [], "endpoint_body": None, "errors": []}
+state = {"pings": [], "acks": [], "replies": [], "endpoint_body": None, "errors": [], "connections": 0, "endpoint_calls": 0}
 def dump(): json.dump(state, open(REPORT + ".tmp", "w")); os.replace(REPORT + ".tmp", REPORT)
 # --- protobuf ---
 def varint(v):
@@ -12,9 +12,10 @@ def varint(v):
     return o + bytes([v])
 def fld(n, wt): return varint((n << 3) | wt)
 def lenf(n, b): return fld(n, 2) + varint(len(b)) + b
-def frame(seq, service, method, headers, payload=b""):
+def frame(seq, service, method, headers, payload=b"", encoding=""):
     o = fld(1, 0) + varint(seq) + fld(2, 0) + varint(0) + fld(3, 0) + varint(service) + fld(4, 0) + varint(method)
     for k, v in headers: o += lenf(5, lenf(1, k.encode()) + lenf(2, v.encode()))
+    if encoding: o += lenf(6, encoding.encode())
     if payload: o += lenf(8, payload)
     return o
 def rvar(b, i):
@@ -53,8 +54,12 @@ def send_bin(c, d):
 EVENT = {"schema": "2.0", "header": {"event_id": "ev1", "event_type": "im.message.receive_v1"},
          "event": {"sender": {"sender_id": {"open_id": "ou_1"}}, "message": {"chat_id": "oc_1", "chat_type": "p2p", "message_type": "text",
                    "content": json.dumps({"text": "hello lark"})}}}
+CARD = {"schema": "2.0", "header": {"event_id": "ev2", "event_type": "card.action.trigger"},
+        "event": {"operator": {"open_id": "ou_2"}, "action": {"tag": "button", "value": {"text": "approve it"}},
+                  "context": {"open_chat_id": "oc_9", "open_message_id": "om_1"}}}
 def ws(c, path):
-    first_ping = True
+    state["connections"] += 1; conn = state["connections"]; dump()
+    first_ping = conn == 1
     c.settimeout(0.2)
     while True:
         try: f = recv_frame(c)
@@ -73,14 +78,19 @@ def ws(c, path):
                     send_bin(c, frame(7, 33, 1, [("type", "event"), ("message_id", "M1"), ("sum", "2"), ("seq", str(seq)), ("trace_id", "tr")], part))
             dump()
         elif p.get("method") == 1:
-            state["acks"].append({"headers": p["headers"], "payload": json.loads(p["payload"] or b"{}"), "seq": p.get("seq")}); dump()
+            state["acks"].append({"headers": p["headers"], "payload": json.loads(p["payload"] or b"{}"), "seq": p.get("seq"), "conn": conn}); dump()
+            if p["headers"].get("message_id") == "M1":   # then a gzip-encoded card callback
+                send_bin(c, frame(8, 33, 1, [("type", "card"), ("message_id", "C1"), ("sum", "1"), ("seq", "0")], gzip.compress(json.dumps(CARD).encode()), "gzip"))
+            elif p["headers"].get("message_id") == "C1":  # drop the connection: client must reconnect per ClientConfig
+                c.sendall(b"\x88\x00"); c.close(); return
 def http(c, req, body):
     line = req.split(b"\r\n")[0].decode(); method, path = line.split(" ")[:2]
     hdr = {l.split(b":", 1)[0].strip().lower().decode(): l.split(b":", 1)[1].strip().decode() for l in req.split(b"\r\n")[1:] if b":" in l}
     if path == "/open-apis/auth/v3/tenant_access_token/internal": out = {"code": 0, "tenant_access_token": "t-123", "expire": 7200}
     elif path == "/callback/ws/endpoint":
-        state["endpoint_body"] = json.loads(body); state["endpoint_locale"] = hdr.get("locale")
-        out = {"code": 0, "data": {"URL": "ws://127.0.0.1:%d/ws?device_id=d1&service_id=33" % PORT, "ClientConfig": {"PingInterval": 30}}}
+        state["endpoint_body"] = json.loads(body); state["endpoint_locale"] = hdr.get("locale"); state["endpoint_calls"] += 1
+        out = {"code": 0, "data": {"URL": "ws://127.0.0.1:%d/ws?device_id=d1&service_id=33" % PORT,
+               "ClientConfig": {"PingInterval": 30, "ReconnectCount": 3, "ReconnectInterval": 1, "ReconnectNonce": 0}}}
     elif path.startswith("/open-apis/im/v1/messages"):
         state["replies"].append({"auth": hdr.get("authorization"), "path": path, "body": json.loads(body)}); out = {"code": 0}
     else: out = {"code": 404}
