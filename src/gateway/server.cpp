@@ -355,6 +355,7 @@ void Server::RefreshPluginExtensions() {
 }
 
 void Server::Run() {
+    for (auto* a : deps_.adapters.List()) a->SetConfig(deps_.config.raw);
     RefreshPluginExtensions();
     RefreshDiscordCommands();
     std::size_t nworkers = 8;
@@ -673,6 +674,7 @@ nlohmann::json Server::ReloadConfigNow() {
         auto* a = deps_.adapters.Get(id);
         if (!a) continue;
         a->Stop();
+        a->SetConfig(deps_.config.raw);
         a->Start([this](const channels::InboundMessage& m) { return DeliverInbound(m); });
         restarted.push_back(id);
     }
@@ -869,12 +871,48 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         return "Session " + msg.session_key + ": " + std::to_string(msgs.size()) + " messages, ~" +
                std::to_string(context::EstimateTokens(msgs)) + " tokens.";
     }
-    if (text_in == "/stop") return "No active run to stop.";
+    if (text_in == "/stop") {
+        std::shared_ptr<std::atomic<bool>> flag;
+        { std::lock_guard lock(session_ctrl_mu_);
+          auto it = session_cancel_.find(msg.session_key);
+          if (it != session_cancel_.end()) flag = it->second;
+        }
+        if (flag) { flag->store(true); return "⏹ Stopping current run…"; }
+        return "No active run to stop.";
+    }
     if (text_in == "/model" || text_in.rfind("/model ", 0) == 0) {
+        std::string arg;
+        if (text_in.size() > 7) arg = text_in.substr(7);
+        while (!arg.empty() && (arg[0]==' '||arg[0]=='\t')) arg.erase(arg.begin());
         auto cur = config::GetPath(deps_.config.raw, "agents.defaults.model.primary").value_or(nlohmann::json(""));
-        std::string m = cur.is_string() ? cur.get<std::string>() : "";
-        if (m.empty()) if (const char* e = std::getenv("OPENCLAW_DEFAULT_PROVIDER")) m = e;
-        return "Current model: " + (m.empty() ? std::string("default") : m);
+        std::string def = cur.is_string() ? cur.get<std::string>() : "";
+        if (def.empty()) if (const char* e = std::getenv("OPENCLAW_DEFAULT_PROVIDER")) def = e;
+        std::string sess;
+        { std::lock_guard lock(session_ctrl_mu_);
+          auto it = session_model_.find(msg.session_key);
+          if (it != session_model_.end()) sess = it->second;
+        }
+        if (arg.empty() || arg == "status") {
+            return "Current model: " + (sess.empty() ? (def.empty() ? "default" : def) : sess)
+                   + (sess.empty() ? " (config)" : " (session override)");
+        }
+        if (arg == "clear" || arg == "reset" || arg == "default") {
+            std::lock_guard lock(session_ctrl_mu_);
+            session_model_.erase(msg.session_key);
+            return "Model override cleared; using " + (def.empty() ? std::string("default") : def);
+        }
+        if (arg == "list") {
+            std::string out = "Models:";
+            if (deps_.router) {
+                // Router may expose names via Resolve trial — list config providers
+                auto prov = config::GetPath(deps_.config.raw, "models.providers");
+                if (prov && prov->is_object()) for (auto& [k,v] : prov->items()) out += "\n- " + k;
+            }
+            if (out == "Models:") out += "\n- " + (def.empty() ? "default" : def) + " (current default)";
+            return out;
+        }
+        { std::lock_guard lock(session_ctrl_mu_); session_model_[msg.session_key] = arg; }
+        return "Model set for this session: " + arg;
     }
     // Plugin commands (api.registerCommand) run before skills and bypass the model.
     if (deps_.js_host && !text_in.empty() && text_in[0] == '/') {
@@ -954,13 +992,29 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     }
     auto assembled = context::Assemble(messages, aopts);
     agent::LoopOptions lopts = MakeLoopOpts(deps_);
-    lopts.cancel = &cancel_agents_;
+    auto run_cancel = std::make_shared<std::atomic<bool>>(false);
+    {
+        std::lock_guard lock(session_ctrl_mu_);
+        session_cancel_[msg.session_key] = run_cancel;
+    }
+    // Session cancel; watcher also mirrors cancel_agents_.
+    lopts.cancel = run_cancel.get();
     provider::Provider* prov = &deps_.provider;
     if (deps_.router) prov = deps_.router;
     {
         auto agents = agent::routing::ListAgents(deps_.config.raw);
         if (auto* ad = agent::routing::FindAgent(agents, agent_id); ad && !ad->model.empty() && deps_.router) {
             if (auto* rp = deps_.router->Resolve(ad->model)) prov = rp;
+        }
+    }
+    {
+        std::string override_model;
+        { std::lock_guard lock(session_ctrl_mu_);
+          auto it = session_model_.find(msg.session_key);
+          if (it != session_model_.end()) override_model = it->second;
+        }
+        if (!override_model.empty() && deps_.router) {
+            if (auto* rp = deps_.router->Resolve(override_model)) prov = rp;
         }
     }
     auto skill_entries = config::GetPath(deps_.config.raw, "skills.entries").value_or(nlohmann::json::object());
@@ -970,7 +1024,21 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         tools::exec::ScopedRunContext exec_ctx({agent_id, msg.session_key, msg.channel,
                                                 msg.conversation_id.empty() ? msg.sender : msg.conversation_id, msg.sender});
         if (deps_lock.owns_lock()) deps_lock.unlock();  // do not hold deps_mu_ across the model/tool loop
+        // Poll gateway-wide cancel into session flag
+        std::thread watch([&] {
+            while (run_cancel && !run_cancel->load()) {
+                if (cancel_agents_.load()) { run_cancel->store(true); break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        });
         result = agent::RunAgentLoop(*prov, tools, assembled, lopts);
+        run_cancel->store(true);  // stop watcher
+        if (watch.joinable()) watch.join();
+    }
+    {
+        std::lock_guard lock(session_ctrl_mu_);
+        auto it = session_cancel_.find(msg.session_key);
+        if (it != session_cancel_.end() && it->second == run_cancel) session_cancel_.erase(it);
     }
     for (const auto& w : result.warnings) {
         deps_.logs.Append("warn", w);

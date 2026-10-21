@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.53.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.54.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -85,6 +85,12 @@
 - real: tools.allow / tools.deny / tools.profile (`minimal|coding|messaging|full`) from global `tools.*`, then `agents.defaults.tools`, then `agents.list[]|entries.<id>.tools` — deny wins; profile supplies a base allow set (coding includes exec/read/write/edit/http_get/browser_*).
 - real: per-agent sandbox object (mode/backend/…) still flows into exec ResolvePolicy; agent Pool rebuilds tool registries on config reload and after JS plugin host restart (re-RegisterTools into the shared base).
 - real-sim: skills library and JS plugin host remain process-global (not per-agent); MCP tool list is shared then filtered by allow/deny.
+
+## 1.54 Slack response_url · Discord /stop /model · config credentials
+- real: Slack interactive + slash replies POST to Slack `response_url` when present (Block Kit preserved); covered by `scripts/e2e-stop-model-response-url.sh`.
+- real: `/stop` sets a per-session cancel flag that aborts an in-flight agent loop (Discord slash `/stop` and chat); `/model [name|clear|list|status]` sets a session model override used via the provider router.
+- real: built-in adapters call `SetConfig` on gateway start / hot-reload / channel restart and resolve tokens via env **or** `channels.<id>.*` (botToken/token/appToken/…). Start exports missing env from config so Socket Mode / Discord Gateway children also see credentials.
+- real-sim: Socket/Gateway still primarily read process env after export; no per-account multi-token rotation.
 
 ## 1.53 Exec: SQLite approvals, binary revalidation, background/process
 - real: approvals policy stored in `$OPENCLAW_STATE_DIR|$OPENCLAW_DATA_DIR/state/openclaw.sqlite` key `exec_approvals_config` (upstream locator); legacy `exec-approvals.json` migrated once to `.migrated`. `OPENCLAW_EXEC_APPROVALS_PATH` still forces JSON for tests.

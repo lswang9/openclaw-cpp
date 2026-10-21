@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdlib>
+#include "openclaw/config/config.hpp"
 
 #include "openclaw/channels/adapter.hpp"
 
@@ -6,6 +8,27 @@
 #include <vector>
 
 namespace openclaw::channels {
+
+// Env wins; else channels.<id>.<key> string from adapter config snapshot.
+inline std::string ChannelCred(const nlohmann::json& cfg, const std::string& channel_id,
+                               const std::string& key, const char* env) {
+    if (env && *env) {
+        if (const char* v = std::getenv(env); v && *v) return v;
+    }
+    auto v = config::GetPath(cfg, "channels." + channel_id + "." + key);
+    if (v && v->is_string() && !v->get<std::string>().empty()) return v->get<std::string>();
+    // Common aliases
+    if (key == "token") {
+        auto a = config::GetPath(cfg, "channels." + channel_id + ".botToken");
+        if (a && a->is_string()) return a->get<std::string>();
+    }
+    if (key == "botToken") {
+        auto a = config::GetPath(cfg, "channels." + channel_id + ".token");
+        if (a && a->is_string()) return a->get<std::string>();
+    }
+    return {};
+}
+
 
 class OutboundRecordAdapter : public Adapter {
 public:

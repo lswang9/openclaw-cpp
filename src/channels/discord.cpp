@@ -1,9 +1,16 @@
 #include "openclaw/channels/discord.hpp"
+#include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/discord_commands.hpp"
 #include <cstdlib>
 
 namespace openclaw::channels {
 namespace {
+void ExportIfEmpty(const char* env, const std::string& val) {
+    if (val.empty()) return;
+    if (const char* e = std::getenv(env); e && *e) return;
+    setenv(env, val.c_str(), 0);
+}
+
 std::string Env(const char* k) {
     if (const char* v = std::getenv(k); v && *v) return v;
     return {};
@@ -20,7 +27,7 @@ DiscordAdapter::DiscordAdapter()
 }
 
 bool DiscordAdapter::Verify(const nlohmann::json& body) const {
-    const auto expect = Env("DISCORD_VERIFY_TOKEN");
+    const auto expect = ChannelCred(Config(), "discord", "verifyToken", "DISCORD_VERIFY_TOKEN");
     if (expect.empty()) return true;
     return body.value("token", body.value("verify_token", "")) == expect;
 }
@@ -48,14 +55,16 @@ nlohmann::json DiscordAdapter::Status() const {
     s["type"] = "discord";
     s["inbound"] = inbound_;
     s["inbound_path"] = "/api/channels/discord/inbound";
-    s["verify_token_set"] = !Env("DISCORD_VERIFY_TOKEN").empty();
+    s["verify_token_set"] = !ChannelCred(Config(), "discord", "verifyToken", "DISCORD_VERIFY_TOKEN").empty();
     s["gateway"] = gateway_.Status();
     return s;
 }
 
 void DiscordAdapter::Start(DeliverFn deliver) {
     SetEnabled(true);
-    if (!Env("DISCORD_BOT_TOKEN").empty() && !Env("DISCORD_APPLICATION_ID").empty() && !specs_.empty()) (void)SyncCommands();
+    ExportIfEmpty("DISCORD_BOT_TOKEN", ChannelCred(Config(), "discord", "token", "DISCORD_BOT_TOKEN"));
+    ExportIfEmpty("DISCORD_APPLICATION_ID", ChannelCred(Config(), "discord", "applicationId", "DISCORD_APPLICATION_ID"));
+    if (!ChannelCred(Config(), "discord", "token", "DISCORD_BOT_TOKEN").empty() && !ChannelCred(Config(), "discord", "applicationId", "DISCORD_APPLICATION_ID").empty() && !specs_.empty()) (void)SyncCommands();
     (void)gateway_.Start(std::move(deliver));
 }
 
@@ -108,9 +117,9 @@ nlohmann::json DiscordAdapter::HandleHttpInbound(const nlohmann::json& body, con
 
 nlohmann::json DiscordAdapter::Api(const std::string& method, const std::string& path, const nlohmann::json& body) {
     nlohmann::json entry{{"api", method + " " + path}, {"body", body}, {"mode", "recorded"}};
-    const auto token = Env("DISCORD_BOT_TOKEN");
+    const auto token = ChannelCred(Config(), "discord", "token", "DISCORD_BOT_TOKEN");
     if (!token.empty()) {
-        auto base = Env("DISCORD_API_BASE");
+        auto base = ChannelCred(Config(), "discord", "apiBase", "DISCORD_API_BASE");
         if (base.empty()) base = "https://discord.com/api/v10";
         auto r = HttpJson(method, base + path, body, {"Authorization: Bot " + token});
         entry["mode"] = "live_http";
@@ -122,8 +131,8 @@ nlohmann::json DiscordAdapter::Api(const std::string& method, const std::string&
 }
 
 nlohmann::json DiscordAdapter::SyncCommands() {
-    const auto app = Env("DISCORD_APPLICATION_ID");
-    const auto guild = Env("DISCORD_GUILD_ID");
+    const auto app = ChannelCred(Config(), "discord", "applicationId", "DISCORD_APPLICATION_ID");
+    const auto guild = ChannelCred(Config(), "discord", "guildId", "DISCORD_GUILD_ID");
     std::string path = "/applications/" + (app.empty() ? std::string("{application_id}") : app) +
                        (guild.empty() ? "/commands" : "/guilds/" + guild + "/commands");
     auto r = Api("PUT", path, specs_);
@@ -159,7 +168,7 @@ nlohmann::json DiscordAdapter::HandleInteraction(const nlohmann::json& in, const
     out["session_key"] = msg.session_key;
     out["reply"] = reply;
     if (via_gateway) {
-        const auto app = in.value("application_id", Env("DISCORD_APPLICATION_ID"));
+        const auto app = in.value("application_id", ChannelCred(Config(), "discord", "applicationId", "DISCORD_APPLICATION_ID"));
         out["followup"] = Api("PATCH", "/webhooks/" + app + "/" + itok + "/messages/@original",
                               {{"content", reply.empty() ? "(done)" : reply}});
     } else {

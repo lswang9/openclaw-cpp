@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.53.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.54.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -216,6 +216,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ### 1.51.0-dev
 - 多智能体隔离：每个 agents.list 条目独立会话目录、工作区、记忆索引与工具集（allow/deny/profile）；main 在设置了 OPENCLAW_SESSION_DIR 时仍用该目录以保持兼容。技能库与 JS 插件宿主仍为进程级共享。
+
+### 1.54.0-dev
+- Slack `response_url` 回帖；Discord/聊天 `/stop` 取消当前会话回合、`/model` 会话级切换；渠道适配器从配置读取凭证（热重载/重启时 SetConfig，Start 时补齐 env 供 Socket/Gateway）。
 
 ### 1.53.0-dev
 - exec 审批改为 SQLite（`state/openclaw.sqlite#exec_approvals_config`），自动从旧 JSON 迁移；批准前后对可执行文件/脚本做 SHA-256 校验，变更则拒绝；支持 `yieldMs`/`background` + `process`（list/poll/log/kill）；有 docker 用 docker，否则 bwrap。`mode=auto` 仍无 LLM reviewer（等同 ask）。

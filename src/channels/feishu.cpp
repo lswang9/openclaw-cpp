@@ -1,4 +1,5 @@
 #include "openclaw/channels/feishu.hpp"
+#include "openclaw/channels/outbound.hpp"
 
 #include <cstdlib>
 
@@ -18,7 +19,7 @@ FeishuAdapter::FeishuAdapter()
 }
 
 bool FeishuAdapter::VerifyToken(const nlohmann::json& body) const {
-    const auto expect = Env("FEISHU_VERIFY_TOKEN");
+    const auto expect = ChannelCred(Config(), "feishu", "verifyToken", "FEISHU_VERIFY_TOKEN");
     if (expect.empty()) return true;  // no token configured → accept (dev)
     auto got = body.value("token", "");
     if (got.empty() && body.contains("header")) got = body["header"].value("token", "");
@@ -56,8 +57,8 @@ nlohmann::json FeishuAdapter::Status() const {
     s["type"] = "feishu";
     s["inbound"] = inbound_;
     s["inbound_path"] = "/api/channels/feishu/inbound";
-    s["verify_token_set"] = !Env("FEISHU_VERIFY_TOKEN").empty();
-    s["app_id_set"] = !Env("FEISHU_APP_ID").empty();
+    s["verify_token_set"] = !ChannelCred(Config(), "feishu", "verifyToken", "FEISHU_VERIFY_TOKEN").empty();
+    s["app_id_set"] = !ChannelCred(Config(), "feishu", "appId", "FEISHU_APP_ID").empty();
     s["longconn"] = longconn_.Status();
     return s;
 }

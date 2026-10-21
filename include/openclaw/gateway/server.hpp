@@ -135,6 +135,9 @@ public:
 private:
     std::map<std::string, std::string> agent_prompts_;
     std::mutex agent_prompts_mu_;
+    std::mutex session_ctrl_mu_;
+    std::map<std::string, std::shared_ptr<std::atomic<bool>>> session_cancel_;
+    std::map<std::string, std::string> session_model_;  // /model override per session key
     std::string AgentSystemPrompt(const std::string& agent_id);
     session::Store& SessionsFor(const std::string& agent_id);
     std::shared_ptr<tools::Registry> ToolsFor(const std::string& agent_id);

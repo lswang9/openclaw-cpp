@@ -1,9 +1,16 @@
 #include "openclaw/channels/slack.hpp"
+#include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/slack_interactive.hpp"
 #include <cstdlib>
 
 namespace openclaw::channels {
 namespace {
+void ExportIfEmpty(const char* env, const std::string& val) {
+    if (val.empty()) return;
+    if (const char* e = std::getenv(env); e && *e) return;
+    setenv(env, val.c_str(), 0);
+}
+
 std::string Env(const char* k) {
     if (const char* v = std::getenv(k); v && *v) return v;
     return {};
@@ -19,7 +26,7 @@ SlackAdapter::SlackAdapter()
 }
 
 bool SlackAdapter::Verify(const nlohmann::json& body) const {
-    const auto expect = Env("SLACK_VERIFY_TOKEN");
+    const auto expect = ChannelCred(Config(), "slack", "verifyToken", "SLACK_VERIFY_TOKEN");
     if (expect.empty()) return true;
     auto got = body.value("token", "");
     return got == expect;
@@ -30,14 +37,16 @@ nlohmann::json SlackAdapter::Status() const {
     s["type"] = "slack";
     s["inbound"] = inbound_;
     s["inbound_path"] = "/api/channels/slack/inbound";
-    s["verify_token_set"] = !Env("SLACK_VERIFY_TOKEN").empty();
+    s["verify_token_set"] = !ChannelCred(Config(), "slack", "verifyToken", "SLACK_VERIFY_TOKEN").empty();
     s["socket_mode"] = socket_.Status();
-    s["bot_token_set"] = !Env("SLACK_BOT_TOKEN").empty();
+    s["bot_token_set"] = !ChannelCred(Config(), "slack", "botToken", "SLACK_BOT_TOKEN").empty();
     return s;
 }
 
 void SlackAdapter::Start(DeliverFn deliver) {
     SetEnabled(true);
+    ExportIfEmpty("SLACK_BOT_TOKEN", ChannelCred(Config(), "slack", "botToken", "SLACK_BOT_TOKEN"));
+    ExportIfEmpty("SLACK_APP_TOKEN", ChannelCred(Config(), "slack", "appToken", "SLACK_APP_TOKEN"));
     (void)socket_.Start(std::move(deliver));
 }
 
@@ -63,6 +72,13 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
         nlohmann::json out{{"ok", true}, {"response_type", "in_channel"}, {"text", rendered.value("text", "")},
                            {"session_key", r.value("session_key", "")}, {"impl", "real"}};
         if (rendered.contains("blocks")) out["blocks"] = rendered["blocks"];
+        const auto ru = body.value("response_url", "");
+        if (!ru.empty()) {
+            nlohmann::json body_ru{{"text", rendered.value("text", "")}, {"response_type", "in_channel"}};
+            if (rendered.contains("blocks")) body_ru["blocks"] = rendered["blocks"];
+            auto ru_http = HttpPostJson(ru, body_ru, {});
+            out["response_url"] = {{"ok", ru_http.value("http", 0) == 200}, {"http", ru_http}};
+        }
         return out;
     }
 
@@ -112,9 +128,9 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
 
 nlohmann::json SlackAdapter::CallApi(const std::string& method, const nlohmann::json& body) {
     nlohmann::json entry{{"api", method}, {"body", body}, {"mode", "recorded"}};
-    const auto token = Env("SLACK_BOT_TOKEN");
+    const auto token = ChannelCred(Config(), "slack", "botToken", "SLACK_BOT_TOKEN");
     if (!token.empty()) {
-        auto base = Env("SLACK_API_BASE");
+        auto base = ChannelCred(Config(), "slack", "apiBase", "SLACK_API_BASE");
         if (base.empty()) base = "https://slack.com/api";
         auto r = HttpPostJson(base + "/" + method, body, {"Authorization: Bearer " + token});
         entry["mode"] = "live_http";
@@ -147,6 +163,13 @@ nlohmann::json SlackAdapter::HandleInteractive(const nlohmann::json& payload, co
     }
     if (it.ack_clear_errors) out["response_action"] = "clear";
     if (!it.inbound && it.api_call.is_null()) out["ignored"] = true;
+    if (!it.response_url.empty() && out.contains("reply")) {
+        nlohmann::json body{{"text", out.value("reply", "")}, {"response_type", "in_channel"}, {"replace_original", false}};
+        if (out.contains("message") && out["message"].is_object() && out["message"].contains("blocks"))
+            body["blocks"] = out["message"]["blocks"];
+        auto ru_http = HttpPostJson(it.response_url, body, {});
+        out["response_url"] = {{"ok", ru_http.value("http", 0) == 200}, {"http", ru_http}};
+    }
     return out;
 }
 

@@ -24,12 +24,17 @@ public:
     // Optional start/stop for long-lived adapters (bots etc.)
     virtual void Start(DeliverFn deliver) { (void)deliver; }
     virtual void Stop() {}
+    // Hot-reload / restart: adapters prefer env, then channels.<id>.* from this snapshot.
+    virtual void SetConfig(const nlohmann::json& raw) { config_ = raw; }
+    const nlohmann::json& Config() const { return config_; }
     // HTTP inbound (POST /api/channels/<id>/inbound)
     virtual bool SupportsHttpInbound() const { return false; }
     virtual nlohmann::json HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
         (void)body; (void)deliver;
         return {{"ok", false}, {"error", "inbound not supported"}};
     }
+protected:
+    nlohmann::json config_ = nlohmann::json::object();
 };
 
 // HTTP webhook inbound: Gateway POST /api/channels/{id}/inbound
