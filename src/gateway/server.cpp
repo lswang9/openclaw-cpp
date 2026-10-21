@@ -36,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.34.0-dev";
+constexpr const char* kVersion = "1.35.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -535,6 +535,10 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
                    std::to_string(cr.after_tokens) + " tokens.";
         }
     }
+    if (auto sc = skills::MatchSkillCommand(deps_.skills.List(), text_in)) {
+        Emit("skill.command", {{"sessionKey", msg.session_key}, {"skill", sc->skill}});
+        text_in = sc->prompt;
+    }
     auto messages = deps_.sessions.Load(msg.session_key);
     std::string content = text_in;
     if (!msg.sender.empty()) {
@@ -573,7 +577,12 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
     lopts.cancel = &cancel_agents_;
     provider::Provider* prov = &deps_.provider;
     if (deps_.router) prov = deps_.router;
-    auto result = agent::RunAgentLoop(*prov, deps_.tools, assembled, lopts);
+    auto skill_entries = config::GetPath(deps_.config.raw, "skills.entries").value_or(nlohmann::json::object());
+    agent::LoopResult result;
+    {
+        skills::ScopedEnv skill_env(skills::SkillEnvOverrides(deps_.skills.List(), skill_entries));
+        result = agent::RunAgentLoop(*prov, deps_.tools, assembled, lopts);
+    }
     for (const auto& w : result.warnings) {
         deps_.logs.Append("warn", w);
         Emit("session.tool", {{"warning", w}, {"sessionKey", msg.session_key}});

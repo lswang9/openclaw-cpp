@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <algorithm>
+#include <cctype>
 #include <set>
 #include <sstream>
 
@@ -63,6 +64,8 @@ bool ParseFrontmatter(const std::string& text, std::string& name, std::string& d
             try { *meta = nlohmann::json::parse(val); } catch (...) {}
         } else if (key == "disable-model-invocation" && dmi) {
             *dmi = (val == "true");
+        } else if (key == "user-invocable" && meta) {
+            (*meta)["__userInvocable"] = (val != "false");
         }
     }
     // multiline description: " |" style — keep first line only for skeleton
@@ -103,8 +106,29 @@ std::string XmlEscape(const std::string& s) {
 
 }  // namespace
 
-void EvaluateGating(Skill& s) {
+void EvaluateGating(Skill& s) { EvaluateGating(s, nlohmann::json()); }
+
+std::string SkillKey(const Skill& s) {
+    if (s.metadata.contains("openclaw") && s.metadata["openclaw"].is_object()) {
+        auto k = s.metadata["openclaw"].value("skillKey", std::string());
+        if (!k.empty()) return k;
+    }
+    return s.name;
+}
+
+void EvaluateGating(Skill& s, const nlohmann::json& entry) {
     s.missing.clear();
+    s.enabled = !(entry.is_object() && entry.value("enabled", true) == false);
+    if (!s.enabled) { s.missing.push_back("disabled"); s.eligible = false; return; }
+    std::string primary_env;
+    if (s.metadata.contains("openclaw") && s.metadata["openclaw"].is_object())
+        primary_env = s.metadata["openclaw"].value("primaryEnv", std::string());
+    auto env_from_entry = [&](const std::string& var) {
+        if (!entry.is_object()) return false;
+        if (entry.contains("env") && entry["env"].is_object() && entry["env"].contains(var) &&
+            entry["env"][var].is_string() && !entry["env"][var].get<std::string>().empty()) return true;
+        return var == primary_env && entry.contains("apiKey") && entry["apiKey"].is_string() && !entry["apiKey"].get<std::string>().empty();
+    };
     nlohmann::json oc = s.metadata.contains("openclaw") ? s.metadata["openclaw"] : nlohmann::json::object();
     if (!oc.is_object()) oc = nlohmann::json::object();
     if (oc.value("always", false)) { s.eligible = true; return; }
@@ -121,7 +145,7 @@ void EvaluateGating(Skill& s) {
         for (const auto& e : req.value("env", nlohmann::json::array())) {
             if (!e.is_string()) continue;
             const char* v = std::getenv(e.get<std::string>().c_str());
-            if (!v || !*v) s.missing.push_back("env:" + e.get<std::string>());
+            if ((!v || !*v) && !env_from_entry(e.get<std::string>())) s.missing.push_back("env:" + e.get<std::string>());
         }
     }
     auto os = oc.value("os", nlohmann::json::array());
@@ -138,6 +162,89 @@ void EvaluateGating(Skill& s) {
         if (!ok) s.missing.push_back("os:" + me);
     }
     s.eligible = s.missing.empty();
+}
+
+void Library::ApplyEntries(const nlohmann::json& entries) {
+    for (auto& s : skills_) {
+        auto key = SkillKey(s);
+        EvaluateGating(s, entries.is_object() && entries.contains(key) ? entries[key] : nlohmann::json());
+    }
+}
+
+std::vector<std::pair<std::string, std::string>> SkillEnvOverrides(const std::vector<Skill>& skills,
+                                                                   const nlohmann::json& entries) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (!entries.is_object()) return out;
+    for (const auto& s : skills) {
+        if (!s.eligible) continue;
+        auto key = SkillKey(s);
+        if (!entries.contains(key) || !entries[key].is_object()) continue;
+        const auto& e = entries[key];
+        auto add = [&](const std::string& k, const std::string& v) {
+            const char* cur = std::getenv(k.c_str());
+            if (cur && *cur) return;
+            for (auto& p : out) if (p.first == k) return;
+            out.push_back({k, v});
+        };
+        if (e.contains("env") && e["env"].is_object())
+            for (auto it = e["env"].begin(); it != e["env"].end(); ++it) if (it.value().is_string()) add(it.key(), it.value());
+        std::string primary;
+        if (s.metadata.contains("openclaw") && s.metadata["openclaw"].is_object()) primary = s.metadata["openclaw"].value("primaryEnv", std::string());
+        if (!primary.empty() && e.contains("apiKey") && e["apiKey"].is_string()) add(primary, e["apiKey"]);
+    }
+    return out;
+}
+
+ScopedEnv::ScopedEnv(const std::vector<std::pair<std::string, std::string>>& vars) {
+    for (const auto& [k, v] : vars) {
+        const char* cur = std::getenv(k.c_str());
+        if (cur && *cur) continue;
+        ::setenv(k.c_str(), v.c_str(), 1);
+        set_.push_back(k);
+    }
+}
+ScopedEnv::~ScopedEnv() { for (const auto& k : set_) ::unsetenv(k.c_str()); }
+
+std::string SlashName(const std::string& n) {
+    std::string o;
+    for (unsigned char c : n) {
+        if (std::isalnum(c)) o += static_cast<char>(std::tolower(c));
+        else if (!o.empty() && o.back() != '_') o += '_';
+    }
+    while (!o.empty() && o.back() == '_') o.pop_back();
+    if (o.size() > 32) o.resize(32);
+    return o;
+}
+
+std::optional<SkillCommand> MatchSkillCommand(const std::vector<Skill>& skills, const std::string& text) {
+    std::size_t i = text.find_first_not_of(" \t\r\n");
+    if (i == std::string::npos || text[i] != '/') return std::nullopt;
+    std::size_t e = text.find_first_of(" \t\r\n", i);
+    std::string cmd = text.substr(i + 1, e == std::string::npos ? std::string::npos : e - i - 1);
+    std::string rest = e == std::string::npos ? "" : text.substr(e);
+    auto trim = [](std::string s) {
+        auto a = s.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) return std::string();
+        return s.substr(a, s.find_last_not_of(" \t\r\n") - a + 1);
+    };
+    rest = trim(rest);
+    std::string want;
+    if (cmd == "skill") {
+        auto sp = rest.find_first_of(" \t\r\n");
+        want = SlashName(rest.substr(0, sp));
+        rest = sp == std::string::npos ? "" : trim(rest.substr(sp));
+    } else {
+        want = cmd;
+    }
+    for (const auto& s : skills) {
+        if (!s.user_invocable || !s.eligible || SlashName(s.name) != want) continue;
+        SkillCommand sc{s.name, rest, ""};
+        sc.prompt = "Use the \"" + s.name + "\" skill for this request.\n\n<skill name=\"" + s.name + "\" location=\"" +
+                    (s.path / "SKILL.md").string() + "\">\n" + s.body + "\n</skill>\n\nUser input:\n" +
+                    (rest.empty() ? std::string("(none)") : rest);
+        return sc;
+    }
+    return std::nullopt;
 }
 
 std::string FormatSkillsForPrompt(const std::vector<Skill>& skills) {
@@ -189,6 +296,7 @@ std::optional<Skill> ParseSkillFile(const fs::path& skill_md) {
         s.name = skill_md.parent_path().filename().string();
     }
     if (!s.metadata.is_object()) s.metadata = nlohmann::json::object();
+    if (s.metadata.contains("__userInvocable")) { s.user_invocable = s.metadata["__userInvocable"]; s.metadata.erase("__userInvocable"); }
     EvaluateGating(s);
     return s;
 }
@@ -238,7 +346,10 @@ nlohmann::json Library::ListJson() const {
                        {"source", s.source},
                        {"eligible", s.eligible},
                        {"missing", s.missing},
-                       {"disableModelInvocation", s.disable_model_invocation}});
+                       {"disableModelInvocation", s.disable_model_invocation},
+                       {"enabled", s.enabled},
+                       {"userInvocable", s.user_invocable},
+                       {"command", s.user_invocable ? "/" + SlashName(s.name) : ""}});
     }
     return arr;
 }

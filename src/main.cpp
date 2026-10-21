@@ -74,7 +74,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.34.0-dev";
+constexpr const char* kVersion = "1.35.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -121,6 +121,8 @@ openclaw::skills::Library LoadSkills() {
     std::string extra = openclaw::EnvOr("OPENCLAW_SKILLS_DIR", "");
     if (!extra.empty()) roots.push_back({fs::path(extra), "extra"});
     lib.ScanRoots(roots);
+    auto lr = openclaw::config::Load(openclaw::config::DefaultPath());
+    if (auto e = openclaw::config::GetPath(lr.snap.raw, "skills.entries")) lib.ApplyEntries(*e);
     return lib;
 }
 
@@ -1477,6 +1479,35 @@ int CmdSelfTest() {
         else std::cerr << "PASS config $include (merge, override, round-trip, cycle) + schema validation\n";
     } catch (const std::exception& e) { std::cerr << "FAIL config include exception: " << e.what() << "\n"; ++failures; }
 
+    // skills.entries (enabled/env/apiKey) + slash commands + scoped env
+    try {
+        namespace fs = std::filesystem;
+        auto root = fs::temp_directory_path() / "oc-skent-st";
+        fs::remove_all(root);
+        auto mk = [](const fs::path& d, const std::string& body) { fs::create_directories(d); std::ofstream(d / "SKILL.md") << body; };
+        mk(root / "gh", "---\nname: GitHub PR\ndescription: gh\nmetadata: {\"openclaw\":{\"primaryEnv\":\"OC_ST_GH_TOKEN\",\"requires\":{\"env\":[\"OC_ST_GH_TOKEN\"]}}}\n---\nOpen PRs carefully.\n");
+        mk(root / "off", "---\nname: off\ndescription: x\n---\nbody\n");
+        mk(root / "noslash", "---\nname: noslash\ndescription: x\nuser-invocable: false\n---\nbody\n");
+        skills::Library lib; lib.ScanRoots({{root, "workspace"}});
+        bool ok = !lib.Find("GitHub PR")->eligible;
+        nlohmann::json entries = {{"GitHub PR", {{"apiKey", "tok123"}, {"env", {{"OC_ST_EXTRA", "1"}}}}}, {"off", {{"enabled", false}}}};
+        lib.ApplyEntries(entries);
+        ok = ok && lib.Find("GitHub PR")->eligible && !lib.Find("off")->eligible;
+        auto ov = skills::SkillEnvOverrides(lib.List(), entries);
+        {
+            skills::ScopedEnv se(ov);
+            ok = ok && std::string(std::getenv("OC_ST_GH_TOKEN") ? std::getenv("OC_ST_GH_TOKEN") : "") == "tok123";
+        }
+        ok = ok && std::getenv("OC_ST_GH_TOKEN") == nullptr && skills::SlashName("GitHub PR") == "github_pr";
+        auto c1 = skills::MatchSkillCommand(lib.List(), "/github_pr fix #12");
+        auto c2 = skills::MatchSkillCommand(lib.List(), "/skill github-pr");
+        ok = ok && c1 && c1->args == "fix #12" && c1->prompt.find("Open PRs carefully.") != std::string::npos &&
+             c2 && c2->skill == "GitHub PR" && !skills::MatchSkillCommand(lib.List(), "/off x") &&
+             !skills::MatchSkillCommand(lib.List(), "/noslash") && !skills::MatchSkillCommand(lib.List(), "hello /github_pr");
+        if (!ok) { std::cerr << "FAIL skills entries/slash\n"; ++failures; }
+        else std::cerr << "PASS skills.entries (enabled/env/apiKey) + scoped env + skill slash commands\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL skills entries exception: " << e.what() << "\n"; ++failures; }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -1897,8 +1928,13 @@ int CmdChat(int argc, char** argv, int argi) {
     auto messages = store.Load(session_id.empty() ? "_" : session_id);
     if (!messages.empty() && messages.front().role == "system") messages.erase(messages.begin());
     messages.insert(messages.begin(), agent::Message{.role = "system", .content = BuildAgentSystemPrompt(registry)});
+    auto skill_lib = LoadSkills();
+    if (auto sc = skills::MatchSkillCommand(skill_lib.List(), user_message)) user_message = sc->prompt;
     messages.push_back({.role = "user", .content = user_message});
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    auto cfg_raw = config::LoadOrDefault(config::DefaultPath()).raw;
+    auto entries = config::GetPath(cfg_raw, "skills.entries").value_or(nlohmann::json::object());
+    skills::ScopedEnv skill_env(skills::SkillEnvOverrides(skill_lib.List(), entries));
     auto result = agent::RunAgentLoop(*prov, registry, messages, {});
     curl_global_cleanup();
     if (!session_id.empty() && result.ok) {

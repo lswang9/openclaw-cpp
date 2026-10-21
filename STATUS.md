@@ -1,6 +1,12 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.34.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.35.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.35.0-dev 新增
+
+- 技能级配置 `skills.entries.<技能名>`：`enabled: false` 禁用；`env: {...}` 与 `apiKey`（对应技能声明的 `primaryEnv`）会在 agent 运行期间注入环境变量（不覆盖已存在的变量），也能满足技能的 env 依赖检查。
+- 技能斜杠命令：`/技能名 参数` 或 `/skill 技能名 参数`（名称转小写、非字母数字变 `_`）；`skills list` 会显示每个技能的命令。`user-invocable: false` 的技能不暴露命令。
+- 注意：环境变量注入是进程级的，同时进行的多个对话之间不隔离。
 
 ## 1.34.0-dev 新增
 

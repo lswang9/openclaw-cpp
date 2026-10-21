@@ -208,4 +208,5 @@ OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat -s smoke:reset "hi" >/dev/null
 OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat -s smoke:reset "/new" | grep -q "New session" && grep -q "previousSessionId" "$OPENCLAW_SESSION_DIR/sessions.json" && echo "[smoke] /new session reset ok"
 ls "$OPENCLAW_SESSION_DIR"/archive/smoke~3areset.*.jsonl >/dev/null || { echo "[smoke] no jsonl transcript" >&2; exit 1; }
 if grep -q "\"role\":\"system\"" "$OPENCLAW_SESSION_DIR"/archive/*.jsonl; then echo "[smoke] system prompt persisted" >&2; exit 1; fi; echo "[smoke] jsonl transcript (no system prompt persisted) ok"
+"$BIN" skills list | grep -q "/hello_skill" && OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat "/hello_skill hi" >/dev/null && echo "[smoke] skill slash command ok" || { echo "[smoke] skill slash failed" >&2; exit 1; }
 echo "[smoke] ALL PASS"
