@@ -20,6 +20,7 @@
 #include <map>
 #include <optional>
 #include <random>
+#include <regex>
 #include <set>
 #include <sstream>
 
@@ -882,6 +883,297 @@ std::string CompletionScript(const std::string& shell, const std::string& bin) {
     return o.str();
 }
 
+// ---------------------------------------------------------------- claws add / status / remove (install records)
+// Install records live in <data>/claws/state.json "installs" (shared with the gateway's claws.removalJournal).
+fs::path ClawsDataDir() { const char* e = std::getenv("OPENCLAW_DATA_DIR"); return e && *e ? fs::path(e) : Home() / ".openclaw-cpp" / "data"; }
+std::string ReadAll(const fs::path& p) { std::ifstream f(p, std::ios::binary); std::stringstream ss; ss << f.rdbuf(); return ss.str(); }
+std::string FileDigest(const std::string& content) { return gateway::ClawDigest(json(content)); }
+void WriteClawState(const json& st) {  // in place: the gateway binds journal mutations to the file's physical identity
+    const auto p = ClawsDataDir() / "claws" / "state.json";
+    std::error_code ec; fs::create_directories(p.parent_path(), ec);
+    std::ofstream f(p, std::ios::trunc); f << st.dump(2);
+}
+// Minimal YAML front matter reader for CLAW.md: nested "key: value" maps by indentation (scalars only).
+json FrontMatter(const std::string& md, std::string* body) {
+    json out = json::object();
+    if (md.rfind("---\n", 0) != 0) { *body = md; return out; }
+    auto end = md.find("\n---", 4);
+    if (end == std::string::npos) { *body = md; return out; }
+    std::istringstream in(md.substr(4, end - 4));
+    *body = md.substr(md.find('\n', end + 1) == std::string::npos ? md.size() : md.find('\n', end + 1) + 1);
+    std::vector<std::pair<int, json*>> stack{{-1, &out}};
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find_first_not_of(' ') == std::string::npos || line[line.find_first_not_of(' ')] == '#') continue;
+        const int ind = static_cast<int>(line.find_first_not_of(' '));
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string k = line.substr(ind, colon - ind), v = line.substr(colon + 1);
+        v.erase(0, v.find_first_not_of(' ')); while (!v.empty() && (v.back() == ' ' || v.back() == '\r')) v.pop_back();
+        while (stack.size() > 1 && stack.back().first >= ind) stack.pop_back();
+        json& parent = *stack.back().second;
+        if (v.empty()) { parent[k] = json::object(); stack.push_back({ind, &parent[k]}); continue; }
+        if (v.size() >= 2 && (v.front() == '"' || v.front() == '\'') && v.back() == v.front()) v = v.substr(1, v.size() - 2);
+        if (std::all_of(v.begin(), v.end(), ::isdigit)) parent[k] = std::stoll(v); else parent[k] = v;
+    }
+    return out;
+}
+struct ClawPackage { json manifest; fs::path base; std::string name, version, source; std::string instructions; std::string error; };
+ClawPackage ReadClaw(const std::string& src) {
+    ClawPackage pk; pk.source = fs::absolute(src).lexically_normal().string();
+    std::error_code ec;
+    fs::path mf;
+    if (fs::is_directory(src, ec)) {
+        pk.base = fs::absolute(src);
+        if (fs::exists(pk.base / "package.json")) {
+            try {
+                auto pj = json::parse(ReadAll(pk.base / "package.json"));
+                pk.name = pj.value("name", ""); pk.version = pj.value("version", "");
+                if (pj.contains("openclaw") && pj["openclaw"].is_object()) mf = pk.base / pj["openclaw"].value("claw", "CLAW.md");
+            } catch (...) { pk.error = "package.json is not valid JSON"; return pk; }
+        }
+        if (mf.empty()) mf = fs::exists(pk.base / "CLAW.md") ? pk.base / "CLAW.md" : pk.base / "claw.json";
+    } else { mf = fs::absolute(src); pk.base = mf.parent_path(); }
+    if (!fs::is_regular_file(mf, ec)) { pk.error = "no Claw manifest at " + mf.string(); return pk; }
+    const auto raw = ReadAll(mf);
+    if (raw.size() > 256 * 1024) { pk.error = "Claw manifest exceeds 256 KiB"; return pk; }
+    if (mf.extension() == ".md") pk.manifest = FrontMatter(raw, &pk.instructions);
+    else try { pk.manifest = json::parse(raw); } catch (const std::exception& e) { pk.error = std::string("invalid manifest JSON: ") + e.what(); return pk; }
+    if (pk.manifest.value("schemaVersion", 0) != 1) { pk.error = "unsupported Claw schemaVersion (expected 1)"; return pk; }
+    if (!pk.manifest.contains("agent") || !pk.manifest["agent"].is_object() || pk.manifest["agent"].value("id", "").empty()) { pk.error = "manifest agent.id is required"; return pk; }
+    if (pk.name.empty()) pk.name = pk.manifest["agent"].value("id", "");
+    return pk;
+}
+bool InsideDir(const fs::path& base, const fs::path& p) {
+    auto b = fs::weakly_canonical(base).string(), q = fs::weakly_canonical(p).string();
+    return q.size() > b.size() && q.rfind(b + "/", 0) == 0;
+}
+bool AgentConfigured(const json& raw, const std::string& id) {
+    auto l = Get(raw, "agents.list");
+    if (l.is_array()) for (auto& a : l) if (a.is_object() && a.value("id", "") == id) return true;
+    auto e = Get(raw, "agents.entries");
+    return e.is_object() && e.contains(id);
+}
+void PrintPlan(const json& plan, bool as_json) {
+    if (as_json) { std::cout << plan.dump(2) << "\n"; return; }
+    for (auto& a : plan["actions"]) std::cout << "  - " << a.get<std::string>() << "\n";
+    std::cout << "plan integrity: " << plan["planIntegrity"].get<std::string>() << "\n";
+}
+
+int CmdClawsAdd(int argc, char** argv) {
+    std::string src, agent_override, ws_override, integrity; bool dry = false, yes = false, as_json = false;
+    for (int i = 3; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+        if (a == "--dry-run") dry = true; else if (a == "--yes") yes = true; else if (a == "--json") as_json = true;
+        else if (a == "--plan-integrity") integrity = next(); else if (a == "--agent-id") agent_override = next();
+        else if (a == "--workspace") ws_override = next();
+        else if (a.rfind("--", 0) == 0) { std::cerr << "unknown option '" << a << "'\n"; return 2; }
+        else if (src.empty()) src = a; else { std::cerr << "unexpected argument '" << a << "'\n"; return 2; }
+    }
+    if (src.empty()) { std::cerr << "usage: openclaw-cpp claws add <source> [--dry-run] [--yes] [--plan-integrity D] [--agent-id ID] [--workspace PATH] [--json]\n"; return 2; }
+    auto pk = ReadClaw(src);
+    if (!pk.error.empty()) { std::cerr << "claws add: " << pk.error << "\n"; return 1; }
+    const std::string id = agent_override.empty() ? pk.manifest["agent"].value("id", "") : agent_override;
+    static const std::regex id_re("^[a-z0-9][a-z0-9_-]{0,63}$");
+    if (!std::regex_match(id, id_re) || id == "main") { std::cerr << "claws add: invalid or reserved agent id '" << id << "'\n"; return 1; }
+    auto c = LoadCfg();
+    if (!c.valid) { std::cerr << "claws add: config invalid: " << c.error << "\n"; return 1; }
+    auto st = gateway::ClawStateRead(ClawsDataDir());
+    if (AgentConfigured(c.raw, id) || st["installs"].contains(id)) { std::cerr << "claws add: agent '" << id << "' already exists; pass --agent-id\n"; return 1; }
+    const fs::path ws = ws_override.empty() ? StateDir() / ("workspace-" + id) : fs::absolute(ExpandHome(ws_override));
+    std::error_code ec;
+    if (fs::exists(ws, ec) && !fs::is_empty(ws, ec)) { std::cerr << "claws add: workspace " << ws.string() << " already exists and is not empty\n"; return 1; }
+    // Files the Claw owns in the new workspace.
+    json files = json::object();
+    std::vector<std::string> errors;
+    auto add_file = [&](const std::string& rel_src, const std::string& dest) {
+        const auto sp = pk.base / rel_src;
+        if (!InsideDir(pk.base, sp) || !fs::is_regular_file(sp, ec)) { errors.push_back("missing or escaping source " + rel_src); return; }
+        if (fs::path(dest).is_absolute() || dest.find("..") != std::string::npos) { errors.push_back("invalid workspace path " + dest); return; }
+        files[dest] = {{"source", rel_src}, {"digest", FileDigest(ReadAll(sp))}};
+    };
+    const auto& wsm = pk.manifest.contains("workspace") && pk.manifest["workspace"].is_object() ? pk.manifest["workspace"] : json::object();
+    if (wsm.contains("bootstrapFiles") && wsm["bootstrapFiles"].is_object())
+        for (auto& [name, v] : wsm["bootstrapFiles"].items()) add_file(v.value("source", ""), name);
+    if (wsm.contains("files") && wsm["files"].is_array())
+        for (auto& f : wsm["files"]) add_file(f.value("source", ""), f.value("path", ""));
+    if (!pk.instructions.empty() && !files.contains("AGENTS.md")) files["AGENTS.md"] = {{"inline", true}, {"digest", FileDigest(pk.instructions)}};
+    if (!errors.empty()) { for (auto& e : errors) std::cerr << "claws add: " << e << "\n"; return 1; }
+    json entry{{"id", id}, {"workspace", ws.string()}};
+    if (auto n = pk.manifest["agent"].value("name", ""); !n.empty()) entry["name"] = n;
+    if (pk.manifest["agent"].contains("identity")) entry["identity"] = pk.manifest["agent"]["identity"];
+    json plan{{"kind", "claws.add"}, {"agentId", id}, {"package", {{"name", pk.name}, {"version", pk.version}, {"source", pk.source}, {"manifestDigest", gateway::ClawDigest(pk.manifest)}}},
+              {"workspace", ws.string()}, {"files", files}, {"configEntry", entry}};
+    json actions = json::array({"create agent '" + id + "' in agents.list", "create workspace " + ws.string()});
+    for (auto& [k, v] : files.items()) actions.push_back("write " + k);
+    plan["planIntegrity"] = gateway::ClawDigest(plan);
+    plan["actions"] = actions;
+    if (dry || !yes) {
+        plan["applied"] = false;
+        PrintPlan(plan, as_json);
+        if (!yes && !dry && !as_json) std::cout << "re-run with --yes --plan-integrity " << plan["planIntegrity"].get<std::string>() << " to apply\n";
+        return 0;
+    }
+    if (!integrity.empty() && integrity != plan["planIntegrity"].get<std::string>()) { std::cerr << "claws add: plan changed since preview (plan integrity mismatch)\n"; return 1; }
+    fs::create_directories(ws, ec);
+    for (auto& [dest, v] : files.items()) {
+        const auto out = ws / dest;
+        fs::create_directories(out.parent_path(), ec);
+        std::ofstream f(out, std::ios::binary);
+        f << (v.value("inline", false) ? pk.instructions : ReadAll(pk.base / v["source"].get<std::string>()));
+    }
+    auto list = Get(c.raw, "agents.list");
+    if (!list.is_array()) list = json::array();
+    list.push_back(entry);
+    Set(c.raw, "agents.list", list);
+    SaveCfg(c);
+    st["installs"][id] = {{"agentId", id}, {"package", plan["package"]}, {"workspace", ws.string()}, {"files", files},
+                          {"configEntryDigest", gateway::ClawDigest(entry)}, {"planIntegrity", plan["planIntegrity"]},
+                          {"createdAtMs", static_cast<long long>(std::time(nullptr)) * 1000}};
+    WriteClawState(st);
+    plan["applied"] = true;
+    if (as_json) std::cout << plan.dump(2) << "\n"; else std::cout << "added Claw agent '" << id << "' (workspace " << Short(ws) << ")\n";
+    return 0;
+}
+
+json ClawDrift(const json& raw, const json& inst) {
+    json drift = json::array();
+    const fs::path ws = inst.value("workspace", "");
+    std::error_code ec;
+    if (!fs::exists(ws, ec)) drift.push_back({{"kind", "workspace_missing"}, {"path", ws.string()}});
+    for (auto& [rel, v] : inst["files"].items()) {
+        const auto p = ws / rel;
+        if (!fs::exists(p, ec)) drift.push_back({{"kind", "file_missing"}, {"path", rel}});
+        else if (FileDigest(ReadAll(p)) != v.value("digest", "")) drift.push_back({{"kind", "file_modified"}, {"path", rel}});
+    }
+    if (!AgentConfigured(raw, inst.value("agentId", ""))) drift.push_back({{"kind", "config_entry_missing"}});
+    return drift;
+}
+std::string ResolveInstallTarget(const json& st, const std::string& target) {
+    if (st["installs"].contains(target)) return target;
+    for (auto& [id, v] : st["installs"].items()) if (v["package"].value("name", "") == target) return id;
+    return {};
+}
+
+int CmdClawsStatus(int argc, char** argv) {
+    std::string target; bool as_json = false;
+    for (int i = 3; i < argc; ++i) { std::string a = argv[i]; if (a == "--json") as_json = true; else if (a.rfind("--", 0) == 0) { std::cerr << "unknown option '" << a << "'\n"; return 2; } else target = a; }
+    const auto c = LoadCfg();
+    auto st = gateway::ClawStateRead(ClawsDataDir());
+    json out = json::array();
+    for (auto& [id, inst] : st["installs"].items()) {
+        if (!target.empty() && id != target && inst["package"].value("name", "") != target) continue;
+        json j{{"agentId", id}, {"package", inst["package"]}, {"workspace", inst["workspace"]}, {"drift", ClawDrift(c.raw, inst)}};
+        if (st["journals"].contains(id)) j["deletionJournal"] = st["journals"][id];
+        out.push_back(j);
+    }
+    if (!target.empty() && out.empty()) { std::cerr << "claws status: no installed Claw '" << target << "'\n"; return 1; }
+    if (as_json) { std::cout << json{{"installs", out}}.dump(2) << "\n"; return 0; }
+    if (out.empty()) std::cout << "no Claw agents installed\n";
+    for (auto& j : out) {
+        std::cout << j["agentId"].get<std::string>() << "  " << j["package"].value("name", "") << " " << j["package"].value("version", "")
+                  << "  " << (j["drift"].empty() ? "in sync" : std::to_string(j["drift"].size()) + " drift item(s)") << "\n";
+        for (auto& d : j["drift"]) std::cout << "    " << d["kind"].get<std::string>() << (d.contains("path") ? " " + d["path"].get<std::string>() : "") << "\n";
+    }
+    return 0;
+}
+
+int CmdClawsRemove(int argc, char** argv) {
+    std::string target, integrity, url; bool dry = false, yes = false, as_json = false;
+    for (int i = 3; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+        if (a == "--dry-run") dry = true; else if (a == "--yes") yes = true; else if (a == "--json") as_json = true;
+        else if (a == "--plan-integrity") integrity = next(); else if (a == "--url") url = next();
+        else if (a == "--remove-unused" || a == "--force-referenced") {}  // Claws here introduce no shared references
+        else if (a == "--remove-referenced") next();
+        else if (a.rfind("--", 0) == 0) { std::cerr << "unknown option '" << a << "'\n"; return 2; }
+        else target = a;
+    }
+    if (target.empty()) { std::cerr << "usage: openclaw-cpp claws remove <claw-or-agent> [--dry-run] [--yes] [--plan-integrity D] [--json]\n"; return 2; }
+    auto c = LoadCfg();
+    const auto data = ClawsDataDir();
+    auto st = gateway::ClawStateRead(data);
+    const auto id = ResolveInstallTarget(st, target);
+    if (id.empty()) { std::cerr << "claws remove: '" << target << "' is not a Claw-created agent (no install record)\n"; return 1; }
+    const auto inst = st["installs"][id];
+    const auto drift = ClawDrift(c.raw, inst);
+    json retained = json::array(), remove_files = json::array();
+    for (auto& [rel, v] : inst["files"].items()) {
+        bool modified = false;
+        for (auto& d : drift) if (d.value("path", "") == rel && d["kind"] == "file_modified") modified = true;
+        (modified ? retained : remove_files).push_back(rel);
+    }
+    json plan{{"kind", "claws.remove"}, {"agentId", id}, {"installDigest", gateway::ClawDigest(inst)}, {"removeFiles", remove_files},
+              {"retainedModifiedFiles", retained}, {"removeConfigEntry", AgentConfigured(c.raw, id)}, {"workspace", inst["workspace"]}};
+    json actions = json::array();
+    if (plan["removeConfigEntry"].get<bool>()) actions.push_back("remove agent '" + id + "' from config");
+    for (auto& f : remove_files) actions.push_back("delete " + f.get<std::string>());
+    for (auto& f : retained) actions.push_back("keep modified " + f.get<std::string>());
+    actions.push_back("delete agent state (sessions, memory) for '" + id + "'");
+    plan["planIntegrity"] = gateway::ClawDigest(plan);
+    plan["actions"] = actions;
+    if (dry || !yes) { plan["applied"] = false; PrintPlan(plan, as_json); return 0; }
+    if (!integrity.empty() && integrity != plan["planIntegrity"].get<std::string>()) { std::cerr << "claws remove: plan changed since preview (plan integrity mismatch)\n"; return 1; }
+    // 1. Gateway journal: begin (lease + digest guarded). The journal's cleanupPaths are what we may delete.
+    const std::string op = "rm-" + RandomToken().substr(0, 16), owner = "cli-" + std::to_string(::getpid());
+    const json journal_prev = st["journals"].contains(id) ? st["journals"][id] : json(nullptr);
+    json req{{"phase", "begin"}, {"agentId", id}, {"operationId", op}, {"binding", gateway::ClawRemovalBinding(data)},
+             {"sourceIdentity", gateway::ClawStateIdentity(data)}, {"lease", {{"scope", "core:agent-deletion"}, {"key", id}, {"owner", owner}}},
+             {"expectedInstallDigest", gateway::ClawDigest(inst)}, {"expectedJournalDigest", gateway::ClawDigest(journal_prev)},
+             {"configDigest", gateway::ClawDigest(c.raw)}};
+    std::string err;
+    const char* tok = std::getenv("OPENCLAW_GATEWAY_TOKEN");
+    { std::string ignore; Rpc(GatewayBase(c.raw, url), tok ? tok : "", "config.reload", json::object(), 30, &ignore); }  // bind to the config on disk
+    auto r = Rpc(GatewayBase(c.raw, url), tok ? tok : "", "claws.removalJournal", req, 600, &err);
+    if (!err.empty()) { std::cerr << "claws remove: the Gateway must accept the deletion journal first: " << err << "\n"; return 1; }
+    const auto journal = r.value("journal", json());
+    if (!journal.is_object() || journal.value("operationId", "") != op) { std::cerr << "claws remove: Claw journal outcome is unknown; inspect claws status before retrying\n"; return 1; }
+    // 2. Cleanup, bounded by the journal: owned workspace files, then agent-private directories.
+    std::error_code ec;
+    const fs::path ws = inst.value("workspace", "");
+    for (auto& f : remove_files) fs::remove(ws / f.get<std::string>(), ec);
+    for (auto it = fs::recursive_directory_iterator(ws, ec); !ec && it != fs::recursive_directory_iterator(); ++it) {}
+    // prune now-empty directories bottom-up
+    std::vector<fs::path> dirs;
+    for (auto it = fs::recursive_directory_iterator(ws, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) if (it->is_directory()) dirs.push_back(it->path());
+    std::sort(dirs.begin(), dirs.end(), [](auto& a, auto& b) { return a.string().size() > b.string().size(); });
+    for (auto& d : dirs) if (fs::is_empty(d, ec)) fs::remove(d, ec);
+    if (fs::exists(ws, ec) && fs::is_empty(ws, ec)) fs::remove(ws, ec);
+    json deleted = json::array();
+    const std::set<std::string> protected_roots{fs::weakly_canonical(data).string(), fs::weakly_canonical(Home()).string(), fs::weakly_canonical(StateDir()).string(), "/"};
+    for (auto& cp : journal["cleanupPaths"]) {
+        const fs::path p = cp.value("path", "");
+        if (p == ws || p.empty()) continue;  // workspace handled per owned file above
+        bool owned = false;
+        for (auto& part : p) if (part == id) owned = true;
+        if (!owned || protected_roots.count(fs::weakly_canonical(p).string())) continue;
+        if (fs::exists(p, ec)) { fs::remove_all(p, ec); deleted.push_back(p.string()); }
+    }
+    // 3. Config entry, then close the journal (cleanupCompleted) and drop the install record.
+    c = LoadCfg();
+    for (const char* path : {"agents.list"}) {
+        auto l = Get(c.raw, path);
+        if (!l.is_array()) continue;
+        json kept = json::array();
+        for (auto& a : l) if (!(a.is_object() && a.value("id", "") == id)) kept.push_back(a);
+        Set(c.raw, path, kept);
+    }
+    if (auto e = Get(c.raw, "agents.entries"); e.is_object() && e.contains(id)) { e.erase(id); Set(c.raw, "agents.entries", e); }
+    SaveCfg(c);
+    st = gateway::ClawStateRead(data);
+    st["journals"][id]["cleanupCompleted"] = true;
+    st["journals"][id]["completedAtMs"] = static_cast<long long>(std::time(nullptr)) * 1000;
+    st["installs"].erase(id);
+    st["leases"].erase(id);
+    WriteClawState(st);
+    plan["applied"] = true; plan["deletedPaths"] = deleted; plan["operationId"] = op;
+    if (as_json) std::cout << plan.dump(2) << "\n";
+    else std::cout << "removed Claw agent '" << id << "'" << (retained.empty() ? "" : " (kept " + std::to_string(retained.size()) + " modified file(s))") << "\n";
+    return 0;
+}
+
 // `claws removal-journal begin|rollback`: the CLI side of upstream's clawRemovalJournalGateway. It computes the
 // gateway binding, physical state identity, config digest and expected install/journal digests locally, then
 // calls claws.removalJournal. --stale-journal deliberately sends an outdated journal digest (test hook).
@@ -923,6 +1215,9 @@ int MaybeLocalCommand(int argc, char** argv) {
     const std::string cmd = argv[1];
     if (cmd == "completion") return CmdCompletion(argc, argv);
     if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "removal-journal") return CmdClawsRemovalJournal(argc, argv);
+    if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "add") return CmdClawsAdd(argc, argv);
+    if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "status") return CmdClawsStatus(argc, argv);
+    if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "remove") return CmdClawsRemove(argc, argv);
     if (cmd == "onboard") return CmdOnboard(argc, argv, 2);
     if (cmd == "configure") return CmdConfigure(argc, argv);
     if (cmd == "migrate") return CmdMigrate(argc, argv);
