@@ -77,7 +77,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.37.0-dev";
+constexpr const char* kVersion = "1.38.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1542,6 +1542,31 @@ int CmdSelfTest() {
         if (!ok) { std::cerr << "FAIL tokenizer\n"; ++failures; }
         else std::cerr << "PASS BPE tokenizer (pre-tokenizer, merges; " << real << ")\n";
     } catch (const std::exception& e) { std::cerr << "FAIL tokenizer exception: " << e.what() << "\n"; ++failures; }
+
+    // upstream session keys
+    {
+        session::KeyParts d; d.channel = "Slack"; d.chat_type = "direct"; d.peer_id = "U1";
+        session::KeyParts g; g.channel = "telegram"; g.chat_type = "group"; g.conversation_id = "-100"; g.thread_id = "7";
+        session::KeyParts c; c.channel = "discord"; c.chat_type = "channel"; c.conversation_id = "C9";
+        bool ok = session::BuildSessionKey(d) == "agent:main:main" &&
+                  session::BuildSessionKey(d, "per-peer") == "agent:main:dm:U1" &&
+                  session::BuildSessionKey(d, "per-channel-peer") == "agent:main:slack:dm:U1" &&
+                  session::BuildSessionKey(g) == "agent:main:telegram:group:-100:thread:7" &&
+                  session::BuildSessionKey(c) == "agent:main:discord:channel:C9" &&
+                  session::InferChatType(session::BuildSessionKey(g)) == "thread" &&
+                  session::InferChatType(session::BuildSessionKey(c)) == "group";
+        // adapters populate the structured fields
+        auto hub = channels::AdapterHub::MakeDefault();
+        channels::InboundMessage seen;
+        auto cap = [&](const channels::InboundMessage& m) { seen = m; return std::string("ok"); };
+        if (auto* sl = hub.Get("slack")) {
+            sl->HandleHttpInbound({{"type", "event_callback"}, {"event", {{"type", "message"}, {"text", "hi"}, {"user", "U1"},
+                              {"channel", "C1"}, {"channel_type", "channel"}, {"ts", "2.0"}, {"thread_ts", "1.0"}}}}, cap);
+            ok = ok && seen.chat_type == "channel" && seen.conversation_id == "C1" && seen.thread_id == "1.0" && !seen.explicit_key;
+        } else ok = false;
+        if (!ok) { std::cerr << "FAIL upstream session keys\n"; ++failures; }
+        else std::cerr << "PASS upstream session keys (dmScope main/per-peer/per-channel-peer, group/channel/thread) + adapter fields\n";
+    }
 
     // canvas disk store + sim bridge
     try {

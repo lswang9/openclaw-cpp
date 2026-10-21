@@ -82,6 +82,11 @@ rpc '{"jsonrpc":"2.0","id":11,"method":"tools.list","params":{}}' | grep -q tool
 echo "[smoke] config hot reload + invalid config rejected (gateway keeps running)"
 rm -f "$OPENCLAW_CONFIG_PATH"
 
+curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/json' \
+  -d '{"type":"event_callback","event":{"type":"message","text":"hi","user":"U1","channel":"C1","channel_type":"channel","ts":"2.0","thread_ts":"1.0"}}' >/dev/null
+grep -q 'agent:main:slack:channel:C1:thread:1.0' "$OPENCLAW_SESSION_DIR/sessions.json" || { echo "[smoke] upstream session key missing" >&2; exit 1; }
+echo "[smoke] slack thread -> agent:main:slack:channel:C1:thread:1.0"
+
 echo "[smoke] POST /v1/rpc sessions.create"
 RPC_SESS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \
   -H 'Content-Type: application/json' \

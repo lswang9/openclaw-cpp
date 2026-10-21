@@ -40,6 +40,9 @@ bool WhatsAppCloudAdapter::ExtractCloudMessage(const nlohmann::json& body, Inbou
         out.text = body.value("text", "");
         out.sender = body.value("from", body.value("sender", "whatsapp"));
         out.session_key = body.value("session_key", "whatsapp-" + out.sender);
+        out.explicit_key = body.contains("session_key");
+        out.chat_type = body.value("chat_type", out.sender.find("@g.us") != std::string::npos ? "group" : "direct");
+        if (out.chat_type == "group") out.conversation_id = body.value("group_id", out.sender);
         return !out.text.empty();
     }
 
@@ -88,6 +91,7 @@ bool WhatsAppCloudAdapter::ExtractCloudMessage(const nlohmann::json& body, Inbou
             return false;
         }
         out.session_key = "whatsapp-" + out.sender;
+        out.chat_type = "direct";  // Cloud API delivers 1:1 conversations
         return !out.text.empty();
     } catch (...) {
         note = "parse error";

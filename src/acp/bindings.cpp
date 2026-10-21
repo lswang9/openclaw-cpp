@@ -12,6 +12,13 @@ bool BindingStore::ParseInbound(const channels::InboundMessage& msg, std::string
     chat_id.clear();
     if (channel.empty()) return false;
     const std::string& sk = msg.session_key;
+    if (sk.rfind("agent:", 0) == 0) {
+        chat_id = !msg.conversation_id.empty() ? msg.conversation_id : (!msg.peer_id.empty() ? msg.peer_id : msg.sender);
+        if (!msg.thread_id.empty()) chat_id += ":thread:" + msg.thread_id;
+        if (chat_id.empty()) chat_id = "default";
+        channel_key = MakeKey(channel, chat_id);
+        return true;
+    }
     const std::string prefix_dash = channel + "-";
     const std::string prefix_colon = channel + ":";
     if (sk.rfind(prefix_dash, 0) == 0) chat_id = sk.substr(prefix_dash.size());

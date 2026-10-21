@@ -1,6 +1,13 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.37.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.38.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.38.0-dev 新增
+
+- 渠道会话键改为上游格式：私聊默认共用 `agent:main:main`（`session.dmScope` 可设为 `per-peer` 或 `per-channel-peer` 按人分开），群聊 `agent:main:<渠道>:group:<群ID>`，Slack/Discord 频道 `agent:main:<渠道>:channel:<ID>`，线程/话题再加 `:thread:<ID>`。
+- Slack、Discord、飞书、Telegram、WhatsApp 会解析私聊/群/线程信息；旧格式会话（如 `slack-C123`）第一次收到消息时自动迁移到新键。
+- 修复：之前 Slack/飞书/Discord/WhatsApp 的消息默认被自动绑定到 ACP 会话，没有进入正常会话；现在改为与上游一致的“需显式绑定”（`OPENCLAW_ACP_AUTO_BIND=1` 可恢复旧行为）。
+- 调用方显式传 `session_key`，或配置 `session.keyFormat: "legacy"` 时保持旧行为。
 
 ## 1.37.0-dev 新增
 

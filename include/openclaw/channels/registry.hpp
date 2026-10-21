@@ -15,7 +15,11 @@ struct InboundMessage {
     std::string sender;
     std::string text;
     std::string session_key;
-    std::string chat_type;  // direct | group | thread ("" = infer from session_key)
+    std::string chat_type;  // direct | group | channel ("" = infer from session_key)
+    std::string peer_id;          // DM peer (defaults to sender)
+    std::string conversation_id;  // group/channel id
+    std::string thread_id;        // thread / topic id (appended as :thread:<id>)
+    bool explicit_key = false;    // caller supplied session_key verbatim → never canonicalised
 };
 
 using InboundHandler = std::function<void(const InboundMessage&)>;

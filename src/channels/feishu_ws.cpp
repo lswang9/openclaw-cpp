@@ -112,6 +112,11 @@ nlohmann::json FeishuLongConn::HandleEventBody(const nlohmann::json& body, const
     if (ev && ev->contains("message")) {
         auto chat = (*ev)["message"].value("chat_id", "");
         if (!chat.empty()) msg.session_key = "feishu-" + chat;
+        const auto& fm = (*ev)["message"];
+        msg.conversation_id = chat;
+        auto ct = fm.value("chat_type", "");
+        msg.chat_type = ct == "p2p" ? "direct" : ct == "group" ? "group" : "";
+        msg.thread_id = fm.value("thread_id", "");
     }
 
     std::string reply = deliver ? deliver(msg) : "";

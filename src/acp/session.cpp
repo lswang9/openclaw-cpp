@@ -19,7 +19,7 @@ bool EnvTruthy(const char* k, bool default_val = false) {
 Registry::Registry() : endpoint_(std::make_shared<AgentEndpoint>()) {}
 
 bool Registry::AutoBindEnabled() const {
-    return EnvTruthy("OPENCLAW_ACP_AUTO_BIND", true);
+    return EnvTruthy("OPENCLAW_ACP_AUTO_BIND", false);  // upstream: channel→ACP binding is opt-in
 }
 
 bool Registry::IsBindableChannel(const std::string& channel) const {

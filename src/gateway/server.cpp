@@ -36,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.37.0-dev";
+constexpr const char* kVersion = "1.38.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -485,8 +485,33 @@ void Server::MaybeReloadConfig() {
     ReloadConfigNow();
 }
 
-std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
+std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     MaybeReloadConfig();
+    channels::InboundMessage msg = msg_in;
+    {
+        // Upstream session keys (agent:main:main / :<ch>:group:<id> / :channel: / :thread:), unless the caller
+        // passed an explicit key or config opts out (session.keyFormat: "legacy").
+        auto fmt = config::GetPath(deps_.config.raw, "session.keyFormat");
+        bool legacy_fmt = fmt && fmt->is_string() && *fmt == "legacy";
+        if (!msg.explicit_key && !legacy_fmt && !msg.channel.empty() && msg.session_key.rfind("agent:", 0) != 0) {
+            session::KeyParts kp;
+            kp.channel = msg.channel;
+            kp.chat_type = msg.chat_type.empty() ? "direct" : msg.chat_type;
+            kp.peer_id = msg.peer_id.empty() ? msg.sender : msg.peer_id;
+            kp.conversation_id = msg.conversation_id;
+            kp.thread_id = msg.thread_id;
+            auto scope = config::GetPath(deps_.config.raw, "session.dmScope");
+            const std::string legacy = msg.session_key;
+            msg.session_key = session::BuildSessionKey(kp, scope && scope->is_string() ? scope->get<std::string>() : "main");
+            if (msg.chat_type.empty()) msg.chat_type = kp.chat_type;
+            // one-time migration of the pre-1.38 transcript into the canonical key
+            if (!legacy.empty() && legacy != msg.session_key && !deps_.sessions.Exists(msg.session_key) &&
+                deps_.sessions.Exists(legacy)) {
+                deps_.sessions.Save(msg.session_key, deps_.sessions.Load(legacy));
+                Emit("session.migrated", {{"from", legacy}, {"to", msg.session_key}});
+            }
+        }
+    }
     // Channel-bound ACP: slack/feishu/discord → session/prompt + outbound reply
     if (deps_.acp) {
         auto outbound = [this](const std::string& channel, const std::string& chat_id,

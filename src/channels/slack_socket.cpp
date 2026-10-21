@@ -62,6 +62,7 @@ nlohmann::json SlackSocketMode::HandleEventsApi(const nlohmann::json& payload,
     std::string text;
     std::string sender = "slack";
     std::string session = "slack-default";
+    std::string conv, ctype, thread;
     if (typ == "event_callback" && payload.contains("event")) {
         const auto& ev = payload["event"];
         const auto et = ev.value("type", "");
@@ -74,6 +75,8 @@ nlohmann::json SlackSocketMode::HandleEventsApi(const nlohmann::json& payload,
             sender = ev.value("user", sender);
             auto ch = ev.value("channel", "");
             if (!ch.empty()) session = "slack-" + ch;
+            conv = ch; ctype = ev.value("channel_type", "");
+            auto tts = ev.value("thread_ts", ""); if (!tts.empty() && tts != ev.value("ts", "")) thread = tts;
         }
     }
     if (text.empty()) text = payload.value("text", "");
@@ -84,6 +87,8 @@ nlohmann::json SlackSocketMode::HandleEventsApi(const nlohmann::json& payload,
     msg.text = text;
     msg.sender = sender;
     msg.session_key = session;
+    msg.chat_type = ctype == "im" ? "direct" : (ctype == "mpim" || ctype == "group") ? "group" : ctype == "channel" ? "channel" : "";
+    msg.conversation_id = conv; msg.thread_id = thread;
     std::string reply = deliver ? deliver(msg) : "";
     {
         std::lock_guard lock(mu_);
@@ -105,6 +110,8 @@ nlohmann::json SlackSocketMode::HandleSlash(const nlohmann::json& payload, const
     msg.sender = payload.value("user_id", payload.value("user_name", "slack"));
     auto ch = payload.value("channel_id", "");
     msg.session_key = ch.empty() ? "slack-slash" : ("slack-" + ch);
+    msg.conversation_id = ch;
+    msg.chat_type = payload.value("channel_name", "") == "directmessage" ? "direct" : "channel";
     std::string reply = deliver ? deliver(msg) : "";
     {
         std::lock_guard lock(mu_);

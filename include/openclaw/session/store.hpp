@@ -25,6 +25,15 @@ ResetPolicy PolicyFromConfig(const nlohmann::json& raw);
 ResetPolicy PolicyFor(const nlohmann::json& raw, const std::string& channel, const std::string& chat_type);
 // Infer direct|group|thread from an upstream-style session key (agent:main:<ch>:group:<id>, ...:thread:...).
 std::string InferChatType(const std::string& session_key);
+
+// Upstream session keys. dm_scope: main (all DMs share agent:<id>:main) | per-peer (agent:<id>:dm:<peer>) |
+// per-channel-peer (agent:<id>:<channel>:dm:<peer>). Groups: agent:<id>:<channel>:group:<conv>; channels:
+// agent:<id>:<channel>:channel:<conv>; threads append :thread:<id>.
+struct KeyParts {
+    std::string agent_id = "main";
+    std::string channel, chat_type, peer_id, conversation_id, thread_id;
+};
+std::string BuildSessionKey(const KeyParts& k, const std::string& dm_scope = "main");
 // True if a session last updated at `updated` must be reset at `now` under policy.
 bool IsStale(const ResetPolicy& p, std::int64_t updated_ms, std::int64_t now_ms);
 

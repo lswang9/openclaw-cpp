@@ -98,9 +98,15 @@ nlohmann::json FeishuAdapter::HandleHttpInbound(const nlohmann::json& body, cons
         if (s.contains("sender_id")) msg.sender = s["sender_id"].value("open_id", msg.sender);
     }
     msg.session_key = body.value("session_key", "feishu-default");
+    msg.explicit_key = body.contains("session_key");
     if (body.contains("event") && body["event"].contains("message")) {
         auto chat = body["event"]["message"].value("chat_id", "");
         if (!chat.empty()) msg.session_key = "feishu-" + chat;
+        const auto& fm = body["event"]["message"];
+        msg.conversation_id = chat;
+        auto ct = fm.value("chat_type", "");
+        msg.chat_type = ct == "p2p" ? "direct" : ct == "group" ? "group" : "";
+        msg.thread_id = fm.value("thread_id", "");
     }
 
     ++inbound_;

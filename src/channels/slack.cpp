@@ -56,6 +56,7 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
     std::string text;
     std::string sender = "slack";
     std::string session = "slack-default";
+    std::string conv, ctype, thread;
     if (typ == "event_callback" && body.contains("event")) {
         auto& ev = body["event"];
         auto et = ev.value("type", "");
@@ -64,6 +65,8 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
             sender = ev.value("user", sender);
             auto ch = ev.value("channel", "");
             if (!ch.empty()) session = "slack-" + ch;
+            conv = ch; ctype = ev.value("channel_type", "");
+            auto tts = ev.value("thread_ts", ""); if (!tts.empty() && tts != ev.value("ts", "")) thread = tts;
         }
     }
     if (text.empty()) text = body.value("text", body.value("message", ""));
@@ -76,6 +79,9 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
     msg.text = text;
     msg.sender = sender;
     msg.session_key = body.value("session_key", session);
+    msg.explicit_key = body.contains("session_key");
+    msg.chat_type = ctype == "im" ? "direct" : (ctype == "mpim" || ctype == "group") ? "group" : ctype == "channel" ? "channel" : "";
+    msg.conversation_id = conv; msg.thread_id = thread;
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
     return {{"ok", true},

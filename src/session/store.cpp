@@ -306,6 +306,24 @@ std::string InferChatType(const std::string& key) {
     return "direct";
 }
 
+std::string BuildSessionKey(const KeyParts& k, const std::string& dm_scope) {
+    auto low = [](std::string s) { for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return s; };
+    const std::string a = "agent:" + (k.agent_id.empty() ? std::string("main") : low(k.agent_id));
+    const std::string ch = low(k.channel);
+    std::string key;
+    if ((k.chat_type == "group" || k.chat_type == "channel") && !k.conversation_id.empty()) {
+        key = a + ":" + ch + ":" + k.chat_type + ":" + k.conversation_id;
+    } else if (dm_scope == "per-peer" && !k.peer_id.empty()) {
+        key = a + ":dm:" + k.peer_id;
+    } else if (dm_scope == "per-channel-peer" && !k.peer_id.empty()) {
+        key = a + ":" + ch + ":dm:" + k.peer_id;
+    } else {
+        key = a + ":main";
+    }
+    if (!k.thread_id.empty()) key += ":thread:" + k.thread_id;
+    return key;
+}
+
 bool IsStale(const ResetPolicy& p, std::int64_t updated_ms, std::int64_t now_ms) {
     if (p.mode == "off" || updated_ms <= 0 || now_ms <= updated_ms) return false;
     if (p.idle_minutes > 0 && now_ms - updated_ms >= std::int64_t(p.idle_minutes) * 60000) return true;

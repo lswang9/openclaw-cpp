@@ -95,7 +95,21 @@ nlohmann::json SimpleInboundAdapter::HandleHttpInbound(const nlohmann::json& bod
         }
     }
     msg.session_key = body.value("session_key", id_ + "-" + msg.sender);
+    msg.explicit_key = body.contains("session_key");
     msg.chat_type = body.value("chat_type", body.value("chatType", std::string()));
+    msg.conversation_id = body.value("conversation_id", std::string());
+    msg.thread_id = body.value("thread_id", std::string());
+    // Telegram update shape
+    if (body.contains("message") && body["message"].is_object() && body["message"].contains("chat")) {
+        const auto& tm = body["message"];
+        const auto& chat = tm["chat"];
+        auto t = chat.value("type", "");
+        std::string cid = chat.contains("id") ? (chat["id"].is_string() ? chat["id"].get<std::string>() : chat["id"].dump()) : "";
+        if (tm.contains("from") && tm["from"].contains("id")) msg.sender = tm["from"]["id"].is_string() ? tm["from"]["id"].get<std::string>() : tm["from"]["id"].dump();
+        if (t == "private") { msg.chat_type = "direct"; }
+        else if (!t.empty()) { msg.chat_type = "group"; msg.conversation_id = cid; }
+        if (tm.value("is_topic_message", false) && tm.contains("message_thread_id")) msg.thread_id = tm["message_thread_id"].dump();
+    }
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
     return {{"ok", true},

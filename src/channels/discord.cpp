@@ -82,6 +82,9 @@ nlohmann::json DiscordAdapter::HandleHttpInbound(const nlohmann::json& body, con
     auto chan = body.value("channel_id", "");
     msg.session_key = chan.empty() ? body.value("session_key", "discord-default")
                                    : ("discord-" + chan);
+    msg.explicit_key = chan.empty() && body.contains("session_key");
+    msg.conversation_id = chan;
+    msg.chat_type = body.contains("guild_id") && !body["guild_id"].is_null() ? "channel" : "direct";
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
     return {{"ok", true},
