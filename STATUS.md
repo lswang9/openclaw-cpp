@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.79.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.80.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.80.0-dev
+- Discord 语音：主网关 op 4 自动取得语音端点/令牌；libopus（conan opus/1.5.2）编码 WAV/TTS 音频；播放后可接收他人语音并按说话人解码为 WAV、可选转写；RPC `discord.voice.*` + agent 工具 `discord_voice`。无 DAVE。
 
 ### 1.79.0-dev
 - Telegram webhook 密钥改为校验 `X-Telegram-Bot-Api-Secret-Token` 头；`messages.tts.auto` 让 Telegram 回复额外以语音（流式 TTS 汇总后 sendVoice/sendAudio）发送；语音转写不再持有网关锁。

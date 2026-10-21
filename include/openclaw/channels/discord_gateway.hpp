@@ -3,6 +3,7 @@
 #include "openclaw/channels/adapter.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <cstdint>
 #include <mutex>
@@ -38,8 +39,18 @@ public:
     using InteractionFn = std::function<nlohmann::json(const nlohmann::json&, const DeliverFn&)>;
     void SetInteractionHandler(InteractionFn fn) { interaction_ = std::move(fn); }
 
+    // Voice: sends op 4 (Update Voice State) over the live connection and waits for this bot's
+    // VOICE_STATE_UPDATE (session_id) + VOICE_SERVER_UPDATE (token, endpoint). channel_id empty = leave.
+    // Returns {ok, endpoint (ws URL, v=8), token, session_id, user_id, guild_id}.
+    nlohmann::json JoinVoice(const std::string& guild_id, const std::string& channel_id, int timeout_ms = 10000);
+    std::string BotUserId() const { std::lock_guard l(mu_); return bot_user_id_; }
+
 private:
     InteractionFn interaction_;
+    std::vector<nlohmann::json> outq_;
+    std::condition_variable_any voice_cv_;
+    nlohmann::json voice_state_, voice_server_;
+    std::string bot_user_id_;
     nlohmann::json HandleDispatch(const std::string& event, const nlohmann::json& data,
                                   const DeliverFn& deliver);
     bool ResolveGatewayUrl(std::string& out_url, std::string& err);

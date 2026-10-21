@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.79.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.80.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +12,7 @@ find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(ZLIB QUIET)
+find_package(Opus QUIET)
 
 set(OPENCLAW_SOURCES
   src/main.cpp
@@ -113,6 +114,10 @@ target_link_libraries(openclaw-cpp PRIVATE
   Threads::Threads
   SQLite::SQLite3
   ${CMAKE_DL_LIBS})
+if(Opus_FOUND)
+  target_link_libraries(openclaw-cpp PRIVATE Opus::opus)
+  target_compile_definitions(openclaw-cpp PRIVATE OPENCLAW_HAVE_OPUS=1)
+endif()
 if(ZLIB_FOUND)
   target_link_libraries(openclaw-cpp PRIVATE ZLIB::ZLIB)
   # Older local generator trees saw zlib only transitively (headers hidden); expose the package include dir.

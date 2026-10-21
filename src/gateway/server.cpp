@@ -49,7 +49,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.79.0-dev";
+constexpr const char* kVersion = "1.80.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2711,6 +2711,10 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         if (method == "discord.commands.sync") {
             RefreshDiscordCommands();
             return ok(dc->SyncCommands());
+        }
+        if (method.rfind("discord.voice.", 0) == 0) {
+            auto pr = params; pr["action"] = method.substr(14);
+            return ok(dc->Voice(pr));
         }
         if (method == "discord.gateway.start") {
             RefreshDiscordCommands();

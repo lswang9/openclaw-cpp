@@ -3,6 +3,11 @@
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/discord_commands.hpp"
 #include <cstdlib>
+#include "openclaw/channels/discord_voice.hpp"
+#include "openclaw/voice/stt.hpp"
+#include "openclaw/voice/tts.hpp"
+#include <filesystem>
+#include <fstream>
 
 namespace openclaw::channels {
 namespace {
@@ -179,6 +184,69 @@ nlohmann::json DiscordAdapter::HandleInteraction(const nlohmann::json& in, const
         out["data"] = {{"content", reply.empty() ? "(done)" : reply}};
     }
     return out;
+}
+
+
+namespace {
+std::string B64Decode(const std::string& in) {
+    static const std::string tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out; int val = 0, bits = -8;
+    for (unsigned char c : in) {
+        auto pos = tbl.find(static_cast<char>(c));
+        if (pos == std::string::npos) continue;
+        val = (val << 6) + static_cast<int>(pos); bits += 6;
+        if (bits >= 0) { out.push_back(static_cast<char>((val >> bits) & 0xff)); bits -= 8; }
+    }
+    return out;
+}
+}  // namespace
+
+nlohmann::json DiscordAdapter::Voice(const nlohmann::json& p) {
+    namespace dv = discord_voice;
+    const auto action = p.value("action", std::string("play"));
+    const auto guild = p.value("guild_id", std::string());
+    const auto channel = p.value("channel_id", std::string());
+    if (action == "status") return {{"ok", true}, {"opus", dv::HaveOpus()}, {"gateway", gateway_.Status()}, {"bot_user_id", gateway_.BotUserId()}};
+    if (guild.empty()) return {{"ok", false}, {"error", "guild_id required"}};
+    if (action == "leave") return gateway_.JoinVoice(guild, "");
+    if (channel.empty()) return {{"ok", false}, {"error", "channel_id required"}};
+    if (action == "join") return gateway_.JoinVoice(guild, channel, p.value("timeout_ms", 10000));
+    if (action != "play") return {{"ok", false}, {"error", "unknown action"}};
+    // Audio source → Opus packets.
+    std::string raw, err;
+    nlohmann::json tts_rep;
+    if (p.contains("audio_path")) { std::ifstream f(p["audio_path"].get<std::string>(), std::ios::binary); raw.assign(std::istreambuf_iterator<char>(f), {}); }
+    else if (p.contains("audio_b64")) raw = B64Decode(p["audio_b64"].get<std::string>());
+    else if (p.contains("text")) {
+        voice::TtsEngine tts;
+        tts_rep = tts.SpeakStream(p["text"].get<std::string>(), p.value("voice", std::string()), [&](const std::string& c) { raw += c; });
+    }
+    if (raw.empty()) return {{"ok", false}, {"error", "no audio (audio_path | audio_b64 | text with a TTS provider)"}, {"tts", tts_rep}};
+    dv::Bytes bytes(raw.begin(), raw.end());
+    auto packets = dv::PacketsFromAudio(bytes, &err);
+    if (packets.empty()) return {{"ok", false}, {"error", err.empty() ? "no audio packets" : err}};
+    auto j = gateway_.JoinVoice(guild, channel, p.value("timeout_ms", 10000));
+    if (!j.value("ok", false)) return j;
+    dv::PlayRequest rq;
+    rq.endpoint = j["endpoint"]; rq.server_id = guild; rq.user_id = j["user_id"]; rq.session_id = j["session_id"]; rq.token = j["token"];
+    rq.packets = std::move(packets);
+    rq.listen_ms = p.value("listen_ms", 0);
+    if (rq.listen_ms > 0) rq.receive_dir = p.value("receive_dir", (std::filesystem::temp_directory_path() / "openclaw-discord-voice").string());
+    auto rep = dv::Play(rq);
+    if (p.value("transcribe", false) && rep.contains("received")) {
+        for (auto& r : rep["received"]) {
+            if (!r.contains("wav")) continue;
+            std::ifstream f(r["wav"].get<std::string>(), std::ios::binary);
+            std::string wav((std::istreambuf_iterator<char>(f)), {});
+            auto tr = voice::DefaultStt().Transcribe(wav, "audio/wav", "voice.wav", "");
+            r["transcript"] = tr.value("text", std::string());
+            if (!tr.value("ok", true) || tr.contains("error")) r["stt"] = tr;
+        }
+    }
+    if (p.value("leave", true)) (void)gateway_.JoinVoice(guild, "");
+    rep["join"] = j;
+    if (!tts_rep.is_null()) rep["tts"] = tts_rep;
+    return rep;
 }
 
 }  // namespace openclaw::channels

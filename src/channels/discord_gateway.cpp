@@ -24,7 +24,7 @@ bool ForceMock() {
 }
 
 // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
-constexpr int kDefaultIntents = 1 | 512 | 32768 | 4096;
+constexpr int kDefaultIntents = 1 | 128 | 512 | 32768 | 4096;  // + GUILD_VOICE_STATES
 
 size_t WriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* out = static_cast<std::string*>(userdata);
@@ -81,7 +81,15 @@ nlohmann::json DiscordGateway::HandleDispatch(const std::string& event, const nl
     if (event == "READY") {
         std::lock_guard lock(mu_);
         session_id_ = data.value("session_id", "");
+        if (data.contains("user") && data["user"].is_object()) bot_user_id_ = data["user"].value("id", "");
         return {{"ready", true}, {"session_id", session_id_}};
+    }
+    if (event == "VOICE_STATE_UPDATE" || event == "VOICE_SERVER_UPDATE") {
+        std::lock_guard lock(mu_);
+        if (event == "VOICE_SERVER_UPDATE") voice_server_ = data;
+        else if (data.value("user_id", "") == bot_user_id_) voice_state_ = data;
+        voice_cv_.notify_all();
+        return {{"voice", event}};
     }
     if (event == "INTERACTION_CREATE") {
         if (!interaction_) return {{"ignored", true}, {"reason", "no interaction handler"}};
@@ -205,6 +213,10 @@ bool DiscordGateway::ResolveGatewayUrl(std::string& out_url, std::string& err) {
         err = "DISCORD_BOT_TOKEN unset";
         return false;
     }
+    if (const char* u = std::getenv("DISCORD_GATEWAY_URL"); u && *u) {  // tests / proxies
+        out_url = u;
+        return true;
+    }
     // Prefer bot gateway URL
     CURL* curl = curl_easy_init();
     if (!curl) {
@@ -295,6 +307,11 @@ void DiscordGateway::LiveLoop(DeliverFn deliver) {
     bool identified = false;
 
     while (!stop_.load()) {
+        {
+            std::vector<nlohmann::json> q;
+            { std::lock_guard l(mu_); q.swap(outq_); }
+            for (auto& f : q) send_json(f);
+        }
         // Heartbeat timer
         if (identified && heartbeat_interval_ms_ > 0 &&
             std::chrono::steady_clock::now() >= next_hb) {
@@ -350,6 +367,27 @@ void DiscordGateway::LiveLoop(DeliverFn deliver) {
     running_ = false;
     std::lock_guard lock(mu_);
     if (mode_ == "live") mode_ = "idle";
+}
+
+nlohmann::json DiscordGateway::JoinVoice(const std::string& guild_id, const std::string& channel_id, int timeout_ms) {
+    std::unique_lock l(mu_);
+    if (!running_.load() || mode_ != "live") return {{"ok", false}, {"error", "discord gateway not connected (live)"}, {"mode", mode_}};
+    voice_state_ = nullptr; voice_server_ = nullptr;
+    outq_.push_back({{"op", 4}, {"d", {{"guild_id", guild_id}, {"channel_id", channel_id.empty() ? nlohmann::json(nullptr) : nlohmann::json(channel_id)},
+                                       {"self_mute", false}, {"self_deaf", false}}}});
+    if (channel_id.empty()) return {{"ok", true}, {"left", true}, {"guild_id", guild_id}};
+    const bool got = voice_cv_.wait_for(l, std::chrono::milliseconds(timeout_ms), [&] {
+        return voice_state_.is_object() && voice_server_.is_object() && !voice_server_.value("endpoint", std::string()).empty();
+    });
+    if (!got) return {{"ok", false}, {"error", "timed out waiting for VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE"}};
+    std::string ep = voice_server_.value("endpoint", std::string());
+    if (ep.find("://") == std::string::npos) {
+        const char* ins = std::getenv("DISCORD_VOICE_INSECURE_WS");  // tests only: fake voice server speaks ws://
+        ep = std::string(ins && *ins == '1' ? "ws://" : "wss://") + ep;
+    }
+    ep += ep.find('?') == std::string::npos ? "/?v=8" : "";
+    return {{"ok", true}, {"endpoint", ep}, {"token", voice_server_.value("token", "")}, {"session_id", voice_state_.value("session_id", "")},
+            {"user_id", bot_user_id_}, {"guild_id", guild_id}, {"channel_id", channel_id}};
 }
 
 bool DiscordGateway::Start(DeliverFn deliver) {

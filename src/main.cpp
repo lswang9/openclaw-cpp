@@ -99,7 +99,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.79.0-dev";
+constexpr const char* kVersion = "1.80.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2523,8 +2523,25 @@ int CmdSelfTest() {
         }
         auto disc = dv::IpDiscoveryRequest(99);
         ok = ok && disc.size() == 74 && disc[1] == 1 && disc[3] == 70 && disc[7] == 99;
+        if (dv::HaveOpus()) {
+            dv::Pcm pcm(48000 * 2 / 5);  // 200 ms stereo
+            for (std::size_t i = 0; i < pcm.size(); ++i) pcm[i] = static_cast<std::int16_t>(6000 * std::sin(i / 2 * 2 * 3.14159265 * 440 / 48000));
+            auto pk = dv::EncodePcm(pcm);
+            auto back = dv::DecodeOpus(pk);
+            ok = ok && pk.size() == 10 && back.size() == pcm.size();
+            auto wav = dv::WavFromPcm(back);
+            ok = ok && dv::PcmFromAudioFile(wav).size() == back.size();
+        }
+        // header extension body (encrypted) is stripped from the payload
+        {
+            dv::Bytes hdr = dv::RtpHeader(1, 960, 9); hdr[0] = 0x90; hdr.insert(hdr.end(), {0xBE, 0xDE, 0x00, 0x01});
+            dv::Bytes body{0x10, 0, 0, 0, 7, 7, 7};
+            auto p = dv::EncryptRtp("aead_aes256_gcm_rtpsize", k, hdr, body, 3);
+            auto op = p ? dv::OpusPayload("aead_aes256_gcm_rtpsize", k, *p) : std::nullopt;
+            ok = ok && op && *op == dv::Bytes({7, 7, 7});
+        }
         if (!ok) { std::cerr << "FAIL discord voice crypto/framing\n"; ++failures; }
-        else std::cerr << "PASS discord voice HChaCha20 vector + rtpsize AEAD (GCM, XChaCha) + IP discovery framing\n";
+        else std::cerr << "PASS discord voice HChaCha20 vector + rtpsize AEAD (GCM, XChaCha) + IP discovery framing + opus encode/decode + RTP ext strip\n";
     }
     {
         namespace sg = openclaw::channels::waweb::signal;
@@ -3149,6 +3166,17 @@ int CmdGateway(int argc, char** argv, int argi) {
     agent::Pool agent_pool(&tools, &approvals);
     agent_pool.SetConfig(cfg.raw);
 
+    tools.Register({"discord_voice", "Speak in a Discord voice channel (needs the live Discord gateway). action: play {guild_id, channel_id, text | audio_path, listen_ms?, transcribe?} | join | leave | status. text is synthesised with the configured TTS provider; listen_ms records others afterwards (decoded per speaker, transcribed when transcribe=true).",
+                    {{"type", "object"}, {"properties", {{"action", {{"type", "string"}, {"enum", {"play", "join", "leave", "status"}}}}, {"guild_id", {{"type", "string"}}},
+                                                         {"channel_id", {{"type", "string"}}}, {"text", {{"type", "string"}}}, {"audio_path", {{"type", "string"}}},
+                                                         {"listen_ms", {{"type", "integer"}}}, {"transcribe", {{"type", "boolean"}}}}},
+                     {"required", nlohmann::json::array({"action"})}},
+                    [&adapters](const nlohmann::json& a) {
+                        auto* dc = dynamic_cast<channels::DiscordAdapter*>(adapters.Get("discord"));
+                        if (!dc) return nlohmann::json{{"ok", false}, {"error", "discord adapter not registered"}}.dump();
+                        return dc->Voice(a).dump();
+                    },
+                    true});
     gateway::ServerDeps deps{
         .provider = router,
         .router = &router,

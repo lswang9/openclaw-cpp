@@ -29,11 +29,28 @@ Bytes HChaCha20(const Bytes& key32, const Bytes& nonce16);  // exposed for test 
 std::vector<Bytes> OggOpusPackets(const Bytes& ogg, std::string* err = nullptr);
 inline const Bytes kOpusSilence{0xF8, 0xFF, 0xFE};
 
+// Decrypt + strip the (encrypted) RTP header-extension body → raw Opus payload.
+std::optional<Bytes> OpusPayload(const std::string& mode, const Bytes& key, const Bytes& packet);
+bool IsRtcp(const Bytes& packet);
+
+// PCM helpers (s16 interleaved stereo 48 kHz).
+using Pcm = std::vector<std::int16_t>;
+bool HaveOpus();
+std::vector<Bytes> EncodePcm(const Pcm& stereo48k, std::string* err = nullptr);  // 20 ms frames
+Pcm DecodeOpus(const std::vector<Bytes>& packets, std::string* err = nullptr);
+Bytes WavFromPcm(const Pcm& stereo48k);
+// WAV (s16le, 48 kHz, mono/stereo) → stereo PCM; other formats via ffmpeg when on PATH. Empty on failure.
+Pcm PcmFromAudioFile(const Bytes& data, std::string* err = nullptr);
+// Ogg Opus → packets as-is; anything else → decode to PCM then Opus-encode.
+std::vector<Bytes> PacketsFromAudio(const Bytes& data, std::string* err = nullptr);
+
 struct PlayRequest {
     std::string endpoint;  // ws(s)://host[:port]/?v=8
     std::string server_id, user_id, session_id, token;
     std::vector<Bytes> packets;
     int frame_ms = 20;
+    int listen_ms = 0;          // after playback, receive others' audio this long
+    std::string receive_dir;    // when set, decoded per-SSRC WAVs land here
 };
 // Full session: connect, handshake, discovery, speaking, paced send, silence, speaking off. Returns a report.
 nlohmann::json Play(const PlayRequest& req);

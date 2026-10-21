@@ -25,6 +25,10 @@ public:
     nlohmann::json HandleInteraction(const nlohmann::json& in, const DeliverFn& deliver, bool via_gateway);
     nlohmann::json Api(const std::string& method, const std::string& path, const nlohmann::json& body);
 
+    // Voice ops: action join | leave | play | status. play: {guild_id, channel_id, audio_path | audio_b64 | text,
+    // listen_ms?, transcribe?, leave?}. Endpoint/token/session come from the live gateway (op 4 → VOICE_*_UPDATE).
+    nlohmann::json Voice(const nlohmann::json& params);
+
     DiscordGateway& Gateway() { return gateway_; }
     const DiscordGateway& Gateway() const { return gateway_; }
 

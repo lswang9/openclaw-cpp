@@ -12,6 +12,13 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <cstdio>
+#include <fstream>
+#include <map>
+#include <filesystem>
+#ifdef OPENCLAW_HAVE_OPUS
+#include <opus.h>
+#endif
 
 namespace openclaw::channels::discord_voice {
 namespace {
@@ -114,6 +121,127 @@ std::optional<Bytes> DecryptRtp(const std::string& mode, const Bytes& key, const
     const std::uint32_t ctr = Rd32(&p[p.size() - 4]);
     Bytes aad(p.begin(), p.begin() + al), ct(p.begin() + al, p.end() - 4);
     return Crypt(false, mode, key, aad, ct, ctr);
+}
+
+bool IsRtcp(const Bytes& p) { return p.size() >= 2 && (p[1] & 0x7f) >= 72 && (p[1] & 0x7f) <= 76; }
+
+std::optional<Bytes> OpusPayload(const std::string& mode, const Bytes& key, const Bytes& p) {
+    auto pt = DecryptRtp(mode, key, p);
+    if (!pt) return std::nullopt;
+    if (p[0] & 0x10) {
+        const std::size_t eh = 12 + 4 * (p[0] & 0x0f);
+        const std::size_t words = (std::size_t(p[eh + 2]) << 8) | p[eh + 3];
+        if (pt->size() < 4 * words) return std::nullopt;
+        pt->erase(pt->begin(), pt->begin() + static_cast<long>(4 * words));
+    }
+    return pt;
+}
+
+bool HaveOpus() {
+#ifdef OPENCLAW_HAVE_OPUS
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::vector<Bytes> EncodePcm(const Pcm& pcm, std::string* err) {
+    std::vector<Bytes> out;
+#ifdef OPENCLAW_HAVE_OPUS
+    int e = 0;
+    OpusEncoder* enc = opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &e);
+    if (!enc) { if (err) *err = "opus_encoder_create"; return out; }
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(64000));
+    constexpr int kFrame = 960;
+    std::vector<std::int16_t> frame(kFrame * 2);
+    unsigned char buf[4000];
+    for (std::size_t i = 0; i < pcm.size(); i += kFrame * 2) {
+        std::fill(frame.begin(), frame.end(), 0);
+        std::copy(pcm.begin() + static_cast<long>(i), pcm.begin() + static_cast<long>(std::min(pcm.size(), i + kFrame * 2)), frame.begin());
+        int n = opus_encode(enc, frame.data(), kFrame, buf, sizeof buf);
+        if (n < 0) { if (err) *err = opus_strerror(n); break; }
+        out.emplace_back(buf, buf + n);
+    }
+    opus_encoder_destroy(enc);
+#else
+    (void)pcm; if (err) *err = "built without libopus";
+#endif
+    return out;
+}
+
+Pcm DecodeOpus(const std::vector<Bytes>& packets, std::string* err) {
+    Pcm out;
+#ifdef OPENCLAW_HAVE_OPUS
+    int e = 0;
+    OpusDecoder* dec = opus_decoder_create(48000, 2, &e);
+    if (!dec) { if (err) *err = "opus_decoder_create"; return out; }
+    std::vector<std::int16_t> buf(5760 * 2);
+    for (auto& p : packets) {
+        int n = opus_decode(dec, p.data(), static_cast<opus_int32>(p.size()), buf.data(), 5760, 0);
+        if (n < 0) { if (err) *err = opus_strerror(n); continue; }
+        out.insert(out.end(), buf.begin(), buf.begin() + n * 2);
+    }
+    opus_decoder_destroy(dec);
+#else
+    (void)packets; if (err) *err = "built without libopus";
+#endif
+    return out;
+}
+
+Bytes WavFromPcm(const Pcm& pcm) {
+    Bytes o;
+    auto s4 = [&](const char* t) { o.insert(o.end(), t, t + 4); };
+    auto le = [&](std::uint32_t v, int n) { for (int i = 0; i < n; ++i) o.push_back((v >> (8 * i)) & 0xff); };
+    const std::uint32_t data = static_cast<std::uint32_t>(pcm.size() * 2);
+    s4("RIFF"); le(36 + data, 4); s4("WAVE"); s4("fmt "); le(16, 4); le(1, 2); le(2, 2); le(48000, 4); le(48000 * 4, 4); le(4, 2); le(16, 2);
+    s4("data"); le(data, 4);
+    for (auto v : pcm) le(static_cast<std::uint16_t>(v), 2);
+    return o;
+}
+
+Pcm PcmFromAudioFile(const Bytes& d, std::string* err) {
+    Pcm out;
+    if (d.size() > 44 && std::memcmp(d.data(), "RIFF", 4) == 0 && std::memcmp(&d[8], "WAVE", 4) == 0) {
+        std::size_t i = 12; int ch = 0, rate = 0, bits = 0, fmt = 0;
+        while (i + 8 <= d.size()) {
+            const std::uint32_t len = d[i + 4] | (d[i + 5] << 8) | (d[i + 6] << 16) | (std::uint32_t(d[i + 7]) << 24);
+            if (std::memcmp(&d[i], "fmt ", 4) == 0 && len >= 16) {
+                fmt = d[i + 8] | (d[i + 9] << 8); ch = d[i + 10] | (d[i + 11] << 8);
+                rate = static_cast<int>(Le32(&d[i + 12])); bits = d[i + 22] | (d[i + 23] << 8);
+            } else if (std::memcmp(&d[i], "data", 4) == 0) {
+                if (fmt != 1 || bits != 16 || rate != 48000 || (ch != 1 && ch != 2)) break;  // → ffmpeg fallback
+                const std::size_t end = std::min(d.size(), i + 8 + len);
+                for (std::size_t k = i + 8; k + 1 < end; k += 2) {
+                    auto v = static_cast<std::int16_t>(d[k] | (d[k + 1] << 8));
+                    out.push_back(v); if (ch == 1) out.push_back(v);
+                }
+                return out;
+            }
+            i += 8 + len + (len & 1);
+        }
+    }
+    // ffmpeg fallback (mp3 from TTS providers, other rates).
+    auto tmp = std::filesystem::temp_directory_path() / ("oc-dv-" + std::to_string(::getpid()) + "-" + std::to_string(rand()));
+    { std::ofstream f(tmp, std::ios::binary); f.write(reinterpret_cast<const char*>(d.data()), static_cast<std::streamsize>(d.size())); }
+    const std::string cmd = "ffmpeg -nostdin -loglevel error -i '" + tmp.string() + "' -f s16le -ac 2 -ar 48000 - 2>/dev/null";
+    if (FILE* pp = popen(cmd.c_str(), "r")) {
+        std::int16_t buf[4096]; size_t n;
+        while ((n = fread(buf, 2, 4096, pp)) > 0) out.insert(out.end(), buf, buf + n);
+        pclose(pp);
+    }
+    std::filesystem::remove(tmp);
+    if (out.empty() && err) *err = "unsupported audio (need Ogg Opus, 48 kHz s16 WAV, or ffmpeg on PATH)";
+    return out;
+}
+
+std::vector<Bytes> PacketsFromAudio(const Bytes& d, std::string* err) {
+    if (d.size() > 4 && std::memcmp(d.data(), "OggS", 4) == 0) {
+        auto p = OggOpusPackets(d, err);
+        if (!p.empty()) return p;
+    }
+    auto pcm = PcmFromAudioFile(d, err);
+    if (pcm.empty()) return {};
+    return EncodePcm(pcm, err);
 }
 
 std::vector<Bytes> OggOpusPackets(const Bytes& b, std::string* err) {
@@ -227,6 +355,49 @@ nlohmann::json Play(const PlayRequest& rq) {
         std::this_thread::sleep_until(next);
     }
     send({{"op", 5}, {"d", {{"speaking", 0}, {"delay", 0}, {"ssrc", ssrc}}}});
+    if (rq.listen_ms > 0) {
+        std::map<std::uint32_t, std::vector<Bytes>> streams;
+        std::map<std::uint32_t, std::string> users;
+        std::size_t bad = 0;
+        timeval stv{0, 50000}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &stv, sizeof stv);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(rq.listen_ms);
+        Bytes pb(2048);
+        char wbuf[65536];
+        while (std::chrono::steady_clock::now() < until) {
+            // drain WS: op 5 Speaking from others maps ssrc → user_id
+            for (;;) {
+                size_t n = 0; const curl_ws_frame* m = nullptr;
+                if (curl_ws_recv(c, wbuf, sizeof wbuf, &n, &m) != CURLE_OK) break;
+                try { auto j = nlohmann::json::parse(std::string(wbuf, n));
+                      if (j.value("op", -1) == 5) users[j["d"].value("ssrc", 0u)] = j["d"].value("user_id", std::string()); } catch (...) {}
+            }
+            auto n = recv(fd, pb.data(), pb.size(), 0);
+            if (n <= 0) continue;
+            Bytes pkt(pb.begin(), pb.begin() + n);
+            if (pkt.size() < 12 || (pkt[0] >> 6) != 2 || IsRtcp(pkt)) continue;
+            auto op = OpusPayload(mode, key, pkt);
+            if (!op) { ++bad; continue; }
+            if (*op == kOpusSilence) continue;
+            streams[Rd32(&pkt[8])].push_back(*op);
+        }
+        nlohmann::json recv_rep = nlohmann::json::array();
+        for (auto& [s, pk] : streams) {
+            std::string derr;
+            auto pcm = DecodeOpus(pk, &derr);
+            nlohmann::json e{{"ssrc", s}, {"user_id", users.count(s) ? users[s] : ""}, {"packets", pk.size()}, {"samples", pcm.size() / 2}};
+            if (!derr.empty()) e["decode_error"] = derr;
+            if (!rq.receive_dir.empty() && !pcm.empty()) {
+                std::filesystem::create_directories(rq.receive_dir);
+                auto path = std::filesystem::path(rq.receive_dir) / ("ssrc-" + std::to_string(s) + ".wav");
+                auto wav = WavFromPcm(pcm);
+                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(wav.data()), static_cast<std::streamsize>(wav.size()));
+                e["wav"] = path.string();
+            }
+            recv_rep.push_back(e);
+        }
+        rep["received"] = recv_rep;
+        rep["undecryptable"] = bad;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     close(fd);
     curl_easy_cleanup(c);
