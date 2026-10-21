@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.101.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.102.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -49,6 +49,7 @@ set(OPENCLAW_SOURCES
   src/channels/discord_commands.cpp
   src/channels/discord_gateway.cpp
   src/channels/discord_voice.cpp
+  src/channels/dave.cpp
   src/channels/simple_inbound.cpp
   src/channels/whatsapp.cpp
   src/daemon/lifecycle.cpp
@@ -145,6 +146,27 @@ if(ZLIB_FOUND)
 endif()
 
 # Sample native plugin (.so) — Linux
+
+# Discord DAVE E2EE: libdave + mlspp built by scripts/build-dave.sh (pinned revisions) into third_party/dave/prefix.
+set(OPENCLAW_DAVE_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dave/prefix" CACHE PATH "libdave install prefix")
+option(OPENCLAW_WITH_DAVE "Link libdave when present" ON)
+if(OPENCLAW_WITH_DAVE AND EXISTS "${OPENCLAW_DAVE_PREFIX}/lib/libdave.a" AND EXISTS "${OPENCLAW_DAVE_PREFIX}/lib/libmlspp.a")
+  set(OPENCLAW_DAVE_LIBS
+    "${OPENCLAW_DAVE_PREFIX}/lib/libdave.a" "${OPENCLAW_DAVE_PREFIX}/lib/libmlspp.a" "${OPENCLAW_DAVE_PREFIX}/lib/libmls_ds.a"
+    "${OPENCLAW_DAVE_PREFIX}/lib/libhpke.a" "${OPENCLAW_DAVE_PREFIX}/lib/libtls_syntax.a" "${OPENCLAW_DAVE_PREFIX}/lib/libbytes.a")
+  target_include_directories(openclaw-cpp PRIVATE "${OPENCLAW_DAVE_PREFIX}/include")
+  target_link_libraries(openclaw-cpp PRIVATE ${OPENCLAW_DAVE_LIBS} OpenSSL::Crypto)
+  target_compile_definitions(openclaw-cpp PRIVATE OPENCLAW_HAVE_DAVE=1)
+  # Test-only MLS external sender + simulated peer (drives scripts/fake-discord-voice.py --dave).
+  add_executable(openclaw-dave-helper tools/dave_helper.cpp)
+  target_include_directories(openclaw-dave-helper PRIVATE "${OPENCLAW_DAVE_PREFIX}/include" "${OPENCLAW_DAVE_PREFIX}/include/mlspp")
+  target_link_libraries(openclaw-dave-helper PRIVATE ${OPENCLAW_DAVE_LIBS} nlohmann_json::nlohmann_json OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+  target_compile_features(openclaw-dave-helper PRIVATE cxx_std_20)
+  message(STATUS "DAVE: libdave found at ${OPENCLAW_DAVE_PREFIX}")
+else()
+  message(STATUS "DAVE: libdave not built (scripts/build-dave.sh) — Discord voice advertises max_dave_protocol_version 0")
+endif()
+
 add_library(openclaw_sample_echo SHARED plugins/sample_echo/plugin.c)
 target_include_directories(openclaw_sample_echo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(openclaw_sample_echo PROPERTIES

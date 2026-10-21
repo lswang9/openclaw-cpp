@@ -47,6 +47,9 @@ std::vector<Bytes> PacketsFromAudio(const Bytes& data, std::string* err = nullpt
 struct PlayRequest {
     std::string endpoint;  // ws(s)://host[:port]/?v=8
     std::string server_id, user_id, session_id, token;
+    std::string channel_id;     // DAVE MLS group id (voice channel snowflake)
+    bool disable_dave = false;  // advertise max_dave_protocol_version 0
+    int dave_timeout_ms = 8000; // wait for the MLS group before sending media
     std::vector<Bytes> packets;
     int frame_ms = 20;
     int listen_ms = 0;          // after playback, receive others' audio this long

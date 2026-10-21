@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.101.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.102.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.102.0-dev 新增
+
+- Discord 语音 DAVE 端到端加密已实现：`scripts/build-dave.sh` 按固定版本构建 libdave（8de72b1）+ mlspp（1cc50a1），CMake 检测到后自动链接。客户端实现 DAVE v1：key package、外部发送者提案→commit/welcome、过渡状态机（21/22/23/24/29/30/31）、成员名单（11/13），Opus 帧在传输加密之前做 DAVE 加密，接收端按说话人解密。离线测试 e2e-discord-dave.sh：假语音服务器通过 `openclaw-dave-helper`（真实 MLS 外部发送者 + 真实 libdave 对端）双向验证。不足：未对 live Discord 测试；仅音频；CI 不构建 libdave（未改 workflows），所以 CI 上该测试会 SKIP。
 
 ## 1.101.0-dev 新增
 

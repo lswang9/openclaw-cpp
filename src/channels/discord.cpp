@@ -1,5 +1,6 @@
 #include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/discord.hpp"
+#include "openclaw/channels/dave.hpp"
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/discord_commands.hpp"
 #include <cstdlib>
@@ -217,7 +218,7 @@ nlohmann::json DiscordAdapter::Voice(const nlohmann::json& p) {
     const auto action = p.value("action", std::string("play"));
     const auto guild = p.value("guild_id", std::string());
     const auto channel = p.value("channel_id", std::string());
-    if (action == "status") return {{"ok", true}, {"opus", dv::HaveOpus()}, {"gateway", gateway_.Status()}, {"bot_user_id", gateway_.BotUserId()}};
+    if (action == "status") return {{"ok", true}, {"opus", dv::HaveOpus()}, {"dave", {{"available", openclaw::channels::dave::Available()}, {"max_protocol_version", openclaw::channels::dave::MaxProtocolVersion()}}}, {"gateway", gateway_.Status()}, {"bot_user_id", gateway_.BotUserId()}};
     if (guild.empty()) return {{"ok", false}, {"error", "guild_id required"}};
     if (action == "leave") return gateway_.JoinVoice(guild, "");
     if (channel.empty()) return {{"ok", false}, {"error", "channel_id required"}};
@@ -239,7 +240,7 @@ nlohmann::json DiscordAdapter::Voice(const nlohmann::json& p) {
     auto j = gateway_.JoinVoice(guild, channel, p.value("timeout_ms", 10000));
     if (!j.value("ok", false)) return j;
     dv::PlayRequest rq;
-    rq.endpoint = j["endpoint"]; rq.server_id = guild; rq.user_id = j["user_id"]; rq.session_id = j["session_id"]; rq.token = j["token"];
+    rq.endpoint = j["endpoint"]; rq.server_id = guild; rq.user_id = j["user_id"]; rq.session_id = j["session_id"]; rq.token = j["token"]; rq.channel_id = channel;
     rq.packets = std::move(packets);
     rq.listen_ms = p.value("listen_ms", 0);
     if (rq.listen_ms > 0) rq.receive_dir = p.value("receive_dir", (std::filesystem::temp_directory_path() / "openclaw-discord-voice").string());

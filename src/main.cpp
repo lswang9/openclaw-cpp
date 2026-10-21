@@ -104,7 +104,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.101.0-dev";
+constexpr const char* kVersion = "1.102.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3908,6 +3908,8 @@ int main(int argc, char** argv) {
                 std::string k = argv[i], v = argv[i + 1];
                 if (k == "--endpoint") rq.endpoint = v; else if (k == "--server") rq.server_id = v; else if (k == "--user") rq.user_id = v;
                 else if (k == "--session") rq.session_id = v; else if (k == "--token") rq.token = v; else if (k == "--ogg") ogg = v;
+                else if (k == "--channel") rq.channel_id = v; else if (k == "--listen-ms") rq.listen_ms = std::atoi(v.c_str());
+                else if (k == "--receive-dir") rq.receive_dir = v; else if (k == "--dave") rq.disable_dave = v == "off";
             }
             std::ifstream in(ogg, std::ios::binary);
             dv::Bytes b((std::istreambuf_iterator<char>(in)), {});

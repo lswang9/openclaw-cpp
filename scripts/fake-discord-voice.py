@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
 """Fake Discord voice server: hand-rolled WebSocket (voice gateway v8) + UDP (IP discovery + RTP decrypt with AES-GCM rtpsize).
-Prints its WS port; writes a JSON report to argv[1] when Speaking(0) arrives."""
-import base64, hashlib, json, os, socket, struct, sys, threading
+Prints its WS port; writes a JSON report to argv[1] when Speaking(0) arrives.
+FAKE_DAVE=1 + DAVE_HELPER=<openclaw-dave-helper>: DAVE protocol v1 — clients_connect(U2), MLS external sender (op 25),
+the client's key package (26), an external Add proposal for the simulated peer U2 (27), the client's commit/welcome
+(28) → announce commit (29, transition 1) + welcome to the peer, transition ready (23) → execute (22); media frames
+are DAVE-decrypted with the peer's real libdave session and the peer's audio is DAVE-encrypted."""
+import base64, hashlib, json, os, socket, struct, subprocess, sys, threading
+DAVE = os.environ.get("FAKE_DAVE") == "1"
+PEER = "2002" if DAVE else "U2"; SELF = "1001"  # DAVE needs numeric snowflakes
+_hl = threading.Lock()
+_helper = subprocess.Popen([os.environ["DAVE_HELPER"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) if DAVE else None
+def helper(**cmd):
+    with _hl:
+        _helper.stdin.write(json.dumps(cmd) + "\n"); _helper.stdin.flush()
+        r = json.loads(_helper.stdout.readline())
+    if not r.get("ok", False) and cmd["cmd"] != "peer_decrypt": raise RuntimeError(r)
+    return r
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 REPORT = sys.argv[1]; KEY = os.urandom(32); SSRC = 4242
 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); udp.bind(("127.0.0.1", 0)); UPORT = udp.getsockname()[1]
-state = {"op4": [], "rtp": [], "discovery": False, "identify": None, "select": None, "speaking": [], "heartbeats": 0, "errors": []}
+state = {"op4": [], "rtp": [], "discovery": False, "identify": None, "select": None, "speaking": [], "heartbeats": 0, "errors": [],
+         "dave": {"key_package": False, "commit_welcome": False, "ready": [], "frames_ok": 0, "frames_bad": 0, "plain_leak": 0}}
+DAVE_READY = threading.Event()
 def udp_loop():
     while True:
         data, addr = udp.recvfrom(4096)
@@ -19,6 +35,11 @@ def udp_loop():
             if hdr[0] != 0x80 or hdr[1] != 0x78: raise ValueError("bad rtp header")
             pt = AESGCM(KEY).decrypt(ctr + b"\x00" * 8, ct, hdr)
             seq, ts, ssrc = struct.unpack(">HII", hdr[2:12])
+            if DAVE and pt != b"\xf8\xff\xfe":
+                if pt[-2:] != b"\xfa\xfa": state["dave"]["plain_leak"] += 1
+                r = helper(cmd="peer_decrypt", frame=pt.hex())
+                if r["ok"]: state["dave"]["frames_ok"] += 1; pt = bytes.fromhex(r["frame"])
+                else: state["dave"]["frames_bad"] += 1
             state["rtp"].append({"seq": seq, "ts": ts, "ssrc": ssrc, "len": len(pt), "silence": pt == b"\xf8\xff\xfe", "sha": hashlib.sha256(pt).hexdigest()[:16]})
         except Exception as e: state["errors"].append(str(e))
 threading.Thread(target=udp_loop, daemon=True).start()
@@ -33,6 +54,10 @@ def recv_frame(c):
     while len(d) < n: d += c.recv(n - len(d))
     d = bytes(b ^ mask[i % 4] for i, b in enumerate(d))
     return h[0] & 0x0f, d
+def send_bin(c, seq, op, payload):
+    d = struct.pack(">HB", seq, op) + payload; n = len(d)
+    h = b"\x82" + (bytes([n]) if n < 126 else b"\x7e" + struct.pack(">H", n) if n < 65536 else b"\x7f" + struct.pack(">Q", n))
+    c.sendall(h + d)
 def send(c, obj):
     d = json.dumps(obj).encode(); n = len(d)
     h = b"\x81" + (bytes([n]) if n < 126 else b"\x7e" + struct.pack(">H", n))
@@ -53,13 +78,14 @@ def dump():
     json.dump(state, open(REPORT + ".tmp", "w")); os.replace(REPORT + ".tmp", REPORT)
 def send_other_audio(c):
     """Another speaker (U2): op 5 Speaking + AES-GCM rtpsize RTP with a one-word header extension."""
-    send(c, {"op": 5, "d": {"user_id": "U2", "ssrc": OTHER_SSRC, "speaking": 1}})
+    send(c, {"op": 5, "d": {"user_id": PEER, "ssrc": OTHER_SSRC, "speaking": 1}})
     addr = state.get("client_addr")
     if not addr or not OGG: return
     seq, ts = 100, 5000
     for k, pkt in enumerate(ogg_packets(OGG)):
         hdr = bytes([0x90, 0x78]) + struct.pack(">HII", seq, ts, OTHER_SSRC) + b"\xbe\xde\x00\x01"
         ctr = struct.pack(">I", 1000 + k)
+        if DAVE: pkt = bytes.fromhex(helper(cmd="peer_encrypt", ssrc=OTHER_SSRC, frame=pkt.hex())["frame"])
         ct = AESGCM(KEY).encrypt(ctr + b"\x00" * 8, b"\x10\x00\x00\x00" + pkt, hdr)
         udp.sendto(hdr + ct + ctr, addr); seq += 1; ts += 960
         import time; time.sleep(0.005)
@@ -98,8 +124,23 @@ def client(c):
     while True:
         f = recv_frame(c)
         if f is None or f[0] == 8: break
+        if f[0] == 2 and DAVE:
+            op, payload = f[1][0], f[1][1:]; seq += 1
+            if op == 26:
+                state["dave"]["key_package"] = len(payload) > 0
+                peer_kp = helper(cmd="peer_create", user=PEER)["key_package"]
+                send_bin(c, seq, 27, bytes.fromhex(helper(cmd="propose_add", epoch=0, key_packages=[peer_kp])["proposals"]))
+            elif op == 28:
+                state["dave"]["commit_welcome"] = True
+                sp = helper(cmd="split", commit_welcome=payload.hex())
+                helper(cmd="peer_welcome", welcome=sp["welcome"], recognized=[SELF, PEER], other=SELF)
+                send_bin(c, seq, 29, struct.pack(">H", 1) + bytes.fromhex(sp["commit"]))
+            dump(); continue
         if f[0] != 1: continue
         m = json.loads(f[1]); op = m.get("op")
+        if op == 23:
+            state["dave"]["ready"].append(m["d"]["transition_id"]); seq += 1
+            send(c, {"op": 22, "seq": seq, "d": {"transition_id": m["d"]["transition_id"]}}); dump(); continue
         if op == 0 and os.environ.get("FAKE_DAVE_REQUIRED") == "1" and m["d"].get("max_dave_protocol_version", 0) < 1:
             state["identify"] = m["d"]; dump()
             c.sendall(b"\x88\x1e" + struct.pack(">H", 4017) + b"E2EE/DAVE protocol required"); break
@@ -108,7 +149,11 @@ def client(c):
             send(c, {"op": 2, "seq": seq, "d": {"ssrc": SSRC, "ip": "127.0.0.1", "port": UPORT, "modes": ["aead_aes256_gcm_rtpsize", "aead_xchacha20_poly1305_rtpsize"]}})
         elif op == 1:
             state["select"] = m["d"]; seq += 1
-            send(c, {"op": 4, "seq": seq, "d": {"mode": m["d"]["data"]["mode"], "secret_key": list(KEY)}})
+            if DAVE:
+                group = int(os.environ.get("FAKE_DAVE_GROUP", "1234567890"))
+                send(c, {"op": 11, "seq": seq, "d": {"user_ids": [PEER]}})
+                send_bin(c, seq, 25, bytes.fromhex(helper(cmd="init", group=group, version=1)["external_sender"]))
+            send(c, {"op": 4, "seq": seq, "d": {"mode": m["d"]["data"]["mode"], "secret_key": list(KEY), "dave_protocol_version": 1 if DAVE else 0}})
         elif op == 3:
             state["heartbeats"] += 1; send(c, {"op": 6, "d": m["d"]})
         elif op == 5:

@@ -1,4 +1,6 @@
 #include "openclaw/channels/discord_voice.hpp"
+#include "openclaw/channels/dave.hpp"
+#include <map>
 
 #include <curl/curl.h>
 #include <openssl/evp.h>
@@ -279,28 +281,62 @@ nlohmann::json Play(const PlayRequest& rq) {
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
     if (auto rc = curl_easy_perform(c); rc != CURLE_OK) { curl_easy_cleanup(c); rep["error"] = std::string("voice ws connect failed: ") + curl_easy_strerror(rc); return rep; }
     auto send = [&](const nlohmann::json& j) { auto s = j.dump(); size_t n = 0; curl_ws_send(c, s.data(), s.size(), &n, 0, CURLWS_TEXT); };
+    auto send_bin = [&](int op, const Bytes& payload) {
+        std::string s(1, static_cast<char>(op)); s.append(payload.begin(), payload.end());
+        size_t n = 0; curl_ws_send(c, s.data(), s.size(), &n, 0, CURLWS_BINARY);
+    };
+    std::uint64_t group = 0;
+    try { group = rq.channel_id.empty() ? 0 : std::stoull(rq.channel_id); } catch (...) {}
+    const std::uint16_t max_dave = rq.disable_dave ? 0 : dave::MaxProtocolVersion();
+    dave::Session ds(rq.user_id, group);
+    std::map<std::uint32_t, std::string> users;  // ssrc → user_id (op 5 Speaking)
+    auto flush = [&](const std::vector<dave::Outgoing>& outs) {
+        for (auto& o : outs) { if (o.binary) send_bin(o.op, o.payload); else send(o.json); }
+    };
     std::string acc;
     int seq_ack = -1;
     int close_code = 0;
+    // Handles one complete WS message: DAVE/roster ops are consumed here; returns the JSON for other ops.
+    auto handle = [&](bool binary, const std::string& data) -> std::optional<nlohmann::json> {
+        if (binary) {
+            if (data.size() < 3) return std::nullopt;
+            seq_ack = (static_cast<unsigned char>(data[0]) << 8) | static_cast<unsigned char>(data[1]);
+            const int op = static_cast<unsigned char>(data[2]);
+            flush(ds.OnBinary(op, Bytes(data.begin() + 3, data.end())));
+            return std::nullopt;
+        }
+        nlohmann::json j;
+        try { j = nlohmann::json::parse(data); } catch (...) { return std::nullopt; }
+        if (j.contains("seq") && j["seq"].is_number()) seq_ack = j["seq"];
+        const int op = j.value("op", -1);
+        if (op == 5 && j.contains("d")) { users[j["d"].value("ssrc", 0u)] = j["d"].value("user_id", std::string()); ds.UserConnected(j["d"].value("user_id", std::string())); }
+        if (op == 11 || op == 13 || (op >= 21 && op <= 24)) { flush(ds.OnJson(op, j.value("d", nlohmann::json::object()))); return std::nullopt; }
+        return j;
+    };
+    auto pump_once = [&](int want, std::optional<nlohmann::json>* got) -> bool {  // false on close/error
+        char buf[65536];
+        size_t n = 0; const curl_ws_frame* m = nullptr;
+        auto r = curl_ws_recv(c, buf, sizeof buf, &n, &m);
+        if (r == CURLE_AGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); return true; }
+        if (r != CURLE_OK) return false;
+        if (m && (m->flags & CURLWS_CLOSE)) {
+            if (n >= 2) close_code = (static_cast<unsigned char>(buf[0]) << 8) | static_cast<unsigned char>(buf[1]);
+            return false;
+        }
+        acc.append(buf, n);
+        if (m && m->bytesleft > 0) return true;
+        const bool binary = m && (m->flags & CURLWS_BINARY);
+        auto j = handle(binary, acc);
+        acc.clear();
+        if (j && j->value("op", -1) == want && got) *got = j;
+        return true;
+    };
     auto recv_op = [&](int want, int timeout_ms) -> std::optional<nlohmann::json> {
         const auto t0 = std::chrono::steady_clock::now();
-        char buf[65536];
+        std::optional<nlohmann::json> got;
         while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(timeout_ms)) {
-            size_t n = 0; const curl_ws_frame* m = nullptr;
-            auto r = curl_ws_recv(c, buf, sizeof buf, &n, &m);
-            if (r == CURLE_AGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
-            if (r != CURLE_OK) return std::nullopt;
-            if (m && (m->flags & CURLWS_CLOSE)) {
-                if (n >= 2) close_code = (static_cast<unsigned char>(buf[0]) << 8) | static_cast<unsigned char>(buf[1]);
-                return std::nullopt;
-            }
-            acc.append(buf, n);
-            if (m && m->bytesleft > 0) continue;
-            nlohmann::json j;
-            try { j = nlohmann::json::parse(acc); } catch (...) { acc.clear(); continue; }
-            acc.clear();
-            if (j.contains("seq") && j["seq"].is_number()) seq_ack = j["seq"];
-            if (j.value("op", -1) == want) return j;
+            if (!pump_once(want, &got)) return std::nullopt;
+            if (got) return got;
         }
         return std::nullopt;
     };
@@ -308,17 +344,19 @@ nlohmann::json Play(const PlayRequest& rq) {
         rep["error"] = e;
         if (close_code) rep["close_code"] = close_code;
         if (close_code == 4017) {  // Discord: "E2EE/DAVE protocol required" — mandatory for non-stage calls since 2026-03-01
-            rep["error"] = "voice server requires DAVE end-to-end encryption (close 4017); openclaw-cpp advertises "
-                           "max_dave_protocol_version 0 and does not implement DAVE — see docs/DAVE.md";
+            rep["error"] = max_dave ? "voice server rejected DAVE negotiation (close 4017)"
+                                    : "voice server requires DAVE end-to-end encryption (close 4017); this build has no libdave "
+                                      "(run scripts/build-dave.sh and rebuild) — see docs/DAVE.md";
             rep["dave_required"] = true;
         }
+        rep["dave"] = ds.Stats();
         curl_easy_cleanup(c);
         return rep;
     };
     auto hello = recv_op(8, 5000);
     if (!hello) return fail("no Hello (op 8)");
     rep["heartbeat_interval"] = (*hello)["d"].value("heartbeat_interval", 0.0);
-    send({{"op", 0}, {"d", {{"server_id", rq.server_id}, {"user_id", rq.user_id}, {"session_id", rq.session_id}, {"token", rq.token}, {"max_dave_protocol_version", 0}}}});
+    send({{"op", 0}, {"d", {{"server_id", rq.server_id}, {"user_id", rq.user_id}, {"session_id", rq.session_id}, {"token", rq.token}, {"max_dave_protocol_version", max_dave}}}});
     auto ready = recv_op(2, 5000);
     if (!ready) return fail("no Ready (op 2)");
     const auto& rd = (*ready)["d"];
@@ -346,7 +384,19 @@ nlohmann::json Play(const PlayRequest& rq) {
     send({{"op", 1}, {"d", {{"protocol", "udp"}, {"data", {{"address", disc->ip}, {"port", disc->port}, {"mode", mode}}}}}});
     auto sd = recv_op(4, 5000);
     if (!sd) { close(fd); return fail("no Session Description (op 4)"); }
-    if ((*sd)["d"].value("dave_protocol_version", 0) > 0) { close(fd); close_code = 4017; return fail("dave"); }
+    const int dave_v = (*sd)["d"].value("dave_protocol_version", 0);
+    if (dave_v > 0) {
+        if (!max_dave) { close(fd); close_code = 4017; return fail("dave"); }
+        if (!group) { close(fd); return fail("DAVE needs the voice channel id (MLS group id)"); }
+        flush(ds.Start(static_cast<std::uint16_t>(dave_v)));
+        // Wait for the MLS group (proposals → commit/welcome → execute) before sending media.
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!ds.Ready() && std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(rq.dave_timeout_ms)) {
+            if (!pump_once(-2, nullptr)) break;
+        }
+        if (!ds.Ready()) { close(fd); return fail("DAVE group not established: " + ds.LastError()); }
+    }
+    rep["dave_protocol_version"] = dave_v;
     Bytes key;
     for (auto& v : (*sd)["d"].value("secret_key", nlohmann::json::array())) key.push_back(static_cast<std::uint8_t>(v.get<int>()));
     if (key.size() != 32) { close(fd); return fail("bad secret_key"); }
@@ -358,13 +408,18 @@ nlohmann::json Play(const PlayRequest& rq) {
     auto last_hb = std::chrono::steady_clock::now();
     const double hbi = rep["heartbeat_interval"].get<double>();
     auto frames = rq.packets;
+    std::size_t dave_fail = 0;
     for (int i = 0; i < 5; ++i) frames.push_back(kOpusSilence);
     for (auto& f : frames) {
         if (hbi > 0 && std::chrono::steady_clock::now() - last_hb > std::chrono::milliseconds(static_cast<int>(hbi))) {
             send({{"op", 3}, {"d", {{"t", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()}, {"seq_ack", seq_ack}}}});
             last_hb = std::chrono::steady_clock::now();
         }
-        auto pkt = EncryptRtp(mode, key, RtpHeader(seq, ts, ssrc), f, nonce++);
+        // pump DAVE control traffic (transitions, new members) between frames
+        for (int k = 0; k < 4; ++k) if (!pump_once(-2, nullptr)) break;
+        Bytes frame;
+        if (!ds.Encrypt(ssrc, f, &frame)) { ++dave_fail; ++seq; ts += 960; next += std::chrono::milliseconds(rq.frame_ms); continue; }
+        auto pkt = EncryptRtp(mode, key, RtpHeader(seq, ts, ssrc), frame, nonce++);
         if (pkt) { sendto(fd, pkt->data(), pkt->size(), 0, reinterpret_cast<sockaddr*>(&sa), sizeof sa); ++sent; }
         ++seq; ts += 960;
         next += std::chrono::milliseconds(rq.frame_ms);
@@ -373,20 +428,14 @@ nlohmann::json Play(const PlayRequest& rq) {
     send({{"op", 5}, {"d", {{"speaking", 0}, {"delay", 0}, {"ssrc", ssrc}}}});
     if (rq.listen_ms > 0) {
         std::map<std::uint32_t, std::vector<Bytes>> streams;
-        std::map<std::uint32_t, std::string> users;
-        std::size_t bad = 0;
+        std::size_t bad = 0, dave_bad = 0;
         timeval stv{0, 50000}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &stv, sizeof stv);
         const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(rq.listen_ms);
         Bytes pb(2048);
         char wbuf[65536];
         while (std::chrono::steady_clock::now() < until) {
-            // drain WS: op 5 Speaking from others maps ssrc → user_id
-            for (;;) {
-                size_t n = 0; const curl_ws_frame* m = nullptr;
-                if (curl_ws_recv(c, wbuf, sizeof wbuf, &n, &m) != CURLE_OK) break;
-                try { auto j = nlohmann::json::parse(std::string(wbuf, n));
-                      if (j.value("op", -1) == 5) users[j["d"].value("ssrc", 0u)] = j["d"].value("user_id", std::string()); } catch (...) {}
-            }
+            // drain WS: op 5 Speaking maps ssrc → user_id; DAVE control traffic keeps the group current
+            for (int k = 0; k < 16; ++k) if (!pump_once(-2, nullptr)) break;
             auto n = recv(fd, pb.data(), pb.size(), 0);
             if (n <= 0) continue;
             Bytes pkt(pb.begin(), pb.begin() + n);
@@ -394,7 +443,11 @@ nlohmann::json Play(const PlayRequest& rq) {
             auto op = OpusPayload(mode, key, pkt);
             if (!op) { ++bad; continue; }
             if (*op == kOpusSilence) continue;
-            streams[Rd32(&pkt[8])].push_back(*op);
+            Bytes plain;
+            const auto who = users.count(Rd32(&pkt[8])) ? users[Rd32(&pkt[8])] : std::string();
+            if (!ds.Decrypt(who, *op, &plain)) { ++dave_bad; continue; }
+            if (plain == kOpusSilence) continue;
+            streams[Rd32(&pkt[8])].push_back(plain);
         }
         nlohmann::json recv_rep = nlohmann::json::array();
         for (auto& [s, pk] : streams) {
@@ -413,11 +466,13 @@ nlohmann::json Play(const PlayRequest& rq) {
         }
         rep["received"] = recv_rep;
         rep["undecryptable"] = bad;
+        rep["dave_undecryptable"] = dave_bad;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     close(fd);
     curl_easy_cleanup(c);
     rep["ok"] = true; rep["mode"] = mode; rep["ssrc"] = ssrc; rep["packets_sent"] = sent; rep["audio_frames"] = rq.packets.size();
+    rep["dave"] = ds.Stats(); rep["dave"]["encrypt_failures"] = dave_fail;
     return rep;
 }
 

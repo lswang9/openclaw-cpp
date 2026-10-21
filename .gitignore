@@ -24,3 +24,4 @@ conan.lock
 graph_info.json
 plugins/**/*.so
 plugins/**/*.so.*
+third_party/dave/
