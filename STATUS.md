@@ -1,6 +1,13 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.27.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.28.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.28.0-dev 新增
+
+- 配置文件改为上游路径 `~/.openclaw/openclaw.json`（可用 `OPENCLAW_CONFIG_PATH` 覆盖；若只有旧的 `~/.openclaw-cpp/config.json` 则继续用旧文件）。
+- 支持 JSON5 写法（注释、尾逗号、无引号键、单引号字符串）和 `${环境变量}` 替换。
+- 新 CLI：`config file|show|validate|get <路径>|set <路径> <值>|unset <路径>`，写入为原子替换并保留 `.bak`。旧版把整个配置嵌套在 `raw` 里的 bug 已修复，读取时自动展开。
+- 仍缺：上游完整 schema 严格校验、`$include`、配置热重载。
 
 ## 1.27.0-dev 新增
 

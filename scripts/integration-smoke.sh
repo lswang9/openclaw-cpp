@@ -190,4 +190,7 @@ if "$BIN" --definitely-unknown >/dev/null 2>&1; then echo "[smoke] unknown flag 
 OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat "hello" | grep -q . && echo "[smoke] chat (mock) ok"
 "$BIN" skills check | grep -q eligible && echo "[smoke] skills check ok"
 "$BIN" context | grep -q systemPromptChars && echo "[smoke] context ok"
+CFGT="${TMPDIR:-/tmp}/oc-smoke-cfg-$$.json"
+OPENCLAW_CONFIG_PATH="$CFGT" "$BIN" config set agents.defaults.model.primary deepseek/deepseek-chat >/dev/null
+[[ "$(OPENCLAW_CONFIG_PATH="$CFGT" "$BIN" config get agents.defaults.model.primary)" == "deepseek/deepseek-chat" ]] && OPENCLAW_CONFIG_PATH="$CFGT" "$BIN" config validate >/dev/null && echo "[smoke] config set/get/validate ok"; rm -f "$CFGT" "$CFGT.bak"
 echo "[smoke] ALL PASS"

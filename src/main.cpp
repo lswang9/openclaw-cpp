@@ -73,7 +73,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.27.0-dev";
+constexpr const char* kVersion = "1.28.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1297,6 +1297,36 @@ int CmdSelfTest() {
         else std::cerr << "PASS skills precedence+gating + system prompt (bootstrap/available_skills)\n";
     } catch (const std::exception& e) { std::cerr << "FAIL system prompt exception: " << e.what() << "\n"; ++failures; }
 
+    // config: JSON5, ${ENV} substitution, dot paths, legacy raw unwrap, round-trip
+    try {
+        namespace fs = std::filesystem;
+        auto j = config::ParseJson5("// c\n{ gateway: { port: 19001, /* x */ bind: 'loopback', }, agents: {defaults: {model: {primary: \"deepseek/deepseek-reasoner\"}}}, list: [1,2,], k: 'it\\'s', h: 0x10, tok: '${OC_ST_TOKEN}', }");
+        setenv("OC_ST_TOKEN", "sekret", 1);
+        auto s = config::SubstituteEnv(j);
+        bool ok = j["gateway"]["port"] == 19001 && j["list"].size() == 2 && j["k"] == "it's" && j["h"] == 16 &&
+                  s["tok"] == "sekret" && j["tok"] == "${OC_ST_TOKEN}";
+        bool threw = false;
+        try { config::SubstituteEnv(nlohmann::json("${OC_ST_MISSING_ZZ}")); } catch (...) { threw = true; }
+        ok = ok && threw && config::SubstituteEnv(nlohmann::json("$${KEEP}")) == "${KEEP}";
+        nlohmann::json r = nlohmann::json::object();
+        ok = ok && config::SetPath(r, "a.b[0].c", 5) && config::GetPath(r, "a.b[0].c") == nlohmann::json(5) &&
+             config::UnsetPath(r, "a.b[0].c") && !config::GetPath(r, "a.b[0].c");
+        auto p = fs::temp_directory_path() / "oc-cfg-st" / "openclaw.json";
+        fs::remove_all(p.parent_path()); fs::create_directories(p.parent_path());
+        std::ofstream(p) << "{ gateway: {port: 19001}, agents: {defaults: {model: {primary: 'deepseek/deepseek-reasoner'}}}, custom: {x: 1}, raw: {old: true} }";
+        auto lr = config::Load(p);
+        ok = ok && lr.error.empty() && lr.snap.gateway_port == 19001 && lr.snap.deepseek_model == "deepseek-reasoner" &&
+             lr.snap.raw.value("old", false);
+        config::Save(p, lr.snap);
+        auto lr2 = config::Load(p);
+        ok = ok && lr2.snap.raw["custom"]["x"] == 1 && !lr2.snap.raw.contains("raw") &&
+             lr2.snap.raw["agents"]["defaults"]["model"]["primary"] == "deepseek/deepseek-reasoner" && fs::exists(p.string() + ".bak");
+        std::ofstream(p) << "{ broken: ";
+        ok = ok && !config::Load(p).error.empty();
+        if (!ok) { std::cerr << "FAIL config json5/env/paths " << lr.snap.raw.dump() << "\n"; ++failures; }
+        else std::cerr << "PASS config JSON5 + ${ENV} + dot paths + round-trip\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL config exception: " << e.what() << "\n"; ++failures; }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -2070,8 +2100,43 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (cmd == "config") {
-            std::cout << openclaw::config::LoadOrDefault(openclaw::config::DefaultPath()).ToJson().dump(2) << '\n';
-            return 0;
+            namespace cfgns = openclaw::config;
+            const auto path = cfgns::DefaultPath();
+            auto lr = cfgns::Load(path);
+            std::string sub = argc > 2 ? argv[2] : "show";
+            if (sub == "file") { std::cout << path.string() << '\n'; return 0; }
+            if (!lr.error.empty() && sub != "validate") { std::cerr << "config error (" << path.string() << "): " << lr.error << '\n'; return 1; }
+            if (sub == "show") { std::cout << lr.snap.ToJson().dump(2) << '\n'; return 0; }
+            if (sub == "validate") {
+                if (!lr.error.empty()) { std::cout << nlohmann::json{{"ok", false}, {"path", path.string()}, {"error", lr.error}}.dump(2) << '\n'; return 1; }
+                auto v = cfgns::ValidateLightJson(lr.snap); v["path"] = path.string(); v["exists"] = lr.exists;
+                std::cout << v.dump(2) << '\n'; return v.value("ok", false) ? 0 : 1;
+            }
+            if (sub == "get" && argc > 3) {
+                auto v = cfgns::GetPath(lr.snap.raw, argv[3]);
+                if (!v) { std::cerr << "config path not found: " << argv[3] << '\n'; return 1; }
+                std::cout << (v->is_string() ? v->get<std::string>() : v->dump(2)) << '\n'; return 0;
+            }
+            if (sub == "set" && argc > 4) {
+                nlohmann::json val;
+                bool as_json = argc > 5 && std::string(argv[5]) == "--json";
+                try { val = cfgns::ParseJson5(argv[4]); } catch (...) {
+                    if (as_json) { std::cerr << "invalid JSON5 value\n"; return 2; }
+                    val = std::string(argv[4]);
+                }
+                auto raw = lr.snap.raw.is_object() ? lr.snap.raw : nlohmann::json::object();
+                if (!cfgns::SetPath(raw, argv[3], val)) { std::cerr << "cannot set path: " << argv[3] << '\n'; return 2; }
+                cfgns::SaveRaw(path, raw);
+                std::cout << "Updated " << argv[3] << " in " << path.string() << '\n'; return 0;
+            }
+            if (sub == "unset" && argc > 3) {
+                auto raw = lr.snap.raw;
+                if (!cfgns::UnsetPath(raw, argv[3])) { std::cerr << "config path not found: " << argv[3] << '\n'; return 1; }
+                cfgns::SaveRaw(path, raw);
+                std::cout << "Removed " << argv[3] << '\n'; return 0;
+            }
+            std::cerr << "usage: config [show|file|validate|get <path>|set <path> <value> [--json]|unset <path>]\n";
+            return 2;
         }
         if (cmd == "methods") {
             std::cout << nlohmann::json{
