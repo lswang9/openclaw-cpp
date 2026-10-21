@@ -10,8 +10,7 @@ fail() { echo "[e2e-cli-local4] FAIL: $*"; [[ -f "$T/gw.log" ]] && tail -8 "$T/g
 mkdir -p "$T/home"; unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN OPENCLAW_DOCS_URL
 export OPENCLAW_DEFAULT_PROVIDER=mock OPENCLAW_SESSION_DIR="$T/sess" OPENCLAW_DATA_DIR="$T/data" OPENCLAW_CONFIG_PATH="$T/cfg.json" HOME="$T/home" OPENCLAW_GATEWAY_PORT=1
 # ---- guard: upstream names with no C++ implementation must not fall through to chat
-for c in connect "acp client"; do out=$("$BIN" $c hello </dev/null 2>&1) && fail "$c exit 0"; [[ $? -eq 2 ]] || true
-  grep -q "not implemented" <<<"$out" || fail "$c: $out"; grep -q mock-default <<<"$out" && fail "$c fell through to chat"; done
+out=$("$BIN" connect </dev/null 2>&1) && fail "connect exit 0"; grep -q "devices join-code" <<<"$out" || fail "connect: $out"; grep -q mock-default <<<"$out" && fail "connect fell through to chat"
 "$BIN" mcp --help | grep -q "login <name>" || fail "mcp help"
 "$BIN" reset --help | grep -q -- "--scope" || fail "reset help"
 # ---- mcp (stdio, against the built-in mock MCP server)

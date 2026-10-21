@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <sqlite3.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -1012,10 +1014,713 @@ int CmdDocs(int argc, char** argv) {
         for (auto& h : out) std::cout << h["title"].get<std::string>() << "\n  " << h["url"].get<std::string>() << (h["snippet"].get<std::string>().empty() ? "" : "\n  " + h["snippet"].get<std::string>()) << "\n"; });
     return 0;
 }
+// ============================================================ 1.124: promos / sandbox / dns / secrets / backup / gmail / node install / connect / hooks relay / mcp serve+configure / acp client
+std::string ShQ(const std::string& s) { std::string o = "'"; for (char ch : s) { if (ch == '\'') o += "'\\''"; else o += ch; } return o + "'"; }
+int ShRun(const std::string& cmd, std::string* out = nullptr) {
+    FILE* p = popen((cmd + " 2>&1").c_str(), "r"); if (!p) return -1;
+    std::string o; char b[4096]; size_t n; while ((n = fread(b, 1, sizeof b, p)) > 0) o.append(b, n);
+    int rc = pclose(p); if (out) *out = o; return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+}
+bool InPath(const std::string& bin) { return ShRun("command -v " + ShQ(bin) + " >/dev/null") == 0; }
+std::string Sanitize(const std::string& s) { std::string o; for (unsigned char ch : s) if (ch >= 0x20 && ch != 0x7f) o += static_cast<char>(ch); return o; }
+std::string ClawHubBase() { for (auto k : {"CLAWHUB_REGISTRY", "CLAWDHUB_REGISTRY"}) if (const char* e = std::getenv(k); e && *e) return NoSlash(e); return "https://clawhub.ai"; }
+bool Confirm(const std::string& q) { if (!isatty(0)) return false; std::cout << q << " [y/N] " << std::flush; std::string l; std::getline(std::cin, l); return Lower(Trim(l)) == "y" || Lower(Trim(l)) == "yes"; }
+// ---------------------------------------------------------------- promos (ClawHub /api/v1/promotions)
+int CmdPromos(int argc, char** argv, const std::string& sub) {
+    auto a = P3(argc, argv, 3, {"--json", "--api-key=", "--set-default"}, "promos " + sub); if (!a) return 2;
+    const bool js = a->has("--json");
+    auto fetch = [&](const std::string& path, long* st) -> json {
+        auto r = Http(ClawHubBase() + path, {"Accept: application/json"}); *st = r.status;
+        if (!r.error.empty()) throw std::runtime_error("ClawHub unreachable: " + r.error);
+        try { return json::parse(r.body); } catch (...) { return nullptr; }
+    };
+    auto days_left = [](const json& p) { long long d = std::max(0LL, (p.value("endsAt", 0LL) - NowMs()) / 86400000LL); return d == 0 ? std::string("ends today") : d == 1 ? std::string("1 day left") : std::to_string(d) + " days left"; };
+    try {
+        if (sub == "list") {
+            long st = 0; auto j = fetch("/api/v1/promotions", &st);
+            if (st == 404) { Emit(js, {{"promotions", json::array()}}, [] { std::cout << "Promotions are not available from ClawHub yet.\n"; }); return 0; }
+            if (st != 200 || !j.is_object()) { std::cerr << "ClawHub promotions request failed (HTTP " << st << ")\n"; return 1; }
+            auto ps = j.value("promotions", json::array());
+            const fs::path notified = StateRoot() / "promotions-notified.json";
+            auto seen = ReadJ(notified, json::array()); for (auto& p : ps) if (std::find(seen.begin(), seen.end(), p["slug"]) == seen.end()) seen.push_back(p["slug"]); WriteJ(notified, seen);
+            Emit(js, {{"promotions", ps}}, [&] {
+                if (ps.empty()) { std::cout << "No active promotions right now.\n"; return; }
+                for (auto& p : ps) {
+                    std::cout << Sanitize(p.value("title", "")) << (p.contains("sponsor") ? " — " + Sanitize(p.value("sponsor", "")) : "") << " (" << days_left(p) << ")\n  " << Sanitize(p.value("blurb", "")) << "\n";
+                    for (auto& m : p.value("models", json::array())) std::cout << "  · " << Sanitize(m.value("modelRef", "")) << (m.contains("alias") ? " (" + Sanitize(m.value("alias", "")) + ")" : "") << (m.value("suggestedDefault", false) ? " — suggested default" : "") << "\n";
+                    std::cout << "  Claim: openclaw-cpp promos claim " << Sanitize(p.value("slug", "")) << "\n";
+                } });
+            return 0;
+        }
+        if (a->pos.empty()) { std::cerr << "error: missing required argument 'slug'\n"; return 2; }
+        const std::string slug = Lower(Trim(a->pos[0]));
+        static const std::regex slug_re("^[a-z0-9][a-z0-9-]{0,63}$"), ref_re("^[a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:/-]*$"), prov_re("^[a-z0-9][a-z0-9-]*$");
+        if (!std::regex_match(slug, slug_re)) { std::cerr << "Invalid promotion slug.\n"; return 1; }
+        auto load = [&]() {
+            long st = 0; auto j = fetch("/api/v1/promotions/" + UrlEnc(slug), &st);
+            if (st == 404) throw std::runtime_error("Promotion \"" + slug + "\" was not found or has ended.");
+            if (st != 200 || !j.is_object()) throw std::runtime_error("ClawHub request failed (HTTP " + std::to_string(st) + ")");
+            return j.contains("promotion") ? j["promotion"] : j;
+        };
+        auto live = [&](const json& x) { const auto now = NowMs(); if (x.value("startsAt", 0LL) > now || x.value("endsAt", 0LL) < now) throw std::runtime_error("Promotion \"" + slug + "\" is not active."); };
+        auto p = load(); live(p);
+        const std::string prov = Trim(p.value("provider", std::string()));
+        if (prov.empty()) throw std::runtime_error("Promotion \"" + slug + "\" does not declare a provider; it cannot be claimed from the CLI.");
+        if (!std::regex_match(prov, prov_re)) throw std::runtime_error("Promotion provider id is invalid.");
+        for (auto& m : p.value("models", json::array())) {
+            const auto ref = m.value("modelRef", std::string());
+            if (!std::regex_match(ref, ref_re) || ref.rfind(prov + "/", 0) != 0) throw std::runtime_error("Promotion model ref \"" + Sanitize(ref) + "\" is invalid for provider " + prov + ".");
+        }
+        json raw = LoadRaw();
+        const bool has_key = raw.contains("models") && raw["models"].contains("providers") && raw["models"]["providers"].contains(prov) && raw["models"]["providers"][prov].contains("apiKey");
+        std::string key = a->get("--api-key");
+        if (key.empty() && !has_key) {
+            if (!isatty(0)) throw std::runtime_error("No credentials for provider " + prov + ". Re-run with --api-key <key>.");
+            std::cout << prov << " API key: " << std::flush; std::getline(std::cin, key); key = Trim(key);
+            if (key.empty()) throw std::runtime_error("API key required.");
+        }
+        auto p2 = load(); live(p2);
+        if (p2.value("provider", "") != p.value("provider", "") || p2.value("models", json::array()) != p.value("models", json::array())) throw std::runtime_error("Promotion changed while claiming; re-run the claim.");
+        if (!key.empty()) {
+            raw["models"]["providers"][prov]["apiKey"] = key;
+            if (p.contains("baseUrl") && !raw["models"]["providers"][prov].contains("baseUrl")) raw["models"]["providers"][prov]["baseUrl"] = p["baseUrl"];
+        }
+        json registered = json::array(), skipped = json::array();
+        json& models = raw["agents"]["defaults"]["models"]; if (!models.is_object()) models = json::object();
+        for (auto& m : p.value("models", json::array())) {
+            const auto ref = m["modelRef"].get<std::string>(); if (!models.contains(ref)) models[ref] = json::object(); registered.push_back(ref);
+            if (m.contains("alias")) {
+                const auto al = Lower(Sanitize(m["alias"].get<std::string>())); bool taken = false;
+                for (auto& [k, v] : models.items()) if (k != ref && v.value("alias", "") == al) taken = true;
+                if (taken) skipped.push_back(al); else if (!models[ref].contains("alias")) models[ref]["alias"] = al;
+            }
+        }
+        json suggested = nullptr; for (auto& m : p.value("models", json::array())) if (m.value("suggestedDefault", false)) suggested = m["modelRef"];
+        if (suggested.is_null() && !p.value("models", json::array()).empty()) suggested = p["models"][0]["modelRef"];
+        bool make_default = a->has("--set-default") && !suggested.is_null();
+        if (!make_default && !suggested.is_null() && !a->has("--api-key")) make_default = Confirm("Set " + suggested.get<std::string>() + " as your default model?");
+        if (make_default) raw["agents"]["defaults"]["model"]["primary"] = suggested;
+        SaveRaw(raw);
+        json claims = ReadJ(StateRoot() / "promotions-claimed.json"); claims[slug] = {{"claimedAt", IsoNow()}, {"provider", prov}, {"models", registered}}; WriteJ(StateRoot() / "promotions-claimed.json", claims);
+        Emit(js, {{"slug", slug}, {"provider", prov}, {"registered", registered}, {"skippedAliases", skipped}, {"defaultModel", make_default ? suggested : json(nullptr)}}, [&] {
+            std::cout << "Claimed \"" << Sanitize(p.value("title", slug)) << "\": " << registered.size() << " model(s) registered for " << prov << ".\n";
+            if (make_default) std::cout << "Default model: " << suggested.get<std::string>() << "\n";
+            for (auto& s : skipped) std::cout << "Alias \"" << s.get<std::string>() << "\" already in use; skipped.\n"; });
+        return 0;
+    } catch (const std::exception& e) { std::cerr << e.what() << "\n"; return 1; }
+}
+// ---------------------------------------------------------------- sandbox list / recreate (docker containers labelled by exec)
+int CmdSandbox(int argc, char** argv, const std::string& sub) {
+    auto a = P3(argc, argv, 3, {"--json", "--browser", "--all", "--session=", "--agent=", "--force"}, "sandbox " + sub); if (!a) return 2;
+    const std::string label = a->has("--browser") ? "openclaw.browser=1" : "openclaw.sandbox=1";
+    const bool docker = InPath("docker");
+    json items = json::array();
+    if (docker) {
+        std::string out;
+        if (ShRun("docker ps -a --filter " + ShQ("label=" + label) + " --format '{{json .}}'", &out) != 0) { std::cerr << "docker ps failed: " << Trim(out) << "\n"; return 1; }
+        std::istringstream is(out); std::string l;
+        while (std::getline(is, l)) {
+            try {
+                auto j = json::parse(l); json lab = json::object(); std::stringstream ls(j.value("Labels", "")); std::string kv;
+                while (std::getline(ls, kv, ',')) { auto e = kv.find('='); if (e != std::string::npos) lab[kv.substr(0, e)] = kv.substr(e + 1); }
+                items.push_back({{"id", j.value("ID", "")}, {"name", j.value("Names", "")}, {"image", j.value("Image", "")}, {"state", j.value("State", "")}, {"status", j.value("Status", "")},
+                                 {"agent", lab.value("openclaw.agent", "")}, {"session", lab.value("openclaw.session", "")}});
+            } catch (...) {}
+        }
+    }
+    if (sub == "list") {
+        Emit(a->has("--json"), {{"containers", items}, {"runtime", docker ? "docker" : (InPath("bwrap") ? "bwrap" : "none")}}, [&] {
+            if (items.empty()) { std::cout << (docker ? "No sandbox containers.\n" : "No sandbox containers (docker not found; bwrap sandboxes are per-command and leave nothing running).\n"); return; }
+            for (auto& c : items) std::cout << c["name"].get<std::string>() << "  " << c["state"].get<std::string>() << "  agent=" << c["agent"].get<std::string>() << "  session=" << c["session"].get<std::string>() << "  " << c["image"].get<std::string>() << "\n"; });
+        return 0;
+    }
+    if (!a->has("--all") && !a->has("--session") && !a->has("--agent")) { std::cerr << "Choose --all, --session <key>, or --agent <id>.\n"; return 1; }
+    json pick = json::array();
+    for (auto& c : items) if (a->has("--all") || (a->has("--session") && c["session"] == a->get("--session")) || (a->has("--agent") && c["agent"] == a->get("--agent"))) pick.push_back(c);
+    if (pick.empty()) { std::cout << "No matching sandbox containers.\n"; return 0; }
+    if (!a->has("--force") && !Confirm("Remove " + std::to_string(pick.size()) + " container(s)?")) { std::cerr << "Refusing to remove " << pick.size() << " container(s) without --force.\n"; return 1; }
+    int removed = 0; for (auto& c : pick) if (ShRun("docker rm -f " + ShQ(c["id"].get<std::string>()) + " >/dev/null") == 0) ++removed;
+    std::cout << "Removed " << removed << " container(s); they are recreated with current config on next use.\n";
+    return removed == static_cast<int>(pick.size()) ? 0 : 1;
+}
+
+// ---------------------------------------------------------------- dns setup
+int CmdDnsSetup(int argc, char** argv) {
+    auto a = P3(argc, argv, 3, {"--domain=", "--apply"}, "dns setup"); if (!a) return 2;
+    json raw = LoadRaw();
+    std::string dom = a->get("--domain");
+    if (dom.empty() && raw.contains("discovery") && raw["discovery"].contains("wideArea")) dom = raw["discovery"]["wideArea"].value("domain", "");
+    if (dom.empty()) if (const char* e = std::getenv("OPENCLAW_WIDE_AREA_DOMAIN")) dom = e;
+    if (dom.empty()) { std::cerr << "No wide-area domain configured. Set discovery.wideArea.domain or pass --domain.\n"; return 1; }
+    dom = Lower(dom); if (dom.back() == '.') dom.pop_back();
+    static const std::regex dre("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$");
+    if (!std::regex_match(dom, dre) || dom == "local") { std::cerr << "Invalid wide-area domain \"" << dom << "\".\n"; return 1; }
+    std::string v4, v6;
+    ifaddrs* ifs = nullptr;
+    if (getifaddrs(&ifs) == 0) {
+        for (auto* i = ifs; i; i = i->ifa_next) {
+            if (!i->ifa_addr) continue; char b[INET6_ADDRSTRLEN];
+            if (i->ifa_addr->sa_family == AF_INET) {
+                auto* s4 = reinterpret_cast<sockaddr_in*>(i->ifa_addr); auto ip = ntohl(s4->sin_addr.s_addr);
+                if ((ip & 0xFFC00000u) == 0x64400000u && v4.empty()) { inet_ntop(AF_INET, &s4->sin_addr, b, sizeof b); v4 = b; }
+            } else if (i->ifa_addr->sa_family == AF_INET6) {
+                auto* s6 = reinterpret_cast<sockaddr_in6*>(i->ifa_addr); const unsigned char* x = s6->sin6_addr.s6_addr;
+                if (x[0] == 0xfd && x[1] == 0x7a && x[2] == 0x11 && x[3] == 0x5c && x[4] == 0xa1 && x[5] == 0xe0 && v6.empty()) { inet_ntop(AF_INET6, &s6->sin6_addr, b, sizeof b); v6 = b; }
+            }
+        }
+        freeifaddrs(ifs);
+    }
+    const fs::path zone = StateRoot() / "dns" / (dom + ".db");
+    std::cout << "DNS setup\n  Domain      " << dom << "\n  Zone file   " << zone.string() << "\n  Tailnet IP  " << (v4.empty() ? "—" : v4) << (v6.empty() ? "" : " (v6 " + v6 + ")") << "\n\n"
+              << "Recommended config ($OPENCLAW_CONFIG_PATH, default ~/.openclaw/openclaw.json):\n"
+              << json{{"gateway", {{"bind", "auto"}}}, {"discovery", {{"wideArea", {{"domain", dom}}}}}}.dump(2) << "\n\n"
+              << "Tailscale admin (DNS → Nameservers):\n- Add nameserver: " << (v4.empty() ? "<this machine's tailnet IPv4>" : v4) << "\n- Restrict to domain (Split DNS): " << dom << "\n";
+    if (!a->has("--apply")) { std::cout << "\nRun with --apply to install CoreDNS and configure it.\n"; return 0; }
+    std::cerr << "dns setup is currently supported on macOS only\n";  // upstream parity: --apply needs Homebrew CoreDNS
+    return 1;
+}
+// ---------------------------------------------------------------- secrets apply / configure
+json* PathRef(json& root, const std::string& dotted, bool create) {
+    json* cur = &root; std::stringstream ss(dotted); std::string seg;
+    while (std::getline(ss, seg, '.')) {
+        if (seg.empty()) return nullptr;
+        if (!cur->is_object()) { if (!create || !cur->is_null()) return nullptr; *cur = json::object(); }
+        if (!cur->contains(seg)) { if (!create) return nullptr; (*cur)[seg] = nullptr; }
+        cur = &(*cur)[seg];
+    }
+    return cur;
+}
+bool SecretKeyName(const std::string& k) {
+    static const std::set<std::string> names{"apikey", "token", "bottoken", "apptoken", "password", "secret", "clientsecret", "signingsecret", "accesstoken", "refreshtoken", "webhooksecret", "privatekey"};
+    return names.count(Lower(k)) > 0;
+}
+void FindPlain(const json& j, const std::string& path, std::vector<std::string>& out) {
+    if (!j.is_object()) return;
+    for (auto& [k, v] : j.items()) {
+        const auto p = path.empty() ? k : path + "." + k;
+        if (p == "secrets") continue;
+        if (v.is_string() && SecretKeyName(k) && !v.get<std::string>().empty() && v.get<std::string>().rfind("${", 0) != 0) out.push_back(p);
+        else if (v.is_object()) FindPlain(v, p, out);
+    }
+}
+std::string JPtrEsc(const std::string& s) { std::string o; for (char c : s) { if (c == '~') o += "~0"; else if (c == '/') o += "~1"; else o += c; } return o; }
+int CmdSecrets(int argc, char** argv, const std::string& sub) {
+    auto a = P3(argc, argv, 3, {"--from=", "--dry-run", "--allow-exec", "--json", "--plan-out=", "--apply", "--yes", "--provider="}, "secrets " + sub); if (!a) return 2;
+    json raw = LoadRaw(); const bool js = a->has("--json");
+    if (sub == "apply") {
+        if (!a->has("--from")) { std::cerr << "error: required option '--from <path>' not specified\n"; return 2; }
+        json plan = ReadJ(a->get("--from"), nullptr);
+        if (!plan.is_object()) { std::cerr << "Could not read plan " << a->get("--from") << "\n"; return 1; }
+        if (plan.value("version", 0) != 1 || plan.value("protocolVersion", 0) != 1) { std::cerr << "Unsupported secrets plan (expected version 1, protocolVersion 1).\n"; return 1; }
+        json changes = json::array();
+        const json ups = plan.value("providerUpserts", json::object()), dels = plan.value("providerDeletes", json::array()), tgts = plan.value("targets", json::array());
+        for (auto& [name, cfg] : ups.items()) {
+            if (cfg.value("source", "") == "exec" && !a->has("--allow-exec")) { std::cerr << "Plan upserts exec provider \"" << name << "\"; re-run with --allow-exec to permit it.\n"; return 1; }
+            raw["secrets"]["providers"][name] = cfg; changes.push_back({{"op", "providerUpsert"}, {"provider", name}});
+        }
+        for (auto& name : dels) {
+            if (raw.contains("secrets") && raw["secrets"].contains("providers")) raw["secrets"]["providers"].erase(name.get<std::string>());
+            changes.push_back({{"op", "providerDelete"}, {"provider", name}});
+        }
+        for (auto& t : tgts) {
+            const auto path = t.value("path", std::string()); if (path.empty() || !t.contains("ref")) { std::cerr << "Invalid plan target: " << t.dump() << "\n"; return 1; }
+            const auto& ref = t["ref"];
+            if (!ref.is_object() || !ref.contains("source") || !ref.contains("provider") || !ref.contains("id")) { std::cerr << "Invalid SecretRef at " << path << "\n"; return 1; }
+            const auto prov = ref["provider"].get<std::string>();
+            const bool known = prov == "default" || (raw.contains("secrets") && raw["secrets"].contains("providers") && raw["secrets"]["providers"].contains(prov));
+            if (!known) { std::cerr << "SecretRef at " << path << " uses unknown provider \"" << prov << "\".\n"; return 1; }
+            if (ref["source"] == "exec" && !a->has("--allow-exec")) { std::cerr << "Target " << path << " uses an exec SecretRef; re-run with --allow-exec.\n"; return 1; }
+            json* slot = PathRef(raw, path, true); if (!slot) { std::cerr << "Cannot write config path " << path << "\n"; return 1; }
+            *slot = ref; changes.push_back({{"op", "target"}, {"path", path}});
+        }
+        if (!a->has("--dry-run")) SaveRaw(raw);
+        Emit(js, {{"ok", true}, {"dryRun", a->has("--dry-run")}, {"changes", changes}}, [&] {
+            std::cout << (a->has("--dry-run") ? "Dry run: " : "Applied ") << changes.size() << " change(s).\n";
+            for (auto& c : changes) std::cout << "  " << c["op"].get<std::string>() << " " << (c.contains("path") ? c["path"].get<std::string>() : c["provider"].get<std::string>()) << "\n"; });
+        return 0;
+    }
+    // configure: move plaintext secrets into a file provider.
+    std::vector<std::string> found; FindPlain(raw, "", found);
+    const std::string prov = a->get("--provider", "openclaw-file");
+    const fs::path file = StateRoot() / "secrets" / "secrets.json";
+    json plan = {{"version", 1}, {"protocolVersion", 1}, {"providerUpserts", {{prov, {{"source", "file"}, {"path", file.string()}, {"mode", "json"}}}}}, {"providerDeletes", json::array()}, {"targets", json::array()}};
+    for (auto& p : found) { std::string ptr; std::stringstream ss(p); std::string seg; while (std::getline(ss, seg, '.')) ptr += "/" + JPtrEsc(seg); plan["targets"].push_back({{"path", p}, {"ref", {{"source", "file"}, {"provider", prov}, {"id", ptr}}}}); }
+    if (a->has("--plan-out")) { std::error_code ec0; WriteJ(a->get("--plan-out"), plan); fs::permissions(a->get("--plan-out"), fs::perms::owner_read | fs::perms::owner_write, ec0); }
+    if (!a->has("--apply")) {
+        Emit(js, {{"plaintext", found}, {"plan", plan}}, [&] {
+            if (found.empty()) { std::cout << "No plaintext secrets found in config.\n"; return; }
+            std::cout << found.size() << " plaintext secret(s) found:\n"; for (auto& p : found) std::cout << "  " << p << "\n";
+            std::cout << "Run `openclaw-cpp secrets configure --apply --yes` to move them into " << file.string() << ".\n"; });
+        return 0;
+    }
+    if (!a->has("--yes") && !Confirm("Move " + std::to_string(found.size()) + " secret(s) into " + file.string() + "?")) { std::cerr << "Refusing to apply without --yes.\n"; return 1; }
+    json store = ReadJ(file);
+    for (auto& t : plan["targets"]) { json* v = PathRef(raw, t["path"], false); if (v) store[json::json_pointer(t["ref"]["id"].get<std::string>())] = *v; }
+    std::error_code ec; fs::create_directories(file.parent_path(), ec); fs::permissions(file.parent_path(), fs::perms::owner_all, ec);
+    { const auto tmp = file.string() + ".tmp"; int fd = ::open(tmp.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0600); if (fd < 0) { std::cerr << "Cannot write " << file.string() << "\n"; return 1; } auto s = store.dump(2); if (::write(fd, s.data(), s.size()) < 0) {} ::close(fd); fs::rename(tmp, file, ec); }
+    raw["secrets"]["providers"][prov] = plan["providerUpserts"][prov];
+    for (auto& t : plan["targets"]) if (json* v = PathRef(raw, t["path"], false)) *v = t["ref"];
+    SaveRaw(raw);
+    Emit(js, {{"ok", true}, {"moved", found}, {"file", file.string()}}, [&] { std::cout << "Moved " << found.size() << " secret(s) into " << file.string() << " (provider " << prov << ").\n"; });
+    return 0;
+}
+// ---------------------------------------------------------------- backup sqlite / git
+std::vector<fs::path> SqliteDbs() {
+    std::vector<fs::path> v; std::error_code ec;
+    for (const auto& root : {StateRoot(), DataRoot()}) {
+        if (!fs::exists(root, ec)) continue;
+        for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) break;
+            const auto p = it->path(); const auto s = p.string();
+            if (s.find("/backups/") != std::string::npos || s.find("/backup-git/") != std::string::npos) continue;
+            if (!it->is_regular_file(ec)) continue;
+            std::ifstream f(p, std::ios::binary); char hdr[16] = {}; f.read(hdr, 16);
+            if (f.gcount() == 16 && std::string(hdr, 15) == "SQLite format 3") v.push_back(p);
+        }
+    }
+    std::sort(v.begin(), v.end()); return v;
+}
+std::string RelName(const fs::path& p) {
+    for (const auto& [tag, root] : std::vector<std::pair<std::string, fs::path>>{{"state", StateRoot()}, {"data", DataRoot()}}) {
+        auto r = fs::relative(p, root); if (!r.empty() && r.string().rfind("..", 0) != 0) return tag + "/" + r.string();
+    }
+    return p.filename().string();
+}
+bool SqlCopy(const fs::path& from, const fs::path& to, std::string* err) {
+    sqlite3 *src = nullptr, *dst = nullptr;
+    if (sqlite3_open_v2(from.c_str(), &src, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) { *err = sqlite3_errmsg(src); sqlite3_close(src); return false; }
+    std::error_code ec; fs::create_directories(to.parent_path(), ec);
+    if (sqlite3_open(to.c_str(), &dst) != SQLITE_OK) { *err = sqlite3_errmsg(dst); sqlite3_close(src); sqlite3_close(dst); return false; }
+    auto* b = sqlite3_backup_init(dst, "main", src, "main"); bool ok = b && sqlite3_backup_step(b, -1) == SQLITE_DONE;
+    if (b) sqlite3_backup_finish(b); if (!ok) *err = sqlite3_errmsg(dst);
+    sqlite3_close(src); sqlite3_close(dst); return ok;
+}
+std::string SqlCheck(const fs::path& p) {
+    sqlite3* db = nullptr; std::string res = "open failed";
+    if (sqlite3_open_v2(p.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK) {
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &st, nullptr) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) res = reinterpret_cast<const char*>(sqlite3_column_text(st, 0));
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db); return res;
+}
+std::string SqlDump(const fs::path& p) {
+    sqlite3* db = nullptr; std::ostringstream o;
+    if (sqlite3_open_v2(p.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) { sqlite3_close(db); return {}; }
+    auto rows = [&](const std::string& sql, const std::function<void(sqlite3_stmt*)>& f) { sqlite3_stmt* st = nullptr; if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) == SQLITE_OK) while (sqlite3_step(st) == SQLITE_ROW) f(st); sqlite3_finalize(st); };
+    std::vector<std::pair<std::string, std::string>> tables;
+    rows("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", [&](sqlite3_stmt* st) { tables.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(st, 0)), sqlite3_column_text(st, 1) ? reinterpret_cast<const char*>(sqlite3_column_text(st, 1)) : ""); });
+    for (auto& [name, sql] : tables) {
+        o << sql << ";\n";
+        std::string q = name; std::string esc; for (char c : q) { if (c == '"') esc += "\"\""; else esc += c; }
+        rows("SELECT * FROM \"" + esc + "\" ORDER BY 1", [&](sqlite3_stmt* st) {
+            o << "INSERT INTO \"" << esc << "\" VALUES(";
+            for (int i = 0; i < sqlite3_column_count(st); ++i) {
+                if (i) o << ",";
+                switch (sqlite3_column_type(st, i)) {
+                    case SQLITE_NULL: o << "NULL"; break;
+                    case SQLITE_INTEGER: o << sqlite3_column_int64(st, i); break;
+                    case SQLITE_FLOAT: { char b[64]; std::snprintf(b, sizeof b, "%.17g", sqlite3_column_double(st, i)); o << b; break; }
+                    case SQLITE_BLOB: { auto* d = static_cast<const unsigned char*>(sqlite3_column_blob(st, i)); int n = sqlite3_column_bytes(st, i); o << "X'"; char b[3]; for (int k = 0; k < n; ++k) { std::snprintf(b, sizeof b, "%02x", d[k]); o << b; } o << "'"; break; }
+                    default: { std::string s = reinterpret_cast<const char*>(sqlite3_column_text(st, i)); o << "'"; for (char c : s) { if (c == '\'') o << "''"; else o << c; } o << "'"; }
+                }
+            }
+            o << ");\n"; });
+    }
+    rows("SELECT sql FROM sqlite_master WHERE type IN ('index','trigger','view') AND sql IS NOT NULL ORDER BY name", [&](sqlite3_stmt* st) { o << reinterpret_cast<const char*>(sqlite3_column_text(st, 0)) << ";\n"; });
+    sqlite3_close(db); return o.str();
+}
+fs::path FromRel(const std::string& rel) { if (rel.rfind("state/", 0) == 0) return StateRoot() / rel.substr(6); if (rel.rfind("data/", 0) == 0) return DataRoot() / rel.substr(5); return {}; }
+int CmdBackupSqlite(int argc, char** argv, const std::string& sub) {
+    auto a = P3(argc, argv, 4, {"--json", "--out=", "--yes", "--dry-run"}, "backup sqlite " + sub); if (!a) return 2;
+    const bool js = a->has("--json"); const fs::path dir = StateRoot() / "backups" / "sqlite";
+    if (sub == "create") {
+        const auto id = a->get("--out").empty() ? "sqlite-" + IsoNow() : a->get("--out"); const fs::path out = dir / id;
+        json files = json::array(); std::string err;
+        for (auto& db : SqliteDbs()) {
+            const auto rel = RelName(db); const auto dst = out / "files" / rel;
+            if (!SqlCopy(db, dst, &err)) { std::cerr << "backup of " << db.string() << " failed: " << err << "\n"; return 1; }
+            std::ifstream f(dst, std::ios::binary); std::string body((std::istreambuf_iterator<char>(f)), {});
+            files.push_back({{"path", rel}, {"bytes", body.size()}, {"sha256", Sha256(body)}});
+        }
+        json man = {{"version", 1}, {"kind", "sqlite"}, {"createdAt", IsoNow()}, {"files", files}}; WriteJ(out / "manifest.json", man);
+        Emit(js, {{"ok", true}, {"path", out.string()}, {"manifest", man}}, [&] { std::cout << "Backed up " << files.size() << " SQLite database(s) to " << out.string() << "\n"; });
+        return 0;
+    }
+    if (sub == "list") {
+        json v = json::array(); std::error_code ec;
+        if (fs::exists(dir, ec)) for (auto& e : fs::directory_iterator(dir, ec)) { auto m = ReadJ(e.path() / "manifest.json", nullptr); if (m.is_object()) v.push_back({{"id", e.path().filename().string()}, {"createdAt", m["createdAt"]}, {"files", m["files"].size()}}); }
+        std::sort(v.begin(), v.end(), [](const json& x, const json& y) { return x["id"] < y["id"]; });
+        Emit(js, {{"backups", v}}, [&] { if (v.empty()) std::cout << "No SQLite backups.\n"; for (auto& b : v) std::cout << b["id"].get<std::string>() << "  " << b["files"].get<size_t>() << " file(s)\n"; });
+        return 0;
+    }
+    if (a->pos.empty()) { std::cerr << "error: missing required argument 'id'\n"; return 2; }
+    const fs::path src = fs::path(a->pos[0]).is_absolute() ? fs::path(a->pos[0]) : dir / a->pos[0];
+    auto man = ReadJ(src / "manifest.json", nullptr); if (!man.is_object()) { std::cerr << "No backup manifest at " << src.string() << "\n"; return 1; }
+    json res = json::array(); bool ok = true;
+    for (auto& f : man["files"]) {
+        const auto p = src / "files" / f["path"].get<std::string>(); std::ifstream in(p, std::ios::binary); std::string body((std::istreambuf_iterator<char>(in)), {});
+        const bool hash_ok = in.good() || !body.empty() ? Sha256(body) == f["sha256"].get<std::string>() : false; const auto integ = hash_ok ? SqlCheck(p) : std::string("missing or modified");
+        res.push_back({{"path", f["path"]}, {"sha256Ok", hash_ok}, {"integrity", integ}}); ok = ok && hash_ok && integ == "ok";
+    }
+    if (sub == "verify") { Emit(js, {{"ok", ok}, {"files", res}}, [&] { for (auto& r : res) std::cout << r["path"].get<std::string>() << ": " << r["integrity"].get<std::string>() << "\n"; std::cout << (ok ? "Backup verified.\n" : "Backup verification FAILED.\n"); }); return ok ? 0 : 1; }
+    if (!ok) { std::cerr << "Refusing to restore: backup failed verification.\n"; return 1; }
+    if (a->has("--dry-run")) { for (auto& f : man["files"]) std::cout << "would restore " << FromRel(f["path"]).string() << "\n"; return 0; }
+    if (!a->has("--yes") && !Confirm("Overwrite live databases from " + src.string() + "?")) { std::cerr << "Refusing to restore without --yes (stop the gateway first).\n"; return 1; }
+    std::string err; int n = 0;
+    for (auto& f : man["files"]) { const auto dst = FromRel(f["path"]); if (dst.empty()) continue; if (!SqlCopy(src / "files" / f["path"].get<std::string>(), dst, &err)) { std::cerr << "restore failed for " << dst.string() << ": " << err << "\n"; return 1; } ++n; }
+    Emit(js, {{"ok", true}, {"restored", n}}, [&] { std::cout << "Restored " << n << " database(s).\n"; });
+    return 0;
+}
+int CmdBackupGit(int argc, char** argv, const std::string& sub) {
+    auto a = P3(argc, argv, 4, {"--json", "--message=", "--yes", "--limit=", "--ref="}, "backup git " + sub); if (!a) return 2;
+    if (!InPath("git")) { std::cerr << "git is required for `backup git`.\n"; return 1; }
+    const fs::path repo = StateRoot() / "backup-git"; const auto G = "git -C " + ShQ(repo.string()) + " -c user.name=openclaw -c user.email=openclaw@localhost ";
+    std::string out;
+    auto ensure = [&] { std::error_code ec; fs::create_directories(repo, ec); if (!fs::exists(repo / ".git")) ShRun(G + "init -q", &out); };
+    if (sub == "init") { ensure(); std::cout << "Initialized backup repository at " << repo.string() << "\n"; return 0; }
+    if (!fs::exists(repo / ".git")) { if (sub != "create") { std::cerr << "No backup repository yet; run `openclaw-cpp backup git init`.\n"; return 1; } ensure(); }
+    if (sub == "create") {
+        std::error_code ec; fs::remove_all(repo / "dumps", ec); json man = {{"version", 1}, {"files", json::array()}};
+        for (auto& db : SqliteDbs()) { const auto rel = RelName(db) + ".sql"; const auto d = SqlDump(db); fs::create_directories((repo / "dumps" / rel).parent_path(), ec); std::ofstream(repo / "dumps" / rel) << d; man["files"].push_back({{"path", RelName(db)}, {"dump", "dumps/" + rel}, {"sha256", Sha256(d)}}); }
+        WriteJ(repo / "manifest.json", man);
+        ShRun(G + "add -A", &out);
+        if (ShRun(G + "diff --cached --quiet") == 0) { std::cout << "No changes since the last backup.\n"; return 0; }
+        if (ShRun(G + "commit -q -m " + ShQ(a->get("--message", "openclaw backup " + IsoNow())), &out) != 0) { std::cerr << out; return 1; }
+        ShRun(G + "rev-parse --short HEAD", &out); std::cout << "Committed backup " << Trim(out) << " (" << man["files"].size() << " database dump(s)).\n"; return 0;
+    }
+    if (sub == "log") { ShRun(G + "log --format='%h %cI %s' -n " + std::to_string(std::max(1, std::atoi(a->get("--limit", "20").c_str()))), &out); std::cout << out; return 0; }
+    const std::string ref = a->pos.empty() ? a->get("--ref", "HEAD") : a->pos[0];
+    if (ShRun(G + "rev-parse --verify -q " + ShQ(ref + "^{commit}"), &out) != 0) { std::cerr << "Unknown backup ref " << ref << "\n"; return 1; }
+    ShRun(G + "show " + ShQ(ref + ":manifest.json"), &out); json man; try { man = json::parse(out); } catch (...) { std::cerr << "Backup " << ref << " has no manifest.\n"; return 1; }
+    bool ok = true;
+    for (auto& f : man["files"]) {
+        std::string d; ShRun(G + "show " + ShQ(ref + ":" + f["dump"].get<std::string>()), &d);
+        sqlite3* db = nullptr; sqlite3_open(":memory:", &db); const bool loads = sqlite3_exec(db, d.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK; sqlite3_close(db);
+        const bool h = Sha256(d) == f["sha256"].get<std::string>(); ok = ok && h && loads;
+        if (sub == "verify") std::cout << f["path"].get<std::string>() << ": " << (h && loads ? "ok" : "FAILED") << "\n";
+    }
+    if (sub == "verify") { std::cout << (ok ? "Backup verified.\n" : "Backup verification FAILED.\n"); return ok ? 0 : 1; }
+    if (!ok) { std::cerr << "Refusing to restore: backup failed verification.\n"; return 1; }
+    if (!a->has("--yes") && !Confirm("Overwrite live databases from backup " + ref + "?")) { std::cerr << "Refusing to restore without --yes (stop the gateway first).\n"; return 1; }
+    int n = 0;
+    for (auto& f : man["files"]) {
+        const auto dst = FromRel(f["path"]); if (dst.empty()) continue; std::string d; ShRun(G + "show " + ShQ(ref + ":" + f["dump"].get<std::string>()), &d);
+        const auto tmp = dst.string() + ".restore"; std::error_code ec; fs::remove(tmp, ec); fs::create_directories(dst.parent_path(), ec);
+        sqlite3* db = nullptr; sqlite3_open(tmp.c_str(), &db); const bool okx = sqlite3_exec(db, ("BEGIN;" + d + "COMMIT;").c_str(), nullptr, nullptr, nullptr) == SQLITE_OK; sqlite3_close(db);
+        if (!okx) { std::cerr << "restore failed for " << dst.string() << "\n"; fs::remove(tmp, ec); return 1; }
+        fs::rename(tmp, dst, ec); fs::remove(dst.string() + "-wal", ec); fs::remove(dst.string() + "-shm", ec); ++n;
+    }
+    std::cout << "Restored " << n << " database(s) from " << ref << ".\n"; return 0;
+}
+// ---------------------------------------------------------------- webhooks gmail setup / run
+int CmdGmail(int argc, char** argv, const std::string& sub) {
+    auto a = P3(argc, argv, 4, {"--account=", "--project=", "--topic=", "--subscription=", "--label=", "--hook-url=", "--hook-token=", "--push-token=", "--bind=", "--port=", "--path=", "--include-body", "--max-bytes=", "--renew-minutes=", "--tailscale=", "--tailscale-path=", "--push-endpoint=", "--json", "--dry-run"}, "webhooks gmail " + sub); if (!a) return 2;
+    json raw = LoadRaw(); json g = raw.contains("hooks") && raw["hooks"].contains("gmail") ? raw["hooks"]["gmail"] : json::object();
+    auto pick = [&](const std::string& opt, const std::string& key, const std::string& d) { return a->has(opt) ? a->get(opt) : g.value(key, d); };
+    const std::string account = pick("--account", "account", "");
+    if (account.empty()) { std::cerr << "error: required option '--account <email>' not specified\n"; return 2; }
+    const std::string topic = pick("--topic", "topic", "gog-gmail-watch"), subn = pick("--subscription", "subscription", "gog-gmail-watch-push"), label = pick("--label", "label", "INBOX");
+    const std::string bind = pick("--bind", "bind", "127.0.0.1"), port = a->has("--port") ? a->get("--port") : std::to_string(g.value("port", 8788)), path = pick("--path", "path", "/gmail-pubsub");
+    std::string hook_token = pick("--hook-token", "hookToken", ""); if (hook_token.empty() && raw.contains("hooks")) hook_token = raw["hooks"].value("token", "");
+    if (hook_token.empty()) hook_token = RandHex(24);
+    std::string push_token = pick("--push-token", "pushToken", ""); if (push_token.empty()) push_token = RandHex(24);
+    const std::string hook_url = pick("--hook-url", "hookUrl", GwBase(raw) + "/hooks/gmail");
+    const bool body = a->has("--include-body") || g.value("includeBody", true);
+    const std::string max_bytes = a->has("--max-bytes") ? a->get("--max-bytes") : std::to_string(g.value("maxBytes", 20000));
+    const std::string renew = a->has("--renew-minutes") ? a->get("--renew-minutes") : std::to_string(g.value("renewEveryMinutes", 720));
+    std::vector<std::string> serve = {"gog", "gmail", "watch", "serve", "--account", account, "--bind", bind, "--port", port, "--path", path, "--token", push_token, "--hook-url", hook_url, "--hook-token", hook_token};
+    if (body) serve.push_back("--include-body"); serve.push_back("--max-bytes"); serve.push_back(max_bytes);
+    auto joined = [](const std::vector<std::string>& v) { std::string s; for (auto& x : v) s += (s.empty() ? "" : " ") + ShQ(x); return s; };
+    if (sub == "run") {
+        if (!InPath("gog")) { std::cerr << "gog not found on PATH (install gogcli: https://gogcli.sh).\n"; return 1; }
+        std::vector<std::string> start = {"gog", "gmail", "watch", "start", "--account", account, "--label", label, "--topic", "projects/" + pick("--project", "project", "") + "/topics/" + topic};
+        std::string out; if (ShRun(joined(start), &out) != 0) std::cerr << "gmail watch start failed: " << Trim(out) << "\n";
+        std::cout << "Serving Gmail push on " << bind << ":" << port << path << " (renew every " << renew << "m)\n" << std::flush;
+        std::vector<char*> av; for (auto& s : serve) av.push_back(const_cast<char*>(s.c_str())); av.push_back(nullptr);
+        execvp("gog", av.data()); std::perror("exec gog"); return 1;
+    }
+    std::string project = pick("--project", "project", "");
+    std::vector<std::string> steps;
+    if (project.empty() && InPath("gcloud")) { std::string out; ShRun("gcloud config get-value project", &out); project = Trim(out); }
+    if (project.empty()) { std::cerr << "GCP project required (--project or `gcloud config set project`).\n"; return 1; }
+    const std::string full_topic = "projects/" + project + "/topics/" + topic;
+    std::string endpoint = a->get("--push-endpoint");
+    if (endpoint.empty() && pick("--tailscale", "tailscaleMode", "funnel") != "off" && InPath("tailscale")) {
+        std::string out; ShRun("tailscale status --json", &out); try { auto s = json::parse(out); auto dns = s["Self"].value("DNSName", ""); if (!dns.empty() && dns.back() == '.') dns.pop_back(); if (!dns.empty()) endpoint = "https://" + dns + pick("--tailscale-path", "tailscalePath", path); } catch (...) {}
+    }
+    if (endpoint.empty()) { std::cerr << "Push endpoint required (--push-endpoint URL, or tailscale funnel).\n"; return 1; }
+    endpoint += (endpoint.find('?') == std::string::npos ? "?token=" : "&token=") + push_token;
+    steps.push_back(joined({"gcloud", "services", "enable", "gmail.googleapis.com", "pubsub.googleapis.com", "--project", project}));
+    steps.push_back(joined({"gcloud", "pubsub", "topics", "create", topic, "--project", project}));
+    steps.push_back(joined({"gcloud", "pubsub", "topics", "add-iam-policy-binding", topic, "--project", project, "--member", "serviceAccount:gmail-api-push@system.gserviceaccount.com", "--role", "roles/pubsub.publisher"}));
+    steps.push_back(joined({"gcloud", "pubsub", "subscriptions", "create", subn, "--project", project, "--topic", topic, "--push-endpoint", endpoint}));
+    steps.push_back(joined({"gog", "gmail", "watch", "start", "--account", account, "--label", label, "--topic", full_topic}));
+    json res = json::array();
+    for (auto& s : steps) {
+        if (a->has("--dry-run")) { res.push_back({{"cmd", s}, {"dryRun", true}}); continue; }
+        std::string out; int rc = ShRun(s, &out); const bool exists = out.find("ALREADY_EXISTS") != std::string::npos || out.find("already exists") != std::string::npos;
+        res.push_back({{"cmd", s}, {"exit", rc}}); if (rc != 0 && !exists) { std::cerr << "step failed: " << s << "\n" << out; return 1; }
+    }
+    raw["hooks"]["enabled"] = true; if (raw["hooks"].value("token", "").empty()) raw["hooks"]["token"] = hook_token;
+    raw["hooks"]["gmail"] = {{"account", account}, {"project", project}, {"topic", full_topic}, {"subscription", subn}, {"label", label}, {"pushToken", push_token}, {"hookUrl", hook_url}, {"hookToken", hook_token}, {"includeBody", body}, {"maxBytes", std::stoi(max_bytes)}, {"renewEveryMinutes", std::stoi(renew)}, {"serve", {{"bind", bind}, {"port", std::stoi(port)}, {"path", path}}}};
+    json presets = raw["hooks"].value("presets", json::array()); if (std::find(presets.begin(), presets.end(), "gmail") == presets.end()) presets.push_back("gmail"); raw["hooks"]["presets"] = presets;
+    if (!a->has("--dry-run")) SaveRaw(raw);
+    Emit(a->has("--json"), {{"ok", true}, {"steps", res}, {"config", raw["hooks"]["gmail"]}}, [&] {
+        for (auto& r : res) std::cout << (a->has("--dry-run") ? "would run: " : "ran: ") << r["cmd"].get<std::string>() << "\n";
+        std::cout << "Gmail hooks configured for " << account << ". Start the watcher with `openclaw-cpp webhooks gmail run`.\n"; });
+    return 0;
+}
+
+// ---------------------------------------------------------------- node install (systemd user unit)
+int InstallNodeUnit(const std::vector<std::string>& run_args, bool force, bool js) {
+    const fs::path unit = HomeDir() / ".config" / "systemd" / "user" / "openclaw-node.service";
+    std::error_code ec;
+    if (fs::exists(unit, ec) && !force) { std::cerr << "Node service already installed at " << unit.string() << " (use --force to reinstall).\n"; return 1; }
+    std::string exec = ShQ(SelfExe().string()) + " node run"; for (auto& x : run_args) exec += " " + ShQ(x);
+    fs::create_directories(unit.parent_path(), ec);
+    std::ofstream(unit) << "[Unit]\nDescription=OpenClaw node host\nAfter=network-online.target\n\n[Service]\nExecStart=" << exec << "\nRestart=always\nRestartSec=5\n"
+                        << (std::getenv("OPENCLAW_STATE_DIR") ? std::string("Environment=OPENCLAW_STATE_DIR=") + std::getenv("OPENCLAW_STATE_DIR") + "\n" : "") << "\n[Install]\nWantedBy=default.target\n";
+    std::string note = "installed";
+    if (!std::getenv("OPENCLAW_SKIP_SYSTEMCTL") && InPath("systemctl")) {
+        std::string out;
+        if (ShRun("systemctl --user daemon-reload && systemctl --user enable --now openclaw-node.service", &out) != 0) { std::cerr << "systemctl failed: " << Trim(out) << "\nUnit written to " << unit.string() << "\n"; return 1; }
+        note = "installed and started";
+    } else note = "installed (systemctl skipped)";
+    Emit(js, {{"ok", true}, {"unit", unit.string()}, {"exec", exec}, {"status", note}}, [&] { std::cout << "Node service " << note << ": " << unit.string() << "\n"; });
+    return 0;
+}
+int CmdNodeInstall(int argc, char** argv) {
+    auto a = P3(argc, argv, 3, {"--url=", "--node-id=", "--display-name=", "--token=", "--force", "--json", "--runtime="}, "node install"); if (!a) return 2;
+    std::vector<std::string> ra; for (auto k : {"--url", "--node-id", "--display-name", "--token"}) if (a->has(k)) { ra.push_back(k); ra.push_back(a->get(k)); }
+    return InstallNodeUnit(ra, a->has("--force"), a->has("--json"));
+}
+
+// ---------------------------------------------------------------- connect <oc-pair URL | setup code | join URL>
+std::string B64UrlDecode(std::string s) {
+    for (auto& c : s) { if (c == '-') c = '+'; else if (c == '_') c = '/'; }
+    while (s.size() % 4) s += '=';
+    static const std::string T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o; int v = 0, bits = -8;
+    for (unsigned char c : s) { if (c == '=') break; auto p = T.find(static_cast<char>(c)); if (p == std::string::npos) return {}; v = (v << 6) + static_cast<int>(p); bits += 6; if (bits >= 0) { o += static_cast<char>((v >> bits) & 0xFF); bits -= 8; } }
+    return o;
+}
+int CmdConnect(int argc, char** argv) {
+    auto a = P3(argc, argv, 2, {"--service", "--ephemeral", "--target-file=", "--display-name=", "--node-id=", "--timeout=", "--json", "--force"}, "connect"); if (!a) return 2;
+    std::string target = a->pos.empty() ? "" : a->pos[0];
+    if (a->has("--target-file")) { std::ifstream f(a->get("--target-file")); std::getline(f, target); target = Trim(target); std::error_code ec; fs::remove(a->get("--target-file"), ec); }
+    if (target.empty()) { std::cerr << "Missing connect target. Mint a join URL on the Gateway host with `openclaw-cpp devices join-code`, then run: openclaw-cpp connect <join-url>" << (a->has("--service") ? " --service" : "") << "\n"; return 2; }
+    json payload;
+    std::string code = target;
+    if (code.rfind("oc-pair://", 0) == 0) { code = code.substr(10); auto q = code.find("code="); if (q != std::string::npos) code = code.substr(q + 5); else { auto s = code.find('/'); if (s != std::string::npos) code = code.substr(s + 1); } auto amp = code.find('&'); if (amp != std::string::npos) code = code.substr(0, amp); }
+    if (code.rfind("http://", 0) == 0 || code.rfind("https://", 0) == 0) {
+        auto j = code.find("/j/"); if (j == std::string::npos) { std::cerr << "Join URL must look like https://<gateway>/j/<code>.\n"; return 1; }
+        const std::string base = code.substr(0, j), jc = code.substr(j + 3);
+        auto r = Http(base + "/j/" + jc, {"Accept: application/json"}, 15000);
+        try { payload = json::parse(r.body); } catch (...) {}
+        if (!payload.is_object() || !payload.contains("bootstrapToken")) { std::cerr << "Join URL did not return a pairing payload (HTTP " << r.status << ").\n"; return 1; }
+        if (!payload.contains("url")) payload["url"] = base;
+    } else {
+        try { payload = json::parse(B64UrlDecode(code)); } catch (...) {}
+        if (!payload.is_object() || !payload.contains("url") || !payload.contains("bootstrapToken")) { std::cerr << "Invalid setup code: expected base64url JSON with url and bootstrapToken.\n"; return 1; }
+    }
+    const std::string url = NoSlash(payload["url"].get<std::string>()), boot = payload["bootstrapToken"].get<std::string>();
+    std::string token;
+    if (auto dot = boot.find('.'); boot.rfind("link-", 0) == 0 && dot != std::string::npos) {
+        const std::string id = boot.substr(0, dot), secret = boot.substr(dot + 1);
+        json raw = json::object(); raw["gateway"]["port"] = 0; setenv("OPENCLAW_GATEWAY_URL", url.c_str(), 1);
+        const int timeout = std::max(1, std::atoi(a->get("--timeout", "300").c_str()));
+        std::cerr << "Waiting for the operator to approve this node (link " << id << ")…\n";
+        for (int t = 0; t < timeout * 2; ++t) {
+            std::string err; auto r = GwRpc(raw, "pairing.link.claim", {{"id", id}, {"poll_secret", secret}}, &err);
+            if (!err.empty()) { std::cerr << "claim failed: " << err << "\n"; return 1; }
+            if (r.value("ok", false) && r.contains("token")) { token = r["token"]; break; }
+            if (!r.value("pending", false)) { std::cerr << "claim rejected: " << r.value("error", r.dump()) << "\n"; return 1; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (token.empty()) { std::cerr << "Timed out waiting for approval.\n"; return 1; }
+    } else token = boot;  // a pre-minted device token
+    std::vector<std::string> ra{"--url", url, "--token", token};
+    if (a->has("--display-name")) { ra.push_back("--display-name"); ra.push_back(a->get("--display-name")); }
+    if (a->has("--node-id")) { ra.push_back("--node-id"); ra.push_back(a->get("--node-id")); }
+    json st = ReadJ(StateRoot() / "node-connect.json"); st["url"] = url; st["connectedAt"] = IsoNow(); WriteJ(StateRoot() / "node-connect.json", st);
+    if (a->has("--service")) return InstallNodeUnit(ra, true, a->has("--json"));
+    std::cerr << "Paired with " << url << "; starting node host.\n";
+    std::vector<std::string> full{SelfExe().string(), "node", "run"}; full.insert(full.end(), ra.begin(), ra.end());
+    std::vector<char*> av; for (auto& s : full) av.push_back(const_cast<char*>(s.c_str())); av.push_back(nullptr);
+    execv(full[0].c_str(), av.data()); std::perror("exec node run"); return 1;
+}
+// ---------------------------------------------------------------- hooks relay (native agent hook bridge)
+int CmdHooksRelay(int argc, char** argv) {
+    auto a = P3(argc, argv, 3, {"--event=", "--agent=", "--session=", "--pre-tool-use-unavailable=", "--timeout=", "--json"}, "hooks relay"); if (!a) return 2;
+    std::string in((std::istreambuf_iterator<char>(std::cin)), {});
+    json ev; try { ev = in.empty() ? json::object() : json::parse(in); } catch (...) { std::cerr << "hooks relay: stdin is not JSON\n"; return 1; }
+    std::string event = a->get("--event", ev.value("hook_event_name", ev.value("hookEventName", std::string())));
+    if (event.empty()) { std::cerr << "hooks relay: missing --event (or hook_event_name in stdin)\n"; return 2; }
+    json raw = LoadRaw(); std::string err;
+    json params = {{"event", event}, {"payload", ev}};
+    if (a->has("--agent")) params["agentId"] = a->get("--agent"); if (a->has("--session")) params["sessionKey"] = a->get("--session");
+    auto r = GwRpc(raw, "nativeHook.invoke", params, &err);
+    const bool pre = Lower(event) == "pretooluse" || event == "pre_tool_use" || event == "beforeToolCall";
+    if (!err.empty()) {
+        if (pre && a->get("--pre-tool-use-unavailable", "allow") == "deny") { std::cerr << "OpenClaw gateway unavailable; blocking tool call (" << err << ")\n"; return 2; }
+        return 0;  // fail open: never wedge the host agent
+    }
+    const json& d = r.contains("result") ? r["result"] : r;
+    const std::string decision = Lower(d.value("decision", d.value("permissionDecision", std::string())));
+    if (d.contains("output")) std::cout << (d["output"].is_string() ? d["output"].get<std::string>() : d["output"].dump()) << "\n";
+    else if (!d.empty() && a->has("--json")) std::cout << d.dump() << "\n";
+    if (decision == "deny" || decision == "block") { std::cerr << d.value("reason", std::string("blocked by OpenClaw hook")) << "\n"; return 2; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- mcp serve (stdio MCP bridge to the gateway)
+int CmdMcpServe(int argc, char** argv) {
+    auto a = P3(argc, argv, 3, {"--url=", "--token=", "--session=", "--claude-channel-mode=", "--verbose"}, "mcp serve"); if (!a) return 2;
+    if (a->has("--url")) setenv("OPENCLAW_GATEWAY_URL", a->get("--url").c_str(), 1);
+    if (a->has("--token")) setenv("OPENCLAW_GATEWAY_TOKEN", a->get("--token").c_str(), 1);
+    const json raw = LoadRaw(); const bool verbose = a->has("--verbose");
+    auto obj = [](json props, json req = json::array()) { return json{{"type", "object"}, {"properties", props}, {"required", req}}; };
+    const json S = {{"type", "string"}}, N = {{"type", "number"}};
+    const json tools = json::array({
+        {{"name", "conversations_list"}, {"description", "List OpenClaw conversations (sessions)."}, {"inputSchema", obj({{"limit", N}, {"search", S}})}},
+        {{"name", "conversation_get"}, {"description", "Get one conversation by session key."}, {"inputSchema", obj({{"session_key", S}}, {"session_key"})}},
+        {{"name", "messages_read"}, {"description", "Read recent messages of a conversation."}, {"inputSchema", obj({{"session_key", S}, {"limit", N}}, {"session_key"})}},
+        {{"name", "attachments_fetch"}, {"description", "Fetch attachments of one message."}, {"inputSchema", obj({{"session_key", S}, {"message_id", S}}, {"session_key", "message_id"})}},
+        {{"name", "events_poll"}, {"description", "Return new messages since a cursor."}, {"inputSchema", obj({{"session_key", S}, {"after", N}})}},
+        {{"name", "events_wait"}, {"description", "Wait up to timeout_ms for new messages."}, {"inputSchema", obj({{"session_key", S}, {"after", N}, {"timeout_ms", N}})}},
+        {{"name", "messages_send"}, {"description", "Send a message into a conversation."}, {"inputSchema", obj({{"session_key", S}, {"text", S}}, {"session_key", "text"})}},
+        {{"name", "permissions_list_open"}, {"description", "List open approval requests."}, {"inputSchema", obj(json::object())}},
+        {{"name", "permissions_respond"}, {"description", "Resolve an approval request."}, {"inputSchema", obj({{"id", S}, {"decision", {{"type", "string"}, {"enum", {"allow-once", "allow-always", "deny"}}}}}, {"id", "decision"})}}});
+    auto rpc = [&](const std::string& m, const json& p) { std::string err; auto r = GwRpc(raw, m, p, &err); if (!err.empty()) throw std::runtime_error(err); return r; };
+    auto msgs = [&](const std::string& key, int limit) { auto h = rpc("chat.history", {{"sessionKey", key}, {"limit", limit}}); return h.contains("messages") ? h["messages"] : h; };
+    auto since = [&](const std::string& key, long long after) {
+        json all = msgs(key.empty() ? std::string("main") : key, 200), out = json::array(); long long idx = 0;
+        for (auto& m : all) { ++idx; if (idx > after) out.push_back({{"seq", idx}, {"message", m}}); }
+        return json{{"events", out}, {"cursor", idx}};
+    };
+    auto call = [&](const std::string& name, const json& x) -> json {
+        const std::string key = x.value("session_key", a->get("--session"));
+        if (name == "conversations_list") return rpc("sessions.list", {{"limit", x.value("limit", 50)}, {"search", x.value("search", "")}});
+        if (name == "conversation_get") return rpc("sessions.get", {{"key", key}});
+        if (name == "messages_read") return msgs(key, x.value("limit", 50));
+        if (name == "attachments_fetch") { auto m = rpc("chat.message.get", {{"sessionKey", key}, {"messageId", x.value("message_id", "")}}); return m.value("attachments", m.contains("message") ? m["message"].value("attachments", json::array()) : json::array()); }
+        if (name == "events_poll") return since(key, x.value("after", 0LL));
+        if (name == "events_wait") {
+            const auto end = NowMs() + std::min(300000LL, x.value("timeout_ms", 30000LL));
+            for (;;) { auto r = since(key, x.value("after", 0LL)); if (!r["events"].empty() || NowMs() >= end) return r; std::this_thread::sleep_for(std::chrono::milliseconds(750)); }
+        }
+        if (name == "messages_send") return rpc("chat.send", {{"sessionKey", key.empty() ? std::string("main") : key}, {"message", x.value("text", "")}, {"idempotencyKey", "mcp-" + RandHex(8)}});
+        if (name == "permissions_list_open") { json o = json::object(); o["exec"] = rpc("exec.approval.list", json::object()); try { o["plugin"] = rpc("plugin.approval.list", json::object()); } catch (...) {} return o; }
+        if (name == "permissions_respond") {
+            const auto id = x.value("id", ""), dec = x.value("decision", "");
+            try { return rpc("exec.approval.resolve", {{"id", id}, {"decision", dec}}); } catch (...) { return rpc("plugin.approval.resolve", {{"id", id}, {"decision", dec}}); }
+        }
+        throw std::runtime_error("unknown tool " + name);
+    };
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (Trim(line).empty()) continue;
+        json req; try { req = json::parse(line); } catch (...) { std::cout << json{{"jsonrpc", "2.0"}, {"id", nullptr}, {"error", {{"code", -32700}, {"message", "parse error"}}}}.dump() << "\n" << std::flush; continue; }
+        const std::string m = req.value("method", ""); if (!req.contains("id")) continue;  // notifications
+        json res, error;
+        if (m == "initialize") res = {{"protocolVersion", req["params"].value("protocolVersion", "2025-06-18")}, {"capabilities", {{"tools", json::object()}}}, {"serverInfo", {{"name", "openclaw"}, {"version", "cpp"}}}};
+        else if (m == "ping") res = json::object();
+        else if (m == "tools/list") res = {{"tools", tools}};
+        else if (m == "tools/call") {
+            const auto name = req["params"].value("name", ""); const auto args = req["params"].value("arguments", json::object());
+            try { auto out = call(name, args); res = {{"content", {{{"type", "text"}, {"text", out.dump(2)}}}}, {"structuredContent", out.is_object() ? out : json{{"result", out}}}}; }
+            catch (const std::exception& e) { if (verbose) std::cerr << "mcp serve: " << name << ": " << e.what() << "\n"; res = {{"content", {{{"type", "text"}, {"text", e.what()}}}}, {"isError", true}}; }
+        } else error = {{"code", -32601}, {"message", "method not found: " + m}};
+        json out = {{"jsonrpc", "2.0"}, {"id", req["id"]}}; if (error.is_null()) out["result"] = res; else out["error"] = error;
+        std::cout << out.dump() << "\n" << std::flush;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------- mcp configure (interactive wrapper over `mcp add`)
+int CmdMcpConfigure(int argc, char** argv) {
+    auto a = P3(argc, argv, 3, {"--name=", "--command=", "--url=", "--arg=", "--auth=", "--yes"}, "mcp configure"); if (!a) return 2;
+    auto ask = [&](const std::string& q, const std::string& d) { if (!isatty(0)) return d; std::cout << q << (d.empty() ? "" : " [" + d + "]") << ": " << std::flush; std::string l; std::getline(std::cin, l); l = Trim(l); return l.empty() ? d : l; };
+    std::string name = a->get("--name"); if (name.empty() && !a->pos.empty()) name = a->pos[0]; name = ask("Server name", name);
+    if (name.empty()) { std::cerr << "A server name is required (--name).\n"; return 2; }
+    std::string url = a->get("--url"), cmd = a->get("--command");
+    if (url.empty() && cmd.empty()) { const auto kind = ask("Transport (stdio/http)", "stdio"); if (kind == "http") url = ask("Server URL", ""); else cmd = ask("Command", ""); }
+    if (url.empty() && cmd.empty()) { std::cerr << "Provide --command or --url.\n"; return 2; }
+    std::vector<std::string> full{SelfExe().string(), "mcp", "add", name};
+    if (!url.empty()) { full.push_back("--url"); full.push_back(url); const auto auth = a->has("--auth") ? a->get("--auth") : ask("Auth (none/oauth)", "none"); if (auth == "oauth") { full.push_back("--auth"); full.push_back("oauth"); } }
+    else { full.push_back("--command"); full.push_back(cmd); auto args = a->all("--arg"); if (args.empty() && isatty(0)) { std::stringstream ss(ask("Arguments (space separated)", "")); std::string x; while (ss >> x) args.push_back(x); } for (auto& x : args) { full.push_back("--arg"); full.push_back(x); } }
+    std::vector<char*> av; for (auto& s : full) av.push_back(const_cast<char*>(s.c_str())); av.push_back(nullptr);
+    execv(full[0].c_str(), av.data()); std::perror("exec mcp add"); return 1;
+}
+
+// ---------------------------------------------------------------- acp client (drive `acp` over stdio)
+int CmdAcpClient(int argc, char** argv) {
+    auto a = P3(argc, argv, 3, {"--cwd=", "--server=", "--server-args=", "--server-verbose", "--verbose", "--prompt=", "--approve=", "--session=", "--url=", "--token="}, "acp client"); if (!a) return 2;
+    int to_child[2], from_child[2]; if (pipe(to_child) || pipe(from_child)) { std::perror("pipe"); return 1; }
+    std::vector<std::string> cargs; if (a->has("--server")) { std::stringstream ss(a->get("--server")); std::string x; while (ss >> x) cargs.push_back(x); } else { cargs = {SelfExe().string(), "acp"}; }
+    if (a->has("--server-args")) { std::stringstream ss(a->get("--server-args")); std::string x; while (ss >> x) cargs.push_back(x); }
+    if (!a->has("--server")) { for (auto k : {"--url", "--token", "--session"}) if (a->has(k)) { cargs.push_back(k); cargs.push_back(a->get(k)); } if (a->has("--server-verbose")) cargs.push_back("--verbose"); }
+    const pid_t pid = fork();
+    if (pid < 0) { std::perror("fork"); return 1; }
+    if (pid == 0) {
+        dup2(to_child[0], 0); dup2(from_child[1], 1); close(to_child[1]); close(from_child[0]);
+        std::vector<char*> av; for (auto& s : cargs) av.push_back(const_cast<char*>(s.c_str())); av.push_back(nullptr);
+        execvp(av[0], av.data()); _exit(127);
+    }
+    close(to_child[0]); close(from_child[1]);
+    FILE* in = fdopen(from_child[0], "r"); const bool verbose = a->has("--verbose"); int next_id = 1;
+    auto send = [&](const json& j) { const auto s = j.dump() + "\n"; if (verbose) std::cerr << "> " << s; return ::write(to_child[1], s.data(), s.size()) == static_cast<ssize_t>(s.size()); };
+    const std::string approve = a->get("--approve", "ask");
+    auto handle = [&](const json& msg) {
+        const std::string m = msg.value("method", "");
+        if (m == "session/update") {
+            const auto& u = msg["params"]["update"]; const auto kind = u.value("sessionUpdate", "");
+            if (kind == "agent_message_chunk" && u.contains("content")) std::cout << u["content"].value("text", "") << std::flush;
+            else if (kind == "tool_call") std::cerr << "\n[tool] " << u.value("title", u.value("toolCallId", "")) << "\n";
+            else if (verbose) std::cerr << "[" << kind << "]\n";
+        } else if (m == "session/request_permission" && msg.contains("id")) {
+            const auto opts = msg["params"].value("options", json::array()); std::string choice;
+            auto find = [&](const std::string& kind) { for (auto& o : opts) if (o.value("kind", "") == kind) return o.value("optionId", std::string()); return std::string(); };
+            if (approve == "allow") choice = find("allow_once"); else if (approve == "deny") choice = find("reject_once");
+            else if (isatty(0)) {
+                std::cerr << "\nPermission requested: " << msg["params"]["toolCall"].value("title", "tool call") << "\n"; for (size_t i = 0; i < opts.size(); ++i) std::cerr << "  " << i + 1 << ") " << opts[i].value("name", opts[i].value("optionId", "")) << "\n";
+                std::cerr << "Choose: " << std::flush; std::string l; std::getline(std::cin, l); size_t k = std::strtoul(l.c_str(), nullptr, 10); if (k >= 1 && k <= opts.size()) choice = opts[k - 1].value("optionId", "");
+            } else choice = find("reject_once");
+            send({{"jsonrpc", "2.0"}, {"id", msg["id"]}, {"result", {{"outcome", choice.empty() ? json{{"outcome", "cancelled"}} : json{{"outcome", "selected"}, {"optionId", choice}}}}}});
+        } else if (msg.contains("id") && msg.contains("method")) send({{"jsonrpc", "2.0"}, {"id", msg["id"]}, {"error", {{"code", -32601}, {"message", "client does not support " + m}}}});
+    };
+    auto request = [&](const std::string& m, const json& p) -> json {
+        const int id = next_id++; if (!send({{"jsonrpc", "2.0"}, {"id", id}, {"method", m}, {"params", p}})) throw std::runtime_error("acp server closed stdin");
+        char* buf = nullptr; size_t cap = 0;
+        while (getline(&buf, &cap, in) > 0) {
+            std::string l(buf); if (verbose) std::cerr << "< " << l; json j; try { j = json::parse(l); } catch (...) { continue; }
+            if (j.contains("id") && !j.contains("method") && j["id"] == id) { free(buf); if (j.contains("error")) throw std::runtime_error(j["error"].value("message", j["error"].dump())); return j.value("result", json::object()); }
+            handle(j);
+        }
+        free(buf); throw std::runtime_error("acp server exited");
+    };
+    int rc = 0;
+    try {
+        request("initialize", {{"protocolVersion", 1}, {"clientCapabilities", {{"fs", {{"readTextFile", false}, {"writeTextFile", false}}}, {"terminal", false}}}, {"clientInfo", {{"name", "openclaw-cpp-acp-client"}, {"version", "1"}}}});
+        auto s = request("session/new", {{"cwd", a->get("--cwd", fs::current_path().string())}, {"mcpServers", json::array()}});
+        const std::string sid = s.value("sessionId", "");
+        auto prompt = [&](const std::string& text) { auto r = request("session/prompt", {{"sessionId", sid}, {"prompt", {{{"type", "text"}, {"text", text}}}}}); std::cout << "\n"; if (verbose) std::cerr << "[stop: " << r.value("stopReason", "") << "]\n"; };
+        if (a->has("--prompt")) prompt(a->get("--prompt"));
+        else { std::string l; if (isatty(0)) std::cerr << "acp client connected (session " << sid << "). Type a prompt; Ctrl-D to exit.\n> " << std::flush;
+            while (std::getline(std::cin, l)) { if (!Trim(l).empty()) prompt(l); if (isatty(0)) std::cerr << "> " << std::flush; } }
+    } catch (const std::exception& e) { std::cerr << "acp client: " << e.what() << "\n"; rc = 1; }
+    close(to_child[1]); fclose(in);
+    int st = 0; for (int i = 0; i < 50 && waitpid(pid, &st, WNOHANG) == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (waitpid(pid, &st, WNOHANG) == 0) { kill(pid, SIGTERM); waitpid(pid, &st, 0); }
+    return rc;
+}
+
 }  // namespace
 
 int MaybeLocalCommand3(int argc, char** argv) {
     if (argc >= 2) { const std::string c1 = argv[1];
+        if (c1 == "connect") return CmdConnect(argc, argv);
         if (c1 == "reset") return CmdReset(argc, argv);
         if (c1 == "uninstall") return CmdUninstall(argc, argv);
         if (c1 == "docs") return CmdDocs(argc, argv);
@@ -1031,6 +1736,32 @@ int MaybeLocalCommand3(int argc, char** argv) {
     if (cmd == "proxy" && (sub == "start" || sub == "run" || sub == "validate" || sub == "coverage" || sub == "sessions" || sub == "query" || sub == "blob" || sub == "purge")) return CmdProxy(argc, argv);
     if (cmd == "database" && (sub == "preflight" || sub == "preflight-agent" || sub == "ownership" || sub == "claim")) return CmdDatabase(argc, argv);
     if (cmd == "update" && (sub == "wizard" || sub == "cleanup" || sub == "recover" || sub == "migration-plan" || sub == "admit" || sub == "adopt-immutable")) return CmdUpdate(argc, argv);
+    {   // nested groups: `<cmd> <group> [--help]` prints the group's subcommands
+        static const std::map<std::pair<std::string, std::string>, std::string> groups = {
+            {{"backup", "sqlite"}, "create [--out ID] | list | verify <id> | restore <id> --yes [--dry-run]"},
+            {{"backup", "git"}, "init | create [--message M] | log [--limit N] | verify [ref] | restore [ref] --yes"},
+            {{"webhooks", "gmail"}, "setup --account EMAIL [--project P] [--push-endpoint URL] [--dry-run] | run --account EMAIL"},
+            {{"directory", "list"}, "(use `directory peers list` or `directory groups list`)"},
+            {{"directory", "members"}, "(use `directory groups members --group-id ID`)"}};
+        auto g = groups.find({cmd, sub});
+        if (g != groups.end() && (argc == 3 || std::string(argv[3]) == "--help" || std::string(argv[3]) == "-h")) {
+            std::cout << "Usage: openclaw-cpp " << cmd << " " << sub << " <command>\n\nCommands:\n  " << g->second << "\n"; return 0;
+        }
+    }
+    if (cmd == "dashboard" && (sub == "reset" || sub == "uninstall")) { std::vector<char*> av(argv, argv + argc); av.erase(av.begin() + 1); av.push_back(nullptr); return sub == "reset" ? CmdReset(argc - 1, av.data()) : CmdUninstall(argc - 1, av.data()); }
+    if (cmd == "mcp" && sub == "serve") return CmdMcpServe(argc, argv);
+    if (cmd == "mcp" && sub == "configure") return CmdMcpConfigure(argc, argv);
+    if (cmd == "promos" && (sub == "list" || sub == "claim")) return CmdPromos(argc, argv, sub);
+    if (cmd == "sandbox" && (sub == "list" || sub == "recreate")) return CmdSandbox(argc, argv, sub);
+    if (cmd == "dns" && sub == "setup") return CmdDnsSetup(argc, argv);
+    if (cmd == "secrets" && (sub == "apply" || sub == "configure")) return CmdSecrets(argc, argv, sub);
+    if (cmd == "backup" && argc >= 4 && sub == "sqlite") { const std::string s3 = argv[3]; if (s3 == "create" || s3 == "list" || s3 == "verify" || s3 == "restore") return CmdBackupSqlite(argc, argv, s3); }
+    if (cmd == "backup" && argc >= 4 && sub == "git") { const std::string s3 = argv[3]; if (s3 == "init" || s3 == "create" || s3 == "log" || s3 == "verify" || s3 == "restore") return CmdBackupGit(argc, argv, s3); }
+    if (cmd == "webhooks" && argc >= 4 && sub == "gmail") { const std::string s3 = argv[3]; if (s3 == "setup" || s3 == "run") return CmdGmail(argc, argv, s3); }
+    if (cmd == "webhooks" && (sub == "setup" || sub == "run")) { std::cerr << "error: unknown command 'webhooks " << sub << "' (did you mean `webhooks gmail " << sub << "`?)\n"; return 2; }
+    if (cmd == "node" && sub == "install") return CmdNodeInstall(argc, argv);
+    if (cmd == "hooks" && sub == "relay") return CmdHooksRelay(argc, argv);
+    if (cmd == "acp" && sub == "client") return CmdAcpClient(argc, argv);
     if (cmd == "mcp" && sub.rfind("-", 0) != 0) return CmdMcp(argc, argv);
     return -1;
 }

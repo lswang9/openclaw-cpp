@@ -18,8 +18,8 @@ grep -q "^  agent:main:cli" <<<"$H" || { echo "$H"; fail "list rendering"; }
 A=$("$BIN" agents list); grep -qE "^id " <<<"$A" || { echo "$A"; fail "agents table header"; }
 "$BIN" devices list --bogus 2>&1 | grep -q "unknown option '--bogus'" || fail "unknown option"
 "$BIN" devices list --json --timeout 5000 >/dev/null || fail "gateway client flags"
-"$BIN" devices clear --yes 2>&1 | grep -q "upstream local command with no gateway RPC" || fail "local-only honest"
-set +e; "$BIN" devices clear >/dev/null 2>&1; rc=$?; set -e; [[ $rc == 2 ]] || fail "local-only rc=$rc"
+"$BIN" devices clear --yes 2>&1 | grep -qi "cleared\|no paired\|removed\|revoked" || fail "devices clear (1.124 real)"
+set +e; "$BIN" devices clear >/dev/null 2>&1; rc=$?; set -e; [[ $rc != 0 ]] || fail "devices clear without --yes rc=$rc"
 "$BIN" nodes frobnicate 2>&1 | grep -q "unknown command 'frobnicate'" || fail "unknown sub"
 L=$("$BIN" logs --limit 3 --json) && python3 -c "import json,sys;json.loads(sys.argv[1])" "$L" || fail "logs --limit"
 F=$(OPENCLAW_LOGS_FOLLOW_ROUNDS=2 "$BIN" logs --follow --interval 100 --limit 2) || fail "logs --follow"

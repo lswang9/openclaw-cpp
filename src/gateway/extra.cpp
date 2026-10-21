@@ -143,7 +143,21 @@ ExtraResult TryExtraDispatchImpl(ServerDeps& deps, const std::string& method,
     if (method == "device.pair.setupCode" || method == "device.pair.setupStatus") {
         r.handled = true;
         if (!deps.device_links) { r.ok = false; r.error = "device links not wired"; return r; }
-        if (method == "device.pair.setupCode") { auto o = deps.device_links->Start(params); o["routed"] = "pairing.link.start"; r.payload = Real(o); }
+        if (method == "device.pair.setupCode") {
+            auto o = deps.device_links->Start(params); o["routed"] = "pairing.link.start";
+            std::string url = params.value("url", params.value("publicUrl", std::string()));
+            if (url.empty()) if (const char* e = std::getenv("OPENCLAW_PUBLIC_URL"); e && *e) url = e;
+            if (url.empty()) { const char* pe = std::getenv("OPENCLAW_GATEWAY_PORT"); url = std::string("http://127.0.0.1:") + (pe && *pe ? pe : "18789"); }
+            if (o.contains("link") && o["link"].contains("id") && o.contains("poll_secret")) {
+                const std::string js = nlohmann::json{{"url", url}, {"bootstrapToken", o["link"]["id"].get<std::string>() + "." + o["poll_secret"].get<std::string>()}}.dump();
+                static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                std::string b; int v = 0, bits = -6;
+                for (unsigned char c : js) { v = (v << 8) + c; bits += 8; while (bits >= 0) { b += T[(v >> bits) & 0x3F]; bits -= 6; } }
+                if (bits > -6) b += T[((v << 8) >> (bits + 8)) & 0x3F];
+                o["setupCode"] = b; o["url"] = url;
+            }
+            r.payload = Real(o);
+        }
         else r.payload = Real(deps.device_links->Status(params.value("id", params.value("code", std::string()))));
         return r;
     }

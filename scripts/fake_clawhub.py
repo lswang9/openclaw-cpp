@@ -49,6 +49,15 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path); q = {k: v[0] for k, v in parse_qs(u.query).items()}; p = unquote(u.path)
         with open(os.path.join(DATA, "requests.log"), "a") as f: f.write(self.path + "\n")
         v = STATE["skill_version"]
+        if p in ("/api/v1/promotions", "/api/v1/promotions/free-tokens"):
+            import time
+            now = int(time.time() * 1000)
+            promo = {"slug": "free-tokens", "title": "Free Tokens", "sponsor": "Acme", "blurb": "Try acme models", "provider": "acme",
+                     "baseUrl": "https://api.acme.test/v1", "startsAt": now - 1000, "endsAt": now + 3 * 86400000,
+                     "models": [{"modelRef": "acme/fast-1", "alias": "fast", "suggestedDefault": True}, {"modelRef": "acme/big-2"}]}
+            return self.send(200, {"promotions": [promo]} if p == "/api/v1/promotions" else {"promotion": promo})
+        if p.startswith("/api/v1/promotions/"):
+            return self.send(404, "not found", "text/plain")
         if p == "/api/v1/search":
             if STATE["hits429"] == 0:
                 STATE["hits429"] = 1

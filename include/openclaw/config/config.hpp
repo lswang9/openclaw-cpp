@@ -39,6 +39,11 @@ nlohmann::json ToFileJson(const Snapshot& snap);
 nlohmann::json ParseJson5(const std::string& text);
 // Replace ${VAR} in all string values (upstream env substitution); missing vars throw. $${VAR} escapes.
 nlohmann::json SubstituteEnv(const nlohmann::json& j);
+// SecretRef {source: env|file|exec, provider?, id} resolution against secrets.providers (upstream secrets contract).
+bool IsSecretRef(const nlohmann::json& j);
+std::string ResolveSecretRef(const nlohmann::json& ref, const nlohmann::json& raw, std::string* err);
+// Replace every SecretRef in `j` (using providers from `raw`); throws on an unresolvable ref.
+nlohmann::json ResolveSecretRefs(const nlohmann::json& j, const nlohmann::json& raw, const std::string& path = "");
 
 // Dot/bracket paths: "agents.defaults.model", "channels.list[0].id".
 std::optional<nlohmann::json> GetPath(const nlohmann::json& root, const std::string& path);

@@ -109,7 +109,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.123.0-dev";
+constexpr const char* kVersion = "1.124.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3773,6 +3773,17 @@ int MaybeUpstreamGatewayCli(int argc, char** argv) {
             return 1;
         }
     }
+    if (std::any_of(flags.begin(), flags.end(), [](const auto& f) { return f.first == "--help" || f.first == "-h"; }) || std::find(pos.begin(), pos.end(), "-h") != pos.end()) {
+        std::cout << "Usage: openclaw-cpp " << cmd << (sub.empty() ? "" : " " + sub) << " [options]\n";
+        if (tree.contains(cmd) && tree[cmd].contains(sub)) {
+            const auto& e = tree[cmd][sub];
+            if (e.contains("description") && e["description"].is_string()) std::cout << "\n" << e["description"].get<std::string>() << "\n";
+            if (e.contains("flags") && !e["flags"].empty()) { std::cout << "\nOptions:\n"; for (auto& x : e["flags"]) { auto f = x.get<std::string>(); std::cout << "  " << (f.back() == '=' ? f.substr(0, f.size() - 1) + " <value>" : f) << "\n"; } }
+        }
+        if (!method.empty()) std::cout << "\nGateway RPC: " << method << "\n";
+        std::cout << "  -h, --help\n";
+        return 0;
+    }
     // Validate flags against the upstream tree entry when we have one.
     if (tree.contains(cmd) && tree[cmd].contains(sub)) {
         const auto& allowed = tree[cmd][sub]["flags"];
@@ -4227,8 +4238,6 @@ int main(int argc, char** argv) {
         } else if (cmd == "acp" && (argc == 2 || argv[2][0] == '-')) {
             if (argc > 2 && (std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h")) { std::cout << "Usage: openclaw-cpp acp\nRun an ACP agent server over stdio (local runtime; session/model come from config).\n"; return 0; }
             return CmdAcpStdio();
-        } else if (cmd == "acp" && std::string(argv[2]) == "client") {
-            std::cerr << "openclaw-cpp acp client: not implemented in the C++ port (use `acp run --agent <id>` to drive an ACP agent).\n"; return 2;
         } else if (cmd == "resume") {
             std::string q = "main";
             for (int i = 2; i < argc; ++i) { std::string x = argv[i]; if (x == "--handoff") { std::cerr << "resume --handoff: Control UI handoff payloads are not supported by the C++ port; pass a session key.\n"; return 2; } if (x == "--help" || x == "-h") { std::cout << "Usage: openclaw-cpp resume [session]\nReopen a session in the terminal UI (default: main).\n"; return 0; } if (x[0] != '-') q = x; }

@@ -96,6 +96,92 @@ nlohmann::json ParseJson5(const std::string& in) {
     }
 }
 
+
+bool IsSecretRef(const nlohmann::json& j) {
+    if (!j.is_object() || !j.contains("source") || !j.contains("id") || !j["source"].is_string() || !j["id"].is_string()) return false;
+    const auto s = j["source"].get<std::string>();
+    if (s != "env" && s != "file" && s != "exec") return false;
+    for (auto it = j.begin(); it != j.end(); ++it) if (it.key() != "source" && it.key() != "id" && it.key() != "provider") return false;
+    return true;
+}
+namespace {
+std::string JsonPointerGet(const nlohmann::json& doc, const std::string& ptr, std::string* err) {
+    if (ptr.empty() || ptr[0] != '/') { *err = "file ref id must be a JSON pointer (\"/a/b\")"; return {}; }
+    const nlohmann::json* cur = &doc; std::size_t i = 1;
+    while (true) {
+        auto e = ptr.find('/', i); std::string tok = ptr.substr(i, e == std::string::npos ? std::string::npos : e - i);
+        for (std::size_t k; (k = tok.find("~1")) != std::string::npos;) tok.replace(k, 2, "/");
+        for (std::size_t k; (k = tok.find("~0")) != std::string::npos;) tok.replace(k, 2, "~");
+        if (cur->is_object() && cur->contains(tok)) cur = &(*cur)[tok];
+        else if (cur->is_array() && !tok.empty() && std::all_of(tok.begin(), tok.end(), ::isdigit) && std::stoul(tok) < cur->size()) cur = &(*cur)[std::stoul(tok)];
+        else { *err = "JSON pointer " + ptr + " not found"; return {}; }
+        if (e == std::string::npos) break; i = e + 1;
+    }
+    if (!cur->is_string()) { *err = "value at " + ptr + " is not a string"; return {}; }
+    return cur->get<std::string>();
+}
+std::string ExpandTilde(const std::string& p) { if (p.rfind("~/", 0) == 0) if (const char* h = std::getenv("HOME")) return std::string(h) + p.substr(1); return p; }
+}  // namespace
+std::string ResolveSecretRef(const nlohmann::json& ref, const nlohmann::json& raw, std::string* err) {
+    const auto src = ref.value("source", std::string()), id = ref.value("id", std::string());
+    const auto pname = ref.value("provider", std::string("default"));
+    nlohmann::json prov = nlohmann::json::object();
+    if (raw.contains("secrets") && raw["secrets"].is_object() && raw["secrets"].contains("providers") && raw["secrets"]["providers"].is_object() && raw["secrets"]["providers"].contains(pname))
+        prov = raw["secrets"]["providers"][pname];
+    if (prov.is_object() && prov.contains("source") && prov["source"] != src) { *err = "provider \"" + pname + "\" is a " + prov["source"].get<std::string>() + " provider, ref uses " + src; return {}; }
+    if (src == "env") {
+        if (prov.is_object() && prov.contains("allowlist") && prov["allowlist"].is_array()) {
+            bool ok = false; for (auto& a : prov["allowlist"]) ok = ok || (a.is_string() && a.get<std::string>() == id);
+            if (!ok) { *err = "env var " + id + " is not in secrets.providers." + pname + ".allowlist"; return {}; }
+        }
+        const char* v = std::getenv(id.c_str()); if (!v || !*v) { *err = "env var " + id + " is not set"; return {}; }
+        return v;
+    }
+    if (src == "file") {
+        if (!prov.is_object() || !prov.contains("path")) { *err = "file provider \"" + pname + "\" is not configured (secrets.providers." + pname + ".path)"; return {}; }
+        std::ifstream f(ExpandTilde(prov["path"].get<std::string>()), std::ios::binary); if (!f) { *err = "cannot read secrets file for provider \"" + pname + "\""; return {}; }
+        std::stringstream ss; ss << f.rdbuf(); std::string body = ss.str();
+        if (prov.value("mode", std::string("json")) == "singleValue") {
+            if (id != "value") { *err = "singleValue file provider \"" + pname + "\" expects ref id \"value\"."; return {}; }
+            while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) body.pop_back(); return body;
+        }
+        nlohmann::json doc; try { doc = nlohmann::json::parse(body); } catch (...) { *err = "secrets file for provider \"" + pname + "\" is not valid JSON"; return {}; }
+        return JsonPointerGet(doc, id, err);
+    }
+    if (src == "exec") {
+        if (!prov.is_object() || !prov.contains("command")) { *err = "exec provider \"" + pname + "\" is not configured"; return {}; }
+        std::string cmd = "'" + prov["command"].get<std::string>() + "'";
+        if (prov.contains("args") && prov["args"].is_array()) for (auto& a : prov["args"]) { std::string s = a.get<std::string>(), q; for (char ch : s) q += ch == '\'' ? std::string("'\\''") : std::string(1, ch); cmd += " '" + q + "'"; }
+        std::string envp; if (prov.contains("env") && prov["env"].is_object()) for (auto it = prov["env"].begin(); it != prov["env"].end(); ++it) envp += it.key() + "='" + it.value().get<std::string>() + "' ";
+        std::string pass; if (prov.contains("passEnv") && prov["passEnv"].is_array()) for (auto& k : prov["passEnv"]) if (const char* v = std::getenv(k.get<std::string>().c_str())) pass += k.get<std::string>() + "='" + v + "' ";
+        const std::string input = nlohmann::json{{"protocolVersion", 1}, {"provider", pname}, {"ids", {id}}}.dump();
+        const std::string full = "printf '%s' '" + input + "' | env -i PATH=/usr/bin:/bin " + pass + envp + "timeout " + std::to_string(std::max(1, prov.value("timeoutMs", 5000) / 1000)) + " " + cmd + " 2>/dev/null";
+        FILE* p = popen(full.c_str(), "r"); if (!p) { *err = "exec provider failed to start"; return {}; }
+        std::string out; char b[4096]; size_t n; while ((n = fread(b, 1, sizeof b, p)) > 0 && out.size() < (1u << 20)) out.append(b, n);
+        const int rc = pclose(p); if (rc != 0) { *err = "exec provider \"" + pname + "\" exited with status " + std::to_string(rc); return {}; }
+        try {
+            auto j = nlohmann::json::parse(out);
+            if (j.value("protocolVersion", 0) != 1 || !j.contains("values") || !j["values"].contains(id)) { *err = "exec provider response missing values." + id; return {}; }
+            return j["values"][id].is_string() ? j["values"][id].get<std::string>() : j["values"][id].dump();
+        } catch (...) {
+            if (!prov.value("jsonOnly", true)) { while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back(); return out; }
+            *err = "exec provider returned invalid JSON"; return {};
+        }
+    }
+    *err = "unknown secret source " + src; return {};
+}
+nlohmann::json ResolveSecretRefs(const nlohmann::json& j, const nlohmann::json& raw, const std::string& path) {
+    if (IsSecretRef(j)) {
+        if (path.rfind("secrets.", 0) == 0) return j;
+        std::string err; auto v = ResolveSecretRef(j, raw, &err);
+        if (!err.empty()) throw std::runtime_error("unresolved SecretRef at " + path + ": " + err);
+        return v;
+    }
+    if (j.is_object()) { nlohmann::json r = nlohmann::json::object(); for (auto it = j.begin(); it != j.end(); ++it) r[it.key()] = ResolveSecretRefs(it.value(), raw, path.empty() ? it.key() : path + "." + it.key()); return r; }
+    if (j.is_array()) { nlohmann::json r = nlohmann::json::array(); std::size_t i = 0; for (const auto& v : j) r.push_back(ResolveSecretRefs(v, raw, path + "[" + std::to_string(i++) + "]")); return r; }
+    return j;
+}
+
 nlohmann::json SubstituteEnv(const nlohmann::json& j) {
     if (j.is_string()) {
         const std::string& s = j.get_ref<const std::string&>();
@@ -274,7 +360,7 @@ SchemaReport ValidateSchema(const nlohmann::json& raw) {
         return v && v->is_object();
     };
     auto expect = [&](const std::string& p, auto pred, const char* what) {
-        if (auto v = GetPath(raw, p); v && !pred(*v)) r.errors.push_back(p + ": expected " + what);
+        if (auto v = GetPath(raw, p); v && !pred(*v) && !IsSecretRef(*v)) r.errors.push_back(p + ": expected " + what);
     };
     auto isint = [](const nlohmann::json& v) { return v.is_number_integer(); };
     auto isstr = [](const nlohmann::json& v) { return v.is_string(); };
@@ -470,7 +556,7 @@ LoadResult Load(const fs::path& path) {
         }
         ExpandAgentEntries(j);
         r.snap.raw = j;  // keep unsubstituted for round-trip writes
-        ApplyTyped(r.snap, SubstituteEnv(j));
+        { auto sub = SubstituteEnv(j); ApplyTyped(r.snap, ResolveSecretRefs(sub, sub)); }
     } catch (const std::exception& e) {
         r.error = e.what();
         r.snap = Snapshot{};

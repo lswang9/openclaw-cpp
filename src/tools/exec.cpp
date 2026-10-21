@@ -685,7 +685,7 @@ nlohmann::json Run(const nlohmann::json& args, const nlohmann::json& cfg_raw, co
         if (pol.sandbox_backend.empty())
             return base.update({{"status", "failed"}, {"error", "sandbox runtime unavailable (need docker or bwrap)"}}), base;
         if (pol.sandbox_backend == "docker") {
-            run_cmd = "docker run --rm -i " + std::string(pol.sandbox_network ? "" : "--network none ") + "-v " +
+            run_cmd = "docker run --rm -i --label openclaw.sandbox=1 --label " + ShellQuote("openclaw.agent=" + CurrentContext().agent_id) + " --label " + ShellQuote("openclaw.session=" + CurrentContext().session_key) + " " + std::string(pol.sandbox_network ? "" : "--network none ") + "-v " +
                       ShellQuote(workspace.string()) + ":/workspace -w /workspace " + ShellQuote(pol.sandbox_image) + " sh -lc " +
                       ShellQuote(cmd);
         } else {  // bwrap: read-only host, writable workspace, no network, private /tmp
