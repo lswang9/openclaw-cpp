@@ -1,0 +1,6 @@
+{
+  "id": "sample-upstream",
+  "name": "Sample Upstream Plugin",
+  "description": "Upstream-style OpenClaw plugin (register(api)) used by openclaw-cpp tests",
+  "configSchema": { "type": "object", "properties": { "greeting": { "type": "string" } } }
+}

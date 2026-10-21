@@ -39,6 +39,20 @@ public:
     // Register js.* tools into a tools::Registry (handlers call CallTool).
     std::size_t RegisterTools(tools::Registry& registry);
 
+    // Upstream plugin API surface (via host.mjs v2).
+    void SetConfig(nlohmann::json cfg) { std::lock_guard l(mu_); config_ = std::move(cfg); }
+    void SetExtraDirs(std::vector<std::filesystem::path> dirs) { std::lock_guard l(mu_); extra_dirs_ = std::move(dirs); }
+    nlohmann::json ListCommands();
+    bool HasCommand(const std::string& name) const;
+    bool HasHook(const std::string& event) const;
+    bool HasGatewayMethod(const std::string& method) const;
+    // {text, raw} or {error}
+    nlohmann::json RunCommand(const std::string& name, const std::string& args, const nlohmann::json& ctx);
+    // {handlers, results, merged} — merged = payload with handler results shallow-merged in order
+    nlohmann::json EmitHook(const std::string& event, const nlohmann::json& payload, const nlohmann::json& ctx = {});
+    nlohmann::json CallGatewayMethod(const std::string& method, const nlohmann::json& params);
+    nlohmann::json LastInit() const { std::lock_guard l(mu_); return last_init_; }
+
     // In-process mock (no Node) — used when FORCE_MOCK or spawn fails in tests.
     void EnableMock();
 
@@ -55,6 +69,8 @@ private:
     std::string last_error_;
     nlohmann::json last_init_;
     int next_id_ = 1;
+    nlohmann::json config_ = nlohmann::json::object();
+    std::vector<std::filesystem::path> extra_dirs_;
 };
 
 }  // namespace openclaw::plugins

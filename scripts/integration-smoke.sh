@@ -88,6 +88,14 @@ curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content
 grep -q 'agent:main:slack:channel:C1:thread:1.0' "$OPENCLAW_SESSION_DIR/sessions.json" || { echo "[smoke] upstream session key missing" >&2; exit 1; }
 echo "[smoke] slack thread -> agent:main:slack:channel:C1:thread:1.0"
 
+if command -v node >/dev/null 2>&1 && [ -z "${OPENCLAW_JS_FORCE_MOCK:-}" ]; then
+  rpc '{"jsonrpc":"2.0","id":12,"method":"sample.status","params":{}}' | grep -q '"plugin": *"sample-upstream"' || { echo "[smoke] plugin gateway method failed" >&2; exit 1; }
+  PING=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/json' \
+    -d '{"type":"event_callback","event":{"type":"message","text":"/ping hey","user":"U2","channel":"D2","channel_type":"im","ts":"3.0"}}')
+  echo "$PING" | grep -q 'pong hey' || { echo "[smoke] plugin command /ping failed: $PING" >&2; exit 1; }
+  echo "[smoke] upstream JS plugin: gateway method + /ping command"
+fi
+
 echo "[smoke] POST /v1/rpc sessions.create"
 RPC_SESS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \
   -H 'Content-Type: application/json' \

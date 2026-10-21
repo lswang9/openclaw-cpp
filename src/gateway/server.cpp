@@ -36,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.42.0-dev";
+constexpr const char* kVersion = "1.43.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -592,6 +592,22 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
                    std::to_string(cr.after_tokens) + " tokens.";
         }
     }
+    // Plugin commands (api.registerCommand) run before skills and bypass the model.
+    if (deps_.js_host && !text_in.empty() && text_in[0] == '/') {
+        auto sp = text_in.find_first_of(" \t\n");
+        std::string name = text_in.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
+        std::string args = sp == std::string::npos ? "" : text_in.substr(sp + 1);
+        if (deps_.js_host->HasCommand(name)) {
+            auto r = deps_.js_host->RunCommand(name, args, {{"senderId", msg.sender}, {"channel", msg.channel},
+                                                             {"sessionKey", msg.session_key}});
+            Emit("plugin.command", {{"sessionKey", msg.session_key}, {"command", name}});
+            if (r.contains("error")) return "error: " + r["error"].value("message", std::string("plugin command failed"));
+            return r.value("text", std::string());
+        }
+    }
+    if (deps_.js_host && deps_.js_host->HasHook("message_received"))
+        deps_.js_host->EmitHook("message_received", {{"from", msg.sender}, {"content", text_in}, {"channel", msg.channel}},
+                                {{"sessionKey", msg.session_key}, {"channelId", msg.channel}});
     if (auto sc = skills::MatchSkillCommand(deps_.skills.List(), text_in)) {
         Emit("skill.command", {{"sessionKey", msg.session_key}, {"skill", sc->skill}, {"dispatch", sc->dispatch_tool.empty() ? "model" : "tool"}});
         if (!sc->dispatch_tool.empty()) {
@@ -643,6 +659,13 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
                              {"channel", msg.channel}, {"sender", msg.sender}});
     context::AssembleOptions aopts;
     aopts.system_prompt = deps_.system_prompt;
+    if (deps_.js_host && deps_.js_host->HasHook("before_agent_start")) {
+        auto h = deps_.js_host->EmitHook("before_agent_start", {{"prompt", content}}, {{"sessionKey", msg.session_key}});
+        auto merged = h.value("merged", nlohmann::json::object());
+        if (merged.contains("systemPrompt") && merged["systemPrompt"].is_string()) aopts.system_prompt = merged["systemPrompt"];
+        if (merged.contains("prependContext") && merged["prependContext"].is_string())
+            aopts.system_prompt += "\n\n" + merged["prependContext"].get<std::string>();
+    }
     auto assembled = context::Assemble(messages, aopts);
     agent::LoopOptions lopts = MakeLoopOpts(deps_);
     lopts.cancel = &cancel_agents_;
@@ -667,8 +690,18 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         deps_.logs.Append("info", "chat ok session=" + msg.session_key);
         Emit("chat", {{"sessionKey", msg.session_key}, {"text", result.final_text}, {"turns", result.turns},
                       {"warnings", result.warnings}});
-        Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "assistant"}, {"text", result.final_text}});
-        return result.final_text;
+        std::string reply = result.final_text;
+        if (deps_.js_host && deps_.js_host->HasHook("agent_end"))
+            deps_.js_host->EmitHook("agent_end", {{"success", true}, {"turns", result.turns}}, {{"sessionKey", msg.session_key}});
+        if (deps_.js_host && deps_.js_host->HasHook("message_sending")) {
+            auto h = deps_.js_host->EmitHook("message_sending", {{"to", msg.sender}, {"content", reply}, {"channel", msg.channel}},
+                                             {{"sessionKey", msg.session_key}});
+            auto merged = h.value("merged", nlohmann::json::object());
+            if (merged.value("cancel", false)) return "";
+            if (merged.contains("content") && merged["content"].is_string()) reply = merged["content"];
+        }
+        Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "assistant"}, {"text", reply}});
+        return reply;
     }
     Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "error"}, {"text", result.error}});
     return std::string("error: ") + result.error;
@@ -1136,6 +1169,13 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
 nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     const std::string method = msg.value("method", msg.value("type", ""));
     if (method != "config.reload") MaybeReloadConfig();
+    if (deps_.js_host && deps_.js_host->HasGatewayMethod(method)) {
+        auto p = msg.contains("params") ? msg["params"] : nlohmann::json::object();
+        auto r = deps_.js_host->CallGatewayMethod(method, p);
+        const auto rid = msg.contains("id") ? msg["id"] : nlohmann::json();
+        if (r.contains("error")) return {{"type", "res"}, {"id", rid}, {"ok", false}, {"error", r["error"]}};
+        return {{"type", "res"}, {"id", rid}, {"ok", true}, {"payload", r}};
+    }
     const auto params = msg.contains("params") ? msg["params"] : nlohmann::json::object();
     const auto id = msg.contains("id") ? msg["id"] : nlohmann::json();
     auto ok = [&](nlohmann::json payload) {

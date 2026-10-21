@@ -78,7 +78,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.42.0-dev";
+constexpr const char* kVersion = "1.43.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1801,6 +1801,14 @@ int CmdSelfTest() {
             auto add = live.CallTool("js.sample_add", {{"a", 2}, {"b", 40}});
             tools::Registry tr;
             auto n = live.RegisterTools(tr);
+            auto pong = live.RunCommand("ping", "z", {});
+            auto hk = live.EmitHook("message_sending", {{"content", "x SECRET"}});
+            auto gm = live.CallGatewayMethod("sample.status", {});
+            const bool up_ok = live.HasCommand("PING") && pong.value("text", "") == "pong z" &&
+                               hk["merged"].value("content", "") == "x [redacted]" && gm.value("ok", false) &&
+                               live.HasHook("before_agent_start") && !live.HasHook("agent_end");
+            if (!up_ok) { std::cerr << "FAIL js upstream api " << pong.dump() << hk.dump() << gm.dump() << "\n"; ++failures; }
+            else std::cerr << "PASS js upstream plugin api (command/hook/gateway method)\n";
             live.Stop();
             const bool echo_ok = echo.value("content", "") == "js-echo:node";
             const bool add_ok = add.value("sum", 0.0) == 42.0 || add.value("content", "") == "42";
@@ -2234,6 +2242,16 @@ int CmdGateway(int argc, char** argv, int argi) {
     plugins.Scan(RepoRoot() / "plugins");
     plugins::JsHost js_host;
     // Auto-start JS bridge (Node) or mock when FORCE_MOCK / no node
+    {
+        auto plr = config::Load(config::DefaultPath());
+        js_host.SetConfig(plr.snap.raw);
+        std::vector<std::filesystem::path> dirs = {
+            std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw" / "extensions",
+            workspace::Workspace::DefaultRoot() / ".openclaw" / "extensions"};
+        if (auto lp = config::GetPath(plr.snap.raw, "plugins.load.paths"); lp && lp->is_array())
+            for (auto& p : *lp) if (p.is_string()) dirs.push_back(p.get<std::string>());
+        js_host.SetExtraDirs(dirs);
+    }
     js_host.Start(RepoRoot() / "plugins");
     const auto js_tools_n = js_host.RegisterTools(tools);
     (void)js_tools_n;

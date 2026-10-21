@@ -1,5 +1,7 @@
 #include "openclaw/plugins/js_host.hpp"
 
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 
@@ -19,6 +21,21 @@ bool ForceMock() {
 std::filesystem::path FindNode() {
     // Prefer PATH via execvp("node"); empty means use "node"
     return "node";
+}
+
+bool NodeSupportsStripTypes() {
+    static int cached = -1;
+    if (cached >= 0) return cached == 1;
+    cached = 0;
+    if (FILE* p = popen("node --version 2>/dev/null", "r")) {
+        char buf[64] = {0};
+        if (fgets(buf, sizeof buf, p)) {
+            int maj = 0, min = 0;
+            if (std::sscanf(buf, "v%d.%d", &maj, &min) == 2) cached = (maj > 22 || (maj == 22 && min >= 6)) ? 1 : 0;
+        }
+        pclose(p);
+    }
+    return cached == 1;
 }
 
 }  // namespace
@@ -53,7 +70,10 @@ bool JsHost::Start(const std::filesystem::path& plugins_dir,
     }
 
     auto proc = std::make_unique<mcp::StdioProcess>();
-    if (!proc->Spawn({FindNode().string(), bridge_js_.string()})) {
+    std::vector<std::string> argv{FindNode().string()};
+    if (NodeSupportsStripTypes()) { argv.push_back("--experimental-strip-types"); argv.push_back("--no-warnings"); }
+    argv.push_back(bridge_js_.string());
+    if (!proc->Spawn(argv)) {
         last_error_ = "failed to spawn node bridge — falling back to mock";
         EnableMock();
         last_init_ = MockHandle("initialize", {{"plugins_dir", plugins_dir_.string()}});
@@ -108,7 +128,7 @@ nlohmann::json JsHost::Status() const {
             {"last_error", last_error_},
             {"init", last_init_},
             {"impl", mock_ ? "real-sim" : "real"},
-            {"gaps", nlohmann::json::array({"not full OpenClaw JS/TS plugin API",
+            {"gaps", nlohmann::json::array({"registerChannel/registerProvider/registerHttpRoute unsupported",
                                             "no hook lifecycle / channel bindings",
                                             "stdio JSON-RPC subset only",
                                             "requires Node.js for live mode"})}};
@@ -182,8 +202,12 @@ nlohmann::json JsHost::Request(const std::string& method, const nlohmann::json& 
     nlohmann::json req{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}};
     try {
         proc_->WriteLine(req.dump());
-        const auto line = proc_->ReadLine();
-        auto resp = nlohmann::json::parse(line);
+        nlohmann::json resp;
+        for (int guard = 0; guard < 1000; ++guard) {  // skip any stray/non-matching lines
+            const auto line = proc_->ReadLine();
+            try { resp = nlohmann::json::parse(line); } catch (...) { continue; }
+            if (resp.contains("id") && resp["id"] == id) break;
+        }
         if (resp.contains("error")) return {{"error", resp["error"]}};
         return resp.value("result", nlohmann::json::object());
     } catch (const std::exception& e) {
@@ -193,7 +217,45 @@ nlohmann::json JsHost::Request(const std::string& method, const nlohmann::json& 
 }
 
 nlohmann::json JsHost::Initialize() {
-    return Request("initialize", {{"plugins_dir", plugins_dir_.string()}});
+    nlohmann::json dirs = nlohmann::json::array({plugins_dir_.string()});
+    nlohmann::json cfg;
+    {
+        std::lock_guard l(mu_);
+        for (auto& d : extra_dirs_) dirs.push_back(d.string());
+        cfg = config_;
+    }
+    return Request("initialize", {{"plugins_dir", plugins_dir_.string()}, {"plugins_dirs", dirs}, {"config", cfg}});
+}
+
+nlohmann::json JsHost::ListCommands() { return Request("list_commands", nlohmann::json::object()); }
+
+namespace {
+bool InitListHas(const nlohmann::json& init, const char* key, const std::string& v) {
+    if (!init.contains(key) || !init[key].is_array()) return false;
+    for (auto& x : init[key]) if (x.is_string() && x.get<std::string>() == v) return true;
+    return false;
+}
+}  // namespace
+
+bool JsHost::HasCommand(const std::string& n) const {
+    std::string low; for (char c : n) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::lock_guard l(mu_); return InitListHas(last_init_, "commands", low);
+}
+bool JsHost::HasHook(const std::string& e) const { std::lock_guard l(mu_); return InitListHas(last_init_, "hooks", e); }
+bool JsHost::HasGatewayMethod(const std::string& m) const { std::lock_guard l(mu_); return InitListHas(last_init_, "gatewayMethods", m); }
+
+nlohmann::json JsHost::RunCommand(const std::string& name, const std::string& args, const nlohmann::json& ctx) {
+    nlohmann::json p = ctx.is_object() ? ctx : nlohmann::json::object();
+    p["name"] = name; p["args"] = args;
+    return Request("run_command", p);
+}
+
+nlohmann::json JsHost::EmitHook(const std::string& event, const nlohmann::json& payload, const nlohmann::json& ctx) {
+    return Request("emit_hook", {{"event", event}, {"payload", payload}, {"ctx", ctx.is_null() ? nlohmann::json::object() : ctx}});
+}
+
+nlohmann::json JsHost::CallGatewayMethod(const std::string& method, const nlohmann::json& params) {
+    return Request("gateway_method", {{"method", method}, {"params", params}});
 }
 
 nlohmann::json JsHost::ListTools() { return Request("list_tools", nlohmann::json::object()); }

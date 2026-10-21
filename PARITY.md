@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.42.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.43.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,3 +28,9 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.43 JS/TS plugin host (upstream API)
+- real: host.mjs v2 discovers openclaw.plugin.json / package.json `openclaw.extensions` / legacy plugin.json across repo plugins/, ~/.openclaw/extensions, <workspace>/.openclaw/extensions, plugins.load.paths; honours plugins.enabled/allow/deny and entries.<id>.enabled/config (api.pluginConfig).
+- real: api.registerTool (execute/handler, factory), registerCommand (gateway runs before skills, no model turn), api.on hooks: message_received, before_agent_start (prependContext/systemPrompt), message_sending (content rewrite / cancel), agent_end; registerGatewayMethod (DispatchRpc fallback); registerService (start/stop).
+- real-sim: TypeScript entries load only on Node >= 22.6 (--experimental-strip-types, auto-detected) or with the `typescript` package installed; box Node 20 has neither, so tests use an .mjs sample.
+- missing: registerChannel / registerProvider / registerHttpRoute (warn only), before_tool_call / after_tool_call / session hooks, plugin CLI commands, npm install of plugins.
