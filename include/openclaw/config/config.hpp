@@ -66,6 +66,9 @@ struct LoadResult {
     std::vector<std::string> warnings;
 };
 LoadResult Load(const std::filesystem::path& path);
+// agents.entries <-> agents.list bridging (see config.cpp).
+void ExpandAgentEntries(nlohmann::json& raw);
+nlohmann::json FoldAgentEntries(nlohmann::json doc);
 Snapshot LoadOrDefault(const std::filesystem::path& path);
 // Write raw file JSON atomically (tmp + rename), keeping a .bak of the previous file.
 void SaveRaw(const std::filesystem::path& path, const nlohmann::json& file_json);

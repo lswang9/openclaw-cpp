@@ -1,3 +1,4 @@
+#include <regex>
 #include "openclaw/auth/webauthn.hpp"
 #include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/auth/oidc.hpp"
@@ -54,7 +55,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.113.0-dev";
+constexpr const char* kVersion = "1.114.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2397,7 +2398,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
     if (method == "config.schema.validate") {
         const auto& doc = params.contains("config") ? params["config"] : deps_.config.raw;
-        auto issues = config::ValidateAgainstSchema(doc);
+        auto issues = config::ValidateAgainstSchema(config::FoldAgentEntries(doc));
         nlohmann::json errors = nlohmann::json::array(), extensions = nlohmann::json::array();
         for (auto& i : issues) (i["code"] == "unrecognized_key" && i["path"].get<std::string>().find('.') == std::string::npos ? extensions : errors).push_back(i);
         return ok({{"valid", errors.empty()}, {"issues", errors}, {"cppExtensionKeys", extensions}, {"schemaPaths", config::SchemaPathCount()}});
@@ -2519,32 +2520,41 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         auto r = agent::routing::ResolveRoute(deps_.config.raw, ri);
         return ok({{"agentId", r.agent_id}, {"matchedBy", r.matched_by}, {"bindingIndex", r.binding_index}});
     }
-    if (method == "agents.create") {
-        auto id = params.value("id", "agent-" + std::to_string(deps_.config.raw.value("agents_list", nlohmann::json::array()).size() + 1));
-        if (!deps_.config.raw.contains("agents_list")) deps_.config.raw["agents_list"] = nlohmann::json::array();
-        deps_.config.raw["agents_list"].push_back({{"id", id}, {"model", params.value("model", deps_.config.deepseek_model)}});
-        config::Save(config::DefaultPath(), deps_.config);
-        return ok({{"created", true}, {"id", id}});
-    }
-    if (method == "agents.update") {
-        auto id = params.value("id", "");
-        if (!deps_.config.raw.contains("agents_list")) return err("no agents");
-        for (auto& a : deps_.config.raw["agents_list"]) {
-            if (a.value("id", "") == id) {
-                if (params.contains("model")) a["model"] = params["model"];
-                config::Save(config::DefaultPath(), deps_.config);
-                return ok({{"updated", true}, {"agent", a}});
-            }
+    if (method == "agents.create" || method == "agents.update" || method == "agents.delete") {
+        // Upstream shape: agents.entries {<id>: {...}}; internally agents.list items tagged __fromEntries (folded on save).
+        auto& ag = deps_.config.raw["agents"];
+        if (!ag.is_object()) ag = nlohmann::json::object();
+        if (!ag.contains("list") || !ag["list"].is_array()) ag["list"] = nlohmann::json::array();
+        if (deps_.config.raw.contains("agents_list") && deps_.config.raw["agents_list"].is_array()) {  // migrate legacy key
+            for (auto& x : deps_.config.raw["agents_list"]) if (x.is_object()) { auto y = x; y["__fromEntries"] = true; ag["list"].push_back(y); }
+            deps_.config.raw.erase("agents_list");
         }
-        return err("agent not found");
-    }
-    if (method == "agents.delete") {
-        auto id = params.value("id", "");
-        if (!deps_.config.raw.contains("agents_list")) return err("no agents");
-        auto& arr = deps_.config.raw["agents_list"];
+        auto& list = ag["list"];
+        const auto id = params.value("id", params.value("agentId", std::string()));
+        auto find = [&]() -> nlohmann::json* { for (auto& x : list) if (x.is_object() && x.value("id", std::string()) == id) return &x; return nullptr; };
+        if (method == "agents.create") {
+            static const std::regex id_re("^[a-z0-9_][a-z0-9_-]{0,63}$");
+            const auto nid = id.empty() ? "agent-" + std::to_string(list.size() + 1) : id;
+            if (!std::regex_match(nid, id_re)) return err("invalid agent id: " + nid);
+            for (auto& x : list) if (x.is_object() && x.value("id", std::string()) == nid) return err("agent already exists: " + nid);
+            nlohmann::json e{{"id", nid}, {"__fromEntries", true}};
+            for (auto k : {"name", "model", "workspace", "description", "identity"}) if (params.contains(k)) e[k] = params[k];
+            list.push_back(e);
+            config::Save(config::DefaultPath(), deps_.config);
+            return ok({{"created", true}, {"id", nid}});
+        }
+        auto* a = find();
+        if (!a) return err("agent not found: " + id);
+        if (method == "agents.update") {
+            for (auto k : {"name", "model", "workspace", "description", "identity", "default"}) if (params.contains(k)) (*a)[k] = params[k];
+            nlohmann::json pub = *a; pub.erase("__fromEntries");
+            config::Save(config::DefaultPath(), deps_.config);
+            return ok({{"updated", true}, {"agent", pub}});
+        }
         nlohmann::json next = nlohmann::json::array();
-        for (auto& a : arr) if (a.value("id", "") != id) next.push_back(a);
-        arr = next;
+        for (auto& x : list) if (!(x.is_object() && x.value("id", std::string()) == id)) next.push_back(x);
+        list = next;
+        if (ag.contains("entries") && ag["entries"].is_object()) ag["entries"].erase(id);
         config::Save(config::DefaultPath(), deps_.config);
         return ok({{"deleted", id}});
     }

@@ -123,6 +123,7 @@ Cfg LoadCfg() {
     std::ifstream in(c.path); std::stringstream ss; ss << in.rdbuf();
     try { c.raw = config::ParseJson5(ss.str()); } catch (const std::exception& e) { c.valid = false; c.error = e.what(); }
     if (!c.raw.is_object()) c.raw = json::object();
+    config::ExpandAgentEntries(c.raw);
     return c;
 }
 void SaveCfg(const Cfg& c) {

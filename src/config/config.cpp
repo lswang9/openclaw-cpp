@@ -1,3 +1,4 @@
+#include <set>
 #include "openclaw/config/config.hpp"
 
 #include <algorithm>
@@ -467,6 +468,7 @@ LoadResult Load(const fs::path& path) {
             for (auto& e : schema.errors) m += " " + e + ";";
             throw std::runtime_error(m);
         }
+        ExpandAgentEntries(j);
         r.snap.raw = j;  // keep unsubstituted for round-trip writes
         ApplyTyped(r.snap, SubstituteEnv(j));
     } catch (const std::exception& e) {
@@ -474,6 +476,47 @@ LoadResult Load(const fs::path& path) {
         r.snap = Snapshot{};
     }
     return r;
+}
+
+
+// Upstream v2026.10.5 declares agents as agents.entries {<id>: {...}}. Internally every consumer reads
+// agents.list [{id,...}], so loads expand entries into list items tagged "__fromEntries", and writes fold
+// them back into entries (edits made through list-based code paths are preserved).
+void ExpandAgentEntries(nlohmann::json& raw) {
+    if (!raw.is_object() || !raw.contains("agents") || !raw["agents"].is_object()) return;
+    auto& ag = raw["agents"];
+    if (!ag.contains("entries") || !ag["entries"].is_object() || ag["entries"].empty()) return;
+    if (!ag.contains("list") || !ag["list"].is_array()) ag["list"] = nlohmann::json::array();
+    for (auto& [id, e] : ag["entries"].items()) {
+        if (!e.is_object()) continue;
+        bool dup = false;
+        for (auto& x : ag["list"]) dup = dup || (x.is_object() && x.value("id", std::string()) == id);
+        if (dup) continue;
+        nlohmann::json item = e; item["id"] = id; item["__fromEntries"] = true;
+        ag["list"].push_back(item);
+    }
+}
+nlohmann::json FoldAgentEntries(nlohmann::json doc) {
+    if (!doc.is_object() || !doc.contains("agents") || !doc["agents"].is_object() || !doc["agents"].contains("list") || !doc["agents"]["list"].is_array()) return doc;
+    auto& ag = doc["agents"];
+    nlohmann::json keep = nlohmann::json::array();
+    bool any = false;
+    std::set<std::string> live;
+    for (auto& x : ag["list"]) {
+        if (x.is_object() && x.value("__fromEntries", false)) {
+            any = true;
+            auto id = x.value("id", std::string()); nlohmann::json e = x; e.erase("id"); e.erase("__fromEntries");
+            if (!ag.contains("entries") || !ag["entries"].is_object()) ag["entries"] = nlohmann::json::object();
+            ag["entries"][id] = e; live.insert(id);
+        } else keep.push_back(x);
+    }
+    if (any && ag.contains("entries")) {  // entries whose expanded item was removed by list-based code were deleted
+        std::vector<std::string> gone;
+        for (auto& [id, e] : ag["entries"].items()) if (!live.count(id)) { bool in_list = false; for (auto& x : keep) in_list = in_list || (x.is_object() && x.value("id", std::string()) == id); if (!in_list) gone.push_back(id); }
+        for (auto& g : gone) ag["entries"].erase(g);
+    }
+    if (keep.empty()) ag.erase("list"); else ag["list"] = keep;
+    return doc;
 }
 
 Snapshot LoadOrDefault(const fs::path& path) { return Load(path).snap; }
@@ -500,7 +543,7 @@ void SaveRaw(const fs::path& path, const nlohmann::json& file_json) {
     std::error_code ec;
     if (fs::exists(path, ec)) fs::copy_file(path, fs::path(path.string() + ".bak"), fs::copy_options::overwrite_existing, ec);
     auto tmp = fs::path(path.string() + ".tmp");
-    { std::ofstream out(tmp); out << file_json.dump(2) << "\n"; }
+    { std::ofstream out(tmp); out << FoldAgentEntries(file_json).dump(2) << "\n"; }
     fs::rename(tmp, path);
 }
 
@@ -528,7 +571,7 @@ nlohmann::json SavePreserving(const fs::path& path, const nlohmann::json& effect
         }
         try { snap = Load(path).snap; } catch (...) {}
     }
-    nlohmann::json file_doc = ToFileDoc(snap, effective);
+    nlohmann::json file_doc = FoldAgentEntries(ToFileDoc(snap, effective));
     if (!snap.include_spec.is_null()) out["preservedInclude"] = true;
 
     auto indent_dump = [](const nlohmann::json& val) {
