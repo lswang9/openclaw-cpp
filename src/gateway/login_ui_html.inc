@@ -15,6 +15,7 @@ button.sec{background:#2a3548}.muted{color:#8b9bb4;font-size:.8rem}#msg{min-heig
 <input id="otp" autocomplete="one-time-code" inputmode="numeric" placeholder="MFA code (if enabled)"/>
 <button type="submit">Log in</button> <button type="button" class="sec" id="out">Log out</button></form>
 <div id="msg"></div>
+<p id="sso" style="display:none"><a href="/login/oidc">Sign in with SSO (OIDC)</a></p>
 <p class="muted">Pairing a new device? Start a link from the device; an operator approves it at /pairing.</p>
 </div>
 <script>
@@ -26,6 +27,7 @@ document.getElementById('f').onsubmit=async e=>{e.preventDefault();
  const j=await r.json().catch(()=>({}));
  if(r.ok&&j.ok){msg('Logged in as '+j.role+' — redirecting…');location.href=safeNext;}else msg('Login failed: '+(j.error||r.status)+(j.mfa_required?' — enter your authenticator code':''));};
 document.getElementById('out').onclick=async()=>{await fetch('/logout',{method:'POST'});msg('Logged out');};
+fetch('/login/methods').then(r=>r.json()).then(j=>{if(j.oidc)document.getElementById('sso').style.display='';}).catch(()=>{});
 fetch('/v1/whoami').then(r=>r.ok?r.json():null).then(j=>{if(j)msg('Current: '+j.role+(j.auth_required?'':' (auth off)'));}).catch(()=>{});
 </script></body></html>
 )HTML"

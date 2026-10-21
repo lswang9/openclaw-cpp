@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.69.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.70.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,10 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.70.0-dev
+- 网关 OIDC 登录：授权码 + PKCE、state/nonce 校验、通过 JWKS 校验 RS256 id_token、白名单默认拒绝；会话角色为 operator 或 admin；用假 IdP 的 e2e 已纳入 smoke。
+- 仍缺：ES256/EdDSA、刷新令牌/登出回调、按组映射角色、真实 IdP 验证。
 
 ### 1.69.0-dev
 - 网关 MFA：/login 支持 TOTP（RFC 6238，防重放）和一次性恢复码；CLI `auth mfa enroll/status/code/verify/disable`；e2e 已纳入 smoke。

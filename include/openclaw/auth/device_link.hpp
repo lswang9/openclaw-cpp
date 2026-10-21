@@ -35,6 +35,8 @@ public:
     // Returns {sid, csrf}; credential_sha256 = SHA-256 of the gateway token or ocd_ token used at login.
     std::pair<std::string, std::string> CreateSession(const std::string& credential_sha256, bool is_gateway_token);
     // gateway_token_sha256: current gateway token hash ("" if none). Empty role = invalid/expired/revoked.
+    // OIDC-backed session (1.70): role fixed at login; valid only while OIDC stays configured.
+    std::pair<std::string, std::string> CreateIdentitySession(const std::string& subject, const std::string& role);
     SessionInfo SessionLookup(const std::string& sid, const std::string& gateway_token_sha256);
     void DeleteSession(const std::string& sid);
     // Per-IP claim rate limiting (persisted). Set by the gateway per connection thread.

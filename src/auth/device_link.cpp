@@ -205,6 +205,19 @@ std::pair<std::string, std::string> DeviceLinkStore::CreateSession(const std::st
     return {sid, csrf};
 }
 
+std::pair<std::string, std::string> DeviceLinkStore::CreateIdentitySession(const std::string& subject, const std::string& role) {
+    std::lock_guard lock(mu_);
+    auto sid = "ocs_" + RandHex(24);
+    auto csrf = RandHex(16);
+    if (!data_.contains("sessions") || !data_["sessions"].is_array()) data_["sessions"] = nlohmann::json::array();
+    const auto now = NowMs();
+    data_["sessions"].push_back({{"sid_sha256", Sha256Hex(sid)}, {"csrf", csrf}, {"oidc_sub", subject}, {"role", role},
+                                 {"created_ms", now},
+                                 {"expires_ms", now + (std::int64_t)EnvInt("OPENCLAW_OIDC_SESSION_TTL_SEC", 43200) * 1000}});
+    Save();
+    return {sid, csrf};
+}
+
 DeviceLinkStore::SessionInfo DeviceLinkStore::SessionLookup(const std::string& sid, const std::string& gw_sha) {
     if (sid.rfind("ocs_", 0) != 0) return {};
     std::lock_guard lock(mu_);
@@ -213,6 +226,12 @@ DeviceLinkStore::SessionInfo DeviceLinkStore::SessionLookup(const std::string& s
     for (auto& s : data_["sessions"]) {
         if (S(s, "sid_sha256") != h) continue;
         if (s.value("expires_ms", (std::int64_t)0) < NowMs()) return {};
+        if (s.contains("oidc_sub")) {
+            const char* iss = std::getenv("OPENCLAW_OIDC_ISSUER");
+            if (!iss || !*iss) return {};
+            const auto r = S(s, "role");
+            return {(r == "admin" || r == "operator") ? r : std::string(), S(s, "csrf")};
+        }
         const auto cred = S(s, "cred_sha256");
         if (s.value("gateway", false)) {
             if (!gw_sha.empty() && cred == gw_sha) return {"admin", S(s, "csrf")};

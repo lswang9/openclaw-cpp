@@ -1,3 +1,4 @@
+#include "openclaw/auth/oidc.hpp"
 #include "openclaw/auth/mfa.hpp"
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/util.hpp"
@@ -47,7 +48,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.69.0-dev";
+constexpr const char* kVersion = "1.70.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1452,7 +1453,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             } catch (...) {}
         }
     }
-    if (path == "/login" || path == "/ui/login" || path == "/logout") public_ok = true;
+    if (path == "/login" || path == "/ui/login" || path == "/logout" || path == "/login/oidc" || path == "/login/oidc/callback" || path == "/login/methods") public_ok = true;
     if (!public_ok && deps_.js_host) {
         auto route = deps_.js_host->MatchHttpRoute(path);
         if (!route.is_null() && route.value("auth", "gateway") == "plugin") public_ok = true;
@@ -1546,6 +1547,68 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                           "Set-Cookie: oc_csrf=; Path=/; SameSite=Strict; Max-Age=0\r\n"));
         return;
     }
+    if (method == "GET" && path == "/login/methods") {
+        send(HttpResponse(200, "OK", nlohmann::json{{"token", true}, {"oidc", auth::oidc::FromEnv().Enabled()}, {"mfa", auth::mfa::Store().Enabled()}}.dump()));
+        return;
+    }
+    if (method == "GET" && (path == "/login/oidc" || path == "/login/oidc/callback")) {
+        const auto oc = auth::oidc::FromEnv();
+        if (!oc.Enabled() || !deps_.device_links) {
+            send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "oidc not configured"}}.dump()));
+            return;
+        }
+        if (oc.allowed_emails.empty() && oc.allowed_subs.empty() && oc.allowed_domains.empty()) {
+            send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", "oidc allowlist empty (set OPENCLAW_OIDC_ALLOWED_EMAILS/SUBS/DOMAINS)"}}.dump()));
+            return;
+        }
+        std::string q;
+        {
+            const auto sp = req.find(' '), sp2 = req.find(' ', sp + 1);
+            const auto target = req.substr(sp + 1, sp2 - sp - 1);
+            if (auto qm = target.find('?'); qm != std::string::npos) q = target.substr(qm + 1);
+        }
+        auto qp = [&](const std::string& k) {
+            std::string out;
+            std::size_t i = 0;
+            while (i <= q.size()) {
+                auto amp = q.find('&', i); if (amp == std::string::npos) amp = q.size();
+                auto kv = q.substr(i, amp - i);
+                auto eq = kv.find('=');
+                if (kv.substr(0, eq) == k && eq != std::string::npos) {
+                    auto v = kv.substr(eq + 1);
+                    for (std::size_t j = 0; j < v.size(); ++j) {
+                        if (v[j] == '%' && j + 2 < v.size()) { out += static_cast<char>(std::stoi(v.substr(j + 1, 2), nullptr, 16)); j += 2; }
+                        else out += v[j] == '+' ? ' ' : v[j];
+                    }
+                    return out;
+                }
+                i = amp + 1;
+            }
+            return out;
+        };
+        if (path == "/login/oidc") {
+            auto host = HeaderValue(req, "Host");
+            auto st = auth::oidc::BeginLogin(oc, "http://" + host + "/login/oidc/callback");
+            if (!st.error.empty()) { send(HttpResponse(502, "Bad Gateway", nlohmann::json{{"error", st.error}}.dump())); return; }
+            send(HttpResponse(302, "Found", "", "text/plain",
+                              "Location: " + st.url + "\r\nSet-Cookie: oc_oidc_state=" + st.state + "; Path=/login/oidc; HttpOnly; SameSite=Lax; Max-Age=600\r\n"));
+            return;
+        }
+        const auto state = qp("state");
+        if (!qp("error").empty()) { send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", "idp: " + qp("error")}}.dump())); return; }
+        if (state.empty() || CookieValue(req, "oc_oidc_state") != state) {
+            send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", "state mismatch (browser binding)"}}.dump()));
+            return;
+        }
+        auto r = auth::oidc::FinishLogin(oc, qp("code"), state);
+        if (!r.ok) { send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", r.error}}.dump())); return; }
+        auto [sid, csrf] = deps_.device_links->CreateIdentitySession(r.sub, r.role);
+        send(HttpResponse(302, "Found", "", "text/plain",
+                          "Location: /\r\nSet-Cookie: oc_session=" + sid + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200\r\n"
+                          "Set-Cookie: oc_csrf=" + csrf + "; Path=/; SameSite=Strict; Max-Age=43200\r\n"
+                          "Set-Cookie: oc_oidc_state=; Path=/login/oidc; HttpOnly; Max-Age=0\r\n"));
+        return;
+    }
     if (method == "GET" && (path == "/login" || path == "/ui/login")) {
         static const std::string kLogin =
 #include "login_ui_html.inc"
@@ -1554,7 +1617,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         return;
     }
     if (method == "GET" && path == "/v1/whoami") {
-        send(HttpResponse(200, "OK", nlohmann::json{{"role", g_rpc_role}, {"auth_required", deps_.auth.require_auth}}.dump()));
+        send(HttpResponse(200, "OK", nlohmann::json{{"role", g_rpc_role}, {"auth_required", deps_.auth.require_auth}, {"oidc", auth::oidc::FromEnv().Enabled()}, {"mfa", auth::mfa::Store().Enabled()}}.dump()));
         return;
     }
     if (method == "GET" && (path == "/pairing" || path == "/ui/pairing")) {
