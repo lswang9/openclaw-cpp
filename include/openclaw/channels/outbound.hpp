@@ -50,6 +50,7 @@ public:
     // Telegram webhook updates (text/caption, voice/audio → auto-transcribed by the gateway); reply via sendMessage.
     bool SupportsHttpInbound() const override { return id_ == "telegram"; }
     nlohmann::json HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) override;
+    nlohmann::json SendVoiceReply(const std::string& chat_id, const std::string& text);
     nlohmann::json OutboundLog() const;
     void ClearLog();
 

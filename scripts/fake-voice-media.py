@@ -32,5 +32,10 @@ class H(BaseHTTPRequestHandler):
                 c = (b"ID3chunk%d" % i) * 50
                 self.wfile.write(b"%x\r\n" % len(c) + c + b"\r\n"); self.wfile.flush(); time.sleep(0.15)
             self.wfile.write(b"0\r\n\r\n"); return
+        if self.path in ("/botTOK/sendAudio", "/botTOK/sendVoice"):
+            ok = b'name="chat_id"' in body and b"ID3chunk2" in body
+            open(os.environ.get("FAKE_VOICE_LOG", "/dev/null"), "a").write(self.path + (" ok\n" if ok else " bad\n"))
+            return self.send(200 if ok else 400, {"ok": ok})
+        if self.path == "/botTOK/sendMessage": return self.send(200, {"ok": True})
         self.send(404, {})
 s = ThreadingHTTPServer(("127.0.0.1", 0), H); print(s.server_address[1], flush=True); s.serve_forever()

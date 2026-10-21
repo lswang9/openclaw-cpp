@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.78.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.79.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,13 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.79 Telegram secret header, voice-note replies from streamed TTS, transcription off the gateway lock
+- real: Telegram webhook secret verified by the gateway HTTP layer from `X-Telegram-Bot-Api-Secret-Token` (constant-time, 401 on mismatch); the old `_secret_token` body field is no longer accepted.
+- real: `messages.tts.auto` (`always` | `inbound` | `off`, env `OPENCLAW_TTS_AUTO`): Telegram replies are also synthesised through `TtsEngine::SpeakStream` and uploaded as multipart `sendVoice` (Ogg Opus) or `sendAudio` (other formats).
+- real: inbound audio transcription runs before the deps lock is taken (config snapshot only), so a slow STT call no longer blocks other inbound messages/RPC.
+- e2e: `e2e-voice-inbound.sh` checks the 401 on a wrong secret and that the fake Bot API received the streamed audio.
+- gaps: the voice reply is only for the Telegram webhook path (not Discord/WhatsApp/Slack). Chunks are buffered, then uploaded once; the Bot API has no streaming upload. Transcription still delays that message's own reply; there's no deferred "transcribing…" follow-up.
 
 ## 1.78 PARITY audit
 - docs: summary "missing" row corrected — Slack interactive (1.44), Discord slash (1.45), JS/TS plugin host (1.43/1.46) are shipped subsets, offline-verified only; `gguf` embedding provider (1.64) is a header-validated stand-in, not real GGUF inference, so that stays listed as missing. Fixed the 1.77 version string (was `1.77.0-dev.0-dev`).

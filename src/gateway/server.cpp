@@ -49,7 +49,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.78.0-dev";
+constexpr const char* kVersion = "1.79.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -945,12 +945,16 @@ std::unique_lock<std::mutex> Server::LockDeps() const {
 }
 std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     MaybeReloadConfig();  // may unique-lock; must run before the shared request lock
-    auto deps_lock = LockDeps();
     channels::InboundMessage msg = msg_in;
     if (!msg.media.empty()) {
-        auto ai = voice::TranscribeInboundAudio(deps_.config.raw, msg);
+        // Transcribe off the deps lock: STT (download + provider call) can take seconds and must not stall
+        // other inbound messages, RPC or chat completions. Only a config snapshot is taken under the lock.
+        nlohmann::json cfg_snapshot;
+        { auto l = LockDeps(); cfg_snapshot = deps_.config.raw; }
+        auto ai = voice::TranscribeInboundAudio(cfg_snapshot, msg);
         if (!ai.empty()) Emit("media.audio.transcribed", {{"channel", msg.channel}, {"results", ai}});
     }
+    auto deps_lock = LockDeps();
     std::string legacy_migrate_from;
     {
         // Upstream session keys (agent:main:main / :<ch>:group:<id> / :channel: / :thread:), unless the caller
@@ -1917,6 +1921,16 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                     if (!channels::signing::VerifySlack(secret, HeaderValue(req, "X-Slack-Request-Timestamp"), raw_body,
                                                         HeaderValue(req, "X-Slack-Signature"), now, &why)) {
                         send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", why}}.dump()));
+                        return;
+                    }
+                }
+            } else if (chan_id == "telegram") {
+                if (auto secret = cfg_str("channels.telegram.webhookSecret", "TELEGRAM_WEBHOOK_SECRET"); !secret.empty()) {
+                    const auto got = HeaderValue(req, "X-Telegram-Bot-Api-Secret-Token");
+                    unsigned diff = got.size() ^ secret.size();
+                    for (std::size_t i = 0; i < secret.size(); ++i) diff |= static_cast<unsigned char>(secret[i]) ^ static_cast<unsigned char>(i < got.size() ? got[i] : 0);
+                    if (diff != 0) {
+                        send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", "telegram secret token mismatch"}}.dump()));
                         return;
                     }
                 }

@@ -1,3 +1,6 @@
+#include "openclaw/voice/tts.hpp"
+#include "openclaw/config/config.hpp"
+#include <curl/curl.h>
 #include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/outbound.hpp"
 
@@ -210,13 +213,46 @@ nlohmann::json OutboundRecordAdapter::SendTyping(const std::string& chat_id) {
     return entry;
 }
 
+nlohmann::json OutboundRecordAdapter::SendVoiceReply(const std::string& chat_id, const std::string& text) {
+    // Streamed TTS: provider chunks are accumulated as they arrive, then uploaded as one voice note
+    // (Telegram Bot API has no streaming upload). Ogg Opus → sendVoice (voice note); other formats → sendAudio.
+    voice::TtsEngine tts;
+    std::string audio;
+    std::size_t chunks = 0;
+    auto r = tts.SpeakStream(text, {}, [&](const std::string& c) { audio += c; ++chunks; });
+    nlohmann::json entry{{"channel", id_}, {"chat_id", chat_id}, {"type", "voice"}, {"tts", r}, {"chunks", chunks}, {"bytes", audio.size()}, {"delivered", false}};
+    const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
+    if (audio.empty() || token.empty()) { entry["mode"] = "record_only"; return entry; }
+    const bool ogg = audio.rfind("OggS", 0) == 0;
+    const std::string method = ogg ? "sendVoice" : "sendAudio";
+    CURL* c = curl_easy_init();
+    curl_mime* form = curl_mime_init(c);
+    auto* f = curl_mime_addpart(form); curl_mime_name(f, "chat_id"); curl_mime_data(f, chat_id.c_str(), CURL_ZERO_TERMINATED);
+    f = curl_mime_addpart(form); curl_mime_name(f, ogg ? "voice" : "audio");
+    curl_mime_data(f, audio.data(), audio.size()); curl_mime_filename(f, ogg ? "reply.ogg" : "reply.mp3");
+    curl_mime_type(f, ogg ? "audio/ogg" : "audio/mpeg");
+    const std::string url = TelegramBase(Config()) + "/bot" + token + "/" + method;
+    std::string resp;
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_MIMEPOST, form);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, +[](char* p, size_t s, size_t n, void* u) { static_cast<std::string*>(u)->append(p, s * n); return s * n; });
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+    long code = 0;
+    if (curl_easy_perform(c) == CURLE_OK) curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    curl_mime_free(form); curl_easy_cleanup(c);
+    entry["mode"] = "live_http"; entry["method"] = method; entry["http"] = code; entry["delivered"] = code >= 200 && code < 300;
+    std::lock_guard l(typing_mu_);
+    sent_.push_back(entry);
+    return entry;
+}
+
 nlohmann::json OutboundRecordAdapter::OutboundLog() const { return sent_; }
 void OutboundRecordAdapter::ClearLog() { sent_.clear(); }
 
 nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
     if (id_ != "telegram") return {{"ok", false}, {"error", "unsupported"}};
-    const auto secret = ChannelCred(Config(), "telegram", "webhookSecret", "TELEGRAM_WEBHOOK_SECRET");
-    if (!secret.empty() && body.value("_secret_token", std::string()) != secret) return {{"ok", false}, {"error", "webhook secret mismatch"}};
+    // Secret is verified by the gateway HTTP layer from X-Telegram-Bot-Api-Secret-Token (1.79).
     const auto& tm = body.contains("message") ? body["message"] : (body.contains("edited_message") ? body["edited_message"] : nlohmann::json());
     if (!tm.is_object() || !tm.contains("chat")) return {{"ok", true}, {"ignored", true}, {"note", "no message"}};
     InboundMessage m;
@@ -236,7 +272,15 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
     auto reply = deliver ? deliver(m) : std::string();
     nlohmann::json sent;
     if (!reply.empty()) sent = SendText(cid, reply);
-    return {{"ok", true}, {"channel", "telegram"}, {"reply", reply}, {"sent", sent}, {"impl", "real"}};
+    nlohmann::json voice_sent;
+    if (!reply.empty()) {
+        // messages.tts.auto: "always" | "inbound" (only when the user sent audio) | "off" (default).
+        auto mode = config::GetPath(Config(), "messages.tts.auto");
+        std::string am = mode && mode->is_string() ? mode->get<std::string>() : std::string("off");
+        if (const char* e = std::getenv("OPENCLAW_TTS_AUTO"); e && *e) am = e;
+        if (am == "always" || (am == "inbound" && !m.media.empty())) voice_sent = SendVoiceReply(cid, reply);
+    }
+    return {{"ok", true}, {"channel", "telegram"}, {"reply", reply}, {"sent", sent}, {"voice", voice_sent}, {"impl", "real"}};
 }
 
 }  // namespace openclaw::channels
