@@ -36,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.41.0-dev";
+constexpr const char* kVersion = "1.42.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -593,7 +593,20 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         }
     }
     if (auto sc = skills::MatchSkillCommand(deps_.skills.List(), text_in)) {
-        Emit("skill.command", {{"sessionKey", msg.session_key}, {"skill", sc->skill}});
+        Emit("skill.command", {{"sessionKey", msg.session_key}, {"skill", sc->skill}, {"dispatch", sc->dispatch_tool.empty() ? "model" : "tool"}});
+        if (!sc->dispatch_tool.empty()) {
+            // command-dispatch: tool → deterministic tool call, no model turn
+            auto skill_entries = config::GetPath(deps_.config.raw, "skills.entries").value_or(nlohmann::json::object());
+            skills::ScopedEnv skill_env(skills::SkillEnvOverrides(deps_.skills.List(), skill_entries));
+            std::string out;
+            try { out = deps_.tools.Invoke(sc->dispatch_tool, skills::DispatchArgs(*sc)); }
+            catch (const std::exception& e) { out = std::string("error: ") + e.what(); }
+            try {
+                auto j = nlohmann::json::parse(out);
+                for (auto k : {"text", "output", "stdout", "result"}) if (j.contains(k) && j[k].is_string()) { out = j[k]; break; }
+            } catch (...) {}
+            return out;
+        }
         text_in = sc->prompt;
     }
     auto messages = deps_.sessions.Load(msg.session_key);

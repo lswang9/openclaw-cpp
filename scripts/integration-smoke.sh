@@ -216,6 +216,11 @@ ls "$OPENCLAW_SESSION_DIR"/archive/smoke~3areset.*.jsonl >/dev/null || { echo "[
 if grep -q "\"role\":\"system\"" "$OPENCLAW_SESSION_DIR"/archive/*.jsonl; then echo "[smoke] system prompt persisted" >&2; exit 1; fi; echo "[smoke] jsonl transcript (no system prompt persisted) ok"
 "$BIN" skills list | grep -q "/hello_skill" && OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat "/hello_skill hi" >/dev/null && echo "[smoke] skill slash command ok" || { echo "[smoke] skill slash failed" >&2; exit 1; }
 "$BIN" tokenizer count "hello world" | grep -q "\"tokens\"" && "$BIN" tokenizer status | grep -q backend && echo "[smoke] tokenizer ok" || { echo "[smoke] tokenizer failed" >&2; exit 1; }
+SK="${TMPDIR:-/tmp}/oc-smoke-skill-$$"; mkdir -p "$SK/echoer"
+printf -- '---\nname: echoer\ndescription: dispatch test\ncommand-dispatch: tool\ncommand-tool: echo\n---\nbody\n' > "$SK/echoer/SKILL.md"
+OUT=$(OPENCLAW_SKILLS_DIR="$SK" OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat "/echoer hi")
+echo "$OUT" | grep -q echoed && ! echo "$OUT" | grep -q mock-default || { echo "[smoke] command-dispatch failed: $OUT" >&2; exit 1; }
+rm -rf "$SK"; echo "[smoke] skill command-dispatch: tool (no model turn) ok"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-memory-flush.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-embeddings.sh"
 echo "[smoke] ALL PASS"

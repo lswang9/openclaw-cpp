@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.41.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.42.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.42.0-dev 新增
+
+- 技能可声明 `command-dispatch: tool` + `command-tool: <工具名>`：用户发 `/技能名 参数` 时直接调用该工具（参数为 `{command, commandName, skillName}`），不经过模型，结果直接回复。
 
 ## 1.41.0-dev 新增
 

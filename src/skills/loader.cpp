@@ -66,6 +66,8 @@ bool ParseFrontmatter(const std::string& text, std::string& name, std::string& d
             *dmi = (val == "true");
         } else if (key == "user-invocable" && meta) {
             (*meta)["__userInvocable"] = (val != "false");
+        } else if ((key == "command-dispatch" || key == "command-tool" || key == "command-arg-mode") && meta) {
+            (*meta)["__" + key] = val;
         }
     }
     // multiline description: " |" style — keep first line only for skeleton
@@ -228,13 +230,18 @@ std::optional<SkillCommand> MatchSkillCommand(const std::vector<Skill>& skills, 
     }
     for (const auto& s : skills) {
         if (!s.user_invocable || !s.eligible || SlashName(s.name) != want) continue;
-        SkillCommand sc{s.name, rest, ""};
+        SkillCommand sc{s.name, rest, "", "", "/" + want};
+        if (s.command_dispatch == "tool" && !s.command_tool.empty()) { sc.dispatch_tool = s.command_tool; return sc; }
         sc.prompt = "Use the \"" + s.name + "\" skill for this request.\n\n<skill name=\"" + s.name + "\" location=\"" +
                     (s.path / "SKILL.md").string() + "\">\n" + s.body + "\n</skill>\n\nUser input:\n" +
                     (rest.empty() ? std::string("(none)") : rest);
         return sc;
     }
     return std::nullopt;
+}
+
+nlohmann::json DispatchArgs(const SkillCommand& c) {
+    return {{"command", c.args}, {"commandName", c.command_name}, {"skillName", c.skill}};
 }
 
 std::string FormatSkillsForPrompt(const std::vector<Skill>& skills) {
@@ -287,6 +294,10 @@ std::optional<Skill> ParseSkillFile(const fs::path& skill_md) {
     }
     if (!s.metadata.is_object()) s.metadata = nlohmann::json::object();
     if (s.metadata.contains("__userInvocable")) { s.user_invocable = s.metadata["__userInvocable"]; s.metadata.erase("__userInvocable"); }
+    for (auto [k, dst] : {std::pair<const char*, std::string*>{"__command-dispatch", &s.command_dispatch},
+                          {"__command-tool", &s.command_tool}, {"__command-arg-mode", &s.command_arg_mode}}) {
+        if (s.metadata.contains(k)) { *dst = s.metadata[k].get<std::string>(); s.metadata.erase(k); }
+    }
     EvaluateGating(s);
     return s;
 }
@@ -339,7 +350,9 @@ nlohmann::json Library::ListJson() const {
                        {"disableModelInvocation", s.disable_model_invocation},
                        {"enabled", s.enabled},
                        {"userInvocable", s.user_invocable},
-                       {"command", s.user_invocable ? "/" + SlashName(s.name) : ""}});
+                       {"command", s.user_invocable ? "/" + SlashName(s.name) : ""},
+                       {"commandDispatch", s.command_dispatch.empty() ? "model" : s.command_dispatch},
+                       {"commandTool", s.command_tool}});
     }
     return arr;
 }

@@ -18,7 +18,10 @@ struct Skill {
     std::string source;          // workspace | managed | bundled | extra
     nlohmann::json metadata = nlohmann::json::object();  // frontmatter `metadata` (JSON), e.g. {"openclaw":{"requires":{...}}}
     bool disable_model_invocation = false;               // frontmatter disable-model-invocation
-    bool user_invocable = true;                          // frontmatter user-invocable (slash command)
+    bool user_invocable = true;
+    std::string command_dispatch;  // "" (model) | "tool"
+    std::string command_tool;      // tool name for command-dispatch: tool
+    std::string command_arg_mode = "raw";                          // frontmatter user-invocable (slash command)
     bool enabled = true;                                 // skills.entries.<key>.enabled
     bool eligible = true;                                // gating result
     std::vector<std::string> missing;                    // unmet requirements ("bin:x", "env:Y", "os:z")
@@ -46,7 +49,13 @@ using ScopedEnv = tools::ScopedRunEnv;
 
 // Slash command name for a skill: lowercase, [a-z0-9_], max 32 chars (upstream sanitisation).
 std::string SlashName(const std::string& skill_name);
-struct SkillCommand { std::string skill; std::string args; std::string prompt; };
+struct SkillCommand {
+    std::string skill, args, prompt;
+    std::string dispatch_tool;  // non-empty → invoke this tool directly (no model turn)
+    std::string command_name;
+};
+// Tool args for a direct dispatch (upstream: {command: rawArgs, commandName, skillName}).
+nlohmann::json DispatchArgs(const SkillCommand& c);
 // "/skill <name> [args]" or "/<slashname> [args]" for user-invocable, eligible skills.
 std::optional<SkillCommand> MatchSkillCommand(const std::vector<Skill>& skills, const std::string& text);
 

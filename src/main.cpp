@@ -78,7 +78,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.41.0-dev";
+constexpr const char* kVersion = "1.42.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1524,6 +1524,16 @@ int CmdSelfTest() {
         ok = ok && c1 && c1->args == "fix #12" && c1->prompt.find("Open PRs carefully.") != std::string::npos &&
              c2 && c2->skill == "GitHub PR" && !skills::MatchSkillCommand(lib.List(), "/off x") &&
              !skills::MatchSkillCommand(lib.List(), "/noslash") && !skills::MatchSkillCommand(lib.List(), "hello /github_pr");
+        {
+            mk(root / "disp", "---\nname: echoer\ndescription: x\ncommand-dispatch: tool\ncommand-tool: cap\ncommand-arg-mode: raw\n---\nb\n");
+            skills::Library l2; l2.ScanRoots({{root / "disp", "workspace"}});
+            auto dc = skills::MatchSkillCommand(l2.List(), "/echoer hello  raw");
+            tools::Registry reg;
+            reg.Register({"cap", "capture", {{"type", "object"}}, [](const nlohmann::json& a) { return a.dump(); }});
+            ok = ok && dc && dc->dispatch_tool == "cap" && dc->args == "hello  raw" &&
+                 skills::DispatchArgs(*dc)["commandName"] == "/echoer" &&
+                 reg.Invoke("cap", skills::DispatchArgs(*dc)).find("\"skillName\":\"echoer\"") != std::string::npos;
+        }
         if (!ok) { std::cerr << "FAIL skills entries/slash\n"; ++failures; }
         else std::cerr << "PASS skills.entries (enabled/env/apiKey) + scoped env + skill slash commands\n";
     } catch (const std::exception& e) { std::cerr << "FAIL skills entries exception: " << e.what() << "\n"; ++failures; }
@@ -2043,7 +2053,13 @@ int CmdChat(int argc, char** argv, int argi) {
     if (!messages.empty() && messages.front().role == "system") messages.erase(messages.begin());
     messages.insert(messages.begin(), agent::Message{.role = "system", .content = BuildAgentSystemPrompt(registry)});
     auto skill_lib = LoadSkills();
-    if (auto sc = skills::MatchSkillCommand(skill_lib.List(), user_message)) user_message = sc->prompt;
+    if (auto sc = skills::MatchSkillCommand(skill_lib.List(), user_message)) {
+        if (!sc->dispatch_tool.empty()) {
+            std::cout << registry.Invoke(sc->dispatch_tool, skills::DispatchArgs(*sc)) << '\n';
+            return 0;
+        }
+        user_message = sc->prompt;
+    }
     messages.push_back({.role = "user", .content = user_message});
     curl_global_init(CURL_GLOBAL_DEFAULT);
     auto cfg_raw = config::LoadOrDefault(config::DefaultPath()).raw;
