@@ -1,5 +1,9 @@
 // Upstream v2026.10.5 local commands (see include/openclaw/cli/local_commands.hpp).
 #include "openclaw/cli/local_commands.hpp"
+#include <sys/wait.h>
+#include <functional>
+#include "openclaw/session/store.hpp"
+#include "openclaw/config/schema.hpp"
 #include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/cli/tui_screen.hpp"
 
@@ -1210,7 +1214,394 @@ int CmdClawsRemovalJournal(int argc, char** argv) {
     return 0;
 }
 
+
+// ---------------------------------------------------------------- 1.113 local commands (upstream local-only subcommands)
+namespace {
+fs::path SessionsDir() {
+    if (const char* e = std::getenv("OPENCLAW_SESSION_DIR"); e && *e) return e;
+    auto r = config::Load(config::DefaultPath());
+    return r.snap.session_dir;
+}
+void Out(bool as_json, const json& j, const std::function<void()>& human) { if (as_json) std::cout << j.dump(2) << "\n"; else human(); }
+std::string NowIso() { auto t = std::time(nullptr); char b[32]; std::strftime(b, sizeof b, "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t)); return b; }
+std::string NowStamp() { auto t = std::time(nullptr); char b[32]; std::strftime(b, sizeof b, "%Y%m%d-%H%M%S", std::gmtime(&t)); return b; }
+int ShellOk(const std::vector<std::string>& argv, std::string* out = nullptr) {
+    std::string cmd; for (auto& a : argv) { cmd += "'"; for (char c : a) { if (c == '\'') cmd += "'\\''"; else cmd += c; } cmd += "' "; }
+    cmd += "2>&1";
+    FILE* f = popen(cmd.c_str(), "r"); if (!f) return -1;
+    char buf[4096]; size_t n; std::string o; while ((n = fread(buf, 1, sizeof buf, f)) > 0) o.append(buf, n);
+    int rc = pclose(f); if (out) *out = o; return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+}
+std::string StoreKey(const std::string& k) { std::string s = k; for (auto& c : s) if (c == ':' || c == '/') c = '_'; return s; }
+
+int CmdTranscriptsPath(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--dir", "--metadata", "--transcript", "--json"}, "transcripts path"); if (!a) return 2;
+    const auto dir = SessionsDir();
+    json out{{"dir", dir.string()}, {"metadata", (dir / "sessions.json").string()}};
+    if (!a->pos.empty()) {
+        session::Store st(dir.string());
+        auto e = st.IndexEntry(a->pos[0]);
+        if (!st.Exists(a->pos[0])) { std::cerr << "transcripts path: unknown session '" << a->pos[0] << "'\n"; return 1; }
+        out["session"] = a->pos[0];
+        out["transcript"] = (dir / (e.value("file", StoreKey(a->pos[0]) + ".jsonl"))).string();
+    }
+    if (a->has("--json")) { std::cout << out.dump(2) << "\n"; return 0; }
+    if (a->has("--metadata")) std::cout << out["metadata"].get<std::string>() << "\n";
+    else if (a->has("--transcript") && out.contains("transcript")) std::cout << out["transcript"].get<std::string>() << "\n";
+    else std::cout << (out.contains("transcript") && !a->has("--dir") ? out["transcript"] : out["dir"]).get<std::string>() << "\n";
+    return 0;
+}
+
+int CmdSessionsExportTrajectory(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--session-key=", "--output=", "--workspace=", "--store=", "--agent=", "--request-json-base64=", "--json"}, "sessions export-trajectory"); if (!a) return 2;
+    const auto key = a->get("--session-key", a->pos.empty() ? "" : a->pos[0]);
+    if (key.empty()) { std::cerr << "sessions export-trajectory: --session-key is required\n"; return 2; }
+    session::Store st(a->get("--store", SessionsDir().string()));
+    if (!st.Exists(key)) { std::cerr << "sessions export-trajectory: unknown session '" << key << "'\n"; return 1; }
+    auto msgs = st.Load(key);
+    json traj{{"version", 1}, {"sessionKey", key}, {"exportedAt", NowIso()}, {"agentId", a->get("--agent", "main")}, {"steps", json::array()}};
+    for (size_t i = 0; i < msgs.size(); ++i) { auto j = msgs[i].ToJson(); j["index"] = i; traj["steps"].push_back(j); }
+    const auto outp = a->get("--output", "trajectory-" + StoreKey(key) + ".json");
+    std::ofstream(outp) << traj.dump(2) << "\n";
+    Out(a->has("--json"), {{"output", outp}, {"steps", msgs.size()}}, [&] { std::cout << "exported " << msgs.size() << " steps to " << outp << "\n"; });
+    return 0;
+}
+
+int CmdSessionsImport(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--all", "--catalog=", "--host=", "--source-home=", "--limit=", "--dry-run"}, "sessions import"); if (!a) return 2;
+    // Local import: a trajectory/JSONL file (from `sessions export-trajectory` or upstream transcript export).
+    if (a->pos.empty()) { std::cerr << "sessions import: pass a trajectory .json or transcript .jsonl file (remote catalogs need their host apps)\n"; return 2; }
+    const fs::path src = a->pos[0];
+    std::error_code ec; if (!fs::is_regular_file(src, ec)) { std::cerr << "sessions import: not a file: " << src.string() << " (remote catalog import is not available offline)\n"; return 1; }
+    std::vector<agent::Message> msgs; std::string key = a->pos.size() > 1 ? a->pos[1] : "imported:" + src.stem().string();
+    auto body = ReadAll(src);
+    try {
+        if (src.extension() == ".jsonl") { std::istringstream is(body); std::string line; while (std::getline(is, line)) if (!line.empty()) msgs.push_back(agent::Message::FromJson(json::parse(line))); }
+        else { auto j = json::parse(body); if (j.contains("sessionKey") && a->pos.size() < 2) key = "imported:" + j["sessionKey"].get<std::string>(); for (auto& s : j.value("steps", json::array())) msgs.push_back(agent::Message::FromJson(s)); }
+    } catch (const std::exception& e) { std::cerr << "sessions import: parse error: " << e.what() << "\n"; return 1; }
+    if (a->has("--limit")) { size_t l = std::stoul(a->get("--limit")); if (msgs.size() > l) msgs.resize(l); }
+    if (a->has("--dry-run")) { std::cout << "would import " << msgs.size() << " messages into " << key << "\n"; return 0; }
+    session::Store st(SessionsDir().string());
+    if (st.Exists(key)) { std::cerr << "sessions import: session '" << key << "' already exists\n"; return 1; }
+    st.Save(key, msgs);
+    std::cout << "imported " << msgs.size() << " messages into " << key << "\n";
+    return 0;
+}
+
+json ParseBind(const std::string& spec) {  // channel[:accountId][/peerKind:peerId]  e.g. telegram, discord:bot1/group:123
+    json m{{"channel", spec.substr(0, spec.find_first_of(":/"))}};
+    auto rest = spec.substr(std::min(spec.size(), m["channel"].get<std::string>().size()));
+    if (!rest.empty() && rest[0] == ':') { auto e = rest.find('/'); m["accountId"] = rest.substr(1, e == std::string::npos ? std::string::npos : e - 1); rest = e == std::string::npos ? "" : rest.substr(e); }
+    if (!rest.empty() && rest[0] == '/') { auto c = rest.find(':'); if (c != std::string::npos) m["peer"] = {{"kind", rest.substr(1, c - 1)}, {"id", rest.substr(c + 1)}}; }
+    return m;
+}
+int CmdAgentsBindings(int argc, char** argv, const std::string& sub) {
+    auto a = Parse(argc, argv, 3, sub == "bindings" ? std::vector<std::string>{"--agent=", "--json"} : sub == "bind" ? std::vector<std::string>{"--agent=", "--bind=", "--json"}
+                                                    : std::vector<std::string>{"--agent=", "--bind=", "--all", "--json"}, "agents " + sub);
+    if (!a) return 2;
+    auto c = LoadCfg(); if (!c.valid) { std::cerr << "config invalid: " << c.error << "\n"; return 1; }
+    json binds = Get(c.raw, "bindings"); if (!binds.is_array()) binds = json::array();
+    const auto agent = a->get("--agent");
+    if (sub == "bindings") {
+        json out = json::array(); for (auto& b : binds) if (agent.empty() || b.value("agentId", "") == agent) out.push_back(b);
+        Out(a->has("--json"), {{"bindings", out}}, [&] { if (out.empty()) std::cout << "no bindings\n"; for (auto& b : out) std::cout << b.value("agentId", "?") << "\t" << b["match"].dump() << "\n"; });
+        return 0;
+    }
+    if (agent.empty()) { std::cerr << "agents " << sub << ": --agent is required\n"; return 2; }
+    const auto spec = a->get("--bind");
+    if (sub == "bind") {
+        if (spec.empty()) { std::cerr << "agents bind: --bind <channel[:account][/kind:id]> is required\n"; return 2; }
+        json b{{"agentId", agent}, {"match", ParseBind(spec)}};
+        for (auto& x : binds) if (x == b) { std::cout << "binding already present\n"; return 0; }
+        binds.push_back(b);
+    } else {
+        json keep = json::array(); int removed = 0;
+        for (auto& x : binds) { bool hit = x.value("agentId", "") == agent && (a->has("--all") || (!spec.empty() && x["match"] == ParseBind(spec))); if (hit) ++removed; else keep.push_back(x); }
+        if (!a->has("--all") && spec.empty()) { std::cerr << "agents unbind: pass --bind <spec> or --all\n"; return 2; }
+        binds = keep; Set(c.raw, "bindings", binds); SaveCfg(c);
+        Out(a->has("--json"), {{"removed", removed}}, [&] { std::cout << "removed " << removed << " binding(s)\n"; });
+        return 0;
+    }
+    Set(c.raw, "bindings", binds); SaveCfg(c);
+    Out(a->has("--json"), {{"bindings", binds}}, [&] { std::cout << "bound " << agent << " to " << spec << "\n"; });
+    return 0;
+}
+
+fs::path BackupDir(const json& raw, const std::string& flag) {
+    if (!flag.empty()) return ExpandHome(flag);
+    auto r = Get(raw, "backup.repository"); if (r.is_string()) return ExpandHome(r.get<std::string>());
+    return StateDir() / "backups";
+}
+int CmdBackup(int argc, char** argv, const std::string& sub) {
+    std::map<std::string, std::vector<std::string>> flags{
+        {"create", {"--output=", "--to=", "--claim-namespace", "--namespace=", "--keep-daily=", "--keep-weekly=", "--keep-monthly=", "--json", "--dry-run", "--verify", "--only-config", "--no-include-workspace", "--repository=", "--all", "--global", "--agent=", "--push", "--exclude-secrets"}},
+        {"list", {"--from=", "--namespace=", "--json", "--repository="}}, {"init", {"--repository=", "--remote=", "--json"}},
+        {"enable", {"--repository=", "--to=", "--claim-namespace", "--namespace=", "--no-include-workspace", "--keep-daily=", "--keep-weekly=", "--keep-monthly=", "--every=", "--push", "--exclude-secrets", "--include-secrets", "--global-only", "--agent="}},
+        {"disable", {"--offsite", "--git"}}, {"log", {"--repository=", "--limit=", "--json", "--target=", "--ref=", "--global", "--agent="}}};
+    auto a = Parse(argc, argv, 3, flags[sub], "backup " + sub); if (!a) return 2;
+    auto c = LoadCfg();
+    const auto dir = BackupDir(c.raw, a->get("--repository", a->get("--to", a->get("--from"))));
+    std::error_code ec;
+    if (sub == "init") {
+        fs::create_directories(dir, ec);
+        if (!fs::exists(dir / ".git")) ShellOk({"git", "-C", dir.string(), "init", "-q"});
+        if (a->has("--remote")) ShellOk({"git", "-C", dir.string(), "remote", "add", "origin", a->get("--remote")});
+        Set(c.raw, "backup.repository", dir.string()); SaveCfg(c);
+        Out(a->has("--json"), {{"repository", dir.string()}}, [&] { std::cout << "backup repository ready at " << dir.string() << "\n"; });
+        return 0;
+    }
+    if (sub == "enable" || sub == "disable") {
+        Set(c.raw, "backup.enabled", sub == "enable");
+        if (sub == "enable") { Set(c.raw, "backup.repository", dir.string()); if (a->has("--every")) Set(c.raw, "backup.every", a->get("--every")); }
+        SaveCfg(c); std::cout << "backups " << sub << "d\n"; return 0;
+    }
+    if (sub == "list" || sub == "log") {
+        json out = json::array();
+        for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec))
+            if (it->path().extension() == ".gz" || it->path().string().find(".tar") != std::string::npos)
+                out.push_back({{"file", it->path().filename().string()}, {"path", it->path().string()}, {"bytes", static_cast<long long>(it->file_size(ec))}});
+        std::sort(out.begin(), out.end(), [](const json& x, const json& y) { return x["file"].get<std::string>() > y["file"].get<std::string>(); });
+        if (sub == "log" && a->has("--limit")) { size_t l = std::stoul(a->get("--limit")); if (out.size() > l) out.erase(out.begin() + static_cast<long>(l), out.end()); }
+        Out(a->has("--json"), {{"backups", out}, {"repository", dir.string()}}, [&] { if (out.empty()) std::cout << "no backups in " << dir.string() << "\n"; for (auto& b : out) std::cout << b["file"].get<std::string>() << "\t" << b["bytes"] << "\n"; });
+        return 0;
+    }
+    // create: tar.gz of config + state (sessions, data, workspace unless --no-include-workspace / --only-config)
+    std::vector<std::string> items;
+    const auto cfgp = config::DefaultPath();
+    if (fs::exists(cfgp, ec)) items.push_back(cfgp.string());
+    if (!a->has("--only-config")) {
+        for (auto p : {SessionsDir(), ClawsDataDir()}) if (fs::exists(p, ec)) items.push_back(p.string());
+        if (!a->has("--no-include-workspace") && fs::exists(DefaultWorkspace(), ec)) items.push_back(DefaultWorkspace());
+    }
+    const auto outp = a->has("--output") ? fs::path(ExpandHome(a->get("--output"))) : dir / ("openclaw-backup-" + NowStamp() + ".tar.gz");
+    if (a->has("--dry-run")) { Out(a->has("--json"), {{"output", outp.string()}, {"items", items}, {"dryRun", true}}, [&] { std::cout << "would back up:\n"; for (auto& i : items) std::cout << "  " << i << "\n"; }); return 0; }
+    fs::create_directories(outp.parent_path(), ec);
+    std::vector<std::string> cmd{"tar", "-czf", outp.string()};
+    if (a->has("--exclude-secrets")) { cmd.push_back("--exclude=auth-profiles.json"); cmd.push_back("--exclude=github-personal.json"); cmd.push_back("--exclude=*.key"); }
+    cmd.push_back("--absolute-names"); for (auto& i : items) cmd.push_back(i);
+    std::string o; if (ShellOk(cmd, &o) != 0) { std::cerr << "backup create: tar failed: " << o << "\n"; return 1; }
+    if (a->has("--verify") && ShellOk({"tar", "-tzf", outp.string()}, &o) != 0) { std::cerr << "backup create: verify failed\n"; return 1; }
+    Out(a->has("--json"), {{"output", outp.string()}, {"items", items}, {"bytes", static_cast<long long>(fs::file_size(outp, ec))}}, [&] { std::cout << "backup written to " << outp.string() << "\n"; });
+    return 0;
+}
+
+int CmdSecurityAudit(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--deep", "--auth=", "--token=", "--password=", "--fix", "--json"}, "security audit"); if (!a) return 2;
+    auto c = LoadCfg();
+    json findings = json::array();
+    auto add = [&](const std::string& sev, const std::string& id, const std::string& msg, const std::string& fix = "") { json f{{"severity", sev}, {"id", id}, {"message", msg}}; if (!fix.empty()) f["fix"] = fix; findings.push_back(f); };
+    std::error_code ec;
+    auto mode_of = [&](const fs::path& p) { return static_cast<int>(fs::status(p, ec).permissions() & fs::perms::mask); };
+    if (fs::exists(c.path, ec) && (mode_of(c.path) & 0077)) {
+        add("warn", "config-perms", "config file " + Short(c.path) + " is readable by group/others", "chmod 600");
+        if (a->has("--fix")) fs::permissions(c.path, fs::perms::owner_read | fs::perms::owner_write, ec);
+    }
+    if (fs::exists(StateDir(), ec) && (mode_of(StateDir()) & 0077)) {
+        add("warn", "state-perms", "state dir " + Short(StateDir()) + " is accessible by group/others", "chmod 700");
+        if (a->has("--fix")) fs::permissions(StateDir(), fs::perms::owner_all, ec);
+    }
+    const auto host = Get(c.raw, "gateway.host"), bind = Get(c.raw, "gateway.bind");
+    const auto token = Get(c.raw, "gateway.auth.token"), mode = Get(c.raw, "gateway.auth.mode");
+    const bool exposed = (host.is_string() && host != "127.0.0.1" && host != "localhost") || (bind.is_string() && bind != "loopback");
+    if (exposed && !token.is_string() && !std::getenv("OPENCLAW_GATEWAY_TOKEN")) add("critical", "gateway-auth", "gateway listens beyond loopback without an auth token", "set gateway.auth.token");
+    if (mode.is_string() && mode == "none") add(exposed ? "critical" : "info", "gateway-auth-none", "gateway.auth.mode is none");
+    for (auto p : {"tools.exec.security", "tools.exec.ask"}) { auto v = Get(c.raw, p); if (v.is_string() && (v == "full" || v == "off")) add("warn", "exec-policy", std::string(p) + " = " + v.get<std::string>() + " (agent exec without approval)"); }
+    auto ch = Get(c.raw, "channels");
+    if (ch.is_object()) for (auto& [k, v] : ch.items()) if (v.is_object() && v.value("dmPolicy", "") == "open") add("warn", "dm-open", "channel " + k + " accepts DMs from anyone (dmPolicy=open)");
+    std::function<void(const json&, const std::string&)> scan = [&](const json& j, const std::string& path) {
+        if (j.is_object()) for (auto& [k, v] : j.items()) {
+            std::string kl = k; std::transform(kl.begin(), kl.end(), kl.begin(), ::tolower);
+            const auto cp = path.empty() ? k : path + "." + k;
+            if (v.is_string() && (kl.find("token") != std::string::npos || kl.find("apikey") != std::string::npos || kl.find("secret") != std::string::npos || kl.find("password") != std::string::npos)
+                && v.get<std::string>().rfind("${", 0) != 0 && !v.get<std::string>().empty())
+                add("info", "plaintext-secret", "plaintext secret in config at " + cp, "use ${ENV} or the secrets store");
+            scan(v, cp);
+        }
+    };
+    scan(c.raw, "");
+    if (a->has("--deep")) {
+        auto issues = config::ValidateAgainstSchema(c.raw);
+        for (auto& i : issues) if (i["code"] != "unrecognized_key" || i["path"].get<std::string>().find('.') != std::string::npos) add("info", "schema", i["path"].get<std::string>() + ": " + i["message"].get<std::string>());
+    }
+    int crit = 0, warn = 0; for (auto& f : findings) { if (f["severity"] == "critical") ++crit; if (f["severity"] == "warn") ++warn; }
+    Out(a->has("--json"), {{"findings", findings}, {"summary", {{"critical", crit}, {"warn", warn}, {"total", findings.size()}}}}, [&] {
+        if (findings.empty()) std::cout << "no findings\n";
+        for (auto& f : findings) std::cout << "[" << f["severity"].get<std::string>() << "] " << f["message"].get<std::string>() << (f.contains("fix") ? "  (fix: " + f["fix"].get<std::string>() + ")" : "") << "\n";
+        std::cout << crit << " critical, " << warn << " warning(s)\n";
+    });
+    return crit ? 1 : 0;
+}
+
+int CmdSecretsAudit(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--check", "--allow-exec", "--json"}, "secrets audit"); if (!a) return 2;
+    auto c = LoadCfg();
+    json refs = json::array(), plain = json::array();
+    std::function<void(const json&, const std::string&)> scan = [&](const json& j, const std::string& path) {
+        if (j.is_object()) for (auto& [k, v] : j.items()) {
+            const auto cp = path.empty() ? k : path + "." + k;
+            if (v.is_string()) {
+                const auto s = v.get<std::string>();
+                std::smatch m; static const std::regex env_re(R"(\$\{([A-Z0-9_]+)\})");
+                if (std::regex_search(s, m, env_re)) refs.push_back({{"path", cp}, {"env", m[1].str()}, {"resolved", std::getenv(m[1].str().c_str()) != nullptr}});
+                else { std::string kl = k; std::transform(kl.begin(), kl.end(), kl.begin(), ::tolower);
+                    if (!s.empty() && (kl.find("token") != std::string::npos || kl.find("apikey") != std::string::npos || kl.find("secret") != std::string::npos || kl.find("password") != std::string::npos)) plain.push_back({{"path", cp}}); }
+            } else if (v.is_object() && v.contains("source") && v.contains("id")) refs.push_back({{"path", cp}, {"ref", v}, {"resolved", v["source"] == "env" ? json(std::getenv(v["id"].get<std::string>().c_str()) != nullptr) : json(nullptr)}});
+            else scan(v, cp);
+        }
+    };
+    scan(c.raw, "");
+    int unresolved = 0; for (auto& r : refs) if (r["resolved"] == false) ++unresolved;
+    Out(a->has("--json"), {{"refs", refs}, {"plaintext", plain}, {"unresolved", unresolved}}, [&] {
+        std::cout << refs.size() << " secret reference(s), " << unresolved << " unresolved, " << plain.size() << " plaintext\n";
+        for (auto& r : refs) if (r["resolved"] == false) std::cout << "  unresolved: " << r["path"].get<std::string>() << "\n";
+        for (auto& p : plain) std::cout << "  plaintext: " << p["path"].get<std::string>() << "\n";
+    });
+    return a->has("--check") && (unresolved || !plain.empty()) ? 1 : 0;
+}
+
+int CmdTelemetryShow(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--json"}, "telemetry show"); if (!a) return 2;
+    auto c = LoadCfg(); auto t2 = Get(c.raw, "telemetry"); auto dg = Get(c.raw, "diagnostics");
+    json out{{"telemetry", t2.is_null() ? json::object() : t2}, {"diagnostics", dg.is_null() ? json::object() : dg}, {"enabled", t2.is_object() && t2.value("enabled", false)},
+             {"note", "openclaw-cpp sends no telemetry; this shows the configured values"}};
+    Out(a->has("--json"), out, [&] { std::cout << "telemetry: " << (out["enabled"].get<bool>() ? "enabled" : "disabled") << " (openclaw-cpp sends none)\n"; if (!out["telemetry"].empty()) std::cout << out["telemetry"].dump(2) << "\n"; });
+    return 0;
+}
+
+int CmdNodeIdentity(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--json"}, "node identity"); if (!a) return 2;
+    const auto p = StateDir() / "node" / "identity.json";
+    json id;
+    std::error_code ec;
+    if (fs::exists(p, ec)) { try { id = json::parse(ReadAll(p)); } catch (...) {} }
+    if (!id.is_object() || !id.contains("nodeId")) {
+        char host[256] = {0}; gethostname(host, sizeof host - 1);
+        std::random_device rd; char hex[17]; std::snprintf(hex, sizeof hex, "%08x%08x", rd(), rd());
+        id = {{"nodeId", std::string(host) + "-" + std::string(hex).substr(0, 8)}, {"displayName", host}, {"createdAt", NowIso()}};
+        fs::create_directories(p.parent_path(), ec); std::ofstream(p) << id.dump(2) << "\n"; fs::permissions(p, fs::perms::owner_read | fs::perms::owner_write, ec);
+    }
+    id["path"] = p.string();
+    Out(a->has("--json"), id, [&] { std::cout << id["nodeId"].get<std::string>() << "\t" << id.value("displayName", "") << "\n"; });
+    return 0;
+}
+
+int CmdHealth(int argc, char** argv, const std::string& sub) {
+    auto a = Parse(argc, argv, 3, sub == "probe" ? std::vector<std::string>{"--url=", "--port=", "--ssh=", "--ssh-identity=", "--ssh-auto", "--token=", "--password=", "--timeout=", "--json"}
+                                : sub == "export" ? std::vector<std::string>{"--output=", "--log-lines=", "--log-bytes=", "--url=", "--token=", "--password=", "--timeout=", "--no-stability-bundle", "--json"}
+                                : std::vector<std::string>{}, "health " + sub);
+    if (!a) return 2;
+    if (a->has("--ssh") || a->has("--ssh-auto")) { std::cerr << "health probe: SSH tunnels are not available in openclaw-cpp; pass --url\n"; return 2; }
+    auto c = LoadCfg();
+    std::string url = a->get("--url");
+    if (url.empty() && a->has("--port")) url = "http://127.0.0.1:" + a->get("--port");
+    const auto base = GatewayBase(c.raw, url);
+    const char* envtok = std::getenv("OPENCLAW_GATEWAY_TOKEN");
+    const auto tok = a->get("--token", envtok ? envtok : "");
+    const long to = a->has("--timeout") ? std::max(1L, std::atol(a->get("--timeout").c_str()) / 1000) : 10;
+    std::string err;
+    auto t0 = std::chrono::steady_clock::now();
+    auto h = Rpc(base, tok, "health", json::object(), to, &err);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (sub == "probe") {
+        json out{{"url", base}, {"ok", err.empty()}, {"latencyMs", ms}};
+        if (!err.empty()) out["error"] = err; else out["health"] = h;
+        Out(a->has("--json"), out, [&] { std::cout << base << ": " << (err.empty() ? "ok" : "unreachable: " + err) << " (" << ms << " ms)\n"; });
+        return err.empty() ? 0 : 1;
+    }
+    if (!err.empty()) { std::cerr << "health " << sub << ": gateway unreachable: " << err << "\n"; return 1; }
+    json bundle{{"exportedAt", NowIso()}, {"url", base}, {"health", h}};
+    for (auto m : {"status", "diagnostics.stability", "system.info"}) { std::string e2; auto r = Rpc(base, tok, m, json::object(), to, &e2); bundle[m] = e2.empty() ? r : json{{"error", e2}}; }
+    if (sub == "diagnostics") { std::cout << bundle.dump(2) << "\n"; return 0; }
+    const auto outp = a->get("--output", "openclaw-health-" + NowStamp() + ".json");
+    std::ofstream(outp) << bundle.dump(2) << "\n";
+    Out(a->has("--json"), {{"output", outp}}, [&] { std::cout << "health bundle written to " << outp << "\n"; });
+    return 0;
+}
+
+int CmdClawsExtra(int argc, char** argv, const std::string& sub) {
+    auto a = Parse(argc, argv, 3, sub == "create" ? std::vector<std::string>{"--name=", "--agent-id=", "--json"} : sub == "export" ? std::vector<std::string>{"--out=", "--bootstrap=", "--json"} : std::vector<std::string>{"--json"}, "claws " + sub);
+    if (!a) return 2;
+    if (a->pos.empty()) { std::cerr << "claws " << sub << ": missing argument\n"; return 2; }
+    const auto target = a->pos[0];
+    if (sub == "validate" || sub == "inspect") {
+        auto pk = ReadClaw(target);
+        json out{{"source", pk.source}, {"valid", pk.error.empty()}};
+        if (!pk.error.empty()) out["errors"] = json::array({pk.error});
+        else { out["name"] = pk.name; out["version"] = pk.version; out["agent"] = pk.manifest.value("agent", json::object()); if (sub == "inspect") { out["manifest"] = pk.manifest; out["instructionsBytes"] = pk.instructions.size(); } }
+        Out(a->has("--json"), out, [&] { if (!pk.error.empty()) std::cout << "invalid: " << pk.error << "\n"; else { std::cout << pk.name << " " << pk.version << " — valid\n"; if (sub == "inspect") std::cout << pk.manifest.dump(2) << "\n"; } });
+        return pk.error.empty() ? 0 : 1;
+    }
+    if (sub == "create") {
+        const fs::path dir = target; std::error_code ec;
+        if (fs::exists(dir, ec) && !fs::is_empty(dir, ec)) { std::cerr << "claws create: " << dir.string() << " exists and is not empty\n"; return 1; }
+        const auto name = a->get("--name", dir.filename().string());
+        const auto id = a->get("--agent-id", name);
+        static const std::regex id_re("^[a-z0-9][a-z0-9_-]{0,63}$");
+        if (!std::regex_match(id, id_re)) { std::cerr << "claws create: invalid agent id '" << id << "'\n"; return 1; }
+        fs::create_directories(dir, ec);
+        std::ofstream(dir / "package.json") << json{{"name", name}, {"version", "0.1.0"}, {"openclaw", {{"claw", "CLAW.md"}}}}.dump(2) << "\n";
+        std::ofstream(dir / "CLAW.md") << "---\nschemaVersion: 1\nagent:\n  id: " << id << "\n  name: " << name << "\n---\n\n# " << name << "\n\nDescribe what this agent does.\n";
+        Out(a->has("--json"), {{"path", fs::absolute(dir).string()}, {"agentId", id}}, [&] { std::cout << "created Claw scaffold in " << dir.string() << "\n"; });
+        return 0;
+    }
+    if (sub == "export") {
+        auto st = gateway::ClawStateRead(ClawsDataDir());
+        if (!st["installs"].contains(target)) { std::cerr << "claws export: no installed Claw for agent '" << target << "'\n"; return 1; }
+        auto inst = st["installs"][target];
+        json files = json::object(); const fs::path ws = inst.value("workspace", std::string());
+        json inst_files = inst.value("files", json::object());
+        for (auto& [rel, meta] : inst_files.items()) { std::error_code ec; if (fs::is_regular_file(ws / rel, ec)) files[rel] = ReadAll(ws / rel); }
+        json bundle{{"format", "openclaw.claw-export.v1"}, {"agentId", target}, {"package", inst["package"]}, {"files", files}, {"exportedAt", NowIso()}};
+        const auto outp = a->get("--out", target + ".claw.json");
+        std::ofstream(outp) << bundle.dump(2) << "\n";
+        Out(a->has("--json"), {{"output", outp}, {"files", files.size()}}, [&] { std::cout << "exported " << files.size() << " file(s) to " << outp << "\n"; });
+        return 0;
+    }
+    return -1;
+}
+
+int CmdSandboxExplain(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--session=", "--agent=", "--json"}, "sandbox explain"); if (!a) return 2;
+    auto c = LoadCfg();
+    const auto agent = a->get("--agent", "main");
+    json mode = Get(c.raw, "agents.defaults.sandbox.mode");
+    json ex = Get(c.raw, "tools.exec");
+    json out{{"agentId", agent}, {"sandboxMode", mode.is_null() ? json("off") : mode}, {"exec", ex.is_null() ? json::object() : ex},
+             {"backend", "openclaw-cpp runs exec on the host or a bubblewrap/namespace sandbox when tools.exec.host=sandbox"}};
+    Out(a->has("--json"), out, [&] { std::cout << "agent " << agent << ": sandbox " << out["sandboxMode"].dump() << "\nexec policy: " << out["exec"].dump() << "\n"; });
+    return 0;
+}
+
+int CmdDatabaseStatus(int argc, char** argv) {
+    auto a = Parse(argc, argv, 3, {"--json"}, "database status"); if (!a) return 2;
+    json out{{"backend", "json-files"}, {"sessions", SessionsDir().string()}, {"data", ClawsDataDir().string()},
+             {"sqlite", false}, {"note", "openclaw-cpp stores state as JSON/JSONL files; upstream's SQLite database commands do not apply"}};
+    Out(a->has("--json"), out, [&] { std::cout << "backend: JSON files (no SQLite)\nsessions: " << out["sessions"].get<std::string>() << "\ndata: " << out["data"].get<std::string>() << "\n"; });
+    return 0;
+}
+}  // namespace
+
+int MaybeLocalCommand2(int argc, char** argv) {
+    if (argc < 3) return -1;
+    const std::string cmd = argv[1], sub = argv[2];
+    if (cmd == "transcripts" && sub == "path") return CmdTranscriptsPath(argc, argv);
+    if (cmd == "sessions" && sub == "export-trajectory") return CmdSessionsExportTrajectory(argc, argv);
+    if (cmd == "sessions" && sub == "import") return CmdSessionsImport(argc, argv);
+    if (cmd == "agents" && (sub == "bindings" || sub == "bind" || sub == "unbind")) return CmdAgentsBindings(argc, argv, sub);
+    if (cmd == "backup" && (sub == "create" || sub == "list" || sub == "init" || sub == "enable" || sub == "disable" || sub == "log")) return CmdBackup(argc, argv, sub);
+    if (cmd == "security" && sub == "audit") return CmdSecurityAudit(argc, argv);
+    if (cmd == "secrets" && sub == "audit") return CmdSecretsAudit(argc, argv);
+    if (cmd == "telemetry" && sub == "show") return CmdTelemetryShow(argc, argv);
+    if (cmd == "node" && sub == "identity") return CmdNodeIdentity(argc, argv);
+    if (cmd == "health" && (sub == "probe" || sub == "export" || sub == "diagnostics")) return CmdHealth(argc, argv, sub);
+    if (cmd == "claws" && (sub == "validate" || sub == "inspect" || sub == "create" || sub == "export")) return CmdClawsExtra(argc, argv, sub);
+    if (cmd == "sandbox" && sub == "explain") return CmdSandboxExplain(argc, argv);
+    if (cmd == "database" && sub == "status") return CmdDatabaseStatus(argc, argv);
+    return -1;
+}
+
 int MaybeLocalCommand(int argc, char** argv) {
+    if (int r = MaybeLocalCommand2(argc, argv); r != -1) return r;
     if (argc < 2) return -1;
     const std::string cmd = argv[1];
     if (cmd == "completion") return CmdCompletion(argc, argv);

@@ -108,7 +108,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.112.0-dev";
+constexpr const char* kVersion = "1.113.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3624,7 +3624,7 @@ const std::map<std::pair<std::string, std::string>, CliRoute>& CliRoutes() {
     static const std::map<std::pair<std::string, std::string>, CliRoute> k = {
         {{"devices", ""}, {"device.pair.list", {}}}, {{"devices", "list"}, {"device.pair.list", {}}},
         {{"devices", "approve"}, {"device.pair.approve", {"requestId"}}}, {{"devices", "reject"}, {"device.pair.reject", {"requestId"}}},
-        {{"devices", "remove"}, {"device.pair.remove", {"deviceId"}}}, {{"devices", "rename"}, {"device.pair.rename", {"deviceId", "name"}}},
+        {{"devices", "remove"}, {"device.pair.remove", {"deviceId"}}}, {{"devices", "rename"}, {"device.pair.rename", {"deviceId", "displayName"}}},
         {{"devices", "rotate"}, {"device.token.rotate", {}}}, {{"devices", "revoke"}, {"device.token.revoke", {}}},
         {{"devices", "join-code"}, {"device.pair.setupCode", {}}}, {{"devices", "setupCode"}, {"device.pair.setupCode", {}}},
         {{"devices", "setupStatus"}, {"device.pair.setupStatus", {}}},
@@ -3646,9 +3646,9 @@ const std::map<std::pair<std::string, std::string>, CliRoute>& CliRoutes() {
         {{"secrets", "reload"}, {"secrets.reload", {}}}, {{"secrets", "list"}, {"secrets.store.list", {}}},
         {{"system", ""}, {"system.info", {}}}, {{"system", "info"}, {"system.info", {}}}, {{"system", "event"}, {"system-event", {"text"}}},
         {{"system", "heartbeat"}, {"last-heartbeat", {}}},
-        {{"users", ""}, {"users.list", {}}}, {{"users", "list"}, {"users.list", {}}}, {{"users", "link-email"}, {"users.linkEmail", {"userId", "email"}}},
-        {{"users", "merge"}, {"users.merge", {"sourceUserId", "targetUserId"}}}, {{"users", "self"}, {"users.self", {}}},
-        {{"worktrees", ""}, {"worktrees.list", {}}}, {{"worktrees", "list"}, {"worktrees.list", {}}}, {{"worktrees", "create"}, {"worktrees.create", {"repoRoot"}}},
+        {{"users", ""}, {"users.list", {}}}, {{"users", "list"}, {"users.list", {}}}, {{"users", "link-email"}, {"users.linkEmail", {"targetProfileId", "email"}}},
+        {{"users", "merge"}, {"users.merge", {"sourceProfileId", "targetProfileId"}}}, {{"users", "self"}, {"users.self", {}}},
+        {{"worktrees", ""}, {"worktrees.list", {}}}, {{"worktrees", "list"}, {"worktrees.list", {}}}, {{"worktrees", "create"}, {"worktrees.create", {"repoRoot", "name"}}},
         {{"worktrees", "remove"}, {"worktrees.remove", {"id"}}}, {{"worktrees", "retire-snapshot"}, {"worktrees.retireSnapshot", {"id"}}},
         {{"worktrees", "recover-removal"}, {"worktrees.recoverRemoval", {"id"}}}, {{"worktrees", "restore"}, {"worktrees.restore", {"id"}}},
         {{"worktrees", "gc"}, {"worktrees.gc", {}}},
