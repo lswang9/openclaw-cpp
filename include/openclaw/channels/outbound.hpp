@@ -4,6 +4,7 @@
 
 #include "openclaw/channels/adapter.hpp"
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,8 @@ public:
     // Feishu:   FEISHU_APP_ID/SECRET deferred — record only unless FEISHU_WEBHOOK_URL set
     nlohmann::json SendText(const std::string& chat_id, const std::string& text,
                             const nlohmann::json& extra = {});
+    // Typing indicator: Telegram sendChatAction, Discord POST /channels/{id}/typing; others record only.
+    nlohmann::json SendTyping(const std::string& chat_id);
     nlohmann::json OutboundLog() const;
     void ClearLog();
 
@@ -60,6 +63,7 @@ private:
     std::string webhook_path_;
     bool enabled_ = false;
     std::vector<nlohmann::json> sent_;
+    std::mutex typing_mu_;
 };
 
 }  // namespace openclaw::channels

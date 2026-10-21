@@ -51,6 +51,11 @@ AuthRotatingProvider::AuthRotatingProvider(std::string provider_id, Factory fact
 
 agent::CompletionResult AuthRotatingProvider::Complete(const std::vector<agent::Message>& messages,
                                                        const nlohmann::json& tools) {
+    return CompleteStreaming(messages, tools, nullptr);
+}
+
+agent::CompletionResult AuthRotatingProvider::CompleteStreaming(const std::vector<agent::Message>& messages,
+                                                                const nlohmann::json& tools, DeltaFn on_delta) {
     // Per-agent store (<state>/agents/<agent>/agent/auth-profiles.json); non-main agents fall back to main's
     // profiles when their own store has none for this provider.
     const std::string agent = tools::exec::CurrentContext().agent_id.empty() ? "main" : tools::exec::CurrentContext().agent_id;
@@ -77,7 +82,10 @@ agent::CompletionResult AuthRotatingProvider::Complete(const std::vector<agent::
         last_profile_ = candidates[i].profile_id;
         auto inner = factory_(candidates[i].token);
         if (!inner) continue;
-        last = inner->Complete(messages, tools);
+        bool emitted = false;
+        DeltaFn wrap = on_delta ? DeltaFn([&](std::string_view d) { emitted = true; on_delta(d); }) : DeltaFn();
+        last = on_delta ? inner->CompleteStreaming(messages, tools, wrap) : inner->Complete(messages, tools);
+        if (emitted && !last.ok) return last;  // never rotate after partial output
         if (last.ok) return last;
         // Rotate on auth / rate-limit failures when more profiles remain.
         if ((last.http_status == 401 || last.http_status == 429 || last.http_status == 402) && i + 1 < candidates.size())

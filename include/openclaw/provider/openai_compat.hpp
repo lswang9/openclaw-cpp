@@ -18,6 +18,8 @@ public:
 
     agent::CompletionResult Complete(const std::vector<agent::Message>& messages,
                                      const nlohmann::json& tools) override;
+    agent::CompletionResult CompleteStreaming(const std::vector<agent::Message>& messages,
+                                              const nlohmann::json& tools, DeltaFn on_delta) override;
 
 private:
     std::string name_;

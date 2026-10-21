@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.66.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.67.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,10 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.67.0-dev
+- 逐 token 流式输出：OpenAI 兼容 / DeepSeek 走 SSE（包括分片的 tool_call 参数），有消费方时启用（WS 客户端、插件、或 `agents.defaults.streaming: true`）；插件可以收到 `onPartialReply` / `onTyping` 回调。
+- 输入中提示保活：Discord / Telegram 在 agent 运行期间定时发送 typing（`channels.<id>.typingIntervalSeconds`，默认 6 秒）。还不支持边生成边编辑消息。
 
 ### 1.66.0-dev
 - 每个 agent 有自己的 auth-profiles（自己的 store 里没有该 provider 的 profile 时回退到 main），CLI 支持 `--agent`；Linux 上有 Secret Service 时密钥存进 libsecret 钥匙串，JSON 文件里只留标记。没有 Secret Service 时如实回退到 0600 文件。

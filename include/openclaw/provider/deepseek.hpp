@@ -16,7 +16,10 @@ public:
                                      const nlohmann::json& tools) override;
 
     // SSE streaming: calls on_delta for each content token; returns final aggregated result.
-    using DeltaFn = std::function<void(std::string_view delta)>;
+    agent::CompletionResult CompleteStreaming(const std::vector<agent::Message>& messages,
+                                              const nlohmann::json& tools, DeltaFn on_delta) override {
+        return CompleteStream(messages, tools, std::move(on_delta));
+    }
     agent::CompletionResult CompleteStream(const std::vector<agent::Message>& messages,
                                            const nlohmann::json& tools, DeltaFn on_delta);
 

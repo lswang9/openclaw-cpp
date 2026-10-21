@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.66.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.67.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,14 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.67 Token-level streaming + typing keep-alive
+- real: `Provider::CompleteStreaming(messages, tools, on_delta)`. A shared OpenAI-compatible SSE parser (`StreamChatCompletion`) handles content deltas, **tool_call deltas** (index/id/name/argument fragments concatenated), `finish_reason`, and servers that ignore `stream:true` (falls back to a plain completion object). DeepSeek and OpenAI-compat use it. Router and AuthRotating forward it, and rotation never happens after partial output. The default for other providers is non-streaming with a single delta. Mock streams word by word, with `delayMs` per script entry.
+- real: the agent loop streams every model turn when `LoopOptions.on_delta` is set. The gateway enables it only when someone consumes it: a connected WS client (`agent.delta` events), a plugin reply sink, or `agents.defaults.streaming: true`.
+- real: plugin `dispatchReplyWithBufferedBlockDispatcher` receives `reply.delta` → `dispatcherOptions.onPartialReply({text})` and `reply.typing` → `onTyping()` while the turn runs, on top of the 1.64 paragraph blocks.
+- real: **typing keep-alive** during agent turns: Discord `POST /channels/{id}/typing` and Telegram `sendChatAction typing`, sent immediately and then every `channels.<id>.typingIntervalSeconds` (default 6). `channels.<id>.typing:false` disables it. Other channels record the typing event and emit `agent.typing` on WS. New `TELEGRAM_API_BASE` / `channels.telegram.apiBase` setting for the outbound base URL.
+- tests: `scripts/e2e-streaming-typing.sh` (smoke) uses a fake SSE server that splits a tool call's arguments across chunks, slow content chunks, a plugin that observes partial replies and typing, and Discord typing pings (≥2) with Bot auth.
+- gaps: no live "draft" message editing (Telegram/Discord/Slack partial-message edit streaming). Slack has no bot typing API, so that is record only. Feishu/WhatsApp typing is record only.
 
 ## 1.66 Per-agent auth profiles + OS keychain (libsecret)
 - real: built-in providers (`AuthRotatingProvider`) and plugin providers resolve credentials from the **running agent's** store, `<state>/agents/<agentId>/agent/auth-profiles.json`, using `agents.list[].auth.order` when set and global `auth.order` otherwise. If the agent's store has no profile for the provider, they fall back to `main`'s store. CLI: `models auth paste-token|list|remove … --agent <id>`.

@@ -78,7 +78,8 @@ LoopResult RunAgentLoop(provider::Provider& provider,
             return out;
         }
 
-        auto completion = provider.Complete(out.messages, tools);
+        auto completion = opts.on_delta ? provider.CompleteStreaming(out.messages, tools, opts.on_delta)
+                                        : provider.Complete(out.messages, tools);
         if (!completion.ok) {
             out.ok = false;
             out.error = completion.error.empty() ? "provider failed" : completion.error;

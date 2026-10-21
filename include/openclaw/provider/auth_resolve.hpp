@@ -38,6 +38,8 @@ public:
     void SetConfig(nlohmann::json cfg) { cfg_ = std::move(cfg); }
     agent::CompletionResult Complete(const std::vector<agent::Message>& messages,
                                      const nlohmann::json& tools) override;
+    agent::CompletionResult CompleteStreaming(const std::vector<agent::Message>& messages,
+                                              const nlohmann::json& tools, DeltaFn on_delta) override;
     // Last profile that succeeded (or was attempted).
     std::string LastProfileId() const { return last_profile_; }
 

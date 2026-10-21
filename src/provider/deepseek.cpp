@@ -142,106 +142,13 @@ agent::CompletionResult DeepSeekProvider::Complete(const std::vector<agent::Mess
 agent::CompletionResult DeepSeekProvider::CompleteStream(const std::vector<agent::Message>& messages,
                                                          const nlohmann::json& tools,
                                                          DeltaFn on_delta) {
-    nlohmann::json body;
-    body["model"] = model_;
-    body["stream"] = true;
+    nlohmann::json body{{"model", model_}};
     nlohmann::json msgs = nlohmann::json::array();
-    for (const auto& m : messages) {
-        msgs.push_back(m.ToJson());
-    }
+    for (const auto& m : messages) msgs.push_back(m.ToJson());
     body["messages"] = msgs;
-    if (!tools.empty()) {
-        body["tools"] = tools;
-    }
-    const std::string payload = body.dump();
-    const std::string url = base_url_ + "/v1/chat/completions";
-
-    struct StreamState {
-        std::string buffer;
-        std::string content;
-        DeltaFn* cb = nullptr;
-        bool saw_error = false;
-        std::string error;
-        int http_status = 0;
-    } state;
-    state.cb = &on_delta;
-
-    auto write = [](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
-        auto* st = static_cast<StreamState*>(userdata);
-        st->buffer.append(ptr, size * nmemb);
-        // process complete SSE lines
-        for (;;) {
-            auto pos = st->buffer.find('\n');
-            if (pos == std::string::npos) break;
-            std::string line = st->buffer.substr(0, pos);
-            st->buffer.erase(0, pos + 1);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.rfind("data:", 0) != 0) continue;
-            std::string data = line.substr(5);
-            while (!data.empty() && data.front() == ' ') data.erase(data.begin());
-            if (data == "[DONE]") continue;
-            try {
-                auto j = nlohmann::json::parse(data);
-                if (j.contains("error")) {
-                    st->saw_error = true;
-                    st->error = j["error"].dump();
-                    continue;
-                }
-                if (!j.contains("choices") || j["choices"].empty()) continue;
-                const auto& delta = j["choices"][0].value("delta", nlohmann::json::object());
-                if (delta.contains("content") && delta["content"].is_string()) {
-                    const std::string piece = delta["content"].get<std::string>();
-                    st->content += piece;
-                    if (st->cb && *st->cb) {
-                        (*st->cb)(piece);
-                    }
-                }
-            } catch (...) {
-            }
-        }
-        return size * nmemb;
-    };
-
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        return Fail(0, "", "curl_easy_init failed");
-    }
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "Accept: text/event-stream");
-    const std::string auth = "Authorization: Bearer " + api_key_;
-    headers = curl_slist_append(headers, auth.c_str());
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +write);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &state);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 180L);
-    const CURLcode rc = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    if (rc != CURLE_OK) {
-        return Fail(0, "", std::string("curl error: ") + curl_easy_strerror(rc));
-    }
-    if (http_code == 402) {
-        return Fail(402, state.buffer, "DeepSeek HTTP 402 (insufficient balance or payment required)");
-    }
-    if (http_code < 200 || http_code >= 300) {
-        return Fail(static_cast<int>(http_code), state.buffer,
-                    "DeepSeek HTTP " + std::to_string(http_code));
-    }
-    if (state.saw_error) {
-        return Fail(static_cast<int>(http_code), state.error, "stream error");
-    }
-    agent::CompletionResult r;
-    r.ok = true;
-    r.http_status = static_cast<int>(http_code);
-    r.finish_reason = "stop";
-    r.message.role = "assistant";
-    r.message.content = state.content;
+    if (!tools.empty()) body["tools"] = tools;
+    auto r = StreamChatCompletion(base_url_ + "/v1/chat/completions", api_key_, body, on_delta, "DeepSeek");
+    if (!r.ok && r.http_status == 402) r.error = "DeepSeek HTTP 402 (insufficient balance or payment required)";
     return r;
 }
 

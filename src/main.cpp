@@ -94,7 +94,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.66.0-dev";
+constexpr const char* kVersion = "1.67.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2849,7 +2849,7 @@ int CmdGateway(int argc, char** argv, int argi) {
                                                         {"function", {{"name", c.name}, {"arguments", c.arguments_json}}}});
                     }
                 }
-                mock_prov->Enqueue(r);
+                mock_prov->Enqueue(r, s.value("delayMs", 0));
             }
             std::cerr << "[gateway] mock script loaded: " << arr.size() << " completions\n";
         }

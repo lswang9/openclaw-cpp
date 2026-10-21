@@ -126,4 +126,134 @@ agent::CompletionResult OpenAiCompatProvider::Complete(const std::vector<agent::
     }
 }
 
+agent::CompletionResult StreamChatCompletion(const std::string& url, const std::string& bearer,
+                                             const nlohmann::json& body_in, const Provider::DeltaFn& on_delta,
+                                             const std::string& label) {
+    nlohmann::json body = body_in;
+    body["stream"] = true;
+    const std::string payload = body.dump();
+    struct St {
+        std::string buf, raw, content, finish = "stop", err;
+        std::vector<agent::ToolCall> calls;
+        const Provider::DeltaFn* cb = nullptr;
+    } st;
+    st.cb = &on_delta;
+    auto write = [](char* ptr, size_t size, size_t n, void* ud) -> size_t {
+        auto* s = static_cast<St*>(ud);
+        s->buf.append(ptr, size * n);
+        if (s->raw.size() < (8u << 20)) s->raw.append(ptr, size * n);
+        for (;;) {
+            auto pos = s->buf.find('\n');
+            if (pos == std::string::npos) break;
+            std::string line = s->buf.substr(0, pos);
+            s->buf.erase(0, pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("data:", 0) != 0) continue;
+            std::string data = line.substr(5);
+            while (!data.empty() && data.front() == ' ') data.erase(data.begin());
+            if (data == "[DONE]") continue;
+            auto j = nlohmann::json::parse(data, nullptr, false);
+            if (!j.is_object()) continue;
+            if (j.contains("error")) { s->err = j["error"].dump(); continue; }
+            if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty()) continue;
+            const auto& ch = j["choices"][0];
+            if (ch.contains("finish_reason") && ch["finish_reason"].is_string()) s->finish = ch["finish_reason"];
+            const auto d = ch.value("delta", nlohmann::json::object());
+            if (d.contains("content") && d["content"].is_string()) {
+                const std::string piece = d["content"];
+                s->content += piece;
+                if (*s->cb && !piece.empty()) (*s->cb)(piece);
+            }
+            if (d.contains("tool_calls") && d["tool_calls"].is_array())
+                for (const auto& tc : d["tool_calls"]) {
+                    const std::size_t idx = tc.value("index", static_cast<int>(s->calls.size()));
+                    if (s->calls.size() <= idx) s->calls.resize(idx + 1);
+                    auto& c = s->calls[idx];
+                    if (tc.contains("id") && tc["id"].is_string()) c.id = tc["id"];
+                    if (tc.contains("function")) {
+                        const auto& f = tc["function"];
+                        if (f.contains("name") && f["name"].is_string()) c.name += f["name"].get<std::string>();
+                        if (f.contains("arguments") && f["arguments"].is_string()) c.arguments_json += f["arguments"].get<std::string>();
+                    }
+                }
+        }
+        return size * n;
+    };
+    CURL* curl = curl_easy_init();
+    if (!curl) return Fail(0, "", "curl_easy_init failed");
+    curl_slist* h = curl_slist_append(nullptr, "Content-Type: application/json");
+    h = curl_slist_append(h, "Accept: text/event-stream");
+    const std::string auth = "Authorization: Bearer " + bearer;
+    h = curl_slist_append(h, auth.c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &st);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 180L);
+    const CURLcode rc = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(h);
+    curl_easy_cleanup(curl);
+    if (rc != CURLE_OK) return Fail(0, "", label + " curl error: " + curl_easy_strerror(rc));
+    if (code < 200 || code >= 300) return Fail(static_cast<int>(code), st.raw, label + " HTTP " + std::to_string(code));
+    if (!st.err.empty()) return Fail(static_cast<int>(code), st.err, label + " stream error");
+    if (st.content.empty() && st.calls.empty()) {
+        // Server ignored stream:true and answered with a plain completion object.
+        auto j = nlohmann::json::parse(st.raw, nullptr, false);
+        if (j.is_object() && j.contains("choices") && j["choices"].is_array() && !j["choices"].empty()) {
+            agent::CompletionResult r;
+            r.ok = true;
+            r.http_status = static_cast<int>(code);
+            r.finish_reason = j["choices"][0].value("finish_reason", "stop");
+            r.message = agent::Message::FromJson(j["choices"][0].at("message"));
+            if (r.message.tool_calls.is_array())
+                for (const auto& tc : r.message.tool_calls) {
+                    agent::ToolCall c;
+                    c.id = tc.value("id", "");
+                    if (tc.contains("function")) {
+                        c.name = tc["function"].value("name", "");
+                        const auto& a = tc["function"].value("arguments", nlohmann::json("{}"));
+                        c.arguments_json = a.is_string() ? a.get<std::string>() : a.dump();
+                    }
+                    r.tool_calls.push_back(c);
+                }
+            if (on_delta && !r.message.content.empty()) on_delta(r.message.content);
+            return r;
+        }
+    }
+    agent::CompletionResult r;
+    r.ok = true;
+    r.http_status = static_cast<int>(code);
+    r.finish_reason = st.finish;
+    r.message.role = "assistant";
+    r.message.content = st.content;
+    if (!st.calls.empty()) {
+        r.message.tool_calls = nlohmann::json::array();
+        for (std::size_t i = 0; i < st.calls.size(); ++i) {
+            auto& c = st.calls[i];
+            if (c.id.empty()) c.id = "call_" + std::to_string(i);
+            if (c.arguments_json.empty()) c.arguments_json = "{}";
+            r.message.tool_calls.push_back({{"id", c.id}, {"type", "function"},
+                                            {"function", {{"name", c.name}, {"arguments", c.arguments_json}}}});
+        }
+        r.tool_calls = st.calls;
+        if (r.finish_reason == "stop") r.finish_reason = "tool_calls";
+    }
+    return r;
+}
+
+agent::CompletionResult OpenAiCompatProvider::CompleteStreaming(const std::vector<agent::Message>& messages,
+                                                                const nlohmann::json& tools, DeltaFn on_delta) {
+    nlohmann::json body{{"model", model_}};
+    nlohmann::json msgs = nlohmann::json::array();
+    for (const auto& m : messages) msgs.push_back(m.ToJson());
+    body["messages"] = msgs;
+    if (!tools.empty()) body["tools"] = tools;
+    std::string url = base_url_;
+    if (!url.empty() && url.back() == '/') url.pop_back();
+    return StreamChatCompletion(url + "/v1/chat/completions", api_key_, body, on_delta, name_);
+}
+
 }  // namespace openclaw::provider

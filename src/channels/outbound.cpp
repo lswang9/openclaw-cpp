@@ -7,6 +7,17 @@
 
 namespace openclaw::channels {
 namespace {
+std::string TrimSlash(std::string s) { while (!s.empty() && s.back() == '/') s.pop_back(); return s; }
+std::string TelegramBase(const nlohmann::json& cfg) {
+    auto b = ChannelCred(cfg, "telegram", "apiBase", "TELEGRAM_API_BASE");
+    return b.empty() ? "https://api.telegram.org" : TrimSlash(b);
+}
+std::string DiscordBase(const nlohmann::json& cfg) {
+    auto b = ChannelCred(cfg, "discord", "apiBase", "DISCORD_API_BASE");
+    return b.empty() ? "https://discord.com/api/v10" : TrimSlash(b);
+}
+}  // namespace
+namespace {
 
 size_t WriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* out = static_cast<std::string*>(userdata);
@@ -99,7 +110,7 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
     if (id_ == "telegram") {
         const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
         if (!token.empty() && !chat_id.empty()) {
-            const std::string url = "https://api.telegram.org/bot" + token + "/sendMessage";
+            const std::string url = TelegramBase(Config()) + "/bot" + token + "/sendMessage";
             http_result = HttpPostJson(url, {{"chat_id", chat_id}, {"text", text}}, {});
             entry["mode"] = "live_http";
             entry["delivered"] = http_result.value("http", 0) >= 200 && http_result.value("http", 0) < 300;
@@ -108,7 +119,7 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
     } else if (id_ == "discord") {
         const auto token = ChannelCred(Config(), "discord", "token", "DISCORD_BOT_TOKEN");
         if (!token.empty() && !chat_id.empty()) {
-            const std::string url = "https://discord.com/api/v10/channels/" + chat_id + "/messages";
+            const std::string url = DiscordBase(Config()) + "/channels/" + chat_id + "/messages";
             http_result = HttpPostJson(url, {{"content", text}},
                                        {"Authorization: Bot " + token});
             entry["mode"] = "live_http";
@@ -170,6 +181,32 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
             {"mode", entry["mode"]},
             {"entry", entry},
             {"sent_count", sent_.size()}};
+}
+
+nlohmann::json OutboundRecordAdapter::SendTyping(const std::string& chat_id) {
+    nlohmann::json entry{{"ts_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::system_clock::now().time_since_epoch()).count()},
+                         {"channel", id_}, {"chat_id", chat_id}, {"type", "typing"}, {"mode", "record_only"}, {"delivered", false}};
+    nlohmann::json http;
+    if (id_ == "telegram") {
+        const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
+        if (!token.empty() && !chat_id.empty())
+            http = HttpPostJson(TelegramBase(Config()) + "/bot" + token + "/sendChatAction", {{"chat_id", chat_id}, {"action", "typing"}}, {});
+    } else if (id_ == "discord") {
+        const auto token = ChannelCred(Config(), "discord", "token", "DISCORD_BOT_TOKEN");
+        if (!token.empty() && !chat_id.empty())
+            http = HttpPostJson(DiscordBase(Config()) + "/channels/" + chat_id + "/typing", nlohmann::json::object(), {"Authorization: Bot " + token});
+    }
+    if (!http.is_null()) {
+        entry["mode"] = "live_http";
+        entry["http"] = http;
+        entry["delivered"] = http.value("http", 0) >= 200 && http.value("http", 0) < 300;
+    }
+    {
+        std::lock_guard l(typing_mu_);
+        sent_.push_back(entry);
+    }
+    return entry;
 }
 
 nlohmann::json OutboundRecordAdapter::OutboundLog() const { return sent_; }

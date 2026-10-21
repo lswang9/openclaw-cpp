@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boots gateway with mock provider (no live LLM) and hits HTTP surface.
-set -e
-export OPENCLAW_KEYCHAIN="${OPENCLAW_KEYCHAIN:-off}"  # deterministic: no host Secret Service in smokeuo pipefail
+set -euo pipefail
+export OPENCLAW_KEYCHAIN="${OPENCLAW_KEYCHAIN:-off}"  # deterministic: no host Secret Service in smoke
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT="${OPENCLAW_SMOKE_PORT:-18796}"
@@ -297,4 +297,5 @@ OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-auth-rotation.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-embeddings-ollama-gguf.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-voice-providers.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-auth-agents-keychain.sh"
+OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-streaming-typing.sh"
 echo "[smoke] ALL PASS"

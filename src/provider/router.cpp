@@ -53,4 +53,10 @@ agent::CompletionResult Router::CompleteRoute(const std::string& route,
     return p->Complete(messages, tools);
 }
 
+agent::CompletionResult Router::CompleteStreaming(const std::vector<agent::Message>& messages,
+                                                  const nlohmann::json& tools, DeltaFn on_delta) {
+    if (auto* p = Resolve(default_)) return p->CompleteStreaming(messages, tools, std::move(on_delta));
+    return Complete(messages, tools);
+}
+
 }  // namespace openclaw::provider

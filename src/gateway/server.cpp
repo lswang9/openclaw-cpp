@@ -1,4 +1,5 @@
 #include "openclaw/gateway/server.hpp"
+#include "openclaw/util.hpp"
 #include "openclaw/net/safe_fetch.hpp"
 #include <openssl/evp.h>
 #include "openclaw/voice/stt.hpp"
@@ -45,7 +46,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.66.0-dev";
+constexpr const char* kVersion = "1.67.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -433,6 +434,12 @@ std::string B64(const std::string& in) {
 }
 }  // namespace
 
+namespace {
+// Set by deferred plugin agent.reply threads: receives token deltas of that turn.
+thread_local std::function<void(std::string_view)> tl_reply_delta_sink;
+thread_local std::function<void()> tl_reply_typing_sink;
+}  // namespace
+
 nlohmann::json Server::PluginHostCall(long long id, const std::string& method, const nlohmann::json& p) {
     const std::string plugin = p.value("plugin", "");
     auto entry = config::GetPath(deps_.config.raw, "plugins.entries." + plugin);
@@ -497,11 +504,19 @@ nlohmann::json Server::PluginHostCall(long long id, const std::string& method, c
         host_threads_.emplace_back([this, id, m, limit, stream] {
             std::string reply;
             std::string err;
+            if (stream && deps_.js_host) {
+                tl_reply_delta_sink = [this, id](std::string_view d) {
+                    deps_.js_host->SendHostEvent(id, "reply.delta", {{"text", std::string(d)}});
+                };
+                tl_reply_typing_sink = [this, id] { deps_.js_host->SendHostEvent(id, "reply.typing", nlohmann::json::object()); };
+            }
             try {
                 reply = DeliverInbound(m);
             } catch (const std::exception& e) {
                 err = e.what();
             }
+            tl_reply_delta_sink = nullptr;
+            tl_reply_typing_sink = nullptr;
             nlohmann::json blocks = nlohmann::json::array();
             std::size_t i = 0;
             while (i < reply.size()) {
@@ -1231,7 +1246,47 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });
+        // Token streaming: only when someone consumes it (WS clients, plugin reply sink, or config opt-in).
+        bool want_stream = static_cast<bool>(tl_reply_delta_sink);
+        { std::lock_guard lock(ws_mu_); want_stream = want_stream || !ws_clients_.empty(); }
+        if (auto s = config::GetPath(deps_.config.raw, "agents.defaults.streaming"); s && s->is_boolean()) want_stream = want_stream || s->get<bool>();
+        if (want_stream) {
+            auto sink = tl_reply_delta_sink;
+            const std::string key = msg.session_key;
+            lopts.on_delta = [this, sink, key](std::string_view d) {
+                Emit("agent.delta", {{"sessionKey", key}, {"delta", std::string(d)}});
+                if (sink) sink(d);
+            };
+        }
+        // Typing keep-alive while the turn runs (channels.<id>.typing != false; interval typingIntervalSeconds, default 6).
+        std::atomic<bool> typing_stop{false};
+        std::thread typing;
+        {
+            auto* out = dynamic_cast<channels::OutboundRecordAdapter*>(deps_.adapters.Get(msg.channel));
+            auto en = config::GetPath(deps_.config.raw, "channels." + msg.channel + ".typing");
+            const bool enabled = !(en && en->is_boolean() && !en->get<bool>());
+            long interval_ms = 6000;
+            if (auto iv = config::GetPath(deps_.config.raw, "channels." + msg.channel + ".typingIntervalSeconds"); iv && iv->is_number())
+                interval_ms = static_cast<long>(iv->get<double>() * 1000);
+            if (auto e = ::openclaw::EnvOr("OPENCLAW_TYPING_INTERVAL_MS", ""); !e.empty()) interval_ms = std::stol(e);
+            interval_ms = std::max(200L, interval_ms);
+            const std::string chat = msg.conversation_id.empty() ? msg.sender : msg.conversation_id;
+            auto plugin_typing = tl_reply_typing_sink;
+            if (enabled && ((out && !chat.empty()) || plugin_typing)) {
+                typing = std::thread([out, chat, interval_ms, plugin_typing, &typing_stop, this, key = msg.session_key] {
+                    while (!typing_stop.load()) {
+                        if (out) out->SendTyping(chat);
+                        if (plugin_typing) plugin_typing();
+                        Emit("agent.typing", {{"sessionKey", key}});
+                        for (long w = 0; w < interval_ms && !typing_stop.load(); w += 50)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                });
+            }
+        }
         result = agent::RunAgentLoop(*prov, tools, assembled, lopts);
+        typing_stop.store(true);
+        if (typing.joinable()) typing.join();
         run_cancel->store(true);  // stop watcher
         if (watch.joinable()) watch.join();
     }

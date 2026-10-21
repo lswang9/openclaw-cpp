@@ -22,6 +22,8 @@ public:
 
     agent::CompletionResult Complete(const std::vector<agent::Message>& messages,
                                      const nlohmann::json& tools) override;
+    agent::CompletionResult CompleteStreaming(const std::vector<agent::Message>& messages,
+                                              const nlohmann::json& tools, DeltaFn on_delta) override;
 
     // Complete with explicit route (does not change default).
     agent::CompletionResult CompleteRoute(const std::string& route,

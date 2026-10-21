@@ -182,6 +182,8 @@ function makeRuntime(rec) {
               conversationId: ctx.conversationId || ctx.To, sessionKey: ctx.sessionKey || ctx.SessionKey, accountId: ctx.accountId || ctx.AccountId,
               chatType: ctx.chatType || ctx.ChatType, blockLimit: d.blockLimit || 2000, stream: d.stream !== false },
               async (ev) => {
+                if (ev.type === 'reply.delta') { if (typeof d.onPartialReply === 'function') await d.onPartialReply({ text: ev.text || '' }); return; }
+                if (ev.type === 'reply.typing') { if (typeof d.onTyping === 'function') await d.onTyping(); return; }
                 if (ev.type !== 'reply.block') return;
                 const kind = ev.kind || 'block';
                 await d.deliver({ text: ev.text || '' }, { kind });

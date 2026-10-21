@@ -30,6 +30,8 @@ struct LoopOptions {
     std::function<nlohmann::json(const std::string& tool, const nlohmann::json& params)> before_tool_call;
     std::function<void(const std::string& tool, const nlohmann::json& params, const std::string& result,
                        long long duration_ms, const std::string& error)> after_tool_call;
+    // Token-level streaming of assistant content (all turns). Set → provider.CompleteStreaming is used.
+    std::function<void(std::string_view delta)> on_delta;
 };
 
 class RateBucket {
