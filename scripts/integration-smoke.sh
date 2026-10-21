@@ -109,7 +109,10 @@ CFG
   MA=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/json' \
     -d '{"type":"event_callback","event":{"type":"message","text":"route me","user":"U8","channel":"C8","channel_type":"channel","ts":"8.0"}}')
   echo "$MA" | grep -q 'samplellm/echo-1' || { echo "[smoke] work agent model not used: $MA" >&2; exit 1; }
-  grep -q 'agent:work:slack:channel:C8' "$OPENCLAW_SESSION_DIR/sessions.json" || { echo "[smoke] agent:work session key missing" >&2; exit 1; }
+  WORK_SESS="$OPENCLAW_DATA_DIR/agents/work/sessions/sessions.json"
+  grep -q 'agent:work:slack:channel:C8' "$WORK_SESS" || { echo "[smoke] agent:work session key missing in $WORK_SESS" >&2; ls -R "$OPENCLAW_DATA_DIR/agents" 2>/dev/null >&2; exit 1; }
+  # main still uses the legacy OPENCLAW_SESSION_DIR; work must NOT share that index
+  ! grep -q 'agent:work:' "$OPENCLAW_SESSION_DIR/sessions.json" 2>/dev/null || { echo "[smoke] work session leaked into main store" >&2; exit 1; }
   rpc '{"jsonrpc":"2.0","id":15,"method":"agents.route","params":{"channel":"slack","peerKind":"channel","peerId":"C1"}}' | grep -q '"agentId": *"main"' || { echo "[smoke] default route wrong" >&2; exit 1; }
   rm -f "$OPENCLAW_CONFIG_PATH"; sleep 1
   echo "[smoke] multi-agent binding: slack C8 -> agent:work (plugin provider model), others -> main"

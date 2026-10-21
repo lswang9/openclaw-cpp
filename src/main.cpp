@@ -22,6 +22,7 @@
 #include "openclaw/plugins/js_host.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
 #include "openclaw/agent/routing.hpp"
+#include "openclaw/agent/pool.hpp"
 #include "openclaw/board/store.hpp"
 #include "openclaw/canvas/store.hpp"
 #include "openclaw/auth/device_link.hpp"
@@ -85,7 +86,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.50.0-dev";
+constexpr const char* kVersion = "1.51.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1804,6 +1805,45 @@ int CmdSelfTest() {
         if (!ok) { std::cerr << "FAIL webhook signing\n"; ++failures; }
         else std::cerr << "PASS webhook signing (Slack HMAC v0 + replay window, Discord Ed25519, form bodies)\n";
     }
+    // per-agent isolation (1.51)
+    {
+        const auto tmp = std::filesystem::temp_directory_path() / ("oc-agents-" + std::to_string(getpid()));
+        setenv("OPENCLAW_AGENTS_DIR", tmp.c_str(), 1);
+        unsetenv("OPENCLAW_SESSION_DIR");
+        nlohmann::json raw = {{"tools", {{"deny", nlohmann::json::array({"http_get"})}}},
+                              {"agents", {{"list", nlohmann::json::array({
+                                  {{"id", "main"}, {"default", true}},
+                                  {{"id", "coder"}, {"workspace", (tmp / "coder-ws").string()},
+                                   {"tools", {{"profile", "coding"}, {"deny", nlohmann::json::array({"browser_*"})}}},
+                                   {"sandbox", {{"mode", "all"}, {"backend", "bwrap"}}}}})}}}};
+        std::filesystem::create_directories(tmp / "coder-ws");
+        auto iso_m = agent::ResolveIsolation(raw, "main");
+        auto iso_c = agent::ResolveIsolation(raw, "coder");
+        bool ok = iso_m.sessions_root == tmp / "main" / "sessions" &&
+                  iso_c.sessions_root == tmp / "coder" / "sessions" &&
+                  iso_c.workspace_root == tmp / "coder-ws" &&
+                  iso_c.memory_index == tmp / "coder" / "memory" / "index.json" &&
+                  iso_c.tools.profile == "coding" && iso_c.sandbox.value("mode", "") == "all";
+        ok = ok && agent::ToolAllowed(iso_c.tools, "exec") && agent::ToolAllowed(iso_c.tools, "read") &&
+             !agent::ToolAllowed(iso_c.tools, "browser_screenshot") &&
+             !agent::ToolAllowed(iso_m.tools, "http_get") && agent::ToolAllowed(iso_m.tools, "read");
+        approvals::Store ap;
+        tools::RegistryOptions bo; bo.approvals = &ap; bo.workspace_root = (tmp / "main-ws").string();
+        tools::Registry base = tools::MakeDefaultRegistry(bo);
+        base.Register({"browser_screenshot", "x", {{"type", "object"}}, [](const nlohmann::json&) { return "{}"; }});
+        agent::Pool pool(&base, &ap);
+        pool.SetConfig(raw);
+        auto& rt = pool.Get("coder");
+        ok = ok && rt.tools->Has("exec") && rt.tools->Has("read") && !rt.tools->Has("browser_screenshot") &&
+             !rt.tools->Has("http_get");
+        rt.sessions->Save("agent:coder:main", {{.role = "user", .content = "hi"}});
+        ok = ok && rt.sessions->Exists("agent:coder:main") && !pool.Get("main").sessions->Exists("agent:coder:main");
+        ok = ok && rt.iso.memory_index != pool.Get("main").iso.memory_index;
+        unsetenv("OPENCLAW_AGENTS_DIR");
+        std::filesystem::remove_all(tmp);
+        if (!ok) { std::cerr << "FAIL per-agent isolation\n"; ++failures; }
+        else std::cerr << "PASS per-agent isolation (sessions/tools/memory/workspace/sandbox per agents.list)\n";
+    }
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -2542,7 +2582,7 @@ int CmdGateway(int argc, char** argv, int argi) {
     auth::DeviceLinkStore device_links(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "device_links.json");
     canvas::Store canvas_store(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "canvas");
     events::Bus bus;
-    agent::FileStore agent_files(std::filesystem::path(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions")) / "agents");
+    agent::FileStore agent_files(agent::AgentsRoot());
     auto& logs = logging::GlobalLog();
     logs.Append("info", "gateway starting");
 
@@ -2586,12 +2626,16 @@ int CmdGateway(int argc, char** argv, int argi) {
     // Keep DeepSeekProvider for streaming path
     provider::DeepSeekProvider deepseek(ds_key, ds_base, ds_model);
 
+    agent::Pool agent_pool(&tools, &approvals);
+    agent_pool.SetConfig(cfg.raw);
+
     gateway::ServerDeps deps{
         .provider = router,
         .router = &router,
         .deepseek = &deepseek,
         .tools = tools,
         .sessions = sessions,
+        .agent_pool = &agent_pool,
         .channels = channels,
         .adapters = adapters,
         .skills = skills,

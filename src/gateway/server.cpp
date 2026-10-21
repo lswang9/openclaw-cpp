@@ -12,6 +12,7 @@
 #include "openclaw/channels/discord_commands.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
 #include "openclaw/agent/routing.hpp"
+#include "openclaw/agent/pool.hpp"
 #include "openclaw/tools/exec.hpp"
 #include "openclaw/channels/signing.hpp"
 #include "openclaw/channels/feishu.hpp"
@@ -41,7 +42,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.50.0-dev";
+constexpr const char* kVersion = "1.51.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -583,6 +584,7 @@ nlohmann::json Server::ReloadConfigNow() {
     // 1) skills + system prompt
     bool prompt_changed = false;
     { std::lock_guard l(agent_prompts_mu_); agent_prompts_.clear(); }
+    if (deps_.agent_pool) deps_.agent_pool->SetConfig(deps_.config.raw);
     if (deps_.rebuild_system_prompt) {
         auto np = deps_.rebuild_system_prompt();
         prompt_changed = np != deps_.system_prompt;
@@ -606,6 +608,8 @@ nlohmann::json Server::ReloadConfigNow() {
             deps_.js_host->Stop();
             deps_.js_host->SetConfig(deps_.config.raw);  // plugins.entries.<id>.config etc. take effect
             deps_.js_host->Start(deps_.plugins.Root());
+            deps_.js_host->RegisterTools(deps_.tools);
+            if (deps_.agent_pool) deps_.agent_pool->SetConfig(deps_.config.raw);
             plugins_restarted = true;
         }
     }
@@ -632,9 +636,18 @@ void Server::MaybeReloadConfig() {
     ReloadConfigNow();
 }
 
+session::Store& Server::SessionsFor(const std::string& agent_id) {
+    if (deps_.agent_pool) return *deps_.agent_pool->Get(agent_id).sessions;
+    return deps_.sessions;
+}
+tools::Registry& Server::ToolsFor(const std::string& agent_id) {
+    if (deps_.agent_pool) return *deps_.agent_pool->Get(agent_id).tools;
+    return deps_.tools;
+}
 std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     MaybeReloadConfig();
     channels::InboundMessage msg = msg_in;
+    std::string legacy_migrate_from;
     {
         // Upstream session keys (agent:main:main / :<ch>:group:<id> / :channel: / :thread:), unless the caller
         // passed an explicit key or config opts out (session.keyFormat: "legacy").
@@ -659,15 +672,26 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
             kp.conversation_id = msg.conversation_id;
             kp.thread_id = msg.thread_id;
             auto scope = config::GetPath(deps_.config.raw, "session.dmScope");
-            const std::string legacy = msg.session_key;
+            legacy_migrate_from = msg.session_key;
             msg.session_key = session::BuildSessionKey(kp, scope && scope->is_string() ? scope->get<std::string>() : "main");
             if (msg.chat_type.empty()) msg.chat_type = kp.chat_type;
-            // one-time migration of the pre-1.38 transcript into the canonical key
-            if (!legacy.empty() && legacy != msg.session_key && !deps_.sessions.Exists(msg.session_key) &&
-                deps_.sessions.Exists(legacy)) {
-                deps_.sessions.Save(msg.session_key, deps_.sessions.Load(legacy));
-                Emit("session.migrated", {{"from", legacy}, {"to", msg.session_key}});
-            }
+            if (legacy_migrate_from == msg.session_key) legacy_migrate_from.clear();
+        }
+    }
+    const std::string agent_id = [&] {
+        auto a = agent::routing::AgentFromSessionKey(msg.session_key);
+        return a.empty() ? agent::routing::DefaultAgentId(deps_.config.raw) : a;
+    }();
+    session::Store& sessions = SessionsFor(agent_id);
+    tools::Registry& tools = ToolsFor(agent_id);
+    if (!legacy_migrate_from.empty() && !sessions.Exists(msg.session_key)) {
+        // Prefer the agent store; fall back to the legacy shared store.
+        if (sessions.Exists(legacy_migrate_from)) {
+            sessions.Save(msg.session_key, sessions.Load(legacy_migrate_from));
+            Emit("session.migrated", {{"from", legacy_migrate_from}, {"to", msg.session_key}});
+        } else if (deps_.sessions.Exists(legacy_migrate_from)) {
+            sessions.Save(msg.session_key, deps_.sessions.Load(legacy_migrate_from));
+            Emit("session.migrated", {{"from", legacy_migrate_from}, {"to", msg.session_key}});
         }
     }
     // Channel-bound ACP: slack/feishu/discord → session/prompt + outbound reply
@@ -723,12 +747,12 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         std::string rest;
         if (session::ParseResetCommand(text_in, rest)) {
             PluginSessionHook("session_end", msg.session_key, "reset");
-            auto e = deps_.sessions.Reset(msg.session_key, "command");
+            auto e = sessions.Reset(msg.session_key, "command");
             PluginSessionHook("session_start", msg.session_key, "reset");
             Emit("session.reset", {{"sessionKey", msg.session_key}, {"sessionId", e.value("sessionId", "")}, {"reason", "command"}});
             if (rest.empty()) return "✅ New session started.";
             text_in = rest;
-        } else if (deps_.sessions.ResetIfStale(msg.session_key, session::PolicyFor(deps_.config.raw, msg.channel,
+        } else if (sessions.ResetIfStale(msg.session_key, session::PolicyFor(deps_.config.raw, msg.channel,
                                           msg.chat_type.empty() ? session::InferChatType(msg.session_key) : msg.chat_type))) {
             Emit("session.reset", {{"sessionKey", msg.session_key}, {"reason", "policy"}});
             PluginSessionHook("session_end", msg.session_key, "policy");
@@ -740,9 +764,9 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         std::string instr;
         if (context::ParseCompactCommand(text_in, instr)) {
             auto pol = context::CompactionFromConfig(deps_.config.raw);
-            auto cr = context::CompactWithSummary(*cprov, deps_.sessions.Load(msg.session_key), pol.keep_recent, instr);
+            auto cr = context::CompactWithSummary(*cprov, sessions.Load(msg.session_key), pol.keep_recent, instr);
             if (!cr.compacted) return "Nothing to compact.";
-            deps_.sessions.Save(msg.session_key, cr.messages);
+            sessions.Save(msg.session_key, cr.messages);
             Emit("session.compacted", {{"sessionKey", msg.session_key}, {"before", cr.before_tokens},
                                        {"after", cr.after_tokens}, {"summarized", cr.summarized}, {"manual", true}});
             return "🧹 Compacted session: ~" + std::to_string(cr.before_tokens) + " → ~" +
@@ -756,7 +780,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         return h;
     }
     if (text_in == "/status") {
-        auto msgs = deps_.sessions.Load(msg.session_key);
+        auto msgs = sessions.Load(msg.session_key);
         return "Session " + msg.session_key + ": " + std::to_string(msgs.size()) + " messages, ~" +
                std::to_string(context::EstimateTokens(msgs)) + " tokens.";
     }
@@ -790,7 +814,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
             auto skill_entries = config::GetPath(deps_.config.raw, "skills.entries").value_or(nlohmann::json::object());
             skills::ScopedEnv skill_env(skills::SkillEnvOverrides(deps_.skills.List(), skill_entries));
             std::string out;
-            try { out = deps_.tools.Invoke(sc->dispatch_tool, skills::DispatchArgs(*sc)); }
+            try { out = tools.Invoke(sc->dispatch_tool, skills::DispatchArgs(*sc)); }
             catch (const std::exception& e) { out = std::string("error: ") + e.what(); }
             try {
                 auto j = nlohmann::json::parse(out);
@@ -800,7 +824,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         }
         text_in = sc->prompt;
     }
-    auto messages = deps_.sessions.Load(msg.session_key);
+    auto messages = sessions.Load(msg.session_key);
     if (messages.empty()) PluginSessionHook("session_start", msg.session_key, "new");
     std::string content = text_in;
     if (!msg.sender.empty()) {
@@ -834,10 +858,6 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "user"}, {"text", msg.text},
                              {"channel", msg.channel}, {"sender", msg.sender}});
     context::AssembleOptions aopts;
-    const std::string agent_id = [&] {
-        auto a = agent::routing::AgentFromSessionKey(msg.session_key);
-        return a.empty() ? agent::routing::DefaultAgentId(deps_.config.raw) : a;
-    }();
     aopts.system_prompt = AgentSystemPrompt(agent_id);
     if (deps_.js_host && deps_.js_host->HasHook("before_agent_start")) {
         auto h = deps_.js_host->EmitHook("before_agent_start", {{"prompt", content}}, {{"sessionKey", msg.session_key}});
@@ -863,7 +883,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         skills::ScopedEnv skill_env(skills::SkillEnvOverrides(deps_.skills.List(), skill_entries));
         tools::exec::ScopedRunContext exec_ctx({agent_id, msg.session_key, msg.channel,
                                                 msg.conversation_id.empty() ? msg.sender : msg.conversation_id, msg.sender});
-        result = agent::RunAgentLoop(*prov, deps_.tools, assembled, lopts);
+        result = agent::RunAgentLoop(*prov, tools, assembled, lopts);
     }
     for (const auto& w : result.warnings) {
         deps_.logs.Append("warn", w);
@@ -874,7 +894,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         // (never the assembled/pruned view or the injected system prompt).
         std::vector<agent::Message> full = messages;
         for (std::size_t i = assembled.size(); i < result.messages.size(); ++i) full.push_back(result.messages[i]);
-        deps_.sessions.Save(msg.session_key, full);
+        sessions.Save(msg.session_key, full);
         deps_.logs.Append("info", "chat ok session=" + msg.session_key);
         Emit("chat", {{"sessionKey", msg.session_key}, {"text", result.final_text}, {"turns", result.turns},
                       {"warnings", result.warnings}});

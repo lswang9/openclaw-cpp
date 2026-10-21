@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.50.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.51.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -78,3 +78,9 @@
 - real: Discord interactions Ed25519 (DISCORD_PUBLIC_KEY or channels.discord.publicKey) over `X-Signature-Timestamp + body` → 401 otherwise.
 - real: application/x-www-form-urlencoded inbound bodies (Slack slash commands and interactive `payload=`); HTTP Slack slash commands answer with `response_type`/`text`/`blocks`.
 - unchanged: other webhook channels still use shared verify tokens only.
+
+## 1.51 Per-agent isolation
+- real: each agents.list entry gets its own sessions root (`$OPENCLAW_AGENTS_DIR|<state|data>/agents/<id>/sessions`; `main` keeps `OPENCLAW_SESSION_DIR` when set for back-compat), workspace (`agents.list[].workspace` or `agents/<id>/workspace`), memory index (`agents/<id>/memory/index.json`; main keeps `$OPENCLAW_DATA_DIR/memory/main.index.json`), and agent files under `AgentsRoot()/<id>/`.
+- real: tools.allow / tools.deny / tools.profile (`minimal|coding|messaging|full`) from global `tools.*`, then `agents.defaults.tools`, then `agents.list[]|entries.<id>.tools` — deny wins; profile supplies a base allow set (coding includes exec/read/write/edit/http_get/browser_*).
+- real: per-agent sandbox object (mode/backend/…) still flows into exec ResolvePolicy; agent Pool rebuilds tool registries on config reload and after JS plugin host restart (re-RegisterTools into the shared base).
+- real-sim: skills library and JS plugin host remain process-global (not per-agent); MCP tool list is shared then filtered by allow/deny.

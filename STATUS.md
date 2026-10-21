@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.50.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.51.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -213,3 +213,6 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ### 1.50.0-dev
 - Webhook 鉴权：Slack 签名密钥（HMAC v0 + 5 分钟防重放）与 Discord Ed25519 签名校验，失败返回 401；支持表单编码请求体（Slack 斜杠命令、交互 payload）。
+
+### 1.51.0-dev
+- 多智能体隔离：每个 agents.list 条目独立会话目录、工作区、记忆索引与工具集（allow/deny/profile）；main 在设置了 OPENCLAW_SESSION_DIR 时仍用该目录以保持兼容。技能库与 JS 插件宿主仍为进程级共享。

@@ -37,6 +37,7 @@
 #include "openclaw/session/store.hpp"
 #include "openclaw/skills/loader.hpp"
 #include "openclaw/tools/registry.hpp"
+#include "openclaw/agent/pool.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -57,7 +58,8 @@ struct ServerDeps {
     provider::Router* router = nullptr;
     provider::DeepSeekProvider* deepseek = nullptr;
     tools::Registry& tools;
-    session::Store& sessions;
+    session::Store& sessions;  // legacy/default (= main); prefer agent_pool when set
+    agent::Pool* agent_pool = nullptr;
     channels::Registry& channels;
     channels::AdapterHub& adapters;
     skills::Library& skills;
@@ -132,6 +134,8 @@ private:
     std::map<std::string, std::string> agent_prompts_;
     std::mutex agent_prompts_mu_;
     std::string AgentSystemPrompt(const std::string& agent_id);
+    session::Store& SessionsFor(const std::string& agent_id);
+    tools::Registry& ToolsFor(const std::string& agent_id);
     std::vector<std::string> plugin_channels_;
     std::set<std::string> plugin_providers_;
     std::mutex reload_mu_;
