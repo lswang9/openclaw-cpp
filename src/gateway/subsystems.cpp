@@ -1,3 +1,7 @@
+#include <optional>
+#include "openclaw/mcp/client.hpp"
+#include "openclaw/voice/tts.hpp"
+#include "openclaw/voice/stt.hpp"
 #include "openclaw/tokenizer/bpe.hpp"
 #include "openclaw/auth/device_link.hpp"
 #include "openclaw/auth/profiles.hpp"
@@ -1878,6 +1882,200 @@ ExtraResult Batch3(ServerDeps& d, const fs::path& root, const std::string& m, co
     return {};
 }
 
+
+// ---------------------------------------------------------------- talk (voice sessions over STT → agent turn → TTS) and MCP Apps views
+std::string ReadAll(const fs::path& f) { std::ifstream i(f, std::ios::binary); return std::string(std::istreambuf_iterator<char>(i), {}); }
+std::string B64Decode(const std::string& in) {
+    static const std::string tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out; int val = 0, bits = -8;
+    for (unsigned char c : in) { if (c == '=' ) break; auto pos = tbl.find(static_cast<char>(c == '-' ? '+' : c == '_' ? '/' : c)); if (pos == std::string::npos) continue;
+        val = (val << 6) + static_cast<int>(pos); bits += 6; if (bits >= 0) { out.push_back(static_cast<char>((val >> bits) & 0xFF)); bits -= 8; } }
+    return out;
+}
+json SttTranscribe(const std::string& audio, const std::string& mime, const std::string& lang) {
+    const char* sp = std::getenv("OPENCLAW_STT_PROVIDER");
+    if (sp && std::string(sp) == "mock") {  // offline test provider: printable payloads are their own transcript
+        bool printable = !audio.empty(); for (unsigned char c : audio) printable = printable && (c >= 32 || c == '\n');
+        return {{"ok", true}, {"text", printable ? audio : "(audio " + std::to_string(audio.size()) + " bytes)"}, {"provider", "mock"}};
+    }
+    return voice::DefaultStt().Transcribe(audio, mime, "audio.wav", lang);
+}
+ExtraResult Talk(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    static std::mutex tmu;
+    std::unique_lock<std::mutex> l(tmu);
+    auto db = ReadJsonFile(MetaPath(root, "talk"), json{{"sessions", json::object()}, {"clients", json::object()}, {"mode", {{"enabled", false}}}});
+    auto save = [&] { WriteJsonFile(MetaPath(root, "talk"), db); };
+    const char* stt_url = std::getenv("OPENCLAW_STT_URL"); const char* stt_mock = std::getenv("OPENCLAW_STT_PROVIDER");
+    const bool stt_ok = stt_url || (stt_mock && std::string(stt_mock) == "mock");
+    if (m == "talk.config") return Ok({{"enabled", db["mode"].value("enabled", false)}, {"tts", d.tts ? d.tts->Status() : json(nullptr)},
+                                       {"stt", {{"configured", stt_ok}, {"provider", stt_mock ? stt_mock : (stt_url ? "http" : "none")}}}, {"transports", json::array({"gateway-relay"})}});
+    if (m == "talk.mode") { if (p.contains("enabled")) db["mode"]["enabled"] = p.value("enabled", false); if (p.contains("phase")) db["mode"]["phase"] = p["phase"]; save(); return Ok(db["mode"]); }
+    if (m == "talk.catalog") return Ok({{"providers", d.tts ? d.tts->Providers() : json::array()}, {"stt", {{"configured", stt_ok}}}, {"realtime", json::array()}});
+    if (m == "talk.speak") {
+        if (str("text").empty()) return Fail("text is required");
+        if (!d.tts) return Fail("TTS engine not available");
+        l.unlock(); return Ok(d.tts->Speak(str("text"), str("voiceId")));
+    }
+    // A turn: transcript text → agent reply in the bound chat session → optional TTS.
+    auto run_turn = [&](json& s, const std::string& text, const std::string& role_note) -> json {
+        const auto key = s.value("sessionKey", std::string("agent:main:main"));
+        s["transcript"].push_back({{"role", "user"}, {"text", text}, {"at", NowMs()}});
+        const auto sid = s["sessionId"].get<std::string>();
+        save(); l.unlock();
+        auto r = GatewayRpc("chat.send", {{"sessionKey", key}, {"message", role_note + text}});
+        json speech = nullptr;
+        std::string reply = r.value("ok", false) ? r["payload"].value("text", std::string()) : std::string();
+        if (!reply.empty() && d.tts && d.tts->Enabled()) speech = d.tts->Speak(reply, s.value("voice", std::string()));
+        l.lock();
+        db = ReadJsonFile(MetaPath(root, "talk"), db);
+        auto& s2 = db["sessions"][sid];
+        const auto turn = "turn-" + std::to_string(NowMs());
+        if (r.value("ok", false)) s2["transcript"].push_back({{"role", "assistant"}, {"text", reply}, {"turnId", turn}, {"at", NowMs()}});
+        s2["lastTurnId"] = turn; save();
+        if (!r.value("ok", false)) return {{"ok", false}, {"error", r.value("error", json()).dump()}};
+        return {{"ok", true}, {"turnId", turn}, {"transcript", text}, {"reply", reply}, {"speech", speech}};
+    };
+    if (m == "talk.session.create" || m == "talk.client.create") {
+        const auto id = Rid(m == "talk.session.create" ? "talk" : "tclient");
+        json s{{"sessionId", id}, {"sessionKey", str("sessionKey").empty() ? std::string("agent:main:main") : str("sessionKey")}, {"provider", str("provider")}, {"model", str("model")},
+               {"voice", str("voice")}, {"language", str("language")}, {"mode", str("mode").empty() ? std::string("conversation") : str("mode")}, {"createdAt", NowMs()},
+               {"state", "open"}, {"audioBytes", 0}, {"transcript", json::array()}, {"marks", json::array()}, {"toolResults", json::array()}};
+        if (m == "talk.session.create") db["sessions"][id] = s; else { s["voiceSessionId"] = str("voiceSessionId"); db["clients"][s["sessionKey"].get<std::string>()] = s; }
+        save();
+        json out = s; out.erase("transcript"); out["stt"] = stt_ok; return Ok(out);
+    }
+    if (m.rfind("talk.client.", 0) == 0) {
+        const auto key = str("sessionKey"); if (!db["clients"].contains(key)) return Fail("no talk client for session " + key);
+        auto& c = db["clients"][key];
+        if (m == "talk.client.close") { db["clients"].erase(key); save(); return Ok({{"closed", true}}); }
+        if (m == "talk.client.transcript") {
+            if (str("text").empty()) return Fail("text is required");
+            c["transcript"].push_back({{"entryId", str("entryId")}, {"role", str("role").empty() ? std::string("user") : str("role")}, {"text", str("text")}, {"at", p.value("timestamp", NowMs())}});
+            save(); l.unlock();
+            GatewayRpc("chat.inject", {{"sessionKey", key}, {"message", "[voice " + p.value("role", std::string("user")) + "] " + str("text")}});
+            return Ok({{"ok", true}});
+        }
+        if (m == "talk.client.steer") { if (str("text").empty()) return Fail("text is required"); l.unlock(); auto r = GatewayRpc("chat.send", {{"sessionKey", key}, {"message", str("text")}});
+            return r.value("ok", false) ? Ok({{"reply", r["payload"].value("text", "")}}) : Fail("steer failed"); }
+        if (m == "talk.client.toolCall") {
+            if (str("name").empty()) return Fail("name is required");
+            l.unlock(); auto r = GatewayRpc("tools.invoke", {{"name", str("name")}, {"args", p.value("args", json::object())}, {"sessionKey", key}});
+            return r.value("ok", false) ? Ok({{"callId", str("callId")}, {"result", r["payload"].value("result", json())}}) : Fail("tool call failed: " + r.value("error", json()).dump());
+        }
+    }
+    const auto sid = str("sessionId");
+    if (!db["sessions"].contains(sid)) return Fail("unknown talk session: " + sid);
+    auto& s = db["sessions"][sid];
+    if (s.value("state", "") == "closed") return Fail("talk session is closed");
+    if (m == "talk.session.close") { s["state"] = "closed"; s["closedAt"] = NowMs(); save(); return Ok({{"closed", true}, {"transcript", s["transcript"]}}); }
+    if (m == "talk.session.acknowledgeMark") { if (str("markName").empty()) return Fail("markName is required"); s["marks"].push_back({{"name", str("markName")}, {"at", NowMs()}}); save(); return Ok({{"ok", true}}); }
+    if (m == "talk.session.cancelOutput") { s["cancelled"].push_back({{"turnId", str("turnId").empty() ? s.value("lastTurnId", std::string()) : str("turnId")}, {"reason", str("reason")}}); save(); return Ok({{"cancelled", true}}); }
+    if (m == "talk.session.appendAudio") {
+        const auto audio = B64Decode(str("audio").empty() ? str("chunk") : str("audio"));
+        const auto buf = root / "talk" / (sid + ".pcm");
+        std::error_code ec; fs::create_directories(buf.parent_path(), ec);
+        if (!audio.empty()) std::ofstream(buf, std::ios::app | std::ios::binary) << audio;
+        s["audioBytes"] = s.value("audioBytes", 0LL) + static_cast<long long>(audio.size());
+        if (!p.value("commit", p.value("final", false))) { save(); return Ok({{"buffered", s["audioBytes"]}}); }
+        const auto all = ReadAll(buf); fs::remove(buf, ec); s["audioBytes"] = 0;
+        auto tr = SttTranscribe(all, p.value("mime", std::string("audio/wav")), s.value("language", std::string()));
+        if (!tr.value("ok", false)) { save(); return Fail("transcription failed: " + tr.value("error", std::string("no STT provider (set OPENCLAW_STT_URL)"))); }
+        auto r = run_turn(s, tr.value("text", std::string()), "");
+        return r.value("ok", false) ? Ok(r) : Fail(r.value("error", std::string("turn failed")));
+    }
+    if (m == "talk.session.steer") {
+        if (str("text").empty()) return Fail("text is required");
+        auto r = run_turn(s, str("text"), str("mode") == "instruction" ? "[instruction] " : "");
+        return r.value("ok", false) ? Ok(r) : Fail(r.value("error", std::string("turn failed")));
+    }
+    if (m == "talk.session.submitToolResult") {
+        if (str("callId").empty()) return Fail("callId is required");
+        s["toolResults"].push_back({{"callId", str("callId")}, {"result", p.value("result", json())}, {"at", NowMs()}});
+        if (p.value("suppressResponse", false)) { save(); return Ok({{"ok", true}}); }
+        auto r = run_turn(s, "Tool result for " + str("callId") + ": " + p.value("result", json()).dump(), "");
+        return r.value("ok", false) ? Ok(r) : Fail(r.value("error", std::string("turn failed")));
+    }
+    return {};
+}
+
+ExtraResult McpApp(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    auto cli = d.mcp_client;
+    static std::mutex vmu;
+    std::lock_guard<std::mutex> l(vmu);
+    auto db = ReadJsonFile(MetaPath(root, "mcp-apps"), json{{"views", json::object()}, {"settings", json::object()}, {"onboarded", json::object()}});
+    auto save = [&] { WriteJsonFile(MetaPath(root, "mcp-apps"), db); };
+    auto resources = [&]() -> json { if (!cli) return json::array(); auto r = cli->ListResources(); return r.contains("resources") ? r["resources"] : r.is_array() ? r : json::array(); };
+    auto read = [&](const std::string& uri) -> json { if (!cli) return nullptr; return cli->ReadResource(uri); };
+    if (m == "mcp.app.discover") {
+        json apps = json::array();
+        for (auto& r : resources()) { auto uri = r.value("uri", std::string()); if (uri.rfind("ui://", 0) == 0) apps.push_back({{"uri", uri}, {"name", r.value("name", uri)}, {"mimeType", r.value("mimeType", "text/html")}}); }
+        return Ok({{"apps", apps}, {"connected", static_cast<bool>(cli)}});
+    }
+    if (m == "mcp.app.settings") {
+        const auto app = str("appId").empty() ? str("uri") : str("appId");
+        if (p.contains("settings")) { db["settings"][app] = p["settings"]; save(); }
+        return Ok({{"appId", app}, {"settings", db["settings"].value(app, json::object())}});
+    }
+    if (m == "mcp.app.onboard") { const auto app = str("appId").empty() ? str("uri") : str("appId"); db["onboarded"][app] = NowMs(); save(); return Ok({{"onboarded", true}, {"appId", app}}); }
+    if (m == "mcp.app.launch" || m == "mcp.app.formResource") {
+        const auto uri = str("uri"), key = str("sessionKey");
+        if (uri.empty()) return Fail("uri is required");
+        if (!cli) return Fail("no MCP server connected");
+        auto res = read(uri);
+        json content = res.contains("contents") && res["contents"].is_array() && !res["contents"].empty() ? res["contents"][0] : res;
+        if (m == "mcp.app.formResource") return Ok({{"uri", uri}, {"resource", content}});
+        if (key.empty()) return Fail("sessionKey is required");
+        const auto vid = Rid("view");
+        db["views"][vid] = {{"viewId", vid}, {"uri", uri}, {"sessionKey", key}, {"createdAt", NowMs()}, {"modelContext", json::array()}, {"subscriptions", json::array()}};
+        save();
+        return Ok({{"viewId", vid}, {"uri", uri}, {"resource", content}});
+    }
+    const auto vid = str("viewId");
+    if (!db["views"].contains(vid)) return Fail("MCP App view expired or unknown: " + vid);
+    auto& v = db["views"][vid];
+    if (!str("sessionKey").empty() && v["sessionKey"] != str("sessionKey")) return Fail("view belongs to another session");
+    const auto host_dir = root / "mcp-apps" / vid;
+    auto safe_path = [&](const std::string& rel) -> std::optional<fs::path> { if (rel.empty() || rel.find("..") != std::string::npos || rel[0] == '/') return std::nullopt; return host_dir / rel; };
+    if (m == "mcp.app.view") { auto res = read(v["uri"].get<std::string>()); json out = v; out["resource"] = res.contains("contents") && !res["contents"].empty() ? res["contents"][0] : res; return Ok(out); }
+    if (m == "mcp.app.modelContext") return Ok({{"state", v["modelContext"].empty() ? json(nullptr) : json{{"items", v["modelContext"]}, {"updateId", v.value("updateId", std::string())}}}});
+    if (m == "mcp.app.updateModelContext") {
+        json item = p.contains("content") ? p["content"] : p.value("structuredContent", json());
+        if (item.is_null()) return Fail("content is required");
+        v["modelContext"].push_back(item); v["updateId"] = Rid("upd"); save();
+        return Ok({{"updateId", v["updateId"]}, {"items", v["modelContext"].size()}});
+    }
+    if (m == "mcp.app.removeModelContext") {
+        if (str("updateId") != v.value("updateId", std::string())) return Fail("stale updateId");
+        if (p.contains("index")) { auto i = p["index"].get<size_t>(); if (i < v["modelContext"].size()) v["modelContext"].erase(i); } else v["modelContext"] = json::array();
+        v["updateId"] = Rid("upd"); save();
+        return Ok({{"state", {{"items", v["modelContext"]}, {"updateId", v["updateId"]}}}});
+    }
+    if (m == "mcp.app.writeResource") {
+        auto pth = safe_path(str("path").empty() ? str("uri") : str("path")); if (!pth) return Fail("invalid path");
+        std::error_code ec; fs::create_directories(pth->parent_path(), ec); std::ofstream(*pth) << str("content");
+        return Ok({{"written", true}, {"path", pth->string()}});
+    }
+    if (m == "mcp.app.subscribeResource" || m == "mcp.app.unsubscribeResource") {
+        const auto uri = str("uri"); if (uri.empty()) return Fail("uri is required");
+        json next = json::array(); for (auto& x : v["subscriptions"]) if (x != uri) next.push_back(x);
+        if (m == "mcp.app.subscribeResource") next.push_back(uri);
+        v["subscriptions"] = next; save(); return Ok({{"subscriptions", next}});
+    }
+    if (m == "mcp.app.openFile") {
+        auto pth = safe_path(str("path")); if (!pth) return Fail("invalid path");
+        std::error_code ec; if (!fs::is_regular_file(*pth, ec)) return Fail("file not found");
+        return Ok({{"path", pth->string()}, {"content", ReadAll(*pth)}});
+    }
+    if (m == "mcp.app.mention") {
+        const auto text = str("text").empty() ? "[MCP App " + v["uri"].get<std::string>() + "]" : str("text");
+        auto r = GatewayRpc("chat.inject", {{"sessionKey", v["sessionKey"]}, {"message", text}});
+        return r.value("ok", false) ? Ok({{"mentioned", true}}) : Fail("mention failed");
+    }
+    return {};
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
@@ -1888,6 +2086,9 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
         if (method == "message.action") return MessageAction(root, params);
         { auto r = LocalGroups(deps, root, method, params); if (r.handled) return r; }
         { auto r = Batch3(deps, root, method, params); if (r.handled) return r; }
+        if (method.rfind("talk.", 0) == 0) { auto r = Talk(deps, root, method, params); if (r.handled) return r; }
+        if (method.rfind("mcp.app.", 0) == 0 && method != "mcp.app.listTools" && method != "mcp.app.callTool" && method != "mcp.app.listResources" &&
+            method != "mcp.app.listResourceTemplates" && method != "mcp.app.readResource") { auto r = McpApp(deps, root, method, params); if (r.handled) return r; }
         if (method == "projects.list" || method == "projects.register" || method == "projects.add" || method == "projects.remove") return Projects(deps, root, method, params);
         if (method == "sessions.companion.ask" || method == "sessions.companion.state" || method == "sessions.companion.reset")
             return Companion(deps, method, params);
