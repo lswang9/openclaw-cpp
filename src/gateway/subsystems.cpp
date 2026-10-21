@@ -1,3 +1,11 @@
+#include <openssl/ecdsa.h>
+#include <openssl/param_build.h>
+#include <openssl/core_names.h>
+#include <openssl/ec.h>
+#include <openssl/rand.h>
+#include <openssl/pem.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 #include <cstring>
 #include <csignal>
 #include <malloc.h>
@@ -2871,6 +2879,261 @@ ExtraResult Lifecycle(ServerDeps& d, const fs::path& root, const std::string& m,
     return {};
 }
 
+
+// ---------------------------------------------------------------- Web Push (RFC 8030/8291/8292): VAPID keys, subscriptions, aes128gcm delivery
+namespace webpush {
+std::string B64u(const std::string& in) {
+    static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string o; int v = 0, b = -6;
+    for (unsigned char c : in) { v = (v << 8) + c; b += 8; while (b >= 0) { o.push_back(t[(v >> b) & 0x3F]); b -= 6; } }
+    if (b > -6) o.push_back(t[((v << 8) >> (b + 8)) & 0x3F]);
+    return o;
+}
+std::string Hmac(const std::string& key, const std::string& data) {
+    unsigned char out[32]; unsigned int n = 32;
+    HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(data.data()), data.size(), out, &n);
+    return std::string(reinterpret_cast<char*>(out), n);
+}
+std::string RawPub(EVP_PKEY* k) {
+    unsigned char buf[80]; size_t n = 0;
+    if (EVP_PKEY_get_octet_string_param(k, OSSL_PKEY_PARAM_PUB_KEY, buf, sizeof buf, &n) != 1) return {};
+    return std::string(reinterpret_cast<char*>(buf), n);
+}
+EVP_PKEY* Gen() { return EVP_EC_gen("P-256"); }
+EVP_PKEY* FromPem(const std::string& pem) { BIO* b = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size())); EVP_PKEY* k = PEM_read_bio_PrivateKey(b, nullptr, nullptr, nullptr); BIO_free(b); return k; }
+std::string ToPem(EVP_PKEY* k) { BIO* b = BIO_new(BIO_s_mem()); PEM_write_bio_PrivateKey(b, k, nullptr, nullptr, 0, nullptr, nullptr); char* d = nullptr; long n = BIO_get_mem_data(b, &d); std::string s(d, n); BIO_free(b); return s; }
+EVP_PKEY* FromRawPub(const std::string& raw) {
+    EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr); EVP_PKEY* k = nullptr;
+    OSSL_PARAM ps[] = {OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, const_cast<char*>("prime256v1"), 0),
+                       OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY, const_cast<char*>(raw.data()), raw.size()), OSSL_PARAM_construct_end()};
+    if (EVP_PKEY_fromdata_init(c) != 1 || EVP_PKEY_fromdata(c, &k, EVP_PKEY_PUBLIC_KEY, ps) != 1) k = nullptr;
+    EVP_PKEY_CTX_free(c); return k;
+}
+std::string Ecdh(EVP_PKEY* priv, EVP_PKEY* peer) {
+    EVP_PKEY_CTX* c = EVP_PKEY_CTX_new(priv, nullptr); size_t n = 0; std::string out;
+    if (EVP_PKEY_derive_init(c) == 1 && EVP_PKEY_derive_set_peer(c, peer) == 1 && EVP_PKEY_derive(c, nullptr, &n) == 1) { out.resize(n); EVP_PKEY_derive(c, reinterpret_cast<unsigned char*>(out.data()), &n); out.resize(n); }
+    EVP_PKEY_CTX_free(c); return out;
+}
+std::string Es256Jwt(EVP_PKEY* k, const json& claims) {
+    const auto si = B64u(R"({"typ":"JWT","alg":"ES256"})") + "." + B64u(claims.dump());
+    EVP_MD_CTX* m = EVP_MD_CTX_new(); size_t n = 0; std::string der;
+    EVP_DigestSignInit(m, nullptr, EVP_sha256(), nullptr, k); EVP_DigestSign(m, nullptr, &n, reinterpret_cast<const unsigned char*>(si.data()), si.size());
+    der.resize(n); EVP_DigestSign(m, reinterpret_cast<unsigned char*>(der.data()), &n, reinterpret_cast<const unsigned char*>(si.data()), si.size()); der.resize(n); EVP_MD_CTX_free(m);
+    const unsigned char* pp = reinterpret_cast<const unsigned char*>(der.data()); ECDSA_SIG* sig = d2i_ECDSA_SIG(nullptr, &pp, static_cast<long>(der.size()));
+    unsigned char rs[64]; BN_bn2binpad(ECDSA_SIG_get0_r(sig), rs, 32); BN_bn2binpad(ECDSA_SIG_get0_s(sig), rs + 32, 32); ECDSA_SIG_free(sig);
+    return si + "." + B64u(std::string(reinterpret_cast<char*>(rs), 64));
+}
+// RFC 8291 aes128gcm body for one record.
+std::optional<std::string> Encrypt(const std::string& ua_pub, const std::string& auth, const std::string& plaintext) {
+    EVP_PKEY* peer = FromRawPub(ua_pub); if (!peer) return std::nullopt;
+    EVP_PKEY* as = Gen(); const auto as_pub = RawPub(as); const auto shared = Ecdh(as, peer);
+    EVP_PKEY_free(peer); EVP_PKEY_free(as); if (shared.empty()) return std::nullopt;
+    std::string salt(16, '\0'); RAND_bytes(reinterpret_cast<unsigned char*>(salt.data()), 16);
+    const auto prk_key = Hmac(auth, shared);
+    const auto ikm = Hmac(prk_key, std::string("WebPush: info") + '\0' + ua_pub + as_pub + '\x01');
+    const auto prk = Hmac(salt, ikm);
+    const auto cek = Hmac(prk, std::string("Content-Encoding: aes128gcm") + '\0' + '\x01').substr(0, 16);
+    const auto nonce = Hmac(prk, std::string("Content-Encoding: nonce") + '\0' + '\x01').substr(0, 12);
+    const std::string pt = plaintext + '\x02';
+    std::string ct(pt.size() + 16, '\0'); int l = 0, l2 = 0;
+    EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new();
+    EVP_EncryptInit_ex(c, EVP_aes_128_gcm(), nullptr, reinterpret_cast<const unsigned char*>(cek.data()), reinterpret_cast<const unsigned char*>(nonce.data()));
+    EVP_EncryptUpdate(c, reinterpret_cast<unsigned char*>(ct.data()), &l, reinterpret_cast<const unsigned char*>(pt.data()), static_cast<int>(pt.size()));
+    EVP_EncryptFinal_ex(c, reinterpret_cast<unsigned char*>(ct.data()) + l, &l2);
+    EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, 16, ct.data() + l + l2); EVP_CIPHER_CTX_free(c);
+    ct.resize(l + l2 + 16);
+    std::string hdr = salt; hdr += std::string("\x00\x00\x10\x00", 4); hdr.push_back(static_cast<char>(as_pub.size())); hdr += as_pub;
+    return hdr + ct;
+}
+}  // namespace webpush
+ExtraResult Push(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    std::lock_guard<std::mutex> l(g_mu);
+    auto db = ReadJsonFile(MetaPath(root, "web-push"), json{{"subscriptions", json::array()}});
+    auto save = [&] { WriteJsonFile(MetaPath(root, "web-push"), db); std::error_code ec; fs::permissions(MetaPath(root, "web-push"), fs::perms::owner_read | fs::perms::owner_write, ec); };
+    auto vapid = [&]() -> EVP_PKEY* {
+        if (db.contains("vapidPrivatePem")) return webpush::FromPem(db["vapidPrivatePem"].get<std::string>());
+        EVP_PKEY* k = webpush::Gen(); db["vapidPrivatePem"] = webpush::ToPem(k); db["vapidPublicKey"] = webpush::B64u(webpush::RawPub(k)); save(); return k;
+    };
+    const auto endpoint = str("endpoint").empty() ? (p.contains("subscription") ? p["subscription"].value("endpoint", std::string()) : std::string()) : str("endpoint");
+    auto find = [&]() -> json* { for (auto& s : db["subscriptions"]) if (s.value("endpoint", "") == endpoint && (s.value("owner", "") == t_principal || t_principal == "operator")) return &s; return nullptr; };
+    if (m == "push.web.vapidPublicKey") { EVP_PKEY* k = vapid(); EVP_PKEY_free(k); return Ok({{"publicKey", db["vapidPublicKey"]}}); }
+    if (m == "push.web.subscribe") {
+        auto sub = p.value("subscription", json::object());
+        const auto keys = sub.value("keys", json::object());
+        if (endpoint.rfind("https://", 0) != 0 && endpoint.rfind("http://127.0.0.1", 0) != 0 && endpoint.rfind("http://localhost", 0) != 0) return Fail("subscription.endpoint must be an https URL");
+        if (keys.value("p256dh", "").empty() || keys.value("auth", "").empty()) return Fail("subscription.keys.p256dh and keys.auth are required");
+        json rec{{"endpoint", endpoint}, {"keys", keys}, {"owner", t_principal}, {"createdAtMs", NowMs()}, {"preferences", json::object()}};
+        if (auto* s = find()) { (*s)["keys"] = keys; } else db["subscriptions"].push_back(rec);
+        save(); return Ok({{"subscribed", true}, {"endpoint", endpoint}});
+    }
+    if (m == "push.web.unsubscribe") {
+        json next = json::array(); bool rm = false; for (auto& s : db["subscriptions"]) { if (s.value("endpoint", "") == endpoint && !rm) { rm = true; continue; } next.push_back(s); }
+        db["subscriptions"] = next; save(); return Ok({{"unsubscribed", rm}});
+    }
+    if (m == "push.web.preferences.get" || m == "push.web.preferences.set") {
+        auto* s = find(); if (!s) return Fail("unknown web push subscription");
+        if (m == "push.web.preferences.set") { if (!p.contains("preferences") || !p["preferences"].is_object()) return Fail("preferences object is required"); (*s)["preferences"].merge_patch(p["preferences"]); save(); }
+        return Ok({{"durableIdentity", t_principal != "operator"}, {"user", (*s)["preferences"]}, {"endpoint", endpoint}});
+    }
+    if (m == "push.web.test") {
+        if (db["subscriptions"].empty()) return Fail("no web push subscriptions registered");
+        EVP_PKEY* k = vapid();
+        const json payload{{"title", str("title").empty() ? std::string("OpenClaw") : str("title")}, {"body", str("body").empty() ? std::string("Web push test notification") : str("body")}};
+        json results = json::array(); bool any = false;
+        for (auto& s : db["subscriptions"]) {
+            const auto ep = s["endpoint"].get<std::string>();
+            const auto ua = B64Decode(s["keys"]["p256dh"].get<std::string>()), au = B64Decode(s["keys"]["auth"].get<std::string>());
+            auto body = webpush::Encrypt(ua, au, payload.dump());
+            if (!body) { results.push_back({{"endpoint", ep}, {"ok", false}, {"error", "invalid subscription keys"}}); continue; }
+            static const std::regex ore("^(https?://[^/]+)"); std::smatch om; std::regex_search(ep, om, ore);
+            const auto jwt = webpush::Es256Jwt(k, {{"aud", om[1].str()}, {"exp", NowMs() / 1000 + 12 * 3600}, {"sub", "mailto:openclaw@localhost"}});
+            CURL* c = curl_easy_init(); curl_slist* h = nullptr; std::string resp; long code = 0;
+            h = curl_slist_append(h, "Content-Encoding: aes128gcm"); h = curl_slist_append(h, "Content-Type: application/octet-stream"); h = curl_slist_append(h, "TTL: 60");
+            h = curl_slist_append(h, ("Authorization: vapid t=" + jwt + ", k=" + db["vapidPublicKey"].get<std::string>()).c_str());
+            curl_easy_setopt(c, CURLOPT_URL, ep.c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, h); curl_easy_setopt(c, CURLOPT_POSTFIELDS, body->data());
+            curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, static_cast<long>(body->size())); curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+            curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, Sink); curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
+            auto rc = curl_easy_perform(c); curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code); curl_slist_free_all(h); curl_easy_cleanup(c);
+            const bool ok = rc == CURLE_OK && code >= 200 && code < 300; any = any || ok;
+            json r{{"endpoint", ep}, {"ok", ok}, {"status", code}}; if (rc != CURLE_OK) r["error"] = curl_easy_strerror(rc);
+            if (code == 404 || code == 410) { s["expired"] = true; r["expired"] = true; }
+            results.push_back(r);
+        }
+        EVP_PKEY_free(k);
+        json keep = json::array(); for (auto& s : db["subscriptions"]) if (!s.value("expired", false)) keep.push_back(s); db["subscriptions"] = keep; save();
+        if (!any) { ExtraResult f = Fail("all web push deliveries failed"); f.payload = {{"results", results}}; return f; }
+        return Ok({{"results", results}});
+    }
+    if (m == "push.test") {
+        if (str("nodeId").empty()) return Fail("nodeId required");
+        auto reg = ReadJsonFile(MetaPath(root, "apns-registrations"), json::object());
+        if (!reg.contains(str("nodeId"))) return Fail("node " + str("nodeId") + " has no APNs registration (connect iOS node first)");
+        const auto relay = config::GetPath(d.config.raw, "push.apns.relayUrl");
+        if (!relay || !relay->is_string()) return Fail("APNs delivery needs push.apns.relayUrl (direct APNs keys are not supported in the C++ runtime)");
+        auto r = GitHubRequest(relay->get<std::string>(), "POST", "", json{{"token", reg[str("nodeId")].value("token", "")}, {"title", str("title").empty() ? std::string("OpenClaw") : str("title")},
+                                                                          {"body", str("body").empty() ? "Push test for node " + str("nodeId") : str("body")}}.dump());
+        return Ok({{"ok", r.status >= 200 && r.status < 300}, {"status", r.status}, {"transport", "relay"}});
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------- users.authConnect (per-user model account connect) and tools.github (agent GitHub identity)
+ExtraResult AuthConnect(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    std::unique_lock<std::mutex> l(g_mu);
+    auto db = ReadJsonFile(MetaPath(root, "auth-connect"), json::object());
+    auto save = [&] { WriteJsonFile(MetaPath(root, "auth-connect"), db); };
+    if (m == "users.authConnect.catalog") {
+        json out = json::array();
+        for (auto& h : kProviderHints) out.push_back({{"provider", h.provider}, {"methods", json::array({{{"id", "api-key"}, {"label", "API key"}, {"available", true}}})}});
+        return Ok({{"providers", out}});
+    }
+    if (m == "users.authConnect.start") {
+        if (str("provider").empty()) return Fail("provider is required");
+        const auto meth = str("method").empty() ? std::string("api-key") : str("method");
+        if (meth != "api-key") return Fail("connect method " + meth + " is not available for " + str("provider") + "; use api-key");
+        const auto id = Rid("connect");
+        db[id] = {{"connectId", id}, {"provider", str("provider")}, {"method", meth}, {"owner", t_principal}, {"profileId", str("profileId").empty() ? t_principal : str("profileId")},
+                  {"status", "awaiting_input"}, {"step", {{"stepId", "apiKey"}, {"kind", "secret"}, {"label", str("provider") + " API key"}}}, {"expiresAtMs", NowMs() + 15 * 60 * 1000}};
+        save(); json o = db[id]; o.erase("owner"); return Ok(o);
+    }
+    const auto id = str("connectId");
+    if (!db.contains(id) || db[id].value("owner", "") != t_principal) return Fail("unknown connect session");
+    auto& c = db[id];
+    if (c.value("expiresAtMs", 0LL) < NowMs() && c["status"] == "awaiting_input") c["status"] = "expired";
+    auto view = [&] { json o = c; o.erase("owner"); return o; };
+    if (m == "users.authConnect.status") { save(); return Ok(view()); }
+    if (m == "users.authConnect.cancel") { if (c["status"] == "awaiting_input") c["status"] = "cancelled"; save(); return Ok(view()); }
+    if (m == "users.authConnect.answer") {
+        if (c["status"] != "awaiting_input") return Fail("connect session is " + c["status"].get<std::string>());
+        if (str("stepId") != c["step"].value("stepId", "")) return Fail("answer is for a different step");
+        const auto key = str("value"); if (Trim(key).size() < 8) return Fail("that does not look like an API key");
+        const auto prov = c["provider"].get<std::string>(); const auto ap = prov + ":user-" + SafeName(c["profileId"].get<std::string>());
+        auth::ProfileStore store(auth::DefaultProfilesPath("main"));
+        if (!store.Upsert(ap, {{"type", "api_key"}, {"provider", prov}, {"key", Trim(key)}, {"owner", c["profileId"]}})) return Fail("could not save credentials");
+        c["status"] = "connected"; c["authProfileId"] = ap; c.erase("step"); save();
+        const auto prof = c["profileId"]; l.unlock();
+        auto r = GatewayRpc("users.linkAuthProfile", {{"profileId", prof}, {"authProfileId", ap}});
+        l.lock(); db = ReadJsonFile(MetaPath(root, "auth-connect"), db); db[id]["linked"] = r.value("ok", false); save();
+        json o = db[id]; o.erase("owner"); return Ok(o);
+    }
+    return {};
+}
+ExtraResult ToolsGitHub(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    const auto agent = str("agentId");
+    const auto scope = str("scope").empty() ? str("selectedScope") : str("scope");
+    if (m != "tools.github.authorize.poll" && m != "tools.github.authorize.cancel") {
+        if (agent.empty()) return Fail("agentId is required");
+        if (scope != "system" && scope != "agent") return Fail("scope must be system or agent");
+    }
+    auto cfgdb = ReadJsonFile(MetaPath(root, "tools-github"), json::object());
+    auto principal = [&](const std::string& sc) { return sc == "system" ? std::string("tools-github:system") : "tools-github:agent:" + agent; };
+    auto facts = [&](const std::string& sc) -> json {
+        const auto key = sc == "system" ? std::string("system") : "agent:" + agent;
+        auto c = cfgdb.value(key, json::object());
+        json author{{"name", c.value("gitAuthor", json::object()).value("name", json(nullptr))}, {"email", c.value("gitAuthor", json::object()).value("email", json(nullptr))}};
+        std::lock_guard<std::mutex> l(g_mu);
+        auto db = PersonalRead(root);
+        const auto pr = principal(sc);
+        if (db["accounts"].contains(pr)) { auto& a = db["accounts"][pr];
+            return {{"source", sc == "system" ? "system-configured" : "agent-override"}, {"credentialKind", a.value("kind", std::string("managed-oauth"))}, {"credentialState", "available"},
+                    {"account", {{"login", a["account"]["login"]}}}, {"gitAuthor", author}, {"evidence", "github-api"}, {"accessExpiresAtMs", a.value("accessExpiresAtMs", json(nullptr))},
+                    {"refreshState", a.contains("accessExpiresAtMs") ? "available" : "not_applicable"}, {"oauthScopes", a.value("scopes", json::array())}, {"repositoryGrants", "unknown"}}; }
+        if (sc == "system" && !GitHubToken().empty())
+            return {{"source", "system-detected"}, {"credentialKind", "native"}, {"credentialState", "unverified"}, {"account", nullptr}, {"gitAuthor", author}, {"evidence", "unverified"},
+                    {"accessExpiresAtMs", nullptr}, {"refreshState", "not_applicable"}, {"oauthScopes", json::array()}, {"repositoryGrants", "unknown"}};
+        return nullptr;
+    };
+    if (m == "tools.github.status") {
+        auto sel = facts(scope); const bool inherit = cfgdb.value("agent:" + agent, json::object()).value("mode", "") == "inherit";
+        json eff = scope == "agent" && (sel.is_null() || inherit) ? facts("system") : sel;
+        if (eff.is_null()) eff = {{"source", "system-detected"}, {"credentialKind", "native"}, {"credentialState", "unavailable"}, {"account", nullptr}, {"gitAuthor", {{"name", nullptr}, {"email", nullptr}}},
+                                  {"evidence", "none"}, {"accessExpiresAtMs", nullptr}, {"refreshState", "not_applicable"}, {"oauthScopes", json::array()}, {"repositoryGrants", "unknown"}};
+        return Ok({{"agentId", agent}, {"selectedScope", scope}, {"selected", {{"scope", scope}, {"configured", !sel.is_null()}, {"identity", sel}}}, {"effective", eff}});
+    }
+    if (m == "tools.github.configure") {
+        const auto key = scope == "system" ? std::string("system") : "agent:" + agent;
+        const auto mode = str("mode");
+        if (mode == "inherit") {
+            if (scope == "system") return Fail("the system scope cannot inherit");
+            cfgdb[key] = {{"mode", "inherit"}}; WriteJsonFile(MetaPath(root, "tools-github"), cfgdb);
+            std::lock_guard<std::mutex> l(g_mu); auto db = PersonalRead(root); db["accounts"].erase(principal(scope)); PersonalWrite(root, db);
+            return Ok({{"configured", true}, {"mode", "inherit"}});
+        }
+        if (mode != "managed") return Fail("mode must be managed or inherit");
+        const auto sn = str("secretName"); const char* tok = sn.empty() ? nullptr : std::getenv(sn.c_str());
+        if (!tok || !*tok) return Fail("temporary GitHub credential is unavailable");
+        std::string api; try { api = GitHubApiBase(d.config.raw); } catch (const std::exception& e) { return Fail(e.what()); }
+        auto u = GitHubRequest(api + "/user", "GET", tok);
+        json acct; try { auto uj = json::parse(u.body); acct = {{"accountId", uj.at("id")}, {"login", uj.at("login")}}; } catch (...) {}
+        if (u.status != 200 || acct.is_null()) return Fail("GitHub identity setup failed");
+        json c{{"mode", "managed"}};
+        if (p.contains("gitAuthor")) { json a = json::object(); for (auto k : {"name", "email"}) if (p["gitAuthor"].contains(k)) a[k] = Trim(p["gitAuthor"][k].get<std::string>()); c["gitAuthor"] = a; }
+        cfgdb[key] = c; WriteJsonFile(MetaPath(root, "tools-github"), cfgdb);
+        { std::lock_guard<std::mutex> l(g_mu); auto db = PersonalRead(root); db["accounts"][principal(scope)] = {{"generation", Uuid()}, {"account", acct}, {"token", tok}, {"kind", "managed-pat"}, {"connectedAtMs", NowMs()}}; PersonalWrite(root, db); }
+        return Ok({{"configured", true}, {"mode", "managed"}, {"account", {{"login", acct["login"]}}}});
+    }
+    // Device flow reuses the personal GitHub flow under an agent/system principal.
+    const auto prev = t_principal;
+    json q = json::object();
+    if (m == "tools.github.authorize.start") t_principal = principal(scope);
+    else {
+        auto rid = str("requestId"); if (rid.rfind("github-device-", 0) != 0) return Fail("invalid requestId");
+        rid = rid.substr(14);
+        std::lock_guard<std::mutex> l(g_mu); auto db = PersonalRead(root);
+        for (auto& [k, v] : db["pending"].items()) { std::string kk = k; kk.erase(std::remove(kk.begin(), kk.end(), '-'), kk.end());
+            if (kk == rid && v.value("principal", "").rfind("tools-github:", 0) == 0) { t_principal = v.value("principal", prev); rid = k; } }
+        q["requestId"] = rid;
+    }
+    auto r = UsersGitHub(d, root, m == "tools.github.authorize.start" ? "users.github.authorize.start" : m == "tools.github.authorize.poll" ? "users.github.authorize.poll" : "users.github.authorize.cancel", q);
+    t_principal = prev;
+    if (r.ok && r.payload.contains("requestId")) { std::string id = r.payload["requestId"]; id.erase(std::remove(id.begin(), id.end(), '-'), id.end()); r.payload["requestId"] = "github-device-" + id; }
+    if (r.ok && r.payload.contains("personal")) { r.payload.erase("personal"); }
+    return r;
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
@@ -2894,6 +3157,9 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
         if (method.rfind("gateway.suspend.", 0) == 0 || method == "gateway.stop.request" || (method.rfind("diagnostics.", 0) == 0 &&
             (method == "diagnostics.lanes" || method == "diagnostics.cpuProfile" || method == "diagnostics.heapProfile" || method == "diagnostics.heapSnapshot"))) {
             auto r = Lifecycle(deps, root, method, params); if (r.handled) return r; }
+        if (method.rfind("push.", 0) == 0 && method != "push.list" && method != "push.status") { auto r = Push(deps, root, method, params); if (r.handled) return r; }
+        if (method.rfind("users.authConnect.", 0) == 0) { auto r = AuthConnect(deps, root, method, params); if (r.handled) return r; }
+        if (method.rfind("tools.github.", 0) == 0) { auto r = ToolsGitHub(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("talk.", 0) == 0) { auto r = Talk(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("mcp.app.", 0) == 0 && method != "mcp.app.listTools" && method != "mcp.app.callTool" && method != "mcp.app.listResources" &&
             method != "mcp.app.listResourceTemplates" && method != "mcp.app.readResource") { auto r = McpApp(deps, root, method, params); if (r.handled) return r; }

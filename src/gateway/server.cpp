@@ -55,7 +55,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.118.0-dev";
+constexpr const char* kVersion = "1.119.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -3008,7 +3008,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         // Subsystem handlers that call back into RPCs (GatewayRpc) must not run under the deps lock.
         static const std::set<std::string> reentrant{"taskSuggestions.accept", "sessions.patchMany", "wake", "node.invoke.progress", "mentions.list",
                                                      "message.action", "worktrees.create", "talk.speak", "talk.session.appendAudio", "talk.session.steer",
-                                                     "talk.session.submitToolResult", "talk.client.steer", "talk.client.toolCall", "talk.client.transcript", "mcp.app.mention", "sessions.catalog.continue", "sessions.catalog.startTerminal", "sessions.providerReview.continue", "openclaw.setup.activate", "openclaw.chat", "openclaw.approval.list", "wizard.next", "wizard.start", "gateway.suspend.prepare", "gateway.suspend.status"};
+                                                     "talk.session.submitToolResult", "talk.client.steer", "talk.client.toolCall", "talk.client.transcript", "mcp.app.mention", "sessions.catalog.continue", "sessions.catalog.startTerminal", "sessions.providerReview.continue", "openclaw.setup.activate", "openclaw.chat", "openclaw.approval.list", "wizard.next", "wizard.start", "gateway.suspend.prepare", "gateway.suspend.status", "users.authConnect.answer"};
         if (reentrant.count(method) && deps_lock.owns_lock()) deps_lock.unlock();
         auto extra = TryExtraDispatch(deps_, method, params);
         if (extra.handled) {
