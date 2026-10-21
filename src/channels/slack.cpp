@@ -116,7 +116,9 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
     std::string reply = deliver ? deliver(msg) : "";
     auto rendered = slack_interactive::RenderReply(reply);
     if (rendered.contains("blocks")) reply = rendered.value("text", reply);
+    auto voice = MaybeAutoVoice(msg.conversation_id, reply, !msg.media.empty());
     return {{"ok", true},
+            {"voice", voice},
             {"message", rendered},
             {"channel", "slack"},
             {"session_key", msg.session_key},

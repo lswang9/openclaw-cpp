@@ -113,8 +113,10 @@ nlohmann::json FeishuAdapter::HandleHttpInbound(const nlohmann::json& body, cons
     ++inbound_;
     std::string reply;
     if (deliver) reply = deliver(msg);
+    auto voice = MaybeAutoVoice(msg.conversation_id, reply, !msg.media.empty());
     return {{"ok", true},
             {"channel", "feishu"},
+            {"voice", voice},
             {"session_key", msg.session_key},
             {"sender", msg.sender},
             {"reply", reply},

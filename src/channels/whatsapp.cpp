@@ -166,8 +166,11 @@ nlohmann::json WhatsAppCloudAdapter::HandleHttpInbound(const nlohmann::json& bod
         outbound = {{"recorded", true}, {"mode", "mock_or_no_token"}, {"to", msg.sender}, {"text", reply}};
     }
 
+    nlohmann::json voice;
+    if (!ForceMock()) voice = MaybeAutoVoice(msg.sender, reply, !msg.media.empty());
     return {{"ok", true},
             {"channel", "whatsapp"},
+            {"voice", voice},
             {"session_key", msg.session_key},
             {"sender", msg.sender},
             {"reply", reply},

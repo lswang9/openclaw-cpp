@@ -956,6 +956,16 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
             r.payload = Real(out->SendText(chat_id, text, params));
             return r;
         }
+        if (method == "channels.voice.send") {
+            const std::string channel = params.value("channel", std::string());
+            const std::string text = params.value("text", std::string());
+            const std::string chat_id = params.value("chat_id", params.value("to", std::string()));
+            auto* out = dynamic_cast<channels::OutboundRecordAdapter*>(deps.adapters.Get(channel));
+            if (!out) { r.ok = false; r.error = "no outbound adapter: " + channel; return r; }
+            if (text.empty() || chat_id.empty()) { r.ok = false; r.error = "channel, to and text required"; return r; }
+            r.payload = Real(out->SendVoiceReply(chat_id, text));
+            return r;
+        }
         r.payload = Real({{"adapters", deps.adapters.StatusJson()}, {"method", method}});
         return r;
     }

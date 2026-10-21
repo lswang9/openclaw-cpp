@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.90.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.91.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -39,6 +39,8 @@
 - Local GGUF embeddings: **real** llama.cpp inference (Conan llama-cpp/b6565, CPU, OpenMP) for memorySearch provider `gguf`: tokenize → decode/encode with embeddings → model pooling (mean fallback) → L2. scripts/e2e-gguf-llama.sh downloads all-MiniLM-L6-v2 Q4_K_M (~21 MB, cached) at test time and asserts a zero-word-overlap semantic hit; SKIPs honestly when offline or built without llama.cpp. OPENCLAW_GGUF_HASH_FALLBACK=1 keeps the old hashed path (header-only stub files). Remaining: no GPU offload, single 512-token context (longer chunks truncated), no batching across texts.
 
 - ACP client (acpx): **real** `terminal` client capability (terminal/create|output|wait_for_exit|kill|release; cwd confined to the session root, env, outputByteLimit tail-truncation at char boundary, process-group kill, all terminals reaped at end). Off by default; CLI `--terminal`, RPC/tool callers need `acp.agents.<id>.allowTerminal=true`. **real** multi-turn (`--then` / `turns`: several session/prompt in one session, per-turn text + stopReason). **real** session resume via session/load (`--session` / `session_id`, only when the agent advertises loadSession). **real** login: auth_required (-32000) → `authenticate{methodId}` (`--auth <id>|auto`, or `acp.agents.<id>.authMethod`) → retry. All covered by e2e-acpx.sh against a fake agent. Remaining: interactive/browser-based agent login flows (the agent's own OAuth) are the agent's business; no live Codex/Claude/Gemini runs.
+
+- Voice replies beyond Telegram: **real** Discord voice messages (multipart, flags 8192 IS_VOICE_MESSAGE, duration from the Ogg granule, waveform), Slack (files.getUploadURLExternal → upload → completeUploadExternal), Feishu (tenant token → im/v1/files file_type=opus with duration → msg_type=audio), WhatsApp Cloud (/media → type=audio, voice=true). Streamed TTS output is transcoded to Ogg/Opus with ffmpeg when it isn't already (Discord falls back to a plain attachment without ffmpeg). Shared `messages.tts.auto` policy now applies to Discord/Slack/Feishu/WhatsApp inbound replies too; new RPC `channels.voice.send`. Fixed: TTS `body_prefix` put raw audio bytes into JSON (invalid UTF-8 crash on binary TTS). e2e-voice-channels.sh against fake platforms. Remaining: Discord waveform is a coarse byte envelope, not a decoded amplitude; no live platform runs.
 
 ## 1.85 Discord autocomplete + message context menu
 - real: command specs mark the `args` option `autocomplete: true` and add a MESSAGE context-menu command "Ask OpenClaw" (type 3).

@@ -19,6 +19,7 @@ std::vector<std::string> ImplementedMethods() {
         "sessions.github.confirm",
         "plugins.controlUi.reload",
         "claws.removalJournal",
+        "channels.voice.send",
         "sessions.export",
         "sessions.import",
         "sessions.exportOne",

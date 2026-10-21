@@ -123,10 +123,17 @@ nlohmann::json TtsEngine::HttpPost(const std::string& text, const std::string& v
     curl_easy_cleanup(curl);
     nlohmann::json out{{"curl_ok", rc == CURLE_OK}, {"http", http}, {"bytes", response.size()}, {"url", url},
                        {"content_type", ctype},
-                       {"body_prefix", response.substr(0, std::min<size_t>(64, response.size()))},
+                       {"body_prefix", [&] {  // printable ASCII only: audio bytes are not valid UTF-8 JSON
+                            std::string s;
+                            for (size_t i = 0; i < std::min<size_t>(64, response.size()); ++i) {
+                                unsigned char ch = static_cast<unsigned char>(response[i]);
+                                s.push_back(ch >= 0x20 && ch < 0x7f ? static_cast<char>(ch) : '.');
+                            }
+                            return s;
+                        }()},
                        {"error", rc == CURLE_OK ? "" : curl_easy_strerror(rc)}};
     if (on_chunk) { out["streamed"] = true; out["chunks"] = sink.chunks; }
-    if (http >= 400) out["error"] = "TTS HTTP " + std::to_string(http) + ": " + response.substr(0, 200);
+    if (http >= 400) out["error"] = "TTS HTTP " + std::to_string(http) + ": " + nlohmann::json(response.substr(0, 200)).dump(-1, ' ', true, nlohmann::json::error_handler_t::replace);
     if (const char* d = std::getenv("OPENCLAW_TTS_OUT_DIR"); d && *d && http >= 200 && http < 300 && !response.empty()) {
         std::string ext = ctype.find("wav") != std::string::npos ? "wav" : ctype.find("ogg") != std::string::npos ? "ogg" : "mp3";
         std::string path = std::string(d) + "/tts-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "." + ext;

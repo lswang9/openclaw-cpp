@@ -50,7 +50,13 @@ public:
     // Telegram webhook updates (text/caption, voice/audio → auto-transcribed by the gateway); reply via sendMessage.
     bool SupportsHttpInbound() const override { return id_ == "telegram"; }
     nlohmann::json HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) override;
+    // Streamed TTS → voice note. Telegram sendVoice/sendAudio; Discord voice message (flags 8192, waveform,
+    // duration) or plain attachment; Slack files.getUploadURLExternal + completeUploadExternal; Feishu im/v1/files
+    // (opus) + msg_type=audio; WhatsApp Cloud /media + type=audio (voice). Non-Ogg TTS output is transcoded to
+    // Ogg/Opus with ffmpeg when available (Discord/Feishu/WhatsApp voice notes need Opus).
     nlohmann::json SendVoiceReply(const std::string& chat_id, const std::string& text);
+    // messages.tts.auto policy ("always" | "inbound" | "off"; OPENCLAW_TTS_AUTO overrides).
+    nlohmann::json MaybeAutoVoice(const std::string& chat_id, const std::string& reply, bool inbound_had_audio);
     nlohmann::json OutboundLog() const;
     void ClearLog();
 

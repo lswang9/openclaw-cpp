@@ -111,8 +111,10 @@ nlohmann::json DiscordAdapter::HandleHttpInbound(const nlohmann::json& body, con
     if (body.contains("guild_id") && body["guild_id"].is_string()) msg.guild_id = body["guild_id"];
     ++inbound_;
     std::string reply = deliver ? deliver(msg) : "";
+    auto voice = MaybeAutoVoice(msg.conversation_id, reply, !msg.media.empty());
     return {{"ok", true},
             {"channel", "discord"},
+            {"voice", voice},
             {"session_key", msg.session_key},
             {"sender", msg.sender},
             {"reply", reply},
