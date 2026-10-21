@@ -1,6 +1,11 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.30.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.31.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.31.0-dev 新增
+
+- 会话记录改为上游 JSONL 格式（`<键>.jsonl`：首行 session 头，之后每行一条消息，带 parentId 链）；旧 `.json` 首次写入时自动迁移并改名为 `.json.migrated`。
+- 修复：网关不再把裁剪后的上下文（`[pruned tool result]`）和系统提示词写进会话文件，保存的是完整记录。
 
 ## 1.30.0-dev 新增
 

@@ -25,6 +25,9 @@ ResetPolicy PolicyFromConfig(const nlohmann::json& raw);
 bool IsStale(const ResetPolicy& p, std::int64_t updated_ms, std::int64_t now_ms);
 
 // "/new", "/reset" (optionally followed by text). Returns remainder in `rest`.
+// Parse an upstream JSONL transcript (or legacy {messages:[...]} JSON).
+std::vector<agent::Message> ParseTranscript(const std::filesystem::path& path);
+
 bool ParseResetCommand(const std::string& text, std::string& rest);
 
 // File-backed session store with per-id mutexes for concurrent gateway requests.

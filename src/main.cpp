@@ -74,7 +74,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.30.0-dev";
+constexpr const char* kVersion = "1.31.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1395,6 +1395,30 @@ int CmdSelfTest() {
         else std::cerr << "PASS compaction (model summary, tool-boundary safe, /compact, auto threshold)\n";
     } catch (const std::exception& e) { std::cerr << "FAIL compaction exception: " << e.what() << "\n"; ++failures; }
 
+    // JSONL transcripts + migration from legacy JSON
+    try {
+        namespace fs = std::filesystem;
+        auto root = fs::temp_directory_path() / "oc-jsonl-st";
+        fs::remove_all(root); fs::create_directories(root);
+        std::ofstream(root / "chan~3ax.json") << R"({"id":"chan:x","messages":[{"role":"user","content":"old"}]})";
+        session::Store st(root);
+        bool ok = st.Load("chan:x").size() == 1;
+        auto msgs = st.Load("chan:x");
+        msgs.push_back({.role = "tool", .content = std::string(6000, 'T'), .tool_call_id = "c1"});
+        st.Save("chan:x", msgs);
+        st.Append("chan:x", {.role = "assistant", .content = "done"});
+        ok = ok && fs::exists(root / "chan~3ax.jsonl") && fs::exists(root / "chan~3ax.json.migrated") && !fs::exists(root / "chan~3ax.json");
+        std::ifstream in(root / "chan~3ax.jsonl"); std::string first; std::getline(in, first);
+        auto hdr = nlohmann::json::parse(first);
+        auto back = st.Load("chan:x");
+        ok = ok && hdr["type"] == "session" && hdr["id"] == st.IndexEntry("chan:x")["sessionId"] && back.size() == 3 &&
+             back[1].content.size() == 6000 && back[2].content == "done";
+        { std::ofstream(root / "chan~3ax.jsonl", std::ios::app) << "{\"type\":\"mess"; }
+        ok = ok && st.Load("chan:x").size() == 3;
+        if (!ok) { std::cerr << "FAIL jsonl transcripts\n"; ++failures; }
+        else std::cerr << "PASS JSONL transcripts (header+parentId chain, migration, torn-line tolerant)\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL jsonl exception: " << e.what() << "\n"; ++failures; }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -1819,7 +1843,11 @@ int CmdChat(int argc, char** argv, int argi) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     auto result = agent::RunAgentLoop(*prov, registry, messages, {});
     curl_global_cleanup();
-    if (!session_id.empty() && result.ok) store.Save(session_id, result.messages);
+    if (!session_id.empty() && result.ok) {
+        auto full = result.messages;
+        if (!full.empty() && full.front().role == "system") full.erase(full.begin());
+        store.Save(session_id, full);
+    }
     if (!result.ok) {
         std::cerr << "error: " << result.error << '\n';
         return result.error.find("402") != std::string::npos ? 2 : 1;

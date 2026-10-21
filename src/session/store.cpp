@@ -2,7 +2,9 @@
 #include <cctype>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -12,6 +14,7 @@
 
 namespace openclaw::session {
 namespace fs = std::filesystem;
+std::string NewSessionIdPublic();
 
 Store::Store(fs::path root) : root_(std::move(root)) {
     fs::create_directories(root_);
@@ -28,39 +31,36 @@ std::shared_ptr<std::recursive_mutex> Store::MutexFor(const std::string& id) con
 
 Store::Guard Store::Lock(const std::string& id) const { return Guard(MutexFor(id)); }
 
-fs::path Store::PathFor(const std::string& id) const {
-    // Reversible-ish encoding: safe chars kept, others as ~HH (no collisions like "a:b" vs "ab").
+namespace {
+std::string EncodeKey(const std::string& id) {
     static const char* hex = "0123456789abcdef";
-    std::string safe;
-    for (unsigned char c : id) {
-        if (std::isalnum(c) || c == '-' || c == '_') safe.push_back(static_cast<char>(c));
-        else { safe.push_back('~'); safe.push_back(hex[c >> 4]); safe.push_back(hex[c & 15]); }
-    }
-    if (safe.empty()) safe = "default";
-    if (safe.size() > 200) safe = safe.substr(0, 180) + "~h" + std::to_string(std::hash<std::string>{}(id));
-    fs::path p = root_ / (safe + ".json");
-    if (!fs::exists(p)) {
-        // Pre-1.29 stores stripped unsafe chars; read those only for keys the index has never seen.
-        auto legacy = LegacyPathFor(id);
-        if (legacy != p && fs::exists(legacy)) {
-            std::lock_guard<std::recursive_mutex> ig(index_mu_);
-            if (!ReadIndex().contains(id)) return legacy;
-        }
-    }
-    return p;
-}
-
-fs::path Store::WritePathFor(const std::string& id) const {
     std::string enc;
-    static const char* hex = "0123456789abcdef";
     for (unsigned char c : id) {
         if (std::isalnum(c) || c == '-' || c == '_') enc.push_back(static_cast<char>(c));
         else { enc.push_back('~'); enc.push_back(hex[c >> 4]); enc.push_back(hex[c & 15]); }
     }
     if (enc.empty()) enc = "default";
     if (enc.size() > 200) enc = enc.substr(0, 180) + "~h" + std::to_string(std::hash<std::string>{}(id));
-    return root_ / (enc + ".json");
+    return enc;
 }
+}  // namespace
+
+// Read path: <enc>.jsonl (upstream) > <enc>.json (1.29/1.30) > pre-1.29 stripped .json (unindexed keys only).
+fs::path Store::PathFor(const std::string& id) const {
+    const auto enc = EncodeKey(id);
+    fs::path jl = root_ / (enc + ".jsonl");
+    if (fs::exists(jl)) return jl;
+    fs::path p = root_ / (enc + ".json");
+    if (fs::exists(p)) return p;
+    auto legacy = LegacyPathFor(id);
+    if (legacy != p && fs::exists(legacy)) {
+        std::lock_guard<std::recursive_mutex> ig(index_mu_);
+        if (!ReadIndex().contains(id)) return legacy;
+    }
+    return jl;
+}
+
+fs::path Store::WritePathFor(const std::string& id) const { return root_ / (EncodeKey(id) + ".jsonl"); }
 
 fs::path Store::LegacyPathFor(const std::string& id) const {
     std::string safe;
@@ -77,7 +77,8 @@ std::vector<std::string> Store::List() const {
     std::vector<std::string> ids;
     if (!fs::exists(root_)) return ids;
     for (const auto& e : fs::directory_iterator(root_)) {
-        if (e.path().extension() != ".json" || e.path().filename() == "sessions.json") continue;
+        const auto ext = e.path().extension();
+        if ((ext != ".json" && ext != ".jsonl") || e.path().filename() == "sessions.json") continue;
         std::string stem = e.path().stem().string(), dec;
         for (std::size_t i = 0; i < stem.size(); ++i) {
             if (stem[i] == '~' && i + 2 < stem.size() && std::isxdigit(static_cast<unsigned char>(stem[i + 1])) &&
@@ -85,7 +86,7 @@ std::vector<std::string> Store::List() const {
                 dec.push_back(static_cast<char>(std::stoi(stem.substr(i + 1, 2), nullptr, 16))); i += 2;
             } else dec.push_back(stem[i]);
         }
-        ids.push_back(dec);
+        if (std::find(ids.begin(), ids.end(), dec) == ids.end()) ids.push_back(dec);
     }
     return ids;
 }
@@ -95,56 +96,78 @@ bool Store::Exists(const std::string& id) const {
     return fs::exists(PathFor(id));
 }
 
+std::vector<agent::Message> ParseTranscript(const fs::path& path) {
+    std::vector<agent::Message> msgs;
+    std::ifstream in(path);
+    if (path.extension() == ".jsonl") {
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            try {
+                auto j = nlohmann::json::parse(line);
+                if (j.value("type", "") == "message" && j.contains("message")) msgs.push_back(agent::Message::FromJson(j["message"]));
+            } catch (...) {}  // tolerate a torn last line
+        }
+        return msgs;
+    }
+    nlohmann::json j;
+    try { in >> j; } catch (...) { return msgs; }
+    if (j.contains("messages") && j["messages"].is_array())
+        for (const auto& m : j["messages"]) msgs.push_back(agent::Message::FromJson(m));
+    return msgs;
+}
+
 std::vector<agent::Message> Store::Load(const std::string& id) const {
     auto g = Lock(id);
     const auto path = PathFor(id);
     if (!fs::exists(path)) return {};
-    std::ifstream in(path);
-    nlohmann::json j;
-    in >> j;
-    std::vector<agent::Message> msgs;
-    if (j.contains("messages") && j["messages"].is_array()) {
-        for (const auto& m : j["messages"]) msgs.push_back(agent::Message::FromJson(m));
-    }
-    return msgs;
+    return ParseTranscript(path);
 }
 
 void Store::Save(const std::string& id, const std::vector<agent::Message>& messages) const {
     auto g = Lock(id);
-    nlohmann::json j;
-    j["id"] = id;
-    j["messages"] = nlohmann::json::array();
-    for (const auto& m : messages) j["messages"].push_back(m.ToJson());
+    const auto src = PathFor(id);
+    const auto dst = WritePathFor(id);
+    if (!IndexEntry(id).is_object()) Touch(id, 0);
+    auto entry = IndexEntry(id);
+    std::string sid = entry.is_object() ? entry.value("sessionId", std::string()) : std::string();
+    if (sid.empty()) sid = NewSessionIdPublic();
+    auto ts = [] {
+        auto t = std::chrono::system_clock::now();
+        std::time_t tt = std::chrono::system_clock::to_time_t(t);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count() % 1000;
+        std::tm u{}; gmtime_r(&tt, &u);
+        char buf[40]; std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%S", &u);
+        char out[48]; std::snprintf(out, sizeof out, "%s.%03dZ", buf, static_cast<int>(ms));
+        return std::string(out);
+    }();
+    auto tmp = fs::path(dst.string() + ".tmp");
     {
-        std::ofstream out(WritePathFor(id));
-        out << j.dump(2);
+        std::ofstream out(tmp, std::ios::trunc);
+        out << nlohmann::json{{"type", "session"}, {"version", 3}, {"id", sid}, {"key", id}, {"timestamp", ts}}.dump() << "\n";
+        std::string parent;
+        for (std::size_t i = 0; i < messages.size(); ++i) {
+            std::ostringstream mid; mid << std::hex << std::setw(8) << std::setfill('0') << (i + 1);
+            nlohmann::json line{{"type", "message"}, {"id", mid.str()}, {"timestamp", ts}, {"message", messages[i].ToJson()}};
+            line["parentId"] = parent.empty() ? nlohmann::json(nullptr) : nlohmann::json(parent);
+            out << line.dump() << "\n";
+            parent = mid.str();
+        }
+    }
+    fs::rename(tmp, dst);
+    // migrate this key's own old-format file (never a stripped legacy name that may belong to another key)
+    if (src != dst && src == root_ / (EncodeKey(id) + ".json")) {
+        std::error_code ec;
+        fs::rename(src, fs::path(src.string() + ".migrated"), ec);
     }
     Touch(id, messages.size());
 }
 
 void Store::Append(const std::string& id, const agent::Message& message) const {
-    // Lock once via Save path — but Load also locks; avoid double-lock deadlock by inlining
     auto g = Lock(id);
-    const auto path = PathFor(id);
-    std::vector<agent::Message> msgs;
-    if (fs::exists(path)) {
-        std::ifstream in(path);
-        nlohmann::json j;
-        in >> j;
-        if (j.contains("messages") && j["messages"].is_array()) {
-            for (const auto& m : j["messages"]) msgs.push_back(agent::Message::FromJson(m));
-        }
-    }
+    auto msgs = Load(id);
     msgs.push_back(message);
-    nlohmann::json j;
-    j["id"] = id;
-    j["messages"] = nlohmann::json::array();
-    for (const auto& m : msgs) j["messages"].push_back(m.ToJson());
-    {
-        std::ofstream out(WritePathFor(id));
-        out << j.dump(2);
-    }
-    Touch(id, msgs.size());
+    Save(id, msgs);
 }
 
 bool Store::Remove(const std::string& id) const {
@@ -171,6 +194,8 @@ std::string NewSessionId() {
     return s.substr(0, 8) + "-" + s.substr(8, 4) + "-4" + s.substr(13, 3) + "-a" + s.substr(17, 3) + "-" + s.substr(20, 12);
 }
 }  // namespace
+
+std::string NewSessionIdPublic() { return NewSessionId(); }
 
 nlohmann::json Store::ReadIndex() const {
     auto p = root_ / "sessions.json";
@@ -221,7 +246,7 @@ nlohmann::json Store::Reset(const std::string& key, const std::string& reason) c
     if (fs::exists(path)) {
         fs::create_directories(root_ / "archive");
         std::string sid = old.value("sessionId", std::string("legacy"));
-        fs::rename(path, root_ / "archive" / (path.stem().string() + "." + sid + ".json"));
+        fs::rename(path, root_ / "archive" / (path.stem().string() + "." + sid + path.extension().string()));
     }
     auto now = NowMs();
     nlohmann::json e{{"sessionId", NewSessionId()}, {"createdAt", now}, {"updatedAt", now}, {"messages", 0},

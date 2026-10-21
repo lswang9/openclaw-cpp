@@ -36,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.30.0-dev";
+constexpr const char* kVersion = "1.31.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -525,7 +525,11 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
         Emit("session.tool", {{"warning", w}, {"sessionKey", msg.session_key}});
     }
     if (result.ok) {
-        deps_.sessions.Save(msg.session_key, result.messages);
+        // Persist the full transcript: un-pruned history + only the messages this run produced
+        // (never the assembled/pruned view or the injected system prompt).
+        std::vector<agent::Message> full = messages;
+        for (std::size_t i = assembled.size(); i < result.messages.size(); ++i) full.push_back(result.messages[i]);
+        deps_.sessions.Save(msg.session_key, full);
         deps_.logs.Append("info", "chat ok session=" + msg.session_key);
         Emit("chat", {{"sessionKey", msg.session_key}, {"text", result.final_text}, {"turns", result.turns},
                       {"warnings", result.warnings}});

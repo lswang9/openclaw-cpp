@@ -195,4 +195,5 @@ OPENCLAW_CONFIG_PATH="$CFGT" "$BIN" config set agents.defaults.model.primary dee
 [[ "$(OPENCLAW_CONFIG_PATH="$CFGT" "$BIN" config get agents.defaults.model.primary)" == "deepseek/deepseek-chat" ]] && OPENCLAW_CONFIG_PATH="$CFGT" "$BIN" config validate >/dev/null && echo "[smoke] config set/get/validate ok"; rm -f "$CFGT" "$CFGT.bak"
 OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat -s smoke:reset "hi" >/dev/null
 OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat -s smoke:reset "/new" | grep -q "New session" && grep -q "previousSessionId" "$OPENCLAW_SESSION_DIR/sessions.json" && echo "[smoke] /new session reset ok"
+ls "$OPENCLAW_SESSION_DIR"/smoke~3areset.jsonl >/dev/null && ! grep -q "\"role\":\"system\"" "$OPENCLAW_SESSION_DIR"/archive/*.jsonl && echo "[smoke] jsonl transcript (no system prompt persisted) ok"
 echo "[smoke] ALL PASS"
