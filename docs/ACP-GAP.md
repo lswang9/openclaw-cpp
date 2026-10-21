@@ -13,7 +13,7 @@ Canonical protocol: [Agent Client Protocol](https://agentclientprotocol.com/) (J
 | In-process client + `acp-stdio` | **present** | **real** |
 | Gateway `acp.*` / `acp.wire` | **present** | **real** (subset) |
 | Live LLM via ACP (DeepSeek/OpenAI) | injectable via `SetLoopBackend` / env naming; **CLI stdio still defaults mock** unless wired | **honest** / optional |
-| acpx / Claude Code / Codex adapters | **not implemented** | **missing** |
+| acpx / Claude Code / Codex adapters | client runner (1.81): presets codex/claude/gemini via npx/CLI, config `acp.agents.<id>.command`; permission + fs/* handled | **real** (offline-tested with fake agent + own acp-stdio; never run against live Codex/Claude) |
 | Channel-bound ACP sessions | **present** — `acp.bind` / auto-bind on slack/feishu/discord inbound → `session/prompt` + outbound | **real** |
 | Multimodal prompt (text + image_base64/image_url + optional file) | **present** — mock echoes `mock-saw-image:N`; OpenAI-compat maps vision `content` array | **real** (mock) / **honest** (live vision depends on model) |
 | **session MCP** (`session/mcp/add|list|remove`, gateway `acp.session.mcp.*`) | **present** — mock/stdio attach; tools merged into AgentLoop registry on prompt | **real** (mock) / **honest** (stdio) |

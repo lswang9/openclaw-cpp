@@ -1,3 +1,4 @@
+#include "openclaw/acp/acpx.hpp"
 #include "openclaw/channels/discord_voice.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
@@ -99,7 +100,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.80.0-dev";
+constexpr const char* kVersion = "1.81.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3166,6 +3167,13 @@ int CmdGateway(int argc, char** argv, int argi) {
     agent::Pool agent_pool(&tools, &approvals);
     agent_pool.SetConfig(cfg.raw);
 
+    tools.Register({"acp_agent", "Delegate a task to an external ACP coding agent (acpx): agent = codex | claude | gemini | openclaw | an id from config acp.agents. The agent runs as a subprocess in cwd; its file reads are confined to cwd, writes only when fs_write=true, tool permissions follow `permission` (deny by default). Returns the agent's reply text, tool calls and stop reason.",
+                    {{"type", "object"}, {"properties", {{"agent", {{"type", "string"}}}, {"prompt", {{"type", "string"}}}, {"audio_path", {{"type", "string"}}},
+                                                         {"cwd", {{"type", "string"}}}, {"permission", {{"type", "string"}, {"enum", {"deny", "allow_once", "allow_always"}}}},
+                                                         {"fs_write", {{"type", "boolean"}}}, {"timeout_ms", {{"type", "integer"}}}}},
+                     {"required", nlohmann::json::array({"agent", "prompt"})}},
+                    [&cfg](const nlohmann::json& a) { return acp::acpx::RunFromParams(cfg.raw, a).dump(); },
+                    true});
     tools.Register({"discord_voice", "Speak in a Discord voice channel (needs the live Discord gateway). action: play {guild_id, channel_id, text | audio_path, listen_ms?, transcribe?} | join | leave | status. text is synthesised with the configured TTS provider; listen_ms records others afterwards (decoded per speaker, transcribed when transcribe=true).",
                     {{"type", "object"}, {"properties", {{"action", {{"type", "string"}, {"enum", {"play", "join", "leave", "status"}}}}, {"guild_id", {{"type", "string"}}},
                                                          {"channel_id", {{"type", "string"}}}, {"text", {{"type", "string"}}}, {"audio_path", {{"type", "string"}}},
@@ -3595,6 +3603,27 @@ int main(int argc, char** argv) {
         if (cmd == "cron-daemon") return CmdCronDaemon();
         if (cmd == "mcp-mock-server") return CmdMcpMockServer();
         if (cmd == "acp-stdio") return CmdAcpStdio();
+        if (cmd == "acp" && argc > 2 && std::string(argv[2]) == "run") {
+            // openclaw-cpp acp run --agent ID [--cwd DIR] [--permission P] [--fs-write] [--audio FILE] PROMPT...
+            nlohmann::json p{{"agent", ""}};
+            std::string prompt;
+            for (int i = 3; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--agent" && i + 1 < argc) p["agent"] = argv[++i];
+                else if (a == "--cwd" && i + 1 < argc) p["cwd"] = std::filesystem::absolute(argv[++i]).string();
+                else if (a == "--permission" && i + 1 < argc) p["permission"] = argv[++i];
+                else if (a == "--audio" && i + 1 < argc) p["audio_path"] = argv[++i];
+                else if (a == "--timeout-ms" && i + 1 < argc) p["timeout_ms"] = std::atoi(argv[++i]);
+                else if (a == "--fs-write") p["fs_write"] = true;
+                else if (a == "--updates") p["include_updates"] = true;
+                else prompt += (prompt.empty() ? "" : " ") + a;
+            }
+            if (!prompt.empty()) p["prompt"] = prompt;
+            auto cfgl = openclaw::config::Load(openclaw::config::DefaultPath());
+            auto r = openclaw::acp::acpx::RunFromParams(cfgl.snap.raw, p);
+            std::cout << r.dump(2) << "\n";
+            return r.value("ok", false) ? 0 : 1;
+        }
         if (cmd == "gateway") return CmdGateway(argc, argv, 2);
         if (cmd == "chat") return CmdChat(argc, argv, 2);
         if (cmd == "plugins") return CmdPlugins(argc, argv);

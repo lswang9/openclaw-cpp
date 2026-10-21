@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.80.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.81.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.81.0-dev
+- ACP acpx：openclaw-cpp 作为 ACP 客户端驱动外部智能体（codex/claude/gemini 预设或配置命令），处理权限请求、限定在 cwd 内的 fs 读写；音频块直通或本地转写；内置 ACP agent 支持音频与规范字段（v1、agent_message_chunk、stopReason）。RPC `acp.agents.run`、工具 `acp_agent`、CLI `acp run`。
 
 ### 1.80.0-dev
 - Discord 语音：主网关 op 4 自动取得语音端点/令牌；libopus（conan opus/1.5.2）编码 WAV/TTS 音频；播放后可接收他人语音并按说话人解码为 WAV、可选转写；RPC `discord.voice.*` + agent 工具 `discord_voice`。无 DAVE。

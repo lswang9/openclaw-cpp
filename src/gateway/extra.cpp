@@ -1,3 +1,4 @@
+#include "openclaw/acp/acpx.hpp"
 #include "openclaw/channels/waweb/noise.hpp"
 #include <chrono>
 #include "openclaw/desktop/desktop.hpp"
@@ -179,7 +180,11 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         }
         if (method == "acp.status") { r.payload = Real(deps.acp->StatusJson()); return r; }
         if (method == "acp.agents.list") {
-            r.payload = Real({{"agents", deps.acp->AgentsListJson()}});
+            r.payload = Real({{"agents", deps.acp->AgentsListJson()}, {"acpx_presets", acp::acpx::Presets()}});
+            return r;
+        }
+        if (method == "acp.agents.run") {
+            r.payload = Real(acp::acpx::RunFromParams(deps.config.raw, params));
             return r;
         }
         if (method == "acp.sessions.list") {

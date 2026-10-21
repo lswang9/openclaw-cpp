@@ -149,6 +149,7 @@ std::vector<std::string> ImplementedMethods() {
         "acp.auth.logout",
         "acp.authenticate",
         "acp.agents.list",
+        "acp.agents.run",
         "acp.sessions.list",
         "acp.sessions.create",
         "acp.sessions.prompt",

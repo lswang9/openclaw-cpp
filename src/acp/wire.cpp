@@ -1,3 +1,4 @@
+#include "openclaw/voice/stt.hpp"
 #include "openclaw/acp/wire.hpp"
 #include "openclaw/mcp/bridge.hpp"
 #include "openclaw/mcp/stdio.hpp"
@@ -15,8 +16,9 @@ namespace openclaw::acp {
 namespace {
 
 nlohmann::json AgentCapabilities() {
-    return {{"session",
-             {{"prompt", {{"image", true}, {"file", true}}},
+    return {{"promptCapabilities", {{"image", true}, {"audio", true}, {"embeddedContext", true}}},
+            {"session",
+             {{"prompt", {{"image", true}, {"file", true}, {"audio", true}}},
               {"_meta",
                {{"openclawCpp",
                  {{"sessionMcp", true},
@@ -334,6 +336,21 @@ AgentEndpoint::PromptParsed AgentEndpoint::ParsePrompt(const nlohmann::json& pro
                 if (!out.text.empty()) out.text += "\n";
                 out.text += "[image]";
             }
+            continue;
+        }
+        if (type == "audio" || type == "input_audio") {
+            // ACP AudioContent {data: base64, mimeType}; transcribed with the configured STT provider.
+            std::string data = b.value("data", std::string());
+            std::string mime = b.value("mimeType", std::string("audio/wav"));
+            if (b.contains("input_audio") && b["input_audio"].is_object()) { data = b["input_audio"].value("data", data); mime = "audio/" + b["input_audio"].value("format", std::string("wav")); }
+            static const std::string tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string raw; int val = 0, bits = -8;
+            for (unsigned char c : data) { auto pos = tbl.find(static_cast<char>(c)); if (pos == std::string::npos) continue; val = (val << 6) + static_cast<int>(pos); bits += 6; if (bits >= 0) { raw.push_back(static_cast<char>((val >> bits) & 0xff)); bits -= 8; } }
+            auto ext = mime.substr(mime.find('/') + 1);
+            auto tr = raw.empty() ? nlohmann::json{{"error", "empty audio"}} : voice::DefaultStt().Transcribe(raw, mime, "audio." + ext, "");
+            const auto txt = tr.value("text", std::string());
+            out.notify_parts.push_back({{"type", "audio"}, {"mimeType", mime}, {"bytes", raw.size()}, {"transcribed", !txt.empty()}});
+            push_text(txt.empty() ? std::string("[audio: transcription unavailable]") : "[Audio] Transcript: " + txt);
             continue;
         }
         if (type == "image_url") {
@@ -694,6 +711,10 @@ nlohmann::json AgentEndpoint::RunPromptTurn(std::unique_lock<std::mutex>& lock, 
              {{"sessionUpdate", "agent_message"},
               {"messageId", agent_mid},
               {"content", nlohmann::json::array({{{"type", "text"}, {"text", reply}}})}}}});
+    // Spec ACP clients (Zed, acpx) render agent_message_chunk with a single ContentBlock.
+    Notify("session/update",
+           {{"sessionId", sid},
+            {"update", {{"sessionUpdate", "agent_message_chunk"}, {"content", {{"type", "text"}, {"text", reply}}}}}});
     if (!loop_out.cancelled) {
         Notify("session/update",
                {{"sessionId", sid},
@@ -753,11 +774,8 @@ nlohmann::json AgentEndpoint::Handle(const nlohmann::json& request) {
     if (method == "initialize") {
         int requested = params.value("protocolVersion", 0);
         if (requested < 1) return Err(id, -32602, "Invalid params: protocolVersion");
-        if (requested < kAcpProtocolVersion) {
-            return Err(id, -32022, "Unsupported protocol version",
-                       {{"requested", requested}, {"supported", nlohmann::json::array({kAcpProtocolVersion})}});
-        }
-        const int selected = kAcpProtocolVersion;
+        // ACP v1 is the published spec version (Zed, acpx, codex-acp, claude-code-acp); v2 = openclaw-cpp extensions.
+        const int selected = requested >= kAcpProtocolVersion ? kAcpProtocolVersion : 1;
         initialized_ = true;
         client_protocol_ = selected;
         client_info_ = params.value("info", nlohmann::json::object());
@@ -775,6 +793,9 @@ nlohmann::json AgentEndpoint::Handle(const nlohmann::json& request) {
             authed_now = true;
         }
         return Ok(id, {{"protocolVersion", selected},
+                       {"agentCapabilities", AgentCapabilities()},
+                       {"agentInfo", {{"name", name_}, {"version", version_}}},
+                       {"authMethods", nlohmann::json::array()},
                        {"capabilities", AgentCapabilities()},
                        {"info",
                         {{"name", name_},
@@ -946,6 +967,9 @@ nlohmann::json AgentEndpoint::Handle(const nlohmann::json& request) {
         auto meta = RunPromptTurn(lock, *s, parsed, user_mid);
         // ACP: return messageId of inserted user message; loop outcome in notifications + _meta
         nlohmann::json result{{"messageId", meta.value("messageId", user_mid)}};
+        // ACP StopReason: end_turn | cancelled | refusal | max_tokens | max_turn_requests.
+        auto sr = meta.value("stopReason", std::string("end_turn"));
+        result["stopReason"] = sr == "error" ? "end_turn" : sr;  // failures surface in _meta.openclawCpp.ok
         if (meta.contains("_meta")) result["_meta"] = meta["_meta"];
         return Ok(id, result);
     }
