@@ -62,4 +62,71 @@ P
 # history persisted through the gateway: plain mode sees the full-screen turn
 OUT=$(printf '/history\n/exit\n' | "$BIN" tui --session fs --plain 2>/dev/null)
 grep -q "^you: .*hello world" <<<"$OUT" || { echo "$OUT"; fail "transcript via gateway"; }
-echo "[e2e-tui] full-screen tui (pty: edit, history, send, slash, scroll, resize, restore): PASS"
+# 1.106: live streaming (agent.delta), tool blocks (agent.tool), thinking blocks, input queue, model/agent pickers
+kill $GW; wait $GW 2>/dev/null || true
+mkdir -p "$T/ws"; echo "secret notes" >"$T/ws/notes.txt"
+cat >"$T/script.json" <<'J'
+[
+  {"tool_calls": [{"name": "read", "arguments": {"path": "notes.txt"}}]},
+  {"content": "<think>pondering the notes carefully</think>The answer is forty two after reading", "delayMs": 2500}
+]
+J
+OPENCLAW_MOCK_SCRIPT="$T/script.json" OPENCLAW_WORKSPACE="$T/ws" OPENCLAW_GATEWAY_PORT=$PORT "$BIN" gateway >>"$T/gw.log" 2>&1 & GW=$!
+for i in $(seq 1 50); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.2; done
+python3 - <<'P' || fail "pty streaming/tools/queue/pickers"
+import os, pty, time, select, struct, fcntl, termios, re
+BIN = os.environ["BIN"]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execv(BIN, [BIN, "tui", "--session", "st"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
+buf = b""
+def pump(t=0.6, until=None):
+    global buf
+    end = time.time() + t
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try: buf += os.read(fd, 65536)
+            except OSError: return
+        if until and (until in buf if isinstance(until, bytes) else re.search(until, buf)): return
+def send(s): os.write(fd, s.encode() if isinstance(s, str) else s)
+pump(4, b"| live")
+assert b"| live" in buf, "event stream connected: " + repr(buf[-300:])
+send("what do the notes say\r")
+pump(3, "✓ read".encode())
+assert "✓ read (".encode() in buf, "tool block: " + repr(buf[-1500:])
+send("follow up please\r")
+pump(1, b"queued (1)")
+assert b"queued (1): follow up please" in buf and b"queued 1" in buf, "input queue"
+pump(2, "▌".encode())
+assert "▌".encode() in buf, "streaming cursor while deltas arrive"
+assert "▸ thinking (".encode() in buf, "collapsed thinking block"
+pump(6, b"you: follow up please")
+assert b"agent: The answer is forty two after reading" in buf, "final streamed answer"
+assert b"you: follow up please" in buf, "queued message sent after the reply"
+pump(4, re.compile(rb"you: follow up please[\s\S]*agent: "))
+buf = b""; send(b"\x14"); pump(1, b"thinking: pondering")
+assert b"thinking: pondering the notes carefully" in buf, "Ctrl+T expands thinking"
+buf = b""; send(b"\x0f"); pump(1, b"secret notes")
+assert b"secret notes" in buf, "Ctrl+O expands tool output"
+buf = b""; send(b"\x10"); pump(2, b"Select model")
+assert b"Select model for agent:main:st" in buf and b"default (agent setting)" in buf, "model picker"
+send(b"\x1b[B"); time.sleep(0.2); send("\r"); pump(2, b"model for this session:")
+m = re.search(rb"model for this session: ([A-Za-z0-9_.:-]+)", buf); assert m, buf[-800:]
+chosen = m.group(1)
+pump(1); assert b"| model " + chosen in buf, "header shows model"
+buf = b""; send(b"\x07"); pump(2, b"Switch agent")
+assert b"Switch agent" in buf and b"main" in buf, "agent picker"
+send("\r"); pump(2, b"agent main (session agent:main:main)")
+assert b"agent main (session agent:main:main)" in buf
+buf = b""; send(b"\x10"); pump(1, b"Select model"); send(b"\x1b"); pump(1)
+send("/queue\r"); pump(1, b"queue empty"); assert b"queue empty" in buf
+send("/exit\r"); pump(2)
+_, st = os.waitpid(pid, 0)
+assert os.WIFEXITED(st) and os.WEXITSTATUS(st) == 0, st
+print("ok")
+P
+curl -s "http://127.0.0.1:$PORT/v1/rpc" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"sessions.patch","params":{"key":"agent:main:st"}}' | grep -q '"model": "' || fail "picker set the session model override"
+echo "[e2e-tui] full-screen tui (pty: edit, history, send, slash, scroll, resize, restore; streaming, tool/thinking blocks, queue, model/agent pickers): PASS"

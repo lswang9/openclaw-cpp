@@ -53,7 +53,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.105.0-dev";
+constexpr const char* kVersion = "1.106.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -834,7 +834,8 @@ void Server::Emit(const std::string& event, const nlohmann::json& payload) {
         frame += payload;
         return frame;
     };
-    const auto frame = make_frame(frame_payload);
+    (void)make_frame;
+    const auto frame = WsFrameText(frame_payload);
     std::lock_guard lock(ws_mu_);
     for (int fd : ws_clients_) {
         (void)::send(fd, frame.data(), frame.size(), MSG_NOSIGNAL);
@@ -1311,6 +1312,20 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
                     }
                 });
             }
+        }
+        {   // tool lifecycle events for live clients (tui tool blocks); chained with plugin hooks
+            const std::string key = msg.session_key;
+            auto before = lopts.before_tool_call;
+            lopts.before_tool_call = [this, key, before](const std::string& tool, const nlohmann::json& args) {
+                Emit("agent.tool", {{"sessionKey", key}, {"phase", "start"}, {"tool", tool}, {"args", args}});
+                return before ? before(tool, args) : nlohmann::json::object();
+            };
+            auto after = lopts.after_tool_call;
+            lopts.after_tool_call = [this, key, after](const std::string& tool, const nlohmann::json& args, const std::string& res, long long ms, const std::string& error) {
+                Emit("agent.tool", {{"sessionKey", key}, {"phase", "end"}, {"tool", tool}, {"result", res.substr(0, 2000)},
+                                    {"durationMs", ms}, {"error", error}});
+                if (after) after(tool, args, res, ms, error);
+            };
         }
         result = agent::RunAgentLoop(*prov, tools, assembled, lopts);
         typing_stop.store(true);
@@ -2256,12 +2271,19 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     if (method == "sessions.patch") {
         const std::string key = params.value("key", params.value("id", ""));
         if (key.empty()) return err("missing session key");
+        if (params.contains("model")) {  // per-session model override (same state as the /model chat command)
+            std::lock_guard lock(session_ctrl_mu_);
+            if (params["model"].is_string() && !params["model"].get<std::string>().empty()) session_model_[key] = params["model"].get<std::string>();
+            else session_model_.erase(key);
+        }
         if (params.contains("messages") && params["messages"].is_array()) {
             std::vector<agent::Message> msgs;
             for (const auto& m : params["messages"]) msgs.push_back(agent::Message::FromJson(m));
             deps_.sessions.Save(key, msgs);
         }
-        return ok({{"key", key}, {"patched", true}});
+        nlohmann::json out{{"key", key}, {"patched", true}};
+        { std::lock_guard lock(session_ctrl_mu_); auto it = session_model_.find(key); out["model"] = it == session_model_.end() ? nlohmann::json(nullptr) : nlohmann::json(it->second); }
+        return ok(out);
     }
     if (method == "sessions.subscribe" || method == "sessions.messages.subscribe") {
         events::SubFilter filt;

@@ -802,7 +802,7 @@ int CmdTui(int argc, char** argv) {
     if (full) {
         TuiBackend tb;
         tb.rpc = [&](const std::string& m, const json& p, long t, std::string* e) { return Rpc(base, token, m, p, t, e); };
-        tb.base = base; tb.session = session; tb.timeout_s = timeout; tb.history_limit = hist;
+        tb.base = base; tb.token = token; tb.session = session; tb.timeout_s = timeout; tb.history_limit = hist;
         if (a->has("--thinking")) tb.send_extra["thinking"] = a->get("--thinking");
         if (a->has("--deliver")) tb.send_extra["deliver"] = true;
         tb.initial_message = a->get("--message");
