@@ -1,5 +1,6 @@
 #pragma once
-#include <shared_mutex>
+#include <condition_variable>
+#include <queue>
 #include <map>
 #include <functional>
 #include <chrono>
@@ -141,8 +142,17 @@ private:
     std::unique_lock<std::mutex> LockDeps() const;
     std::vector<std::string> plugin_channels_;
     std::set<std::string> plugin_providers_;
-    mutable std::mutex deps_mu_;  // exclusive: reload vs all request handlers
+    mutable std::mutex deps_mu_;  // exclusive: reload vs request handlers that touch deps
     std::mutex reload_mu_;
+    // Bounded worker pool for HTTP clients (unbounded detach OOMed under reload hammers).
+    std::mutex workers_mu_;
+    std::condition_variable workers_cv_;
+    std::queue<std::pair<int, std::string>> workers_q_;  // fd, client ip
+    std::vector<std::thread> workers_;
+    bool workers_stop_ = false;
+    void StartWorkers(std::size_t n);
+    void StopWorkers();
+    void EnqueueClient(int fd, std::string ip);
     std::filesystem::file_time_type cfg_mtime_{};
     std::chrono::steady_clock::time_point last_reload_check_{};
 

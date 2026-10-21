@@ -283,6 +283,7 @@ void Server::Stop() {
     cancel_agents_.store(true);
     running_.store(false);
     if (listen_fd_ >= 0) shutdown(listen_fd_, SHUT_RDWR);
+    // Wake accept loop; workers joined at end of Run().
 }
 
 std::string Server::AgentSystemPrompt(const std::string& agent_id) {
@@ -356,6 +357,11 @@ void Server::RefreshPluginExtensions() {
 void Server::Run() {
     RefreshPluginExtensions();
     RefreshDiscordCommands();
+    std::size_t nworkers = 8;
+    if (const char* e = std::getenv("OPENCLAW_GATEWAY_WORKERS"); e && *e) {
+        int v = std::atoi(e); if (v >= 1 && v <= 64) nworkers = static_cast<std::size_t>(v);
+    }
+    StartWorkers(nworkers);
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
     int yes = 1;
@@ -387,23 +393,65 @@ void Server::Run() {
         socklen_t plen = sizeof(peer);
         int client = accept(listen_fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
         if (client < 0) { if (!running_.load()) break; continue; }
-        { char ipbuf[INET_ADDRSTRLEN] = {0}; inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf));
-          auth::DeviceLinkStore::SetThreadClientIp(ipbuf); }
         std::string ip;
         { char ipbuf[INET_ADDRSTRLEN] = {0}; inet_ntop(AF_INET, &peer.sin_addr, ipbuf, sizeof(ipbuf)); ip = ipbuf; }
-        // Each HTTP client on its own thread so a run waiting on an exec approval can't block /approve or RPCs.
-        std::thread([this, client, ip] {
-            auth::DeviceLinkStore::SetThreadClientIp(ip);
-            bool should_close = true;
-            try { should_close = HandleClient(client); } catch (const std::exception& e) {
-                if (opts_.verbose) std::cerr << "[gateway] " << e.what() << '\n';
-                should_close = true;
-            }
-            if (should_close) close(client);
-        }).detach();
+        EnqueueClient(client, std::move(ip));
     }
+    StopWorkers();
     if (listen_fd_ >= 0) { close(listen_fd_); listen_fd_ = -1; }
     running_.store(false);
+}
+
+void Server::StartWorkers(std::size_t n) {
+    workers_stop_ = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        workers_.emplace_back([this] {
+            for (;;) {
+                int fd = -1; std::string ip;
+                {
+                    std::unique_lock lock(workers_mu_);
+                    workers_cv_.wait(lock, [&] { return workers_stop_ || !workers_q_.empty(); });
+                    if (workers_stop_ && workers_q_.empty()) return;
+                    fd = workers_q_.front().first; ip = std::move(workers_q_.front().second);
+                    workers_q_.pop();
+                }
+                auth::DeviceLinkStore::SetThreadClientIp(ip);
+                bool should_close = true;
+                try { should_close = HandleClient(fd); } catch (const std::exception& e) {
+                    if (opts_.verbose) std::cerr << "[gateway] " << e.what() << '\n';
+                    should_close = true;
+                }
+                if (should_close) close(fd);
+            }
+        });
+    }
+}
+
+void Server::StopWorkers() {
+    {
+        std::lock_guard lock(workers_mu_);
+        workers_stop_ = true;
+    }
+    workers_cv_.notify_all();
+    for (auto& t : workers_) if (t.joinable()) t.join();
+    workers_.clear();
+    std::lock_guard lock(workers_mu_);
+    while (!workers_q_.empty()) { close(workers_q_.front().first); workers_q_.pop(); }
+}
+
+void Server::EnqueueClient(int fd, std::string ip) {
+    constexpr std::size_t kMaxQueue = 256;
+    {
+        std::lock_guard lock(workers_mu_);
+        if (workers_q_.size() >= kMaxQueue) {
+            const char msg[] = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            (void)::send(fd, msg, sizeof(msg) - 1, MSG_NOSIGNAL);
+            close(fd);
+            return;
+        }
+        workers_q_.emplace(fd, std::move(ip));
+    }
+    workers_cv_.notify_one();
 }
 
 bool Server::HandleClient(int client_fd) {
@@ -506,6 +554,7 @@ void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bo
 
     agent::LoopOptions lopts = MakeLoopOpts(deps_, body);
     lopts.cancel = &cancel_agents_;
+    if (deps_lock.owns_lock()) deps_lock.unlock();
     auto result = agent::RunAgentLoop(deps_.provider, deps_.tools, messages, lopts);
     if (!session_id.empty() && result.ok) deps_.sessions.Save(session_id, result.messages);
     if (!result.ok) {
@@ -879,7 +928,8 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
                 fm.push_back({.role = "user", .content = mf.prompt});
                 agent::LoopOptions flo = MakeLoopOpts(deps_);
                 flo.cancel = &cancel_agents_;
-                auto fr = agent::RunAgentLoop(*cprov, deps_.tools, fm, flo);
+                if (deps_lock.owns_lock()) deps_lock.unlock();
+                auto fr = agent::RunAgentLoop(*cprov, tools, fm, flo);
                 deps_.logs.Append("info", "memory flush session=" + msg.session_key + " ok=" + (fr.ok ? "1" : "0"));
                 Emit("session.memoryFlush", {{"sessionKey", msg.session_key}, {"ok", fr.ok}, {"turns", fr.turns}});
             }
@@ -919,6 +969,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         skills::ScopedEnv skill_env(skills::SkillEnvOverrides(deps_.skills.List(), skill_entries));
         tools::exec::ScopedRunContext exec_ctx({agent_id, msg.session_key, msg.channel,
                                                 msg.conversation_id.empty() ? msg.sender : msg.conversation_id, msg.sender});
+        if (deps_lock.owns_lock()) deps_lock.unlock();  // do not hold deps_mu_ across the model/tool loop
         result = agent::RunAgentLoop(*prov, tools, assembled, lopts);
     }
     for (const auto& w : result.warnings) {
@@ -1618,7 +1669,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         im.sender = params.value("sender", "user");
         im.text = text;
         im.session_key = session_key;
-        deps_lock.unlock();  // DeliverInbound may MaybeReload (unique) then take shared
+        if (deps_lock.owns_lock()) deps_lock.unlock();  // DeliverInbound may reload then LockDeps
         auto reply = DeliverInbound(im);
         if (reply.rfind("error:", 0) == 0) return err(reply.substr(6));
         return ok({{"sessionKey", session_key}, {"text", reply}});

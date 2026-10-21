@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prove config.reload (unique deps lock) does not race concurrent HTTP inbound (shared lock).
+# Prove config.reload (deps lock) does not race concurrent HTTP inbound; bounded workers avoid OOM.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
@@ -55,7 +55,7 @@ sys.exit(0 if ok else 1)
 PY
 }
 
-# Modest overlap: enough to exercise shared vs unique, avoid thread/memory storms beside smoke's gateway.
+# Modest overlap: enough to exercise reload vs inbound, avoid thread/memory storms beside smoke's gateway.
 fail=0
 for wave in $(seq 1 6); do
   pids=()
@@ -125,4 +125,4 @@ curl -sS -m 30 -o "$T/jobs/final-tools.json" -X POST "http://127.0.0.1:$PORT/v1/
   -d '{"jsonrpc":"2.0","id":4,"method":"tools.list","params":{}}'
 check_json "$T/jobs/final-tools.json" 'data.get("ok") is True and isinstance(data.get("payload",{}).get("tools"), list)'
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null
-echo "[e2e-lock] concurrent config.reload + inbound/tools.list under shared_mutex: PASS"
+echo "[e2e-lock] concurrent config.reload + inbound/tools.list under exclusive deps lock + worker pool: PASS"
