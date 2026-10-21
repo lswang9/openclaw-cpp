@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 // Real implementations of upstream v2026.10.5 RPCs that were stubs before 1.100:
 //   sessions.companion.{ask,state,reset}   read-only side chat per session (in-memory, ≤24 exchanges)
 //   sessions.{dispatch,move,reclaim}       worker placement ledger (device workers from the node registry)
@@ -43,6 +44,12 @@ std::optional<nlohmann::json> RunTurnOnPlacedWorker(ServerDeps& d, const std::fi
                                                     const std::string& key, const std::string& text, std::string* err);
 
 // Upstream agent tools that read gateway state: sessions_list, sessions_history, session_status, agents_list, nodes.
+// In-process RPC used by agent tools that wrap gateway methods (returns the response frame {ok,payload,error}).
+void SetGatewayRpc(std::function<nlohmann::json(const std::string&, const nlohmann::json&)> fn);
+nlohmann::json GatewayRpc(const std::string& method, const nlohmann::json& params);
+// Media generation provider interface (image|video|music). Mock provider writes deterministic files.
+nlohmann::json GenerateMedia(const std::string& kind, const nlohmann::json& args);
+std::vector<std::string> GatewayToolNames();
 std::string GatewayTool(const std::string& name, const nlohmann::json& args, const std::string& agent, const std::string& session_key);
 
 // GitHub API base (gateway.github.apiBaseUrl / OPENCLAW_GITHUB_API_BASE_URL); https only unless loopback http.

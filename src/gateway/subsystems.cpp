@@ -1,3 +1,4 @@
+#include <ctime>
 #include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/gateway/node_hub.hpp"
 
@@ -1251,18 +1252,27 @@ std::string GatewayTool(const std::string& name, const nlohmann::json& a, const 
     auto fail = [](const std::string& e) { return json{{"ok", false}, {"error", e}}.dump(); };
     if (!g_tool_deps) return fail("gateway not running");
     auto& d = *g_tool_deps;
+    session::Store& store = d.agent_pool ? d.agent_pool->Sessions(agent.empty() ? std::string("main") : agent) : d.sessions;
+    // Accept the stored key, or the short form a caller used (k1 → agent:<agent>:k1 / any key ending in :k1).
+    auto resolve = [&](const std::string& k) -> std::string {
+        if (k.empty() || store.Exists(k)) return k;
+        const std::string full = "agent:" + (agent.empty() ? std::string("main") : agent) + ":" + k;
+        if (store.Exists(full)) return full;
+        for (auto& s : store.List()) if (s.size() > k.size() && s.compare(s.size() - k.size() - 1, std::string::npos, ":" + k) == 0) return s;
+        return k;
+    };
     if (name == "sessions_list") {
         const int limit = std::clamp(a.value("limit", 50), 1, 200);
         json out = json::array();
-        for (auto& k : d.sessions.List()) { if (static_cast<int>(out.size()) >= limit) break; out.push_back({{"key", k}, {"entry", d.sessions.IndexEntry(k)}}); }
+        for (auto& k : store.List()) { if (static_cast<int>(out.size()) >= limit) break; out.push_back({{"key", k}, {"entry", store.IndexEntry(k)}}); }
         return json{{"sessions", out}}.dump();
     }
     if (name == "sessions_history") {
-        const auto key = a.value("sessionKey", session_key);
-        if (key.empty() || !d.sessions.Exists(key)) return fail("session not found: " + key);
+        const auto key = resolve(a.value("sessionKey", session_key));
+        if (key.empty() || !store.Exists(key)) return fail("session not found: " + key);
         const int limit = std::clamp(a.value("limit", 20), 1, 200);
         const bool tools = a.value("includeTools", false);
-        auto msgs = d.sessions.Load(key);
+        auto msgs = store.Load(key);
         json out = json::array();
         for (auto it = msgs.rbegin(); it != msgs.rend() && static_cast<int>(out.size()) < limit; ++it) {
             if (it->role == "system" || (!tools && it->role == "tool")) continue;
@@ -1271,9 +1281,9 @@ std::string GatewayTool(const std::string& name, const nlohmann::json& a, const 
         return json{{"sessionKey", key}, {"messages", out}}.dump();
     }
     if (name == "session_status") {
-        const auto key = a.value("sessionKey", session_key);
-        if (key.empty() || !d.sessions.Exists(key)) return fail("session not found: " + key);
-        json out{{"sessionKey", key}, {"entry", d.sessions.IndexEntry(key)}, {"messageCount", d.sessions.Load(key).size()}, {"agentId", agent}};
+        const auto key = resolve(a.value("sessionKey", session_key));
+        if (key.empty() || !store.Exists(key)) return fail("session not found: " + key);
+        json out{{"sessionKey", key}, {"entry", store.IndexEntry(key)}, {"messageCount", store.Load(key).size()}, {"agentId", agent}};
         auto db = ReadJsonFile(PlacementsPath(g_tool_root), json::object());
         if (db.contains(agent + ":" + key)) out["placement"] = PlacementView(db[agent + ":" + key]);
         return out.dump();
@@ -1298,6 +1308,273 @@ std::string GatewayTool(const std::string& name, const nlohmann::json& a, const 
         }
         return fail("action must be list, describe or invoke");
     }
+    // ---- tools that wrap gateway RPCs
+    auto rpc = [&](const std::string& m, const json& p) -> std::string {
+        auto r = GatewayRpc(m, p);
+        if (r.value("ok", false)) return r.value("payload", json::object()).dump();
+        auto e = r.contains("error") ? r["error"] : json("error");
+        return fail(e.is_object() ? e.value("message", e.dump()) : e.is_string() ? e.get<std::string>() : e.dump());
+    };
+    const std::string me = agent.empty() ? std::string("main") : agent;
+    if (name == "sessions_send") {
+        const auto msg = a.value("message", std::string());
+        auto key = a.value("sessionKey", a.value("label", std::string()));
+        if (msg.empty() || key.empty()) return fail("sessionKey and message are required");
+        key = resolve(key);
+        if (key == session_key) return fail("cannot send to the current session");
+        return rpc("chat.send", {{"sessionKey", key}, {"message", msg}, {"agentId", a.value("agentId", me)}, {"sender", "agent:" + me}});
+    }
+    if (name == "sessions_spawn") {
+        const auto task = a.value("task", std::string());
+        if (task.empty()) return fail("task is required");
+        const auto label = a.value("label", a.value("taskName", std::string("subagent")));
+        const auto key = "agent:" + a.value("agentId", me) + ":subagent:" + label + "-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count() % 1000000000LL);
+        auto reg = ReadJsonFile(fs::path(g_tool_root) / "subagents.json", json::object());
+        reg[key] = {{"parent", session_key}, {"label", label}, {"task", task}, {"status", "running"}, {"startedAt", NowMs()}};
+        WriteJsonFile(fs::path(g_tool_root) / "subagents.json", reg);
+        json p{{"sessionKey", key}, {"message", task}, {"agentId", a.value("agentId", me)}};
+        if (a.contains("model")) p["model"] = a["model"];
+        auto r = GatewayRpc("chat.send", p);
+        reg = ReadJsonFile(fs::path(g_tool_root) / "subagents.json", json::object());
+        reg[key]["status"] = r.value("ok", false) ? "done" : "failed";
+        reg[key]["result"] = r.value("ok", false) ? r["payload"].value("text", "") : r.value("error", json()).dump();
+        reg[key]["endedAt"] = NowMs();
+        WriteJsonFile(fs::path(g_tool_root) / "subagents.json", reg);
+        return json{{"status", reg[key]["status"]}, {"runId", key}, {"childSessionKey", key}, {"result", reg[key]["result"]}}.dump();
+    }
+    if (name == "subagents") {
+        auto reg = ReadJsonFile(fs::path(g_tool_root) / "subagents.json", json::object());
+        const auto action = a.value("action", std::string("list"));
+        json out = json::array();
+        for (auto& [k, v] : reg.items())
+            if (action == "list" ? v.value("parent", "") == session_key || a.value("all", false) : true) { json x = v; x["runId"] = k; out.push_back(x); }
+        if (action == "wait" || action == "status") {
+            json ids = a.contains("runIds") ? a["runIds"] : json::array({a.value("runId", std::string())});
+            json res = json::array();
+            for (auto& id : ids) if (id.is_string() && reg.contains(id.get<std::string>())) { json x = reg[id.get<std::string>()]; x["runId"] = id; res.push_back(x); }
+            return json{{"runs", res}}.dump();
+        }
+        return json{{"runs", out}}.dump();
+    }
+    if (name == "sessions_yield") {
+        return json{{"yielded", true}, {"message", a.value("message", std::string())}, {"waitFor", a.value("waitFor", json())},
+                    {"note", "turn yields; the next inbound message resumes this session"}}.dump();
+    }
+    if (name == "sessions_search") {
+        auto q = a.value("query", std::string());
+        if (q.empty()) return fail("query is required");
+        std::string ql = q; std::transform(ql.begin(), ql.end(), ql.begin(), ::tolower);
+        const int limit = std::clamp(a.value("limit", 10), 1, 50);
+        json res = json::array();
+        for (auto& k : store.List()) {
+            auto msgs = store.Load(k);
+            for (size_t i = 0; i < msgs.size() && static_cast<int>(res.size()) < limit; ++i) {
+                if (msgs[i].role == "system") continue;
+                std::string c = msgs[i].content, cl = c; std::transform(cl.begin(), cl.end(), cl.begin(), ::tolower);
+                auto pos = cl.find(ql);
+                if (pos == std::string::npos) continue;
+                const size_t s = pos > 60 ? pos - 60 : 0;
+                res.push_back({{"sessionKey", k}, {"messageId", i}, {"role", msgs[i].role}, {"snippet", c.substr(s, 160)}});
+            }
+        }
+        return json{{"status", "ok"}, {"query", q}, {"results", res}}.dump();
+    }
+    if (name == "message") {
+        const auto action = a.value("action", std::string("send"));
+        if (action == "send")
+            return rpc("send", {{"channel", a.value("channel", std::string())}, {"to", a.value("to", a.value("target", std::string()))},
+                                {"message", a.value("message", a.value("text", std::string()))}});
+        json p = a; p["action"] = action;
+        return rpc("message.action", p);
+    }
+    if (name == "automations") {
+        const auto action = a.value("action", std::string("list"));
+        if (action == "list") return rpc("cron.list", json::object());
+        if (action == "add" || action == "create")
+            return rpc("cron.add", {{"id", a.value("id", "auto-" + std::to_string(NowMs()))}, {"cron", a.value("schedule", a.value("cron", std::string()))},
+                                    {"payload", a.value("message", a.value("prompt", std::string()))}, {"enabled", a.value("enabled", true)}});
+        if (action == "remove" || action == "delete") return rpc("cron.remove", {{"id", a.value("id", std::string())}});
+        if (action == "run") return rpc("cron.run", {{"id", a.value("id", std::string())}});
+        return fail("action must be list, add, remove or run");
+    }
+    if (name == "reminder") {
+        const auto text = a.value("text", a.value("message", std::string()));
+        if (text.empty()) return fail("text is required");
+        long long at = a.value("atMs", 0LL);
+        if (!at && a.contains("inSeconds")) at = NowMs() + a.value("inSeconds", 0LL) * 1000;
+        if (!at) return fail("atMs or inSeconds is required");
+        std::time_t tt = at / 1000; std::tm tm{}; localtime_r(&tt, &tm);
+        char expr[64]; std::snprintf(expr, sizeof expr, "%d %d %d %d *", tm.tm_min, tm.tm_hour, tm.tm_mday, tm.tm_mon + 1);
+        const auto id = "reminder-" + std::to_string(at);
+        auto r = rpc("cron.add", {{"id", id}, {"cron", expr}, {"payload", "Reminder: " + text}, {"enabled", true}});
+        return json{{"id", id}, {"cron", expr}, {"atMs", at}, {"text", text}, {"cron_result", json::parse(r)}}.dump();
+    }
+    if (name == "tts") {
+        const auto text = a.value("text", std::string());
+        if (text.empty()) return fail("text is required");
+        return rpc("tts.convert", {{"text", text}, {"channel", a.value("channel", std::string())}});
+    }
+    if (name == "presence") return rpc("system-presence", json::object());
+    if (name == "skills_search") return rpc("skills.search", {{"query", a.value("query", std::string())}});
+    if (name == "skills_read") {
+        const auto nm = a.value("name", std::string());
+        if (nm.empty() || nm.find("..") != std::string::npos || nm.find('/') != std::string::npos) return fail("valid skill name required");
+        auto st = GatewayRpc("skills.status", json::object());
+        for (auto& s : st.value("payload", json::object()).value("skills", json::array())) {
+            if (s.value("name", "") != nm) continue;
+            std::string path = s.value("path", s.value("filePath", s.value("baseDir", std::string())));
+            if (fs::is_directory(path)) path = (fs::path(path) / "SKILL.md").string();
+            std::ifstream in(path); std::stringstream ss; ss << in.rdbuf();
+            if (!in) return fail("skill file unreadable: " + path);
+            return json{{"name", nm}, {"path", path}, {"content", ss.str().substr(0, 60000)}}.dump();
+        }
+        return fail("skill not found: " + nm);
+    }
+    if (name == "docs_search") {
+        const auto q = a.value("query", std::string());
+        if (q.empty()) return fail("query is required");
+        std::string ql = q; std::transform(ql.begin(), ql.end(), ql.begin(), ::tolower);
+        std::vector<fs::path> roots;
+        if (const char* d = std::getenv("OPENCLAW_DOCS_DIR")) roots.emplace_back(d);
+        roots.emplace_back(fs::path(g_tool_root) / "docs");
+        json res = json::array();
+        for (auto& r : roots) {
+            std::error_code ec;
+            if (!fs::is_directory(r, ec)) continue;
+            for (auto it = fs::recursive_directory_iterator(r, ec); it != fs::recursive_directory_iterator() && res.size() < 10; it.increment(ec)) {
+                if (!it->is_regular_file() || (it->path().extension() != ".md" && it->path().extension() != ".mdx")) continue;
+                std::ifstream in(it->path()); std::stringstream ss; ss << in.rdbuf(); std::string c = ss.str(), cl = c;
+                std::transform(cl.begin(), cl.end(), cl.begin(), ::tolower);
+                auto pos = cl.find(ql);
+                if (pos == std::string::npos) continue;
+                res.push_back({{"path", fs::relative(it->path(), r).string()}, {"snippet", c.substr(pos > 80 ? pos - 80 : 0, 240)}});
+            }
+        }
+        return json{{"query", q}, {"results", res}, {"roots", json::array()}}.dump();
+    }
+    if (name == "create_goal" || name == "get_goal" || name == "update_goal") {
+        static std::mutex goals_mu;
+        std::lock_guard lk(goals_mu);
+        const auto path = fs::path(g_tool_root) / "goals.json";
+        auto db = ReadJsonFile(path, json::object());
+        const auto key = a.value("sessionKey", session_key);
+        if (name == "get_goal") return db.contains(key) ? db[key].dump() : json{{"goal", nullptr}}.dump();
+        if (name == "create_goal") {
+            const auto obj = a.value("objective", a.value("goal", std::string()));
+            if (obj.empty()) return fail("objective is required");
+            db[key] = {{"objective", obj}, {"status", "active"}, {"createdAt", NowMs()}, {"successCriteria", a.value("successCriteria", json::array())}};
+        } else {
+            if (!db.contains(key)) return fail("no goal for this session");
+            for (auto f : {"status", "objective", "progress", "notes"}) if (a.contains(f)) db[key][f] = a[f];
+            db[key]["updatedAt"] = NowMs();
+        }
+        WriteJsonFile(path, db);
+        return db[key].dump();
+    }
+    if (name == "transcripts") {
+        const auto path = fs::path(g_tool_root) / "transcripts.json";
+        auto db = ReadJsonFile(path, json::object());
+        const auto action = a.value("action", std::string("list"));
+        if (action == "list") { json out = json::array(); for (auto& [k, v] : db.items()) out.push_back({{"id", k}, {"title", v.value("title", "")}, {"createdAt", v.value("createdAt", 0LL)}}); return json{{"transcripts", out}}.dump(); }
+        if (action == "read" || action == "get") { auto id = a.value("id", a.value("sessionId", std::string())); return db.contains(id) ? db[id].dump() : fail("transcript not found: " + id); }
+        if (action == "save" || action == "create") {
+            const auto tx = a.value("transcript", std::string());
+            if (tx.empty()) return fail("transcript is required");
+            const auto id = "tx-" + std::to_string(NowMs());
+            db[id] = {{"title", a.value("title", std::string("transcript"))}, {"transcript", tx}, {"createdAt", NowMs()}, {"sessionKey", session_key}};
+            WriteJsonFile(path, db);
+            return json{{"id", id}}.dump();
+        }
+        return fail("action must be list, read or save (live meeting capture is not available offline)");
+    }
+    if (name == "secrets") {
+        const auto nm = a.value("name", std::string());
+        auto lst = GatewayRpc("secrets.list", json::object());
+        if (nm.empty()) return lst.value("ok", false) ? lst["payload"].dump() : fail("secrets.list failed");
+        // Never return secret values to the model; report availability only.
+        bool have = lst.value("payload", json::object()).dump().find("\"" + nm + "\"") != std::string::npos;
+        return json{{"name", nm}, {"available", have}, {"reason", a.value("reason", std::string())}, {"note", "values are never returned to the model"}}.dump();
+    }
+    if (name == "image_generate" || name == "video_generate" || name == "music_generate")
+        return GenerateMedia(name.substr(0, name.find('_')), a).dump();
+    if (name == "image" || name == "pdf") {
+        json paths = a.contains("paths") ? a["paths"] : a.contains("pdfs") ? a["pdfs"] : json::array({a.value("path", a.value("pdf", a.value("image", std::string())))});
+        json out = json::array();
+        for (auto& pj : paths) {
+            if (!pj.is_string() || pj.get<std::string>().empty()) continue;
+            const fs::path pth = pj.get<std::string>();
+            std::error_code ec;
+            if (!fs::is_regular_file(pth, ec)) { out.push_back({{"path", pth.string()}, {"error", "not found"}}); continue; }
+            json item{{"path", pth.string()}, {"bytes", fs::file_size(pth, ec)}};
+            if (name == "pdf") {
+                const std::string cmd = "pdftotext -layout -q '" + std::regex_replace(pth.string(), std::regex("'"), "'\\''") + "' - 2>/dev/null";
+                std::string text; if (FILE* f = popen(cmd.c_str(), "r")) { char buf[4096]; size_t n; while ((n = fread(buf, 1, sizeof buf, f)) > 0 && text.size() < 200000) text.append(buf, n); pclose(f); }
+                item["text"] = text; if (text.empty()) item["error"] = "no text extracted (pdftotext missing or image-only pdf)";
+            } else {
+                std::ifstream in(pth, std::ios::binary); unsigned char h[24] = {0}; in.read(reinterpret_cast<char*>(h), 24);
+                if (h[0] == 0x89 && h[1] == 'P') { item["format"] = "png"; item["width"] = (h[16] << 24) | (h[17] << 16) | (h[18] << 8) | h[19]; item["height"] = (h[20] << 24) | (h[21] << 16) | (h[22] << 8) | h[23]; }
+                else if (h[0] == 0xFF && h[1] == 0xD8) item["format"] = "jpeg";
+                else if (h[0] == 'G' && h[1] == 'I') item["format"] = "gif";
+                else if (h[8] == 'W' && h[9] == 'E') item["format"] = "webp";
+                item["description"] = "vision analysis requires a vision-capable provider; returning file metadata";
+            }
+            out.push_back(item);
+        }
+        if (out.empty()) return fail("path is required");
+        return json{{"prompt", a.value("prompt", std::string())}, {"items", out}}.dump();
+    }
     return fail("unknown gateway tool " + name);
+}
+}  // namespace openclaw::gateway
+
+namespace openclaw::gateway {
+namespace {
+std::function<nlohmann::json(const std::string&, const nlohmann::json&)> g_gw_rpc;
+std::mutex g_goals_mu;
+}
+void SetGatewayRpc(std::function<nlohmann::json(const std::string&, const nlohmann::json&)> fn) { g_gw_rpc = std::move(fn); }
+nlohmann::json GatewayRpc(const std::string& m, const nlohmann::json& p) {
+    if (!g_gw_rpc) return {{"ok", false}, {"error", {{"message", "gateway not running"}}}};
+    return g_gw_rpc(m, p);
+}
+std::vector<std::string> GatewayToolNames() {
+    return {"sessions_list", "sessions_history", "session_status", "agents_list", "nodes", "sessions_send", "sessions_spawn", "sessions_yield",
+            "sessions_search", "subagents", "message", "automations", "reminder", "image", "pdf", "tts", "image_generate", "video_generate",
+            "music_generate", "create_goal", "get_goal", "update_goal", "docs_search", "skills_search", "skills_read", "transcripts", "secrets", "presence"};
+}
+
+nlohmann::json GenerateMedia(const std::string& kind, const nlohmann::json& a) {
+    using nlohmann::json;
+    const auto prompt = a.value("prompt", std::string());
+    if (prompt.empty()) return {{"ok", false}, {"error", "prompt is required"}};
+    const char* prov = std::getenv("OPENCLAW_MEDIA_PROVIDER");
+    const char* def = std::getenv("OPENCLAW_DEFAULT_PROVIDER");
+    const std::string provider = prov ? prov : (def && std::string(def) == "mock" ? "mock" : "");
+    if (provider != "mock")
+        return {{"ok", false}, {"error", kind + " generation needs a provider (set OPENCLAW_MEDIA_PROVIDER; only 'mock' is built in)"}, {"code", "UNAVAILABLE"}};
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(g_tool_root) / "media" / "generated";
+    fs::create_directories(dir);
+    const int count = std::clamp(a.value("count", 1), 1, 4);
+    const std::string ext = kind == "image" ? ".png" : kind == "video" ? ".mp4" : ".wav";
+    json files = json::array();
+    const auto h = std::hash<std::string>{}(kind + prompt);
+    for (int i = 0; i < count; ++i) {
+        const fs::path f = dir / (kind + "-" + std::to_string(h % 1000000007ULL) + "-" + std::to_string(i) + ext);
+        std::ofstream o(f, std::ios::binary);
+        if (kind == "image") {  // 1x1 PNG
+            static const unsigned char png[] = {0x89,'P','N','G',13,10,26,10,0,0,0,13,'I','H','D','R',0,0,0,1,0,0,0,1,8,6,0,0,0,0x1f,0x15,0xc4,0x89,0,0,0,13,'I','D','A','T',0x78,0x9c,0x63,0xf8,0x0f,0,0,0x01,0x01,0,0x05,0x18,0xd8,0x4e,0,0,0,0,'I','E','N','D',0xae,0x42,0x60,0x82};
+            o.write(reinterpret_cast<const char*>(png), sizeof png);
+        } else if (kind == "music") {  // 0.1 s silent 8 kHz mono WAV
+            const uint32_t n = 800; std::string w = "RIFF"; auto u32 = [&](uint32_t v) { for (int k = 0; k < 4; ++k) w.push_back(char(v >> (8 * k))); };
+            auto u16 = [&](uint16_t v) { w.push_back(char(v)); w.push_back(char(v >> 8)); };
+            u32(36 + n); w += "WAVEfmt "; u32(16); u16(1); u16(1); u32(8000); u32(8000); u16(1); u16(8); w += "data"; u32(n); w.append(n, char(128));
+            o << w;
+        } else {
+            o << "mock-video:" << prompt;  // placeholder container; not playable
+        }
+        files.push_back(f.string());
+    }
+    return {{"ok", true}, {"provider", "mock"}, {"kind", kind}, {"prompt", prompt}, {"files", files}};
 }
 }  // namespace openclaw::gateway

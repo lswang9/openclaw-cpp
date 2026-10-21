@@ -53,7 +53,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.107.0-dev";
+constexpr const char* kVersion = "1.108.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -270,6 +270,7 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
 Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {
     deps_.emit = [this](const std::string& ev, const nlohmann::json& p) { Emit(ev, p); };
     SetSubsystemContext(&deps_, SubsystemDataRoot(deps_));
+    SetGatewayRpc([this](const std::string& m, const nlohmann::json& p) { return DispatchRpc({{"type", "req"}, {"id", "tool"}, {"method", m}, {"params", p}}); });
     std::error_code ec;
     cfg_mtime_ = std::filesystem::last_write_time(config::DefaultPath(), ec);
     auto& broker = tools::exec::ApprovalBroker::Global();
@@ -2255,6 +2256,10 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             std::optional<tools::exec::ScopedRunContext> run_ctx;
             if (params.contains("sessionKey") && params["sessionKey"].is_string())
                 run_ctx.emplace(tools::exec::RunContext{params.value("agentId", std::string("main")), params["sessionKey"].get<std::string>(), "", "", ""});
+            {
+                auto gw = GatewayToolNames();
+                if (std::find(gw.begin(), gw.end(), name) != gw.end() && deps_lock.owns_lock()) deps_lock.unlock();  // they call back into RPCs
+            }
             auto result = deps_.tools.Invoke(name, args);
             nlohmann::json rj;
             try { rj = nlohmann::json::parse(result); } catch (...) { rj = result; }  // plain-text tool output
@@ -2340,6 +2345,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         im.sender = params.value("sender", "user");
         im.text = text;
         im.session_key = session_key;
+        im.explicit_key = params.contains("sessionKey") || params.contains("session_id") || params.contains("key");
         if (method != "chat.inject" && method != "sessions.steer") {
             std::string werr;
             if (deps_lock.owns_lock()) deps_lock.unlock();  // a worker turn can take minutes

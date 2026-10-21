@@ -108,7 +108,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.107.0-dev";
+constexpr const char* kVersion = "1.108.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3397,7 +3397,7 @@ int CmdGateway(int argc, char** argv, int argi) {
     {
         using J = nlohmann::json;
         auto obj = [](J props) { return J{{"type", "object"}, {"properties", props}}; };
-        const std::vector<std::tuple<std::string, std::string, J>> gw_tools{
+        std::vector<std::tuple<std::string, std::string, J>> gw_tools{
             {"sessions_list", "List gateway sessions (key + index entry). limit ≤ 200.", obj({{"limit", {{"type", "integer"}}}})},
             {"sessions_history", "Read a session's recent transcript (default: this session). limit ≤ 200; includeTools adds tool results.",
              obj({{"sessionKey", {{"type", "string"}}}, {"limit", {{"type", "integer"}}}, {"includeTools", {{"type", "boolean"}}}})},
@@ -3406,6 +3406,10 @@ int CmdGateway(int argc, char** argv, int argi) {
             {"nodes", "Connected node hosts. action: list | describe {nodeId} | invoke {nodeId, command, params, timeoutMs}.",
              obj({{"action", {{"type", "string"}, {"enum", {"list", "describe", "invoke"}}}}, {"nodeId", {{"type", "string"}}}, {"command", {{"type", "string"}}}, {"params", {{"type", "object"}}}, {"timeoutMs", {{"type", "integer"}}}})},
         };
+        for (auto& nm : gateway::GatewayToolNames()) {
+            bool have = false; for (auto& [x, d2, s2] : gw_tools) have = have || x == nm;
+            if (!have && !tools.Has(nm)) gw_tools.emplace_back(nm, "Upstream OpenClaw tool `" + nm + "` (gateway-backed; see docs/tools.md).", obj(J::object()));
+        }
         for (auto& [name, desc, schema] : gw_tools)
             tools.Register({name, desc, schema, [name](const J& a) { const auto& ctx = tools::exec::CurrentContext(); return gateway::GatewayTool(name, a, ctx.agent_id, ctx.session_key); }});
         tools.Register({"web_fetch", "Fetch a URL (http/https) and return its text (maxChars, default 20000). SSRF-guarded like http_get.",
