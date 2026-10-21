@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.54.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.55.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -216,6 +216,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ### 1.51.0-dev
 - 多智能体隔离：每个 agents.list 条目独立会话目录、工作区、记忆索引与工具集（allow/deny/profile）；main 在设置了 OPENCLAW_SESSION_DIR 时仍用该目录以保持兼容。技能库与 JS 插件宿主仍为进程级共享。
+
+### 1.55.0-dev
+- 新增 `plugins install <目录|tgz|npm 包>`、`plugins update/uninstall/installs`：安装到 `~/.openclaw/extensions/<id>`，记录在配置 `plugins.installs`；离线测试覆盖目录、tarball、`file:` 规格。
 
 ### 1.54.0-dev
 - Slack `response_url` 回帖；Discord/聊天 `/stop` 取消当前会话回合、`/model` 会话级切换；渠道适配器从配置读取凭证（热重载/重启时 SetConfig，Start 时补齐 env 供 Socket/Gateway）。

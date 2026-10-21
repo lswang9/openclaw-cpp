@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.54.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.55.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -53,7 +53,7 @@
 - real: before_tool_call (block / blockReason / params rewrite) and after_tool_call (result, durationMs, error) in the agent loop; session_start / session_end on new, reset and policy reset.
 - real-sim: api.registerChannel — openclaw-cpp contract is `inbound.parse(body)` → messages + `outbound.sendText({to,text})`; upstream ChannelPlugin's full adapter surface (gateway start/stop, pairing, directory, actions, threading) is missing.
 - real-sim: api.registerProvider with `complete({model, messages, tools})` → router route `<id>`; upstream provider plugins are auth/catalog descriptors (OAuth flows, model catalogs) — not implemented; a route uses the provider's first model.
-- missing: npm-based `plugins install`, plugin runtime helpers (api.runtime.*), tool_result_persist / before_compaction hooks.
+- missing (install landed in 1.55): plugin runtime helpers (api.runtime.*), tool_result_persist / before_compaction hooks.
 
 ## 1.47 Multi-agent bindings
 - real: agents.list (id, name, default, workspace, model string|{primary}, identity.name, systemPrompt) + bindings[{agentId, match:{channel, accountId, peer:{kind,id}, guildId, teamId}}]; most-specific wins (peer > guild > team > account > channel), first listed on ties; unknown agentIds ignored; missing accountId only matches the default account.
@@ -85,6 +85,12 @@
 - real: tools.allow / tools.deny / tools.profile (`minimal|coding|messaging|full`) from global `tools.*`, then `agents.defaults.tools`, then `agents.list[]|entries.<id>.tools` — deny wins; profile supplies a base allow set (coding includes exec/read/write/edit/http_get/browser_*).
 - real: per-agent sandbox object (mode/backend/…) still flows into exec ResolvePolicy; agent Pool rebuilds tool registries on config reload and after JS plugin host restart (re-RegisterTools into the shared base).
 - real-sim: skills library and JS plugin host remain process-global (not per-agent); MCP tool list is shared then filtered by allow/deny.
+
+## 1.55 plugins install / uninstall / update
+- real: `openclaw-cpp plugins install <dir|.tgz|npm-spec> [--force] [--link] [--no-deps]` → `$OPENCLAW_EXTENSIONS_DIR|~/.openclaw/extensions/<id>` (id from openclaw.plugin.json, else package.json name; requires openclaw.plugin.json or package.json#openclaw). npm specs go through `npm pack` (so registry, `file:`, git specs work when npm can reach them); deps installed with `npm install --omit=dev --ignore-scripts` only when the package has dependencies and no node_modules. Staged copy + atomic rename; symlinks escaping the archive rejected.
+- real: install record `plugins.installs.<id>` {source, spec, installPath, version, installedAt} + `plugins.entries.<id>.enabled=true`; `plugins update <id>` re-installs from the recorded spec; `plugins uninstall <id>` removes dir + records; `plugins installs` lists. JS host scans the extensions dir so installed tools load.
+- real: `scripts/e2e-plugins-install.sh` (smoke, offline: dir, npm-pack tarball, `file:` spec, update, uninstall, non-plugin rejection).
+- missing: registry-backed integrity pinning / signature checks, ClawHub plugin source, `plugins enable/disable` CLI parity flags.
 
 ## 1.54 Slack response_url · Discord /stop /model · config credentials
 - real: Slack interactive + slash replies POST to Slack `response_url` when present (Block Kit preserved); covered by `scripts/e2e-stop-model-response-url.sh`.

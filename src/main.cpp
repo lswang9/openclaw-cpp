@@ -21,6 +21,7 @@
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/plugins/js_host.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
+#include "openclaw/plugins/install.hpp"
 #include "openclaw/agent/routing.hpp"
 #include "openclaw/agent/pool.hpp"
 #include "openclaw/board/store.hpp"
@@ -86,7 +87,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.54.0-dev";
+constexpr const char* kVersion = "1.55.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2289,7 +2290,7 @@ int CmdSelfTest() {
     if (!host.Running()) {
         auto plr = config::Load(config::DefaultPath());
         host.SetConfig(plr.snap.raw);
-        host.SetExtraDirs({std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw" / "extensions",
+        host.SetExtraDirs({plugins::ExtensionsDir(),
                            workspace::Workspace::DefaultRoot() / ".openclaw" / "extensions"});
         host.Start(RepoRoot() / "plugins");
     }
@@ -2324,6 +2325,19 @@ int MaybePluginCli(int argc, char** argv) {
 int CmdPlugins(int argc, char** argv) {
     using namespace ::openclaw;
     const std::string sub = argc > 2 ? argv[2] : "list";
+    if (sub == "install" || sub == "uninstall" || sub == "update" || sub == "installs") {
+        nlohmann::json r;
+        if (sub == "installs") r = plugins::ListInstalls();
+        else if (argc < 4) { std::cerr << "usage: plugins " << sub << " <spec|id> [--force] [--link]\n"; return 2; }
+        else if (sub == "install") {
+            plugins::InstallOptions o;
+            for (int i = 4; i < argc; ++i) { std::string a = argv[i]; if (a == "--force") o.force = true; else if (a == "--link" || a == "-l") o.link = true; else if (a == "--no-deps") o.install_deps = false; }
+            r = plugins::Install(argv[3], o);
+        } else if (sub == "uninstall") r = plugins::Uninstall(argv[3]);
+        else r = plugins::Update(argv[3]);
+        std::cout << r.dump(2) << "\n";
+        return r.value("ok", false) ? 0 : 1;
+    }
     auto& host = StartCliJsHost();
     int rc = 0;
     if (sub == "list") std::cout << host.Rpc("list_plugins", nlohmann::json::object()).dump(2) << "\n";
@@ -2557,7 +2571,7 @@ int CmdGateway(int argc, char** argv, int argi) {
         auto plr = config::Load(config::DefaultPath());
         js_host.SetConfig(plr.snap.raw);
         std::vector<std::filesystem::path> dirs = {
-            std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw" / "extensions",
+            plugins::ExtensionsDir(),
             workspace::Workspace::DefaultRoot() / ".openclaw" / "extensions"};
         if (auto lp = config::GetPath(plr.snap.raw, "plugins.load.paths"); lp && lp->is_array())
             for (auto& p : *lp) if (p.is_string()) dirs.push_back(p.get<std::string>());
