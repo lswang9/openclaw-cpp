@@ -50,7 +50,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.85.0-dev";
+constexpr const char* kVersion = "1.86.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2163,7 +2163,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
 
     if (method == "sessions.list") return ok({{"sessions", deps_.sessions.List()}});
-    if (method == "sessions.get" || method == "sessions.preview" || method == "chat.history") {
+    if (method == "sessions.get" || method == "sessions.preview" || method == "chat.history" || method == "chat.metadata") {
         const std::string key = params.value("key", params.value("id", params.value("sessionKey", "")));
         if (key.empty()) return err("missing session key");
         auto all = deps_.sessions.Load(key);
@@ -2222,7 +2222,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
                    {"recent", deps_.bus.Recent(16, filt)},
                    {"listeners", deps_.bus.ListenerCount()}});
     }
-    if (method == "sessions.send" || method == "chat.send" || method == "chat.inject") {
+    if (method == "sessions.send" || method == "chat.send" || method == "chat.inject" || method == "sessions.steer") {
         const std::string text = params.value("message", params.value("text", ""));
         const std::string session_key = params.value("sessionKey", params.value("session_id", params.value("key", "default")));
         if (text.empty()) return err("missing message");

@@ -101,7 +101,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.85.0-dev";
+constexpr const char* kVersion = "1.86.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;

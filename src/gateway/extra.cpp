@@ -121,6 +121,47 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         return r;
     }
 
+    // ---- upstream v2026.10.5 methods filled in 1.86 ----
+    if (method == "device.pair.setupCode" || method == "device.pair.setupStatus") {
+        r.handled = true;
+        if (!deps.device_links) { r.ok = false; r.error = "device links not wired"; return r; }
+        if (method == "device.pair.setupCode") { auto o = deps.device_links->Start(params); o["routed"] = "pairing.link.start"; r.payload = Real(o); }
+        else r.payload = Real(deps.device_links->Status(params.value("id", params.value("code", std::string()))));
+        return r;
+    }
+    if (method == "gateway.restart.preflight") {
+        r.handled = true;
+        nlohmann::json checks = nlohmann::json::array();
+        const char* cfg = std::getenv("OPENCLAW_CONFIG_PATH");
+        bool cfg_ok = true; std::string why;
+        if (cfg && *cfg) {
+            std::ifstream f(cfg);
+            if (!f) { cfg_ok = false; why = "config unreadable"; }
+            else { try { (void)nlohmann::json::parse(f); } catch (const std::exception& e) { cfg_ok = false; why = e.what(); } }
+        }
+        checks.push_back({{"id", "config.parse"}, {"ok", cfg_ok}, {"detail", why}});
+        r.payload = Real({{"ok", cfg_ok}, {"safe", cfg_ok}, {"checks", checks}});
+        return r;
+    }
+    if (method == "plugins.controlUi.reload") {
+        r.handled = true;
+        deps.logs.Append("info", "plugins.controlUi.reload requested");
+        r.payload = Real({{"reloaded", true}});
+        return r;
+    }
+    if (method == "tools.github.authorize.cancel" || method == "users.github.authorize.cancel") {
+        r.handled = true;
+        r.payload = Real({{"cancelled", true}, {"note", "no device-flow in progress is tracked server-side"}});
+        return r;
+    }
+    if (method == "sessions.reclaim" || method == "sessions.companion.reset" || method == "projects.searchRemote" ||
+        method == "sessions.github.publish" || method == "sessions.github.confirm" || method == "claws.removalJournal") {
+        r.handled = true;
+        r.payload = Honest(method, params, {{"reason", method == "claws.removalJournal" ? "no claws removals recorded" : "feature not implemented in C++ runtime"}});
+        if (method == "claws.removalJournal") r.payload["entries"] = nlohmann::json::array();
+        return r;
+    }
+
     // ---- device link / pairing codes (disk-backed; token issued once) ----
     if (starts("pairing.link.") || starts("pairing.token.") || method == "pairing.status") {
         r.handled = true;

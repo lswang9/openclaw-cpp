@@ -4,6 +4,21 @@ namespace openclaw::gateway {
 
 std::vector<std::string> ImplementedMethods() {
     return {
+        "device.pair.setupCode",
+        "device.pair.setupStatus",
+        "cron.status",
+        "gateway.restart.preflight",
+        "chat.metadata",
+        "sessions.steer",
+        "sessions.reclaim",
+        "sessions.companion.reset",
+        "projects.searchRemote",
+        "tools.github.authorize.cancel",
+        "sessions.github.publish",
+        "users.github.authorize.cancel",
+        "sessions.github.confirm",
+        "plugins.controlUi.reload",
+        "claws.removalJournal",
         "sessions.export",
         "sessions.import",
         "sessions.exportOne",

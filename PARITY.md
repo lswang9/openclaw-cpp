@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.85.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.86.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,9 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+- Device scopes: now driven by the upstream v2026.10.5 per-method table (src/auth/upstream_method_scopes.inc, generated from core-descriptors.ts CORE_GATEWAY_METHOD_SPECS, 519 rows); heuristic fallback only for C++-only methods. `dynamic` rows use operator.write baseline (upstream escalates per-params; we don't) — **partial**. operator.talk / operator.questions accepted as scopes.
+- RPC diff vs upstream 10.5 core table: 15 methods were missing, now present. **real**: device.pair.setupCode/setupStatus, gateway.restart.preflight (config parse check), chat.metadata, sessions.steer (inject), cron.status, plugins.controlUi.reload, *.github.authorize.cancel. **honest stub**: sessions.reclaim, sessions.companion.reset, projects.searchRemote, sessions.github.publish/confirm, claws.removalJournal (empty).
 
 ## 1.85 Discord autocomplete + message context menu
 - real: command specs mark the `args` option `autocomplete: true` and add a MESSAGE context-menu command "Ask OpenClaw" (type 3).

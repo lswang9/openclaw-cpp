@@ -1,3 +1,4 @@
+#include <unordered_map>
 #include "openclaw/auth/device_link.hpp"
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -142,12 +143,16 @@ nlohmann::json DeviceLinkStore::List() const {
 }
 
 bool DeviceLinkStore::ValidScope(const std::string& s) {
-    static const char* k[] = {"operator.read", "operator.write", "operator.approvals", "operator.pairing", "operator.admin"};
+    static const char* k[] = {"operator.read", "operator.write", "operator.approvals", "operator.pairing", "operator.admin", "operator.talk", "operator.questions"};
     for (auto* x : k) if (s == x) return true;
     return s.rfind("rpc:", 0) == 0 && s.size() > 4 && s.size() < 128;
 }
 
 std::string DeviceLinkStore::MethodScope(const std::string& m) {
+    static const std::unordered_map<std::string, std::string> kUpstream = {
+#include "upstream_method_scopes.inc"
+    };
+    if (auto it = kUpstream.find(m); it != kUpstream.end()) return it->second;
     auto starts = [&](const char* p) { return m.rfind(p, 0) == 0; };
     if (starts("config.") || starts("secrets.") || starts("plugins.install") || starts("plugins.uninstall") || starts("update.") ||
         m == "gateway.restart" || m == "gateway.stop" || m == "shutdown" || starts("acp.auth.") || starts("auth.") || starts("webauthn."))
