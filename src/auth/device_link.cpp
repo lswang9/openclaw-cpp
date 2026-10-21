@@ -205,13 +205,28 @@ std::pair<std::string, std::string> DeviceLinkStore::CreateSession(const std::st
     return {sid, csrf};
 }
 
-std::pair<std::string, std::string> DeviceLinkStore::CreateIdentitySession(const std::string& subject, const std::string& role) {
+void DeviceLinkStore::UpdateIdentitySession(const std::string& sid, const std::string& role, const std::string& rt) {
+    std::lock_guard lock(mu_);
+    if (!data_.contains("sessions")) return;
+    const auto h = Sha256Hex(sid);
+    for (auto& s : data_["sessions"]) {
+        if (S(s, "sid_sha256") != h) continue;
+        s["role"] = role;
+        if (!rt.empty()) s["refresh_token"] = rt;
+        s["recheck_ms"] = NowMs() + (std::int64_t)EnvInt("OPENCLAW_OIDC_RECHECK_SEC", 3600) * 1000;
+    }
+    Save();
+}
+
+std::pair<std::string, std::string> DeviceLinkStore::CreateIdentitySession(const std::string& subject, const std::string& role,
+                                                                           const std::string& rt) {
     std::lock_guard lock(mu_);
     auto sid = "ocs_" + RandHex(24);
     auto csrf = RandHex(16);
     if (!data_.contains("sessions") || !data_["sessions"].is_array()) data_["sessions"] = nlohmann::json::array();
     const auto now = NowMs();
-    data_["sessions"].push_back({{"sid_sha256", Sha256Hex(sid)}, {"csrf", csrf}, {"oidc_sub", subject}, {"role", role},
+    data_["sessions"].push_back({{"sid_sha256", Sha256Hex(sid)}, {"csrf", csrf}, {"oidc_sub", subject}, {"role", role}, {"refresh_token", rt},
+                                 {"recheck_ms", now + (std::int64_t)EnvInt("OPENCLAW_OIDC_RECHECK_SEC", 3600) * 1000},
                                  {"created_ms", now},
                                  {"expires_ms", now + (std::int64_t)EnvInt("OPENCLAW_OIDC_SESSION_TTL_SEC", 43200) * 1000}});
     Save();
@@ -230,7 +245,11 @@ DeviceLinkStore::SessionInfo DeviceLinkStore::SessionLookup(const std::string& s
             const char* iss = std::getenv("OPENCLAW_OIDC_ISSUER");
             if (!iss || !*iss) return {};
             const auto r = S(s, "role");
-            return {(r == "admin" || r == "operator") ? r : std::string(), S(s, "csrf")};
+            SessionInfo si{(r == "admin" || r == "operator") ? r : std::string(), S(s, "csrf")};
+            si.oidc_sub = S(s, "oidc_sub");
+            si.refresh_token = S(s, "refresh_token");
+            si.recheck_due = s.value("recheck_ms", (std::int64_t)0) <= NowMs();
+            return si;
         }
         const auto cred = S(s, "cred_sha256");
         if (s.value("gateway", false)) {

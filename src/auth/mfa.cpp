@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <cctype>
 #include <mutex>
 
 namespace openclaw::auth::mfa {
@@ -90,6 +91,23 @@ std::string DefaultPath() {
     else if (const char* d2 = std::getenv("OPENCLAW_DATA_DIR"); d2 && *d2) root = d2;
     else root = fs::path(std::getenv("HOME") ? std::getenv("HOME") : ".") / ".openclaw";
     return (root / "auth" / "mfa.json").string();
+}
+
+std::string UserPath(const std::string& user) {
+    if (user.empty()) return DefaultPath();
+    std::string safe;
+    for (char ch : user) safe += (std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_' || ch == '.' || ch == '@') ? ch : '_';
+    if (safe == "." || safe == "..") safe = "_" + safe;
+    return (fs::path(DefaultPath()).parent_path() / "mfa-users" / (safe + ".json")).string();
+}
+
+std::string PathForPrincipal(const std::string& user) {
+    if (!user.empty()) {
+        auto p = UserPath(user);
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!LoadJ(p).value("secret", std::string()).empty()) return p;
+    }
+    return DefaultPath();
 }
 
 Store::Store(std::string path) : path_(std::move(path)) {}

@@ -14,7 +14,7 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 fail() { echo "[e2e-oidc] FAIL: $*"; tail -20 "$T/gw.log" 2>/dev/null; exit 1; }
-idp() { IDP_PORT=$IP IDP_EMAIL="$1" IDP_BAD_SIG="${2:-0}" python3 "$ROOT/scripts/fake-oidc-idp.py" >"$T/idp.log" 2>&1 & IDPPID=$!; PIDS+=($IDPPID)
+idp() { IDP_PORT=$IP IDP_EMAIL="$1" IDP_BAD_SIG="${2:-0}" IDP_ALG="${3:-RS256}" IDP_GROUPS="${4:-}" IDP_REFRESH_DENY_FILE="$T/deny" python3 "$ROOT/scripts/fake-oidc-idp.py" >"$T/idp.log" 2>&1 & IDPPID=$!; PIDS+=($IDPPID)
   for _ in $(seq 50); do curl -s "http://127.0.0.1:$IP/jwks" >/dev/null 2>&1 && break; sleep 0.1; done; }
 "$BIN" gateway --port "$PORT" --host 127.0.0.1 >"$T/gw.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 50); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 0.1; done
@@ -44,4 +44,23 @@ idp alice@example.com 1
 [[ $(flow) == 403 ]] || fail "bad signature must be 403"
 grep -q "signature invalid" "$T/cb" || fail "sig message"
 curl -s "$U/login/methods" | grep -q "\"oidc\":true" || fail "login methods"
+kill $IDPPID; wait $IDPPID 2>/dev/null || true
+# 1.74: ES256 + group→role mapping + refresh-based re-validation
+restart_gw() { kill ${PIDS[0]} 2>/dev/null; wait ${PIDS[0]} 2>/dev/null || true
+  "$BIN" gateway --port "$PORT" --host 127.0.0.1 >"$T/gw.log" 2>&1 & PIDS[0]=$!
+  for _ in $(seq 80); do curl -s "$U/health" >/dev/null 2>&1 && break; sleep 0.1; done; }
+export OPENCLAW_OIDC_ROLE_MAP="oc-admins=admin,oc-ops=operator" OPENCLAW_OIDC_RECHECK_SEC=0
+restart_gw
+idp alice@example.com 0 ES256 "oc-admins,other"
+[[ $(flow) == 302 ]] || { cat "$T/cb"; fail "ES256 login"; }
+curl -s -b "$T/cj" "$U/v1/whoami" | grep -q '"role":"admin"' || fail "group mapped to admin (after refresh recheck)"
+touch "$T/deny"
+[[ $(curl -s -o /dev/null -w '%{http_code}' -b "$T/cj" "$U/v1/status") == 401 ]] || fail "failed refresh must end session"
+rm -f "$T/deny"
+kill $IDPPID; wait $IDPPID 2>/dev/null || true
+export OPENCLAW_OIDC_REQUIRE_GROUP=1
+restart_gw
+idp alice@example.com 0 ES256 "nobody"
+[[ $(flow) == 403 ]] || fail "require_group must deny"
+grep -q "no mapped group" "$T/cb" || fail "require_group message"
 echo "[e2e-oidc] PASS"

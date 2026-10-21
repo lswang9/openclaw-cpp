@@ -97,7 +97,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.73.0-dev";
+constexpr const char* kVersion = "1.74.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2477,6 +2477,8 @@ int CmdSelfTest() {
         ok = ok && st.Enabled() && st.Verify(code, t0) && !st.Verify(code, t0) /*replay*/ && !st.Verify("000000", t0 + 300) == true;
         ok = ok && st.Verify(en.recovery_codes[0], t0) && !st.Verify(en.recovery_codes[0], t0) && st.RecoveryRemaining() == 7;
         st.Disable();
+        ok = ok && mf::UserPath("dev-1") != mf::DefaultPath() && std::filesystem::path(mf::UserPath("../x")).parent_path() == std::filesystem::path(mf::UserPath("a")).parent_path() &&
+             mf::PathForPrincipal("never-enrolled-user") == mf::DefaultPath();
         if (!ok) { std::cerr << "FAIL mfa totp\n"; ++failures; } else std::cerr << "PASS mfa TOTP RFC6238 vectors + replay + recovery codes\n";
     }
     {
@@ -3452,17 +3454,24 @@ int main(int argc, char** argv) {
         }
         if (cmd == "auth" && argc > 2 && std::string(argv[2]) == "mfa") {
             namespace mf = openclaw::auth::mfa;
-            mf::Store st;
-            const std::string sub = argc > 3 ? argv[3] : "status";
+            std::string user;
+            std::vector<std::string> rest;
+            for (int i = 3; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--user" && i + 1 < argc) user = argv[++i]; else rest.push_back(a);
+            }
+            mf::Store st(mf::UserPath(user));
+            const std::string sub = rest.size() > 0 ? rest[0] : "status";
+            auto arg1 = [&](const char* d) { return rest.size() > 1 ? rest[1] : std::string(d); };
             if (sub == "enroll") {
-                auto r = st.Enroll(argc > 4 ? argv[4] : "openclaw");
-                std::cout << nlohmann::json{{"secret", r.secret_b32}, {"otpauth", r.otpauth_uri}, {"recoveryCodes", r.recovery_codes}, {"path", mf::DefaultPath()}}.dump(2) << "\n";
+                auto r = st.Enroll(arg1(user.empty() ? "openclaw" : user.c_str()));
+                std::cout << nlohmann::json{{"secret", r.secret_b32}, {"otpauth", r.otpauth_uri}, {"recoveryCodes", r.recovery_codes}, {"path", mf::UserPath(user)}, {"user", user}}.dump(2) << "\n";
                 return 0;
             }
             if (sub == "disable") { std::cout << nlohmann::json{{"ok", st.Disable()}}.dump() << "\n"; return 0; }
             if (sub == "code") { auto c = st.CurrentCode(); if (c.empty()) { std::cerr << "mfa not enrolled\n"; return 1; } std::cout << c << "\n"; return 0; }
-            if (sub == "verify" && argc > 4) { std::string how; bool ok = st.Verify(argv[4], 0, &how); std::cout << nlohmann::json{{"ok", ok}, {"via", how}}.dump() << "\n"; return ok ? 0 : 1; }
-            std::cout << nlohmann::json{{"enabled", st.Enabled()}, {"source", st.FromEnv() ? "env" : "file"}, {"recoveryRemaining", st.RecoveryRemaining()}, {"path", mf::DefaultPath()}}.dump() << "\n";
+            if (sub == "verify" && rest.size() > 1) { std::string how; bool ok = st.Verify(rest[1], 0, &how); std::cout << nlohmann::json{{"ok", ok}, {"via", how}}.dump() << "\n"; return ok ? 0 : 1; }
+            std::cout << nlohmann::json{{"enabled", st.Enabled()}, {"source", st.FromEnv() ? "env" : "file"}, {"recoveryRemaining", st.RecoveryRemaining()}, {"path", mf::UserPath(user)}, {"user", user}}.dump() << "\n";
             return 0;
         }
         if (cmd == "cron-daemon") return CmdCronDaemon();

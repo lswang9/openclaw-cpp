@@ -48,7 +48,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.73.0-dev";
+constexpr const char* kVersion = "1.74.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1411,6 +1411,13 @@ std::string Server::AuthRole(const std::string& req) const {
             const auto gw_sha = deps_.auth.gateway_token.empty()
                 ? std::string() : auth::DeviceLinkStore::Sha256Hex(deps_.auth.gateway_token);
             auto s = deps_.device_links->SessionLookup(sid, gw_sha);
+            if (!s.role.empty() && !s.oidc_sub.empty() && s.recheck_due) {
+                // OIDC session re-validation via refresh grant; no refresh token or failure ends the session.
+                auto rr = auth::oidc::Refresh(auth::oidc::FromEnv(), s.refresh_token, s.oidc_sub);
+                if (!rr.ok) { deps_.device_links->DeleteSession(sid); return {}; }
+                if (!rr.role.empty()) s.role = rr.role;
+                deps_.device_links->UpdateIdentitySession(sid, s.role, rr.refresh_token);
+            }
             if (!s.role.empty()) { g_auth_via_cookie = true; g_session_csrf = s.csrf; return s.role; }
         }
     }
@@ -1511,7 +1518,12 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             return;
         }
         std::string mfa_how;
-        if (auth::mfa::Store st; st.Enabled()) {
+        std::string principal = "gateway";
+        if (!(deps_.auth.gateway_token.size() && tok == deps_.auth.gateway_token)) {
+            auto v = deps_.device_links->Verify(tok);
+            principal = v.contains("token_id") && v["token_id"].is_string() ? v["token_id"].get<std::string>() : "";
+        }
+        if (auth::mfa::Store st(auth::mfa::PathForPrincipal(principal)); st.Enabled()) {
             std::string otp;
             try { otp = nlohmann::json::parse(BodyOf(req)).value("otp", std::string()); } catch (...) {}
             if (otp.empty()) {
@@ -1557,7 +1569,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "oidc not configured"}}.dump()));
             return;
         }
-        if (oc.allowed_emails.empty() && oc.allowed_subs.empty() && oc.allowed_domains.empty()) {
+        if (oc.allowed_emails.empty() && oc.allowed_subs.empty() && oc.allowed_domains.empty() && oc.allowed_groups.empty()) {
             send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", "oidc allowlist empty (set OPENCLAW_OIDC_ALLOWED_EMAILS/SUBS/DOMAINS)"}}.dump()));
             return;
         }
@@ -1602,7 +1614,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         }
         auto r = auth::oidc::FinishLogin(oc, qp("code"), state);
         if (!r.ok) { send(HttpResponse(403, "Forbidden", nlohmann::json{{"error", r.error}}.dump())); return; }
-        auto [sid, csrf] = deps_.device_links->CreateIdentitySession(r.sub, r.role);
+        auto [sid, csrf] = deps_.device_links->CreateIdentitySession(r.sub, r.role, r.refresh_token);
         send(HttpResponse(302, "Found", "", "text/plain",
                           "Location: /\r\nSet-Cookie: oc_session=" + sid + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200\r\n"
                           "Set-Cookie: oc_csrf=" + csrf + "; Path=/; SameSite=Strict; Max-Age=43200\r\n"

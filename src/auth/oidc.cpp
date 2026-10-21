@@ -4,6 +4,7 @@
 #include <openssl/bn.h>
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/ecdsa.h>
 #include <openssl/param_build.h>
 #include <openssl/rand.h>
 
@@ -98,6 +99,22 @@ bool InList(const std::string& list, const std::string& v) {
 std::string Lower(std::string s) { for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return s; }
 }  // namespace
 
+std::string MapRole(const Config& c, const std::vector<std::string>& groups, std::string* why) {
+    std::string best;
+    auto rank = [](const std::string& r) { return r == "admin" ? 2 : r == "operator" ? 1 : 0; };
+    std::stringstream ss(c.role_map); std::string e;
+    while (std::getline(ss, e, ',')) {
+        auto eq = e.find('=');
+        if (eq == std::string::npos) continue;
+        auto g = e.substr(0, eq), role = e.substr(eq + 1);
+        while (!g.empty() && g.front() == ' ') g.erase(g.begin());
+        for (auto& x : groups) if (x == g && rank(role) > rank(best)) best = role;
+    }
+    if (!best.empty()) return best;
+    if (c.require_group) { if (why) *why = "no mapped group (OPENCLAW_OIDC_REQUIRE_GROUP=1)"; return ""; }
+    return c.role == "admin" ? "admin" : "operator";
+}
+
 Config FromEnv() {
     Config c;
     c.issuer = Env("OPENCLAW_OIDC_ISSUER");
@@ -109,6 +126,10 @@ Config FromEnv() {
     c.allowed_emails = Lower(Env("OPENCLAW_OIDC_ALLOWED_EMAILS"));
     c.allowed_subs = Env("OPENCLAW_OIDC_ALLOWED_SUBS");
     c.allowed_domains = Lower(Env("OPENCLAW_OIDC_ALLOWED_DOMAINS"));
+    c.allowed_groups = Env("OPENCLAW_OIDC_ALLOWED_GROUPS");
+    c.role_map = Env("OPENCLAW_OIDC_ROLE_MAP");
+    c.groups_claim = Env("OPENCLAW_OIDC_GROUPS_CLAIM", "groups");
+    c.require_group = Env("OPENCLAW_OIDC_REQUIRE_GROUP") == "1";
     return c;
 }
 
@@ -137,6 +158,10 @@ Start BeginLogin(const Config& c, const std::string& redirect_default) {
 }
 
 std::optional<nlohmann::json> VerifyRs256(const std::string& jwt, const nlohmann::json& jwks, std::string* err) {
+    return VerifyJws(jwt, jwks, err);
+}
+
+std::optional<nlohmann::json> VerifyJws(const std::string& jwt, const nlohmann::json& jwks, std::string* err) {
     auto fail = [&](const std::string& e) -> std::optional<nlohmann::json> { if (err) *err = e; return std::nullopt; };
     const auto d1 = jwt.find('.'), d2 = jwt.find('.', d1 == std::string::npos ? 0 : d1 + 1);
     if (d1 == std::string::npos || d2 == std::string::npos) return fail("malformed jwt");
@@ -144,8 +169,41 @@ std::optional<nlohmann::json> VerifyRs256(const std::string& jwt, const nlohmann
     if (!hs || !ps || !sg) return fail("bad base64");
     nlohmann::json hdr, pl;
     try { hdr = nlohmann::json::parse(*hs); pl = nlohmann::json::parse(*ps); } catch (...) { return fail("bad jwt json"); }
-    if (hdr.value("alg", std::string()) != "RS256") return fail("unsupported alg (RS256 only)");
+    const auto alg = hdr.value("alg", std::string());
+    if (alg != "RS256" && alg != "ES256") return fail("unsupported alg " + alg + " (RS256, ES256)");
     const auto kid = hdr.value("kid", std::string());
+    if (alg == "ES256") {
+        const nlohmann::json* ek = nullptr;
+        if (jwks.contains("keys"))
+            for (auto& k : jwks["keys"])
+                if (k.value("kty", std::string()) == "EC" && k.value("crv", std::string()) == "P-256" && (kid.empty() || k.value("kid", std::string()) == kid)) { ek = &k; break; }
+        if (!ek) return fail("no matching EC jwk");
+        auto x = B64UrlDec(ek->value("x", std::string())), y = B64UrlDec(ek->value("y", std::string()));
+        if (!x || !y || x->size() != 32 || y->size() != 32 || sg->size() != 64) return fail("bad EC jwk/signature");
+        std::string pub = std::string(1, '\x04') + *x + *y;
+        OSSL_PARAM_BLD* b = OSSL_PARAM_BLD_new();
+        OSSL_PARAM_BLD_push_utf8_string(b, OSSL_PKEY_PARAM_GROUP_NAME, "prime256v1", 0);
+        OSSL_PARAM_BLD_push_octet_string(b, OSSL_PKEY_PARAM_PUB_KEY, pub.data(), pub.size());
+        OSSL_PARAM* prm = OSSL_PARAM_BLD_to_param(b);
+        EVP_PKEY_CTX* pc = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+        EVP_PKEY* pk = nullptr;
+        bool ok = EVP_PKEY_fromdata_init(pc) == 1 && EVP_PKEY_fromdata(pc, &pk, EVP_PKEY_PUBLIC_KEY, prm) == 1;
+        if (ok) {
+            ECDSA_SIG* es = ECDSA_SIG_new();
+            ECDSA_SIG_set0(es, BN_bin2bn(reinterpret_cast<const unsigned char*>(sg->data()), 32, nullptr),
+                           BN_bin2bn(reinterpret_cast<const unsigned char*>(sg->data()) + 32, 32, nullptr));
+            unsigned char* der = nullptr;
+            int dl = i2d_ECDSA_SIG(es, &der);
+            EVP_MD_CTX* m = EVP_MD_CTX_new();
+            const std::string si = jwt.substr(0, d2);
+            ok = dl > 0 && EVP_DigestVerifyInit(m, nullptr, EVP_sha256(), nullptr, pk) == 1 &&
+                 EVP_DigestVerify(m, der, static_cast<std::size_t>(dl), reinterpret_cast<const unsigned char*>(si.data()), si.size()) == 1;
+            EVP_MD_CTX_free(m); OPENSSL_free(der); ECDSA_SIG_free(es);
+        }
+        EVP_PKEY_free(pk); EVP_PKEY_CTX_free(pc); OSSL_PARAM_free(prm); OSSL_PARAM_BLD_free(b);
+        if (!ok) return fail("signature invalid");
+        return pl;
+    }
     const nlohmann::json* key = nullptr;
     if (jwks.contains("keys"))
         for (auto& k : jwks["keys"])
@@ -199,7 +257,7 @@ Result FinishLogin(const Config& c, const std::string& code, const std::string& 
     if (idt.empty()) { r.error = "no id_token"; return r; }
     auto jwks = Http(d->value("jwks_uri", std::string()), nullptr, &err);
     if (!jwks) { r.error = "jwks: " + err; return r; }
-    auto cl = VerifyRs256(idt, *jwks, &err);
+    auto cl = VerifyJws(idt, *jwks, &err);
     if (!cl) { r.error = "id_token: " + err; return r; }
     const auto now = Now();
     bool aud_ok = false;
@@ -217,11 +275,53 @@ Result FinishLogin(const Config& c, const std::string& code, const std::string& 
     r.email = Lower(cl->value("email", std::string()));
     const bool ev = cl->contains("email_verified") && ((*cl)["email_verified"] == true || (*cl)["email_verified"] == "true");
     if (r.sub.empty()) { r.error = "no sub"; return r; }
+    if (cl->contains(c.groups_claim)) {
+        const auto& g = (*cl)[c.groups_claim];
+        if (g.is_array()) { for (auto& x : g) if (x.is_string()) r.groups.push_back(x.get<std::string>()); }
+        else if (g.is_string()) r.groups.push_back(g.get<std::string>());
+    }
+    r.refresh_token = tok->value("refresh_token", std::string());
     const auto at = r.email.find('@');
-    const bool allowed = InList(c.allowed_subs, r.sub) || (ev && !r.email.empty() && InList(c.allowed_emails, r.email)) ||
+    bool in_group = false;
+    for (auto& g : r.groups) if (InList(c.allowed_groups, g)) in_group = true;
+    const bool allowed = in_group || InList(c.allowed_subs, r.sub) || (ev && !r.email.empty() && InList(c.allowed_emails, r.email)) ||
                          (ev && at != std::string::npos && InList(c.allowed_domains, r.email.substr(at + 1)));
     if (!allowed) { r.error = "not allowed: " + (r.email.empty() ? r.sub : r.email); return r; }
-    r.role = (c.role == "admin") ? "admin" : "operator";
+    std::string why;
+    r.role = MapRole(c, r.groups, &why);
+    if (r.role.empty()) { r.error = why; return r; }
+    r.ok = true;
+    return r;
+}
+
+Result Refresh(const Config& c, const std::string& refresh_token, const std::string& expected_sub) {
+    Result r;
+    if (refresh_token.empty()) { r.error = "no refresh token"; return r; }
+    std::string err;
+    auto d = Discover(c, &err);
+    if (!d) { r.error = err; return r; }
+    std::string form = "grant_type=refresh_token&refresh_token=" + Enc(refresh_token) + "&client_id=" + Enc(c.client_id);
+    if (!c.client_secret.empty()) form += "&client_secret=" + Enc(c.client_secret);
+    auto tok = Http(d->value("token_endpoint", std::string()), &form, &err);
+    if (!tok) { r.error = "refresh failed: " + err; return r; }
+    r.refresh_token = tok->value("refresh_token", refresh_token);
+    r.sub = expected_sub;
+    const auto idt = tok->value("id_token", std::string());
+    if (!idt.empty()) {
+        auto jwks = Http(d->value("jwks_uri", std::string()), nullptr, &err);
+        if (!jwks) { r.error = "jwks: " + err; return r; }
+        auto cl = VerifyJws(idt, *jwks, &err);
+        if (!cl) { r.error = "id_token: " + err; return r; }
+        if (cl->value("iss", std::string()) != d->value("issuer", std::string()) || cl->value("sub", std::string()) != expected_sub) { r.error = "refresh identity mismatch"; return r; }
+        if (cl->contains("exp") && (*cl)["exp"].is_number() && (*cl)["exp"].get<std::int64_t>() + 60 < Now()) { r.error = "id_token expired"; return r; }
+        if (cl->contains(c.groups_claim)) {
+            const auto& g = (*cl)[c.groups_claim];
+            if (g.is_array()) for (auto& x : g) if (x.is_string()) r.groups.push_back(x.get<std::string>());
+        }
+        std::string why;
+        r.role = MapRole(c, r.groups, &why);
+        if (r.role.empty()) { r.error = why; return r; }
+    }
     r.ok = true;
     return r;
 }

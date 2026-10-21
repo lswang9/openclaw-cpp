@@ -15,6 +15,10 @@ std::string Hotp(const Bytes& key, std::uint64_t counter, int digits = 6);
 std::string Totp(const Bytes& key, std::uint64_t unix_s, int step = 30, int digits = 6);
 
 std::string DefaultPath();
+// Per-user enrollment file (<state>/auth/mfa-users/<user>.json); "" → global DefaultPath().
+std::string UserPath(const std::string& user);
+// Login principal → store: per-user enrollment wins, else the global one.
+std::string PathForPrincipal(const std::string& user);
 
 struct EnrollResult {
     std::string secret_b32;
