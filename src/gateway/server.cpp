@@ -13,6 +13,7 @@
 #include "openclaw/plugins/js_extensions.hpp"
 #include "openclaw/agent/routing.hpp"
 #include "openclaw/tools/exec.hpp"
+#include "openclaw/channels/signing.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/whatsapp.hpp"
 #include <thread>
@@ -40,7 +41,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.49.0-dev";
+constexpr const char* kVersion = "1.50.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1334,7 +1335,35 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                                                  {"status", adapter->Status()}}.dump()));
                 return;
             }
-            auto body = nlohmann::json::parse(BodyOf(req));
+            const std::string raw_body = BodyOf(req);
+            auto cfg_str = [&](const std::string& p, const char* env) {
+                if (const char* e = std::getenv(env); e && *e) return std::string(e);
+                auto v = config::GetPath(deps_.config.raw, p);
+                return v && v->is_string() ? v->get<std::string>() : std::string();
+            };
+            std::string why;
+            if (chan_id == "slack") {
+                if (auto secret = cfg_str("channels.slack.signingSecret", "SLACK_SIGNING_SECRET"); !secret.empty()) {
+                    const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                    if (!channels::signing::VerifySlack(secret, HeaderValue(req, "X-Slack-Request-Timestamp"), raw_body,
+                                                        HeaderValue(req, "X-Slack-Signature"), now, &why)) {
+                        send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", why}}.dump()));
+                        return;
+                    }
+                }
+            } else if (chan_id == "discord") {
+                if (auto pk = cfg_str("channels.discord.publicKey", "DISCORD_PUBLIC_KEY"); !pk.empty()) {
+                    if (!channels::signing::VerifyDiscord(pk, HeaderValue(req, "X-Signature-Timestamp"), raw_body,
+                                                          HeaderValue(req, "X-Signature-Ed25519"), &why)) {
+                        send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", why}}.dump()));
+                        return;
+                    }
+                }
+            }
+            auto ctype = HeaderValue(req, "Content-Type");
+            nlohmann::json body = ctype.find("application/x-www-form-urlencoded") != std::string::npos
+                                      ? channels::signing::ParseForm(raw_body)
+                                      : nlohmann::json::parse(raw_body);
             auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
             auto result = adapter->HandleHttpInbound(body, deliver);
             // Feishu/Slack URL verification

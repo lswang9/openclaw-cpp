@@ -128,6 +128,19 @@ DS=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/discord/inbound" -H '
 echo "$DS" | grep -q 'Session agent:main:discord:channel:C7' || { echo "[smoke] discord /status failed: $DS" >&2; exit 1; }
 echo "[smoke] discord slash /status (no model turn) + command specs"
 
+echo "{ channels: { slack: { signingSecret: 'smoke-secret' } } }" > "$OPENCLAW_CONFIG_PATH"; sleep 1
+rpc '{"jsonrpc":"2.0","id":16,"method":"config.reload","params":{}}' >/dev/null
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/json' -d '{"type":"event_callback","event":{"type":"message","text":"x","user":"U1","channel":"C1"}}')
+[[ "$CODE" == "401" ]] || { echo "[smoke] unsigned slack request not rejected ($CODE)" >&2; exit 1; }
+FORM='command=%2Fstatus&text=&user_id=U3&channel_id=D3&channel_name=directmessage&team_id=T1'
+TS=$(date +%s)
+SIG=$(python3 -c "import hmac,hashlib,sys;print('v0='+hmac.new(b'smoke-secret',('v0:'+sys.argv[1]+':'+sys.argv[2]).encode(),hashlib.sha256).hexdigest())" "$TS" "$FORM")
+SL=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/x-www-form-urlencoded' \
+  -H "X-Slack-Request-Timestamp: $TS" -H "X-Slack-Signature: $SIG" --data "$FORM")
+echo "$SL" | grep -q '"text": *"Session agent:main' || { echo "[smoke] signed slack slash /status failed: $SL" >&2; exit 1; }
+rm -f "$OPENCLAW_CONFIG_PATH"; sleep 1
+echo "[smoke] slack signing secret: unsigned → 401, signed form-encoded slash /status ok"
+
 echo "[smoke] POST /v1/rpc sessions.create"
 RPC_SESS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \
   -H 'Content-Type: application/json' \

@@ -39,11 +39,11 @@ public:
 
     using InteractiveFn = std::function<nlohmann::json(const nlohmann::json&, const DeliverFn&)>;
     void SetInteractiveHandler(InteractiveFn fn) { interactive_ = std::move(fn); }
+    nlohmann::json HandleSlash(const nlohmann::json& payload, const DeliverFn& deliver);
 
 private:
     InteractiveFn interactive_;
     nlohmann::json HandleEventsApi(const nlohmann::json& payload, const DeliverFn& deliver);
-    nlohmann::json HandleSlash(const nlohmann::json& payload, const DeliverFn& deliver);
     bool OpenConnectionUrl(std::string& out_url, std::string& err);
     void LiveLoop(DeliverFn deliver);
 

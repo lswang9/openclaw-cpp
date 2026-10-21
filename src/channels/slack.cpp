@@ -56,6 +56,15 @@ nlohmann::json SlackAdapter::HandleHttpInbound(const nlohmann::json& body, const
     }
 
     if (nlohmann::json ip; slack_interactive::ExtractPayload(body, &ip)) return HandleInteractive(ip, deliver);
+    if (body.contains("command") && body.contains("user_id")) {  // HTTP slash command (form-encoded)
+        auto r = socket_.HandleSlash(body, deliver);
+        ++inbound_;
+        auto rendered = slack_interactive::RenderReply(r.value("reply", std::string()));
+        nlohmann::json out{{"ok", true}, {"response_type", "in_channel"}, {"text", rendered.value("text", "")},
+                           {"session_key", r.value("session_key", "")}, {"impl", "real"}};
+        if (rendered.contains("blocks")) out["blocks"] = rendered["blocks"];
+        return out;
+    }
 
     std::string text;
     std::string sender = "slack";

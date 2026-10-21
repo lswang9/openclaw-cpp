@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.49.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.50.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -38,13 +38,13 @@
 - real: reply directives `[[buttons: L|v,...]]`, `[[select: P|a,b]]`, `[[modal: Title|F1,F2]]` → Block Kit (section + actions); plain text keeps a fallback.
 - real: block_actions (button/static_select), view_submission, shortcut/message_action over HTTP (`payload` form field or JSON) and Socket Mode `interactive` envelopes → agent turn with upstream-style session key; reply posted with blocks/thread_ts via chat.postMessage.
 - real: modal button → views.open with plain_text_input per field (live when SLACK_BOT_TOKEN, SLACK_API_BASE overridable; recorded otherwise).
-- real-sim: no live Slack test (no creds); response_url replies and Slack request signing (X-Slack-Signature) still missing.
+- real-sim: no live Slack test (no creds); response_url replies still missing (request signing added in 1.50).
 
 ## 1.45 Discord slash commands + native chat commands
 - real: application command specs built from native (/new /reset /status /help /compact /model /stop) + user-invocable skills + plugin commands (sanitized, dedup, ≤100, optional `args` string option); `discord.commands` / `discord.commands.sync` RPC; PUT /applications/{app}[/guilds/{g}]/commands live with DISCORD_BOT_TOKEN+DISCORD_APPLICATION_ID (auto on adapter start), recorded otherwise.
 - real: APPLICATION_COMMAND + message-component interactions via HTTP (type 4 response) and Gateway INTERACTION_CREATE (deferred type 5 ack + PATCH @original follow-up) → agent pipeline with upstream session keys.
 - real: native /status, /help, /stop, /model handled in gateway without a model turn.
-- real-sim: no live Discord test; Ed25519 request signature verification for the HTTP interactions endpoint missing; /stop does not abort an in-flight run; /model does not switch models.
+- real-sim: no live Discord test; Ed25519 verification added in 1.50; /stop does not abort an in-flight run; /model does not switch models.
 
 ## 1.46 Plugin API completion
 - real: TypeScript plugin entries on Node >= 22.6 (`--experimental-strip-types` auto-added; OPENCLAW_NODE selects the binary) or with the `typescript` package; tested by scripts/e2e-ts-plugin.sh with Node 22.20 (skips honestly when no Node >= 22.6).
@@ -72,3 +72,9 @@
 - real: scripts/e2e-hot-reload-channels.sh (part of smoke) proves a reload restarts only adapters whose channels.<id> subtree changed, restarts nothing on unrelated edits, adapters keep serving afterwards, and a plugins.* change restarts the JS host with the **new** plugin config (bug fixed: the host previously restarted with the stale config) and re-registers plugin channels/providers.
 - fix: `tools.invoke` RPC accepts plain-text tool results (JS plugin tools) instead of failing JSON parse.
 - real-sim: built-in adapters mostly read credentials from env, so a restart re-reads env-backed settings only; config reload swaps `deps.config` without a reader lock while HTTP is now multi-threaded (benign in tests, not formally race-free).
+
+## 1.50 Webhook authenticity + form bodies
+- real: Slack signing secret (SLACK_SIGNING_SECRET or channels.slack.signingSecret): HMAC-SHA256 `v0:ts:body`, constant-time compare, 5-minute replay window → 401 otherwise.
+- real: Discord interactions Ed25519 (DISCORD_PUBLIC_KEY or channels.discord.publicKey) over `X-Signature-Timestamp + body` → 401 otherwise.
+- real: application/x-www-form-urlencoded inbound bodies (Slack slash commands and interactive `payload=`); HTTP Slack slash commands answer with `response_type`/`text`/`blocks`.
+- unchanged: other webhook channels still use shared verify tokens only.

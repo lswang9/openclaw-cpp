@@ -45,6 +45,7 @@
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/slack_interactive.hpp"
 #include "openclaw/channels/discord_commands.hpp"
+#include "openclaw/channels/signing.hpp"
 #include "openclaw/channels/slack_socket.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/discord_gateway.hpp"
@@ -67,6 +68,7 @@
 #include "openclaw/mcp/stdio.hpp"
 
 #include <curl/curl.h>
+#include <openssl/evp.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -83,7 +85,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.49.0-dev";
+constexpr const char* kVersion = "1.50.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1771,6 +1773,36 @@ int CmdSelfTest() {
         ok = ok && session::BuildSessionKey(kp) == "agent:fam:discord:channel:C2";
         if (!ok) { std::cerr << "FAIL multi-agent routing " << r1.matched_by << r2.matched_by << r3.matched_by << r4.binding_index << session::BuildSessionKey(kp) << "\n"; ++failures; }
         else std::cerr << "PASS multi-agent routing (agents.list + bindings precedence, per-agent keys)\n";
+    }
+    // inbound webhook signing (1.50)
+    {
+        namespace sg = channels::signing;
+        const std::string body = "token=x&team_id=T1&command=%2Fstatus&text=hello+world&user_id=U1";
+        auto sig = sg::SlackSignature("8f742231b10e8888abcd99yyyzzz85a5", "1531420618", body);
+        bool ok = sg::VerifySlack("8f742231b10e8888abcd99yyyzzz85a5", "1531420618", body, sig, 1531420618 + 10) &&
+                  !sg::VerifySlack("8f742231b10e8888abcd99yyyzzz85a5", "1531420618", body + "x", sig, 1531420618) &&
+                  !sg::VerifySlack("8f742231b10e8888abcd99yyyzzz85a5", "1531420618", body, sig, 1531420618 + 3600);
+        auto form = sg::ParseForm(body);
+        ok = ok && form["command"] == "/status" && form["text"] == "hello world";
+        // Ed25519: RFC 8032 test-1 secret key signs "ts + body" at runtime; verify with its public key.
+        {
+            const unsigned char sk[32] = {0x9d,0x61,0xb1,0x9d,0xef,0xfd,0x5a,0x60,0xba,0x84,0x4a,0xf4,0x92,0xec,0x2c,0xc4,
+                                          0x44,0x49,0xc5,0x69,0x7b,0x32,0x69,0x19,0x70,0x3b,0xac,0x03,0x1c,0xae,0x7f,0x60};
+            EVP_PKEY* k = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, sk, 32);
+            const std::string msg = std::string("1700000000") + R"({"type":1})";
+            unsigned char sigb[64]; size_t sl = 64;
+            EVP_MD_CTX* c = EVP_MD_CTX_new();
+            EVP_DigestSignInit(c, nullptr, nullptr, nullptr, k);
+            EVP_DigestSign(c, sigb, &sl, reinterpret_cast<const unsigned char*>(msg.data()), msg.size());
+            EVP_MD_CTX_free(c); EVP_PKEY_free(k);
+            std::string hex; const char* hx = "0123456789abcdef";
+            for (size_t i = 0; i < sl; ++i) { hex += hx[sigb[i] >> 4]; hex += hx[sigb[i] & 15]; }
+            const std::string pk = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+            ok = ok && sg::VerifyDiscord(pk, "1700000000", R"({"type":1})", hex) &&
+                 !sg::VerifyDiscord(pk, "1700000001", R"({"type":1})", hex);
+        }
+        if (!ok) { std::cerr << "FAIL webhook signing\n"; ++failures; }
+        else std::cerr << "PASS webhook signing (Slack HMAC v0 + replay window, Discord Ed25519, form bodies)\n";
     }
     // canvas disk store + sim bridge
     try {
