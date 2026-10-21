@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,7 +48,8 @@ BackgroundHandle StartBackground(const std::string& cmd, const std::string& cwd,
 // Translate tmux-style key names (Enter, C-c, Up, Tab, Escape, BSpace, M-x, F1..F12) to bytes; unknown → literal.
 std::string KeysToBytes(const std::vector<std::string>& keys);
 // Drain output until EOF or timeout_ms; waitpid; close read_fd.
-ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out = 200 * 1024);
+ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out = 200 * 1024,
+                             const std::function<void(const char*, std::size_t)>& on_chunk = {});
 // Like WaitBackground but on timeout leaves the process running (pid/read_fd stay set).
 ProcessResult CollectBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out = 200 * 1024);
 void KillBackground(BackgroundHandle& h);

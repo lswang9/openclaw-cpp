@@ -158,7 +158,7 @@ BackgroundHandle StartBackground(const std::string& cmd, const std::string& cwd,
     return h;
 }
 
-ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out) {
+ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out, const std::function<void(const char*, std::size_t)>& on_chunk) {
     ProcessResult r;
     if (h.pid < 0 || h.read_fd < 0) { r.error = "invalid background handle"; return r; }
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms <= 0 ? 86400000 : timeout_ms);
@@ -171,6 +171,7 @@ ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t ma
         if (pr > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR))) {
             ssize_t n = read(h.read_fd, buf, sizeof buf);
             if (n > 0) {
+                if (on_chunk) on_chunk(buf, static_cast<std::size_t>(n));
                 if (r.out.size() < max_out) r.out.append(buf, std::min<std::size_t>(n, max_out - r.out.size()));
                 else r.truncated = true;
             } else if (n == 0) break;
@@ -182,6 +183,7 @@ ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t ma
             for (;;) {
                 ssize_t n = read(h.read_fd, buf, sizeof buf);
                 if (n <= 0) break;
+                if (on_chunk) on_chunk(buf, static_cast<std::size_t>(n));
                 if (r.out.size() < max_out) r.out.append(buf, std::min<std::size_t>(n, max_out - r.out.size()));
                 else r.truncated = true;
             }

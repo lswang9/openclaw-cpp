@@ -1,3 +1,6 @@
+#include "openclaw/auth/device_link.hpp"
+#include "openclaw/auth/profiles.hpp"
+#include "openclaw/tools/exec.hpp"
 #include <atomic>
 #include <unistd.h>
 #include <ctime>
@@ -1622,6 +1625,238 @@ ExtraResult LocalGroups(ServerDeps& d, const fs::path& root, const std::string& 
     return {};
 }
 
+
+// ---------------------------------------------------------------- terminals (PTY via exec background sessions), session processes,
+// model auth profiles, usage, web search, device tokens, local environments, session storage/catalog helpers.
+json ExecProc(const std::string& agent, const json& a) {
+    tools::exec::ScopedRunContext rc(tools::exec::RunContext{agent, "", "", "", ""});
+    return tools::exec::ProcessTool(a);
+}
+ExtraResult Batch3(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    // ---- terminals
+    if (m.rfind("terminal.", 0) == 0) {
+        static std::mutex tmu;
+        std::lock_guard<std::mutex> tl(tmu);
+        auto db = ReadJsonFile(MetaPath(root, "terminals"), json::object());
+        auto save = [&] { WriteJsonFile(MetaPath(root, "terminals"), db); };
+        if (!t_full_write) return Fail("terminal access requires operator write scope");
+        if (m == "terminal.open") {
+            const auto agent = str("agentId").empty() ? std::string("main") : str("agentId");
+            const auto cwd = str("cwd").empty() ? WorkspaceOf(d, agent).string() : str("cwd");
+            const auto shell = str("shell").empty() ? std::string(std::getenv("SHELL") ? std::getenv("SHELL") : "/bin/bash") : str("shell");
+            std::error_code ec; if (!fs::is_directory(cwd, ec)) return Fail("cwd does not exist: " + cwd);
+            tools::exec::ScopedRunContext rc(tools::exec::RunContext{"terminal", "", "", "", ""});
+            json cfg = d.config.raw; cfg["tools"]["exec"]["security"] = "full"; cfg["tools"]["exec"]["ask"] = "off";
+            auto r = tools::exec::Run({{"command", shell + " -i"}, {"pty", true}, {"background", true}, {"workdir", cwd}, {"security", "full"}, {"ask", "off"}, {"timeout", 86400}}, cfg, cwd);
+            if (!r.contains("sessionId")) return Fail("terminal start failed: " + r.value("error", r.dump()));
+            const auto sid = r["sessionId"].get<std::string>();
+            const int cols = std::clamp(p.value("cols", 80), 10, 500), rows = std::clamp(p.value("rows", 24), 5, 200);
+            ExecProc("terminal", {{"action", "resize"}, {"sessionId", sid}, {"rows", rows}, {"cols", cols}});
+            db[sid] = {{"sessionId", sid}, {"agentId", agent}, {"shell", shell}, {"cwd", cwd}, {"confined", false}, {"attached", true}, {"owner", "conn"},
+                       {"createdAtMs", NowMs()}, {"cols", cols}, {"rows", rows}};
+            if (!str("title").empty()) db[sid]["title"] = str("title");
+            if (!str("sessionKey").empty()) db[sid]["sessionKey"] = str("sessionKey");
+            save(); return Ok(db[sid]);
+        }
+        if (m == "terminal.list") {
+            json out = json::array(); auto live = ExecProc("terminal", {{"action", "list"}})["sessions"];
+            for (auto& [k, v] : db.items()) { bool running = false; for (auto& s : live) running = running || (s["sessionId"] == k && s["status"] == "running"); json x = v; x["running"] = running; out.push_back(x); }
+            return Ok({{"sessions", out}});
+        }
+        const auto sid = str("sessionId");
+        if (!db.contains(sid)) return Fail("unknown terminal session: " + sid);
+        if (m == "terminal.attach") { auto r = ExecProc("terminal", {{"action", "log"}, {"sessionId", sid}}); db[sid]["attached"] = true; save();
+            json x = db[sid]; x["buffer"] = r.value("output", std::string()); return Ok(x); }
+        if (m == "terminal.input") { auto r = ExecProc("terminal", {{"action", "write"}, {"sessionId", sid}, {"data", str("data")}}); return r.value("ok", true) ? Ok({{"ok", true}}) : Fail(r.value("error", "write failed")); }
+        if (m == "terminal.resize") { const int c = std::clamp(p.value("cols", 80), 10, 500), r = std::clamp(p.value("rows", 24), 5, 200);
+            ExecProc("terminal", {{"action", "resize"}, {"sessionId", sid}, {"rows", r}, {"cols", c}}); db[sid]["cols"] = c; db[sid]["rows"] = r; save(); return Ok({{"ok", true}, {"cols", c}, {"rows", r}}); }
+        if (m == "terminal.close") { ExecProc("terminal", {{"action", "kill"}, {"sessionId", sid}}); db.erase(sid); save(); return Ok({{"ok", true}, {"closed", true}}); }
+        if (m == "terminal.upload") {
+            const auto name = str("name"), src = str("path");
+            if (name.empty() || name.find('/') != std::string::npos || name.find("..") != std::string::npos) return Fail("invalid upload name");
+            std::error_code ec; if (!fs::is_regular_file(src, ec)) return Fail("upload source not found");
+            const auto dst = fs::path(db[sid]["cwd"].get<std::string>()) / name;
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+            if (ec) return Fail("upload failed: " + ec.message());
+            return Ok({{"ok", true}, {"path", dst.string()}, {"size", fs::file_size(dst, ec)}});
+        }
+    }
+    // ---- session processes (agent exec background sessions)
+    if (m == "sessions.processes.list") {
+        const auto agent = str("agentId").empty() ? std::string("main") : str("agentId");
+        return Ok({{"processes", ExecProc(agent, {{"action", "list"}})["sessions"]}});
+    }
+    if (m == "sessions.processes.stop") {
+        const auto agent = str("agentId").empty() ? std::string("main") : str("agentId");
+        auto r = ExecProc(agent, {{"action", "kill"}, {"sessionId", str("processId").empty() ? str("sessionId") : str("processId")}});
+        return r.value("ok", false) ? Ok({{"stopped", true}}) : Fail(r.value("error", "stop failed"));
+    }
+    // ---- model auth profiles
+    if (m.rfind("models.auth", 0) == 0 && m != "models.authLogin") {
+        const auto agent = str("agentId").empty() ? std::string("main") : str("agentId");
+        auth::ProfileStore store(auth::DefaultProfilesPath(agent));
+        if (!t_full_write && m != "models.authStatus") return Fail(m + " requires operator write scope");
+        if (m == "models.authStatus") {
+            auto prof = store.ListMasked();
+            auto order = ReadJsonFile(root / "auth-order.json", json::object());
+            json providers = json::object();
+            json profs = prof.is_object() && prof.contains("profiles") && prof["profiles"].is_object() ? prof["profiles"] : prof.is_object() && !prof.contains("profiles") ? prof : json::object();
+            for (auto& [id, c] : profs.items()) {
+                if (!c.is_object()) continue;
+                const auto pv = c.value("provider", id.substr(0, id.find(':')));
+                auto& e = providers[pv]; if (!e.is_object()) e = {{"profiles", json::array()}};
+                e["profiles"].push_back({{"id", id}, {"type", c.value("type", "")}, {"expired", c.value("type", "") == "oauth" && auth::OAuthNeedsRefresh(c, 0)}});
+            }
+            for (auto& [pv, e] : providers.items()) if (order.contains(pv)) e["order"] = order[pv];
+            return Ok({{"agentId", agent}, {"providers", providers}});
+        }
+        if (m == "models.authSetApiKey") {
+            const auto pv = str("provider"), key = str("apiKey");
+            if (pv.empty() || key.empty()) return Fail("provider and apiKey are required");
+            if (!store.Upsert(pv + ":default", {{"type", "api_key"}, {"provider", pv}, {"key", key}})) return Fail("could not write auth profiles");
+            return Ok({{"profileId", pv + ":default"}, {"saved", true}});
+        }
+        if (m == "models.authLogout") {
+            const auto pv = str("provider");
+            json removed = json::array();
+            auto ids = p.value("profileIds", json::array());
+            json all_p = store.Load().value("profiles", json::object());
+            if (ids.empty()) for (auto& [id, c] : all_p.items()) if (id.rfind(pv + ":", 0) == 0) ids.push_back(id);
+            for (auto& id : ids) if (id.is_string() && store.Remove(id.get<std::string>())) removed.push_back(id);
+            return Ok({{"removed", removed}});
+        }
+        if (m == "models.authOrderSet") {
+            std::lock_guard<std::mutex> l(g_mu);
+            auto order = ReadJsonFile(root / "auth-order.json", json::object());
+            if (str("provider").empty()) return Fail("provider is required");
+            order[str("provider")] = p.value("profileIds", json::array());
+            WriteJsonFile(root / "auth-order.json", order);
+            return Ok({{"provider", str("provider")}, {"order", order[str("provider")]}});
+        }
+        if (m == "models.authRefresh") {
+            json res = json::array();
+            json all_p = store.Load().value("profiles", json::object());
+            for (auto& [id, c] : all_p.items())
+                if (c.is_object() && c.value("type", "") == "oauth") res.push_back({{"id", id}, {"needsRefresh", auth::OAuthNeedsRefresh(c)}, {"refreshed", false},
+                                                                   {"note", "OAuth refresh runs on first provider use"}});
+            return Ok({{"profiles", res}});
+        }
+    }
+    // ---- usage (from session transcripts)
+    if (m == "usage.status" || m == "usage.cost" || m == "sessions.usage.logs" || m == "sessions.usage.timeseries") {
+        auto& store = d.sessions;
+        long long msgs = 0, chars = 0; json per = json::array();
+        std::map<long long, long long> buckets;
+        for (auto& k : store.List()) {
+            auto e = store.IndexEntry(k); auto ms = store.Load(k);
+            long long c = 0; for (auto& x : ms) c += static_cast<long long>(x.content.size());
+            msgs += static_cast<long long>(ms.size()); chars += c;
+            if (!str("sessionKey").empty() && k != str("sessionKey")) continue;
+            per.push_back({{"sessionKey", k}, {"messages", ms.size()}, {"chars", c}, {"estTokens", c / 4}, {"updatedAt", e.value("updatedAt", 0LL)}});
+            buckets[e.value("updatedAt", 0LL) / 3600000 * 3600000] += c / 4;
+        }
+        if (m == "usage.status") return Ok({{"sessions", store.List().size()}, {"messages", msgs}, {"estTokens", chars / 4}, {"source", "transcripts"}, {"providersReporting", json::array()}});
+        if (m == "usage.cost") return Ok({{"estTokens", chars / 4}, {"costUsd", nullptr}, {"note", "providers do not report billed cost offline; token counts are estimates (chars/4)"}});
+        if (m == "sessions.usage.logs") return Ok({{"entries", per}});
+        json ts = json::array(); for (auto& [b, v] : buckets) ts.push_back({{"t", b}, {"estTokens", v}});
+        return Ok({{"bucketMs", 3600000}, {"points", ts}});
+    }
+    // ---- web search
+    if (m == "webSearch.status" || m == "webSearch.test") {
+        const char* brave = std::getenv("BRAVE_API_KEY"); const char* tav = std::getenv("TAVILY_API_KEY");
+        auto cfgp = config::GetPath(d.config.raw, "tools.web.search");
+        json st{{"configured", brave || tav || (cfgp && cfgp->is_object() && cfgp->contains("apiKey"))},
+                {"providers", json::array({{{"id", "brave"}, {"available", brave != nullptr}}, {{"id", "tavily"}, {"available", tav != nullptr}}})}};
+        if (m == "webSearch.status") return Ok(st);
+        if (!st["configured"].get<bool>()) return Fail("no web search provider configured (set BRAVE_API_KEY or TAVILY_API_KEY)");
+        return Fail("live web search test needs network access to the provider");
+    }
+    // ---- device tokens (issued by pairing links)
+    if (m == "device.token.revoke") {
+        if (!d.device_links) return Fail("device links are not enabled");
+        const auto id = str("deviceId");
+        if (id.empty()) return Fail("deviceId is required");
+        auto r = d.device_links->Revoke(id);
+        return r.value("ok", false) ? Ok(r) : Fail(r.value("error", std::string("unknown device")));
+    }
+    // ---- local environments (directory-scoped exec)
+    if (m.rfind("environments.", 0) == 0) {
+        std::lock_guard<std::mutex> l(g_mu);
+        auto db = ReadJsonFile(MetaPath(root, "environments"), json::object());
+        auto save = [&] { WriteJsonFile(MetaPath(root, "environments"), db); };
+        if (m == "environments.create" || m == "environments.session.create") {
+            const auto idem = str("idempotencyKey");
+            for (auto& [k, v] : db.items()) if (!idem.empty() && v.value("idempotencyKey", "") == idem) return Ok(v);
+            const auto id = Rid("env"); const auto dir = root / "environments" / id; fs::create_directories(dir);
+            db[id] = {{"environmentId", id}, {"id", id}, {"profileId", str("profileId").empty() ? std::string("local") : str("profileId")}, {"status", "ready"},
+                      {"provider", "local"}, {"path", dir.string()}, {"createdAt", NowMs()}, {"idempotencyKey", idem}};
+            if (m == "environments.session.create") db[id]["kind"] = "session";
+            save(); return Ok(db[id]);
+        }
+        const auto id = str("environmentId").empty() ? str("id") : str("environmentId");
+        if (!db.contains(id)) return Fail("unknown environment: " + id);
+        if (m == "environments.status" || m == "environments.session.status") return Ok(db[id]);
+        if (m == "environments.prepare") { db[id]["status"] = "ready"; db[id]["preparedAt"] = NowMs(); save(); return Ok(db[id]); }
+        if (m == "environments.destroy" || m == "environments.session.destroy") {
+            std::error_code ec; fs::remove_all(db[id]["path"].get<std::string>(), ec); db.erase(id); save(); return Ok({{"destroyed", true}, {"environmentId", id}});
+        }
+        if (m == "environments.session.exec") {
+            if (!t_full_write) return Fail("exec requires operator write scope");
+            auto argv = p.value("argv", json::array());
+            if (!argv.is_array() || argv.empty()) return Fail("argv is required");
+            std::vector<std::string> av; for (auto& x : argv) if (x.is_string()) av.push_back(x.get<std::string>());
+            auto r = Run(av, db[id]["path"].get<std::string>(), {}, str("input"));
+            return Ok({{"exitCode", r.code}, {"stdout", r.out.substr(0, 1000000)}, {"stderr", r.err.substr(0, 200000)}});
+        }
+    }
+    // ---- session helpers
+    if (m == "sessions.title.prepare") {
+        auto msg = Trim(str("message"));
+        if (msg.empty()) return Fail("message is required");
+        std::string title; for (char c : msg) { if (c == '\n') break; title.push_back(c); }
+        if (title.size() > 60) { title = title.substr(0, 57); auto sp = title.rfind(' '); if (sp > 30) title = title.substr(0, sp); title += "…"; }
+        return Ok({{"title", title}, {"source", "heuristic"}});
+    }
+    if (m == "sessions.storage.status" || m == "sessions.storage.run") {
+        long long bytes = 0, files = 0; std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(d.sessions.Root(), ec); it != fs::recursive_directory_iterator(); it.increment(ec))
+            if (it->is_regular_file(ec)) { bytes += static_cast<long long>(it->file_size(ec)); ++files; }
+        json st{{"root", d.sessions.Root().string()}, {"bytes", bytes}, {"files", files}, {"sessions", d.sessions.List().size()}};
+        if (m == "sessions.storage.status") return Ok(st);
+        int removed = 0;  // maintenance: drop orphaned empty transcript files
+        for (auto it = fs::directory_iterator(d.sessions.Root(), ec); it != fs::directory_iterator(); it.increment(ec))
+            if (it->path().extension() == ".jsonl" && it->file_size(ec) == 0) { fs::remove(it->path(), ec); ++removed; }
+        st["removedEmpty"] = removed; st["ran"] = true; return Ok(st);
+    }
+    if (m == "sessions.files.assets") {
+        json out = json::array(); const auto media = d.sessions.Root() / "media";
+        for (auto& r : p.value("refs", json::array())) {
+            if (!r.is_string()) continue; auto ref = r.get<std::string>();
+            if (ref.find("..") != std::string::npos) { out.push_back({{"ref", ref}, {"error", "invalid ref"}}); continue; }
+            auto f = media / ref; std::error_code ec;
+            if (fs::is_regular_file(f, ec)) out.push_back({{"ref", ref}, {"path", f.string()}, {"size", fs::file_size(f, ec)}}); else out.push_back({{"ref", ref}, {"error", "not found"}});
+        }
+        return Ok({{"assets", out}});
+    }
+    if (m == "sessions.catalog.list") {
+        json out = json::array();
+        for (auto& k : d.sessions.List()) { auto e = d.sessions.IndexEntry(k); out.push_back({{"catalogId", "local"}, {"sessionKey", k}, {"updatedAt", e.value("updatedAt", 0LL)}, {"messages", e.value("messages", 0)}}); }
+        return Ok({{"catalogs", json::array({{{"id", "local"}, {"label", "This gateway"}, {"sessions", out}}})}});
+    }
+    if (m == "sessions.catalog.read") {
+        const auto k = str("sessionKey");
+        if (k.empty() || !d.sessions.Exists(k)) return Fail("session not found");
+        auto ms = d.sessions.Load(k); const size_t lim = std::clamp(p.value("limit", 100), 1, 1000);
+        size_t start = 0; try { start = str("cursor").empty() ? 0 : std::stoul(str("cursor")); } catch (...) {}
+        json out = json::array(); for (size_t i = start; i < ms.size() && out.size() < lim; ++i) out.push_back(ms[i].ToJson());
+        json r{{"messages", out}}; if (start + out.size() < ms.size()) r["nextCursor"] = std::to_string(start + out.size());
+        return Ok(r);
+    }
+    if (m == "sessions.messages.unsubscribe") return Ok({{"unsubscribed", true}});
+    return {};
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
@@ -1631,6 +1866,7 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
         if (method == "device.pair.rename") return DeviceRename(root, params);
         if (method == "message.action") return MessageAction(root, params);
         { auto r = LocalGroups(deps, root, method, params); if (r.handled) return r; }
+        { auto r = Batch3(deps, root, method, params); if (r.handled) return r; }
         if (method == "projects.list" || method == "projects.register" || method == "projects.add" || method == "projects.remove") return Projects(deps, root, method, params);
         if (method == "sessions.companion.ask" || method == "sessions.companion.state" || method == "sessions.companion.reset")
             return Companion(deps, method, params);

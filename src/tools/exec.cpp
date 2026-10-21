@@ -301,7 +301,12 @@ std::string AdoptBgSession(const std::string& agent_id, const std::string& cmd, 
         // Continue collecting until exit or overall timeout.
         ProcessResult r;
         r.out = s->live_out;
-        auto rest = WaitBackground(s->handle, to_ms, 200 * 1024);
+        const std::size_t base_len = r.out.size();
+        auto rest = WaitBackground(s->handle, to_ms, 200 * 1024, [s](const char* b, std::size_t n) {
+            std::lock_guard lock(s->mu);
+            if (s->live_out.size() < 200 * 1024) s->live_out.append(b, std::min<std::size_t>(n, 200 * 1024 - s->live_out.size()));
+        });
+        (void)base_len;
         {
             std::lock_guard lock(s->mu);
             r.out += rest.out;
