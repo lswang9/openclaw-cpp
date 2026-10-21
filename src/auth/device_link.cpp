@@ -143,7 +143,7 @@ nlohmann::json DeviceLinkStore::List() const {
 }
 
 bool DeviceLinkStore::ValidScope(const std::string& s) {
-    static const char* k[] = {"operator.read", "operator.write", "operator.approvals", "operator.pairing", "operator.admin", "operator.talk", "operator.questions"};
+    static const char* k[] = {"operator.read", "operator.write", "operator.approvals", "operator.pairing", "operator.admin", "operator.talk", "operator.questions", "operator.talk.secrets"};
     for (auto* x : k) if (s == x) return true;
     return s.rfind("rpc:", 0) == 0 && s.size() > 4 && s.size() < 128;
 }
@@ -169,8 +169,39 @@ std::string DeviceLinkStore::MethodScope(const std::string& m) {
     return "operator.write";
 }
 
-bool DeviceLinkStore::ScopeAllows(const std::vector<std::string>& scopes, const std::string& m) {
+std::vector<std::string> DeviceLinkStore::DynamicScopes(const std::string& m, const nlohmann::json& p) {
+    const bool obj = p.is_object();
+    auto str = [&](const char* k) { return obj && p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    if (m == "agent") {
+        auto msg = str("message");
+        while (!msg.empty() && (msg.front() == ' ' || msg.front() == '\t')) msg.erase(0, 1);
+        const bool reset = msg == "/new" || msg == "/reset" || msg.rfind("/new ", 0) == 0 || msg.rfind("/reset ", 0) == 0;
+        return {reset ? "operator.admin" : "operator.write"};
+    }
+    if (m == "talk.config") return obj && p.value("includeSecrets", false) == true ? std::vector<std::string>{"operator.read", "operator.talk.secrets"}
+                                                                                 : std::vector<std::string>{"operator.read"};
+    if (m == "environments.list") return {str("runtimeId").empty() ? "operator.read" : "operator.write"};
+    if (m == "channels.pairing.approve") return obj && p.value("bootstrapCommandOwner", false) == true
+                                                    ? std::vector<std::string>{"operator.pairing", "operator.admin"}
+                                                    : std::vector<std::string>{"operator.pairing"};
+    if (m == "fs.listDir") return {obj && p.contains("nodeId") ? "operator.admin" : "operator.write"};
+    if (m == "sessions.delete") return {"operator.admin"};
+    return {};
+}
+
+bool DeviceLinkStore::ScopeAllows(const std::vector<std::string>& scopes, const std::string& m, const nlohmann::json& params) {
     if (scopes.empty()) return true;
+    if (auto dyn = DynamicScopes(m, params); !dyn.empty()) {
+        auto has = [&](const std::string& need) {
+            for (const auto& s : scopes) {
+                if (s == "operator.admin" || s == need) return true;
+                if (s == "operator.write" && need == "operator.read") return true;
+            }
+            return false;
+        };
+        for (auto& need : dyn) if (!has(need)) return false;
+        return true;
+    }
     const auto need = MethodScope(m);
     for (const auto& s : scopes) {
         if (s == "operator.admin" || s == need) return true;

@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.93.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.94.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -46,6 +46,8 @@
 
 - Discord user context menu: **real** — USER command (type 2) "Ask OpenClaw about user" registered next to the message menu; target user (global_name/username/id/bot) + guild member (nick/joined/roles) become the prompt. self-test + integration-smoke.
 - Discord DAVE: **assessment** in docs/DAVE.md. Since 2026-03-01 Discord voice requires DAVE (MLS + per-frame E2EE) outside Stage channels; we advertise max_dave_protocol_version 0, so **live Discord voice is blocked** (DMs/voice channels) — PARITY for Discord voice downgraded to *partial (offline real; live blocked by DAVE except Stage)*. Close 4017 / dave_protocol_version>0 now surface `dave_required` + `close_code` (e2e-discord-voice.sh). Implementing needs vendored libdave + mlspp (not on ConanCenter).
+
+- Scopes: upstream "dynamic" methods now derive required scopes from params like upstream `resolveDynamicLeastPrivilegeOperatorScopesForMethod`: `agent` with /new|/reset → admin (else write), `talk.config` includeSecrets → read+operator.talk.secrets, `environments.list` runtimeId → write, `channels.pairing.approve` bootstrapCommandOwner → pairing+admin, `fs.listDir` nodeId → admin, `sessions.delete` → admin. 403 carries `required_scopes`. Remaining dynamic rows not mirrored: node.invoke admin-only command list, plugins.sessionAction registered scopes, session-mutation narrowing (sessions.patch/create/dispatch/move).
 
 ## 1.85 Discord autocomplete + message context menu
 - real: command specs mark the `args` option `autocomplete: true` and add a MESSAGE context-menu command "Ask OpenClaw" (type 3).

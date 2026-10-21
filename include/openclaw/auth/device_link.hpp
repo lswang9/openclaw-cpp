@@ -25,7 +25,11 @@ public:
                            const nlohmann::json& scopes = nlohmann::json::array());
     static bool ValidScope(const std::string& s);
     // Scope check for one RPC method (scopes empty = unrestricted beyond the role).
-    static bool ScopeAllows(const std::vector<std::string>& scopes, const std::string& method);
+    static bool ScopeAllows(const std::vector<std::string>& scopes, const std::string& method,
+                            const nlohmann::json& params = nlohmann::json());
+    // Upstream "dynamic" methods: required scopes derived from params (method-scopes.ts
+    // resolveDynamicLeastPrivilegeOperatorScopesForMethod). Empty → static MethodScope applies.
+    static std::vector<std::string> DynamicScopes(const std::string& method, const nlohmann::json& params);
     static std::string MethodScope(const std::string& method);  // the operator.* scope a method needs
     std::vector<std::string> TokenScopes(const std::string& token) const;
     nlohmann::json Deny(const std::string& id_or_code);

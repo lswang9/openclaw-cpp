@@ -50,7 +50,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.93.0-dev";
+constexpr const char* kVersion = "1.94.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2117,9 +2117,11 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         if (!id.is_null()) r["id"] = id;
         return r;
     }
-    if (!g_rpc_scopes.empty() && !auth::DeviceLinkStore::ScopeAllows(g_rpc_scopes, method)) {
+    if (!g_rpc_scopes.empty() && !auth::DeviceLinkStore::ScopeAllows(g_rpc_scopes, method, params)) {
+        auto dyn = auth::DeviceLinkStore::DynamicScopes(method, params);
         nlohmann::json r{{"type", "res"}, {"ok", false}, {"error", "forbidden: token scopes do not allow " + method},
-                         {"required_scope", auth::DeviceLinkStore::MethodScope(method)}, {"scopes", g_rpc_scopes}, {"code", 403}};
+                         {"required_scope", dyn.empty() ? auth::DeviceLinkStore::MethodScope(method) : dyn.back()}, {"scopes", g_rpc_scopes}, {"code", 403}};
+        if (!dyn.empty()) r["required_scopes"] = dyn;
         if (!id.is_null()) r["id"] = id;
         return r;
     }
