@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.62.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.63.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.63.0-dev
+- Provider 鉴权：`models auth login/paste-token/list/remove`，插件 OAuth/API-key 流程（终端提示、openUrl），auth-profiles.json（0600），调用时注入凭证，过期前自动刷新 OAuth。
 
 ### 1.62.0-dev
 - 插件运行时补齐：回复分块派发、媒体抓取（SSRF 防护）/保存、TTS/STT 接口、writeConfigFile（校验 + 热重载）；`http_get` 改用同一 SSRF 防护。

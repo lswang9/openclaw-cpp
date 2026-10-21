@@ -1,3 +1,4 @@
+#include "openclaw/auth/profiles.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
 
 namespace openclaw::plugins {
@@ -47,7 +48,32 @@ agent::CompletionResult PluginProvider::Complete(const std::vector<agent::Messag
     agent::CompletionResult out;
     nlohmann::json msgs = nlohmann::json::array();
     for (auto& m : messages) msgs.push_back(m.ToJson());
-    auto r = host_->Rpc("provider_complete", {{"provider", id_}, {"model", model_}, {"messages", msgs},
+    // Credential from auth profiles (api_key or oauth; refresh oauth via the plugin before expiry).
+    nlohmann::json auth = nullptr;
+    {
+        auth::ProfileStore store;
+        if (auto pr = store.ForProvider(id_)) {
+            auto cred = pr->second;
+            if (auth::OAuthNeedsRefresh(cred)) {
+                auto rr = host_->Rpc("provider_auth_refresh", {{"provider", id_}, {"credential", cred}});
+                if (rr.contains("credential") && rr["credential"].is_object()) {
+                    cred = rr["credential"];
+                    cred["type"] = "oauth";
+                    cred["provider"] = id_;
+                    store.Upsert(pr->first, cred);
+                } else {
+                    out.ok = false; out.finish_reason = "error";
+                    out.error = "plugin provider " + id_ + ": OAuth token expired and refresh failed (" +
+                                (rr.contains("error") ? rr["error"].value("message", rr["error"].dump()) : std::string("no credential")) + ")";
+                    return out;
+                }
+            }
+            auth = {{"profileId", pr->first}, {"type", cred.value("type", "")}};
+            if (cred.value("type", "") == "oauth") auth["accessToken"] = cred.value("access", "");
+            else auth["apiKey"] = cred.value("key", "");
+        }
+    }
+    auto r = host_->Rpc("provider_complete", {{"provider", id_}, {"model", model_}, {"messages", msgs}, {"auth", auth},
                                               {"tools", tools.is_null() ? nlohmann::json::array() : tools}});
     if (r.contains("error")) {
         out.ok = false;

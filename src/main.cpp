@@ -66,6 +66,7 @@
 #include "openclaw/tools/runenv.hpp"
 #include "openclaw/tools/exec.hpp"
 #include "openclaw/clawhub/client.hpp"
+#include "openclaw/auth/profiles.hpp"
 #include "openclaw/net/safe_fetch.hpp"
 #include "openclaw/channels/waweb/noise.hpp"
 #include "openclaw/workspace/embeddings.hpp"
@@ -90,7 +91,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.62.0-dev";
+constexpr const char* kVersion = "1.63.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2479,6 +2480,94 @@ int CmdPlugins(int argc, char** argv) {
     return rc;
 }
 
+int CmdModels(int argc, char** argv) {
+    using namespace ::openclaw;
+    const std::string sub = argc > 2 ? argv[2] : "", act = argc > 3 ? argv[3] : "";
+    auto flag = [&](const std::string& name) -> std::string {
+        for (int i = 4; i + 1 < argc; ++i) if (name == argv[i]) return argv[i + 1];
+        return "";
+    };
+    if (sub != "auth") { std::cerr << "usage: models auth login|paste-token|list|remove ...\n"; return 2; }
+    auth::ProfileStore store;
+    if (act == "list" || act.empty()) { std::cout << store.ListMasked().dump(2) << "\n"; return 0; }
+    if (act == "remove" && argc > 4) {
+        bool ok = store.Remove(argv[4]);
+        std::cout << nlohmann::json{{"ok", ok}, {"removed", argv[4]}}.dump(2) << "\n";
+        return ok ? 0 : 1;
+    }
+    auto record_in_config = [&](const std::string& pid, const std::string& provider, const std::string& mode, const nlohmann::json& patch) {
+        auto path = config::DefaultPath();
+        auto snap = config::LoadOrDefault(path);
+        nlohmann::json raw = snap.raw.is_object() ? snap.raw : nlohmann::json::object();
+        if (patch.is_object()) raw.merge_patch(patch);
+        raw["auth"]["profiles"][pid] = {{"provider", provider}, {"mode", mode}};
+        auto rep = config::ValidateSchema(raw);
+        if (!rep.errors.empty()) throw std::runtime_error("config patch rejected: " + rep.errors.front());
+        config::SaveRaw(path, raw);
+    };
+    if (act == "paste-token") {
+        const std::string provider = flag("--provider");
+        if (provider.empty()) { std::cerr << "usage: models auth paste-token --provider <id> [--profile-id <id>]\n"; return 2; }
+        std::string pid = flag("--profile-id");
+        if (pid.empty()) pid = provider + ":default";
+        std::cerr << "Paste token for " << provider << ": ";
+        std::string tok;
+        std::getline(std::cin, tok);
+        while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' ')) tok.pop_back();
+        if (tok.empty()) { std::cerr << "empty token\n"; return 1; }
+        store.Upsert(pid, {{"type", "api_key"}, {"provider", provider}, {"key", tok}});
+        record_in_config(pid, provider, "api_key", nullptr);
+        std::cout << nlohmann::json{{"ok", true}, {"profileId", pid}, {"path", store.path().string()}}.dump(2) << "\n";
+        return 0;
+    }
+    if (act == "login") {
+        const std::string provider = flag("--provider");
+        if (provider.empty()) { std::cerr << "usage: models auth login --provider <id> [--method <authId>]\n"; return 2; }
+        auto& host = StartCliJsHost();
+        host.host_call = [](long long, const std::string& method, const nlohmann::json& p) -> nlohmann::json {
+            auto ask = [](const std::string& msg) { std::cerr << msg << " "; std::string l; std::getline(std::cin, l);
+                                                    while (!l.empty() && (l.back() == '\r')) l.pop_back(); return l; };
+            if (method == "prompt.text") return ask(p.value("message", "?"));
+            if (method == "prompt.confirm") { auto a = ask(p.value("message", "?") + " [y/N]"); return !a.empty() && (a[0] == 'y' || a[0] == 'Y'); }
+            if (method == "prompt.select") {
+                auto opts = p.value("options", nlohmann::json::array());
+                std::cerr << p.value("message", "Select") << "\n";
+                for (std::size_t i = 0; i < opts.size(); ++i) std::cerr << "  " << (i + 1) << ") " << opts[i].value("label", opts[i].value("value", "")) << "\n";
+                auto a = ask(">");
+                for (auto& o : opts) if (o.value("value", "") == a) return a;
+                std::size_t k = static_cast<std::size_t>(std::atoi(a.c_str()));
+                if (k >= 1 && k <= opts.size()) return opts[k - 1].value("value", "");
+                throw std::runtime_error("invalid selection");
+            }
+            if (method == "prompt.note") { std::cerr << p.value("message", "") << "\n"; return nullptr; }
+            if (method == "open.url") { std::cerr << "Open this URL to continue: " << p.value("url", "") << "\n"; return true; }
+            throw std::runtime_error("unsupported host call in CLI: " + method);
+        };
+        auto r = host.Rpc("provider_auth_run", {{"provider", provider}, {"method", flag("--method")}});
+        host.host_call = nullptr;
+        host.Stop();
+        if (r.contains("error")) { std::cerr << "error: " << r["error"].value("message", r["error"].dump()) << "\n"; return 1; }
+        nlohmann::json saved = nlohmann::json::array();
+        bool first = true;
+        for (auto& pr : r.value("profiles", nlohmann::json::array())) {
+            std::string pid = pr.value("profileId", provider + ":default");
+            auto cred = pr.value("credential", nlohmann::json::object());
+            if (!cred.contains("provider")) cred["provider"] = provider;
+            if (!cred.contains("type")) cred["type"] = cred.contains("access") ? "oauth" : "api_key";
+            store.Upsert(pid, cred);
+            record_in_config(pid, provider, cred["type"], first ? r.value("configPatch", nlohmann::json()) : nlohmann::json());
+            first = false;
+            saved.push_back({{"profileId", pid}, {"type", cred["type"]}});
+        }
+        if (saved.empty()) { std::cerr << "auth method returned no profiles\n"; return 1; }
+        std::cout << nlohmann::json{{"ok", true}, {"provider", provider}, {"method", r.value("method", "")}, {"profiles", saved},
+                                    {"path", store.path().string()}}.dump(2) << "\n";
+        return 0;
+    }
+    std::cerr << "usage: models auth login|paste-token|list|remove\n";
+    return 2;
+}
+
 int CmdChat(int argc, char** argv, int argi) {
     using namespace openclaw;
     std::string session_id;
@@ -3112,6 +3201,7 @@ int main(int argc, char** argv) {
         if (cmd == "gateway") return CmdGateway(argc, argv, 2);
         if (cmd == "chat") return CmdChat(argc, argv, 2);
         if (cmd == "plugins") return CmdPlugins(argc, argv);
+        if (cmd == "models") return CmdModels(argc, argv);
         if (cmd == "approvals" || cmd == "exec-policy") {
             namespace ex = openclaw::tools::exec;
             namespace config = openclaw::config;

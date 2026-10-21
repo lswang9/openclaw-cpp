@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.62.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.63.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,12 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.63 Provider auth: OAuth / API-key flows + auth profiles
+- real: `openclaw models auth login --provider <id> [--method <authId>]` runs the provider plugin's `auth[].run(ctx)`. The `ctx.prompter.text/confirm/select/note` and `ctx.openUrl` calls are host calls answered by the CLI on the terminal. Methods of kind `api_key`/`token` with no `run` get a built-in key prompt. The result's `profiles[]` go to `auth-profiles.json`, its `configPatch` is merge-patched into config (schema-validated), and `auth.profiles.<id> = {provider, mode}` is recorded. Also `models auth paste-token --provider <id> [--profile-id]`, `models auth list` (secrets masked), and `models auth remove <profileId>`.
+- real: `auth-profiles.json` lives at `<OPENCLAW_STATE_DIR|~/.openclaw>/agents/<agent>/agent/auth-profiles.json`, mode 0600, written atomically, with `api_key` and `oauth` credential shapes.
+- real: plugin providers receive `complete({…, auth: {profileId, type, apiKey | accessToken}})`, preferring `<provider>:default` and otherwise the first `<provider>:*` profile. An OAuth credential within 60 s of expiry is refreshed first through `provider.refreshOAuth(cred)` (or `oauth.refresh` / `auth[].refresh`) and persisted. If refresh fails, the turn fails with a clear error.
+- gaps: the OAuth flow itself (authorize URL, PKCE, callback or paste) belongs to the plugin, and the host provides no loopback callback server. Built-in providers (DeepSeek/OpenAI-compat) still read keys from env/config, not from auth profiles. Per-agent profiles exist only for `main` in the CLI. No `auth.order` / cooldown rotation across multiple profiles, and no keychain storage. Test: `scripts/e2e-provider-auth.sh` (smoke).
 
 ## 1.62 Plugin runtime: reply dispatcher, media fetch/store, TTS/STT, writeConfigFile
 - real: plugin → host **reverse calls** over the existing stdio JSON-RPC (`{"hostCall"}` / `{"hostReply"}`; replies bypass the host's request chain). They are served while any host request is in flight, including the 200 ms event pump; agent turns are deferred to a gateway thread so the plugin host lock is never held across them.

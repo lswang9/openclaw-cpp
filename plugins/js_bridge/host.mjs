@@ -536,9 +536,40 @@ async function handle(req) {
         const ent = providers.get(params.provider);
         if (!ent || typeof ent.p.complete !== 'function')
           return respond(id, null, { code: -32601, message: 'provider has no complete(): ' + params.provider });
-        const r = await ent.p.complete({ model: params.model, messages: params.messages || [], tools: params.tools || [], config: hostConfig });
+        const r = await ent.p.complete({ model: params.model, messages: params.messages || [], tools: params.tools || [], config: hostConfig, auth: params.auth || null });
         if (typeof r === 'string') return respond(id, { content: r, tool_calls: [] });
         return respond(id, { content: (r && r.content) || '', tool_calls: (r && r.tool_calls) || [] });
+      }
+      case 'provider_auth_run': {
+        const ent = providers.get(params.provider);
+        if (!ent) return respond(id, null, { code: -32601, message: 'unknown provider: ' + params.provider });
+        const methods = ent.p.auth || [];
+        const m = params.method ? methods.find((a) => a.id === params.method) : methods[0];
+        if (!m) return respond(id, null, { code: -32602, message: 'provider has no auth method' + (params.method ? ': ' + params.method : '') });
+        const rec = { id: ent.plugin };
+        const prompter = {
+          text: (o) => hostCall(rec, 'prompt.text', { message: (o && o.message) || String(o), secret: !!(o && (o.secret || o.mask)) }),
+          confirm: (o) => hostCall(rec, 'prompt.confirm', { message: (o && o.message) || String(o) }),
+          select: (o) => hostCall(rec, 'prompt.select', { message: o.message, options: (o.options || []).map((x) => (typeof x === 'string' ? { value: x, label: x } : x)) }),
+          note: (msg, title) => hostCall(rec, 'prompt.note', { message: String(msg), title }),
+        };
+        const ctx = { config: hostConfig, prompter, env: process.env, isRemote: false,
+          openUrl: (url) => hostCall(rec, 'open.url', { url: String(url) }), runtime: makeRuntime(rec) };
+        let result;
+        if (typeof m.run === 'function') result = await m.run(ctx);
+        else if (m.kind === 'api_key' || m.kind === 'token') {
+          const key = await prompter.text({ message: `${ent.p.label || params.provider} API key`, secret: true });
+          result = { profiles: [{ profileId: `${params.provider}:default`, credential: { type: 'api_key', provider: params.provider, key } }] };
+        } else return respond(id, null, { code: -32602, message: 'auth method has no run(): ' + m.id });
+        return respond(id, { method: m.id, kind: m.kind, ...(result || {}) });
+      }
+      case 'provider_auth_refresh': {
+        const ent = providers.get(params.provider);
+        if (!ent) return respond(id, null, { code: -32601, message: 'unknown provider: ' + params.provider });
+        const fn = ent.p.refreshOAuth || (ent.p.oauth && ent.p.oauth.refresh) || ((ent.p.auth || []).find((a) => typeof a.refresh === 'function') || {}).refresh;
+        if (typeof fn !== 'function') return respond(id, null, { code: -32601, message: 'provider has no OAuth refresh' });
+        const cred = await fn(params.credential || {}, { config: hostConfig });
+        return respond(id, { credential: cred });
       }
       case 'shutdown': {
         for (const run of channelRuns.values()) { try { run.abort.abort(); } catch {} }
