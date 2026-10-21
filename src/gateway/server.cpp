@@ -42,7 +42,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.51.0-dev";
+constexpr const char* kVersion = "1.52.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -371,7 +371,7 @@ void Server::Run() {
         close(listen_fd_); listen_fd_ = -1;
         throw std::runtime_error("bind() failed");
     }
-    if (listen(listen_fd_, 64) < 0) {
+    if (listen(listen_fd_, 512) < 0) {
         close(listen_fd_); listen_fd_ = -1;
         throw std::runtime_error("listen() failed");
     }
@@ -451,6 +451,7 @@ nlohmann::json Server::Stub(const std::string& method, const nlohmann::json& par
 }
 
 void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bool stream) {
+    auto deps_lock = LockDeps();
     auto send = [&](const std::string& resp) { (void)::send(client_fd, resp.data(), resp.size(), 0); };
     std::vector<agent::Message> messages;
     if (body.contains("messages") && body["messages"].is_array()) {
@@ -561,52 +562,80 @@ void Server::Emit(const std::string& event, const nlohmann::json& payload) {
 }
 
 nlohmann::json Server::ReloadConfigNow() {
-    std::lock_guard<std::mutex> g(reload_mu_);
     const auto path = config::DefaultPath();
     std::error_code ec;
     auto mt = std::filesystem::last_write_time(path, ec);
     if (ec) return {{"reloaded", false}, {"reason", "no config file"}};
-    if (mt == cfg_mtime_) return {{"reloaded", false}, {"reason", "unchanged"}};
-    cfg_mtime_ = mt;
-    auto lr = config::Load(path);
-    if (!lr.error.empty()) {
-        deps_.logs.Append("warn", "config reload rejected: " + lr.error);
-        Emit("config.reload", {{"ok", false}, {"error", lr.error}});
-        return {{"reloaded", false}, {"error", lr.error}};
-    }
-    bool restart = (config::GetPath(lr.snap.raw, "gateway.port") && lr.snap.gateway_port != deps_.config.gateway_port) ||
-                   ((config::GetPath(lr.snap.raw, "gateway.host") || config::GetPath(lr.snap.raw, "gateway.bind")) &&
-                    lr.snap.gateway_host != deps_.config.gateway_host);
-    auto keep_host = deps_.config.gateway_host; auto keep_port = deps_.config.gateway_port;
-    const auto old_raw = deps_.config.raw;
-    deps_.config = lr.snap;
-    deps_.config.gateway_host = keep_host; deps_.config.gateway_port = keep_port;  // bind changes need restart
-    // 1) skills + system prompt
+
+    bool restart = false;
     bool prompt_changed = false;
-    { std::lock_guard l(agent_prompts_mu_); agent_prompts_.clear(); }
-    if (deps_.agent_pool) deps_.agent_pool->SetConfig(deps_.config.raw);
-    if (deps_.rebuild_system_prompt) {
-        auto np = deps_.rebuild_system_prompt();
-        prompt_changed = np != deps_.system_prompt;
-        deps_.system_prompt = std::move(np);
-    }
-    // 2) restart running channel adapters whose channels.<id> subtree changed
+    bool plugins_changed = false;
     nlohmann::json restarted = nlohmann::json::array();
-    auto sub = [](const nlohmann::json& raw, const std::string& p) { return config::GetPath(raw, p).value_or(nlohmann::json()); };
-    for (auto* a : deps_.adapters.List()) {
-        const auto id = a->Id();
-        if (!a->Enabled() || sub(old_raw, "channels." + id) == sub(deps_.config.raw, "channels." + id)) continue;
+    std::vector<std::string> channel_ids_to_restart;
+    nlohmann::json warnings;
+    std::size_t prompt_chars = 0;
+    auto sub = [](const nlohmann::json& raw, const std::string& p) {
+        return config::GetPath(raw, p).value_or(nlohmann::json());
+    };
+
+    {
+        // Load file without locks (immutable path). Then unique deps + reload_mu_ together so we never
+        // hold reload_mu_ while blocked on unique (shared holders of deps_mu_ call MaybeReloadConfig).
+        if (mt == cfg_mtime_) return {{"reloaded", false}, {"reason", "unchanged"}};
+        auto lr = config::Load(path);
+        if (!lr.error.empty()) {
+            std::lock_guard<std::mutex> g(reload_mu_);
+            cfg_mtime_ = mt;
+            deps_.logs.Append("warn", "config reload rejected: " + lr.error);
+            Emit("config.reload", {{"ok", false}, {"error", lr.error}});
+            return {{"reloaded", false}, {"error", lr.error}};
+        }
+        {
+            auto deps_lock = LockDeps();
+            std::lock_guard<std::mutex> g(reload_mu_);
+            if (mt == cfg_mtime_) return {{"reloaded", false}, {"reason", "unchanged"}};  // lost race
+            cfg_mtime_ = mt;
+            restart = (config::GetPath(lr.snap.raw, "gateway.port") && lr.snap.gateway_port != deps_.config.gateway_port) ||
+                      ((config::GetPath(lr.snap.raw, "gateway.host") || config::GetPath(lr.snap.raw, "gateway.bind")) &&
+                       lr.snap.gateway_host != deps_.config.gateway_host);
+            auto keep_host = deps_.config.gateway_host; auto keep_port = deps_.config.gateway_port;
+            const auto old_raw = deps_.config.raw;
+            deps_.config = lr.snap;
+            deps_.config.gateway_host = keep_host; deps_.config.gateway_port = keep_port;
+            warnings = lr.warnings;
+            { std::lock_guard l(agent_prompts_mu_); agent_prompts_.clear(); }
+            if (deps_.agent_pool) deps_.agent_pool->SetConfig(deps_.config.raw);
+            if (deps_.rebuild_system_prompt) {
+                auto np = deps_.rebuild_system_prompt();
+                prompt_changed = np != deps_.system_prompt;
+                deps_.system_prompt = std::move(np);
+            }
+            prompt_chars = deps_.system_prompt.size();
+            for (auto* a : deps_.adapters.List()) {
+                const auto id = a->Id();
+                if (!a->Enabled() || sub(old_raw, "channels." + id) == sub(deps_.config.raw, "channels." + id)) continue;
+                channel_ids_to_restart.push_back(id);
+            }
+            plugins_changed = sub(old_raw, "plugins") != sub(deps_.config.raw, "plugins");
+        }
+    }
+
+    for (const auto& id : channel_ids_to_restart) {
+        auto* a = deps_.adapters.Get(id);
+        if (!a) continue;
         a->Stop();
         a->Start([this](const channels::InboundMessage& m) { return DeliverInbound(m); });
         restarted.push_back(id);
     }
-    // 3) plugins: rescan registry; restart the JS host when the plugins subtree changed
+
     bool plugins_restarted = false;
-    if (sub(old_raw, "plugins") != sub(deps_.config.raw, "plugins")) {
+    if (plugins_changed) {
+        auto deps_lock = LockDeps();
+        std::lock_guard<std::mutex> g(reload_mu_);
         if (!deps_.plugins.Root().empty()) deps_.plugins.Scan(deps_.plugins.Root());
         if (deps_.js_host && deps_.js_host->Running() && !deps_.plugins.Root().empty()) {
             deps_.js_host->Stop();
-            deps_.js_host->SetConfig(deps_.config.raw);  // plugins.entries.<id>.config etc. take effect
+            deps_.js_host->SetConfig(deps_.config.raw);
             deps_.js_host->Start(deps_.plugins.Root());
             deps_.js_host->RegisterTools(deps_.tools);
             if (deps_.agent_pool) deps_.agent_pool->SetConfig(deps_.config.raw);
@@ -615,37 +644,43 @@ nlohmann::json Server::ReloadConfigNow() {
     }
     if (plugins_restarted) RefreshPluginExtensions();
     RefreshDiscordCommands();
-    Emit("config.reload", {{"ok", true}, {"restartRequired", restart}, {"warnings", lr.warnings},
+    Emit("config.reload", {{"ok", true}, {"restartRequired", restart}, {"warnings", warnings},
                            {"systemPromptChanged", prompt_changed}, {"channelsRestarted", restarted},
                            {"pluginsRestarted", plugins_restarted}});
     deps_.logs.Append("info", std::string("config hot-reloaded") + (restart ? " (gateway bind change needs restart)" : ""));
-    return {{"reloaded", true}, {"restartRequired", restart}, {"warnings", lr.warnings},
+    return {{"reloaded", true}, {"restartRequired", restart}, {"warnings", warnings},
             {"systemPromptChanged", prompt_changed}, {"channelsRestarted", restarted},
-            {"pluginsRestarted", plugins_restarted}, {"systemPromptChars", deps_.system_prompt.size()}};
+            {"pluginsRestarted", plugins_restarted}, {"systemPromptChars", prompt_chars}};
 }
+
 
 void Server::MaybeReloadConfig() {
     auto mode = deps_.config.raw.is_object() ? config::GetPath(deps_.config.raw, "gateway.reload.mode") : std::nullopt;
     if (mode && mode->is_string() && *mode == "off") return;
     auto now = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> g(reload_mu_);
-        if (now - last_reload_check_ < std::chrono::seconds(1)) return;
-        last_reload_check_ = now;
-    }
+    std::unique_lock<std::mutex> g(reload_mu_, std::try_to_lock);
+    if (!g.owns_lock()) return;
+    if (now - last_reload_check_ < std::chrono::seconds(1)) return;
+    last_reload_check_ = now;
+    g.unlock();
     ReloadConfigNow();
 }
 
 session::Store& Server::SessionsFor(const std::string& agent_id) {
-    if (deps_.agent_pool) return *deps_.agent_pool->Get(agent_id).sessions;
+    if (deps_.agent_pool) return deps_.agent_pool->Sessions(agent_id);
     return deps_.sessions;
 }
-tools::Registry& Server::ToolsFor(const std::string& agent_id) {
-    if (deps_.agent_pool) return *deps_.agent_pool->Get(agent_id).tools;
-    return deps_.tools;
+std::shared_ptr<tools::Registry> Server::ToolsFor(const std::string& agent_id) {
+    if (deps_.agent_pool) return deps_.agent_pool->Tools(agent_id);
+    // non-owning shared_ptr with no-op deleter
+    return std::shared_ptr<tools::Registry>(&deps_.tools, [](tools::Registry*) {});
+}
+std::unique_lock<std::mutex> Server::LockDeps() const {
+    return std::unique_lock<std::mutex>(deps_mu_);
 }
 std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
-    MaybeReloadConfig();
+    MaybeReloadConfig();  // may unique-lock; must run before the shared request lock
+    auto deps_lock = LockDeps();
     channels::InboundMessage msg = msg_in;
     std::string legacy_migrate_from;
     {
@@ -683,7 +718,8 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         return a.empty() ? agent::routing::DefaultAgentId(deps_.config.raw) : a;
     }();
     session::Store& sessions = SessionsFor(agent_id);
-    tools::Registry& tools = ToolsFor(agent_id);
+    std::shared_ptr<tools::Registry> tools_ptr = ToolsFor(agent_id);
+    tools::Registry& tools = *tools_ptr;
     if (!legacy_migrate_from.empty() && !sessions.Exists(msg.session_key)) {
         // Prefer the agent store; fall back to the legacy shared store.
         if (sessions.Exists(legacy_migrate_from)) {
@@ -1019,6 +1055,8 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
     first >> method >> path_raw >> version;
     const std::string path = PathOnly(path_raw);
     auto send = [&](const std::string& resp) { (void)::send(client_fd, resp.data(), resp.size(), 0); };
+    // Deps locking: DeliverInbound / DispatchRpc / HandleChatCompletions take shared (or unique for
+    // config.reload). Do not hold a shared lock across this whole handler — reload needs unique.
 
     // Auth (health exempt)
     g_rpc_role = "admin";
@@ -1339,6 +1377,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
     // POST /api/channels/<id>/inbound
     if (method == "POST" && path.rfind("/api/channels/", 0) == 0 && path.size() > 14 &&
         path.find("/inbound") != std::string::npos) {
+        // Keep shared for adapter/config lookup; drop before DeliverInbound (nested MaybeReload/unique).
         try {
             auto rest = path.substr(std::string("/api/channels/").size());
             auto slash = rest.find('/');
@@ -1384,7 +1423,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             nlohmann::json body = ctype.find("application/x-www-form-urlencoded") != std::string::npos
                                       ? channels::signing::ParseForm(raw_body)
                                       : nlohmann::json::parse(raw_body);
-            auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
+                auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
             auto result = adapter->HandleHttpInbound(body, deliver);
             // Feishu/Slack URL verification
             if (result.contains("challenge") && result.value("mode", "") == "url_verification") {
@@ -1437,7 +1476,16 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
 
 nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     const std::string method = msg.value("method", msg.value("type", ""));
-    if (method != "config.reload") MaybeReloadConfig();
+    if (method == "config.reload") {
+        // Exclusive path: ReloadConfigNow takes the unique deps lock. Do not hold shared.
+        const auto id = msg.contains("id") ? msg["id"] : nlohmann::json();
+        auto payload = ReloadConfigNow();
+        nlohmann::json r{{"type", "res"}, {"ok", true}, {"payload", std::move(payload)}};
+        if (!id.is_null()) r["id"] = id;
+        return r;
+    }
+    MaybeReloadConfig();
+    auto deps_lock = LockDeps();
     if (deps_.js_host && deps_.js_host->HasGatewayMethod(method)) {
         auto p = msg.contains("params") ? msg["params"] : nlohmann::json::object();
         auto r = deps_.js_host->CallGatewayMethod(method, p);
@@ -1570,6 +1618,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         im.sender = params.value("sender", "user");
         im.text = text;
         im.session_key = session_key;
+        deps_lock.unlock();  // DeliverInbound may MaybeReload (unique) then take shared
         auto reply = DeliverInbound(im);
         if (reply.rfind("error:", 0) == 0) return err(reply.substr(6));
         return ok({{"sessionKey", session_key}, {"text", reply}});
@@ -1599,7 +1648,6 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         };
         return ok(schema);
     }
-    if (method == "config.reload") return ok(ReloadConfigNow());
     if (method == "config.schema.lookup") {
         const std::string path = params.value("path", params.value("key", ""));
         auto v = config::ValidateLightJson(deps_.config);

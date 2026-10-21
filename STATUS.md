@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.51.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.52.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -216,3 +216,6 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ### 1.51.0-dev
 - 多智能体隔离：每个 agents.list 条目独立会话目录、工作区、记忆索引与工具集（allow/deny/profile）；main 在设置了 OPENCLAW_SESSION_DIR 时仍用该目录以保持兼容。技能库与 JS 插件宿主仍为进程级共享。
+
+### 1.52.0-dev
+- 热重载与并发 HTTP：`deps_mu_`（`shared_mutex`）保护配置/工具换出；请求路径 shared，`ReloadConfigNow` unique；agent 工具注册改为 `shared_ptr` 以便在途 run 在 rebuild 后仍持有旧 registry。`scripts/e2e-config-lock.sh`（已并入 smoke）并发 config.reload + inbound/tools.list。

@@ -39,6 +39,8 @@
 - **1.24.0-dev**: device token roles (operator/device, chosen at approve, persisted, RPC denylist); /login HttpOnly cookie; UI pages redirect when unauthenticated
 - **1.25.0-dev**: auth hardening — server-side sessions (cookie holds session id, not token; revoke ends session), CSRF token on cookie POSTs, cookie-WS Origin check, WS role smoke, per-IP persisted claim rate limit
 
+- **1.52.0-dev**: config reload `shared_mutex` (readers shared / ReloadConfigNow unique) + `scripts/e2e-config-lock.sh`; agent tools `shared_ptr` across rebuild
+
 - **1.17.0-dev**: ACP multimodal prompt (image_base64/url → vision content); mock-saw-image
 
 - **1.16.0-dev**: Control UI board (disk JSON + /board HTML CRUD); docs/BOARD.md

@@ -41,7 +41,8 @@ tools::Registry FilterTools(const tools::Registry& base, const ToolPolicy& p);
 struct AgentRuntime {
     AgentIsolation iso;
     std::unique_ptr<session::Store> sessions;
-    std::unique_ptr<tools::Registry> tools;
+    // shared_ptr so in-flight runs keep a live registry across SetConfig rebuilds
+    std::shared_ptr<tools::Registry> tools;
 };
 
 // Lazily builds & caches per-agent session stores and tool registries.
@@ -52,6 +53,8 @@ public:
     void SetConfig(nlohmann::json raw);
     // Get or create runtime for agent_id (default "main").
     AgentRuntime& Get(const std::string& agent_id);
+    std::shared_ptr<tools::Registry> Tools(const std::string& agent_id);
+    session::Store& Sessions(const std::string& agent_id);
     // Snapshot of known agents (ids).
     std::vector<std::string> Ids() const;
 

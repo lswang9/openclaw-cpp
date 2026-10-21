@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.51.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.52.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -71,7 +71,8 @@
 ## 1.49 Hot-reload channel/plugin restart coverage
 - real: scripts/e2e-hot-reload-channels.sh (part of smoke) proves a reload restarts only adapters whose channels.<id> subtree changed, restarts nothing on unrelated edits, adapters keep serving afterwards, and a plugins.* change restarts the JS host with the **new** plugin config (bug fixed: the host previously restarted with the stale config) and re-registers plugin channels/providers.
 - fix: `tools.invoke` RPC accepts plain-text tool results (JS plugin tools) instead of failing JSON parse.
-- real-sim: built-in adapters mostly read credentials from env, so a restart re-reads env-backed settings only; config reload swaps `deps.config` without a reader lock while HTTP is now multi-threaded (benign in tests, not formally race-free).
+- real-sim: built-in adapters mostly read credentials from env, so a restart re-reads env-backed settings only.
+- note (superseded by 1.52): the “config reload swaps `deps.config` without a reader lock” gap is closed in **1.52** (`shared_mutex` + e2e).
 
 ## 1.50 Webhook authenticity + form bodies
 - real: Slack signing secret (SLACK_SIGNING_SECRET or channels.slack.signingSecret): HMAC-SHA256 `v0:ts:body`, constant-time compare, 5-minute replay window → 401 otherwise.
@@ -84,3 +85,9 @@
 - real: tools.allow / tools.deny / tools.profile (`minimal|coding|messaging|full`) from global `tools.*`, then `agents.defaults.tools`, then `agents.list[]|entries.<id>.tools` — deny wins; profile supplies a base allow set (coding includes exec/read/write/edit/http_get/browser_*).
 - real: per-agent sandbox object (mode/backend/…) still flows into exec ResolvePolicy; agent Pool rebuilds tool registries on config reload and after JS plugin host restart (re-RegisterTools into the shared base).
 - real-sim: skills library and JS plugin host remain process-global (not per-agent); MCP tool list is shared then filtered by allow/deny.
+
+## 1.52 Config reload vs concurrent HTTP (`shared_mutex`)
+- real: `Server` holds `deps_mu_` (`std::shared_mutex`). HTTP/RPC/inbound readers take a **shared** lock while using `deps_.config` / tools / sessions; `ReloadConfigNow` takes a **unique** lock only around the config + agent-pool tools swap (adapter Stop/Start runs **outside** unique so `DeliverInbound` cannot deadlock). `config.reload` RPC is handled before any shared lock.
+- real: per-agent `tools::Registry` is a `shared_ptr` so in-flight agent runs keep a live registry across SetConfig rebuilds (`tools.reset()` + lazy rebuild on next Get).
+- real: `scripts/e2e-config-lock.sh` (part of smoke) hammers concurrent `config.reload` + Slack inbound + `tools.list` and asserts the gateway stays healthy.
+- real-sim / remaining: not a full formal proof of every deps_ field; long agent loops may still observe a mix of old tools + new config fields if they re-read `deps_` without holding the lock for the whole run (chat completions hold shared for the run). Channel credential env re-read semantics unchanged from 1.49.

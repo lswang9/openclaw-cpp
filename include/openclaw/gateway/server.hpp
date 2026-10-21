@@ -1,4 +1,5 @@
 #pragma once
+#include <shared_mutex>
 #include <map>
 #include <functional>
 #include <chrono>
@@ -135,9 +136,12 @@ private:
     std::mutex agent_prompts_mu_;
     std::string AgentSystemPrompt(const std::string& agent_id);
     session::Store& SessionsFor(const std::string& agent_id);
-    tools::Registry& ToolsFor(const std::string& agent_id);
+    std::shared_ptr<tools::Registry> ToolsFor(const std::string& agent_id);
+    // Shared with request handlers; unique during ReloadConfigNow.
+    std::unique_lock<std::mutex> LockDeps() const;
     std::vector<std::string> plugin_channels_;
     std::set<std::string> plugin_providers_;
+    mutable std::mutex deps_mu_;  // exclusive: reload vs all request handlers
     std::mutex reload_mu_;
     std::filesystem::file_time_type cfg_mtime_{};
     std::chrono::steady_clock::time_point last_reload_check_{};

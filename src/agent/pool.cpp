@@ -167,10 +167,17 @@ AgentRuntime& Pool::Get(const std::string& agent_id_in) {
                 if (auto* t = base_->Get(n)) full.Register(*t);
             }
         }
-        rt.tools = std::make_unique<tools::Registry>(FilterTools(full, rt.iso.tools));
+        rt.tools = std::make_shared<tools::Registry>(FilterTools(full, rt.iso.tools));
         // Re-bind exec/shell to this agent's workspace (MakeDefaultRegistry already did via opts).
     }
     return rt;
+}
+
+std::shared_ptr<tools::Registry> Pool::Tools(const std::string& agent_id) {
+    return Get(agent_id).tools;
+}
+session::Store& Pool::Sessions(const std::string& agent_id) {
+    return *Get(agent_id).sessions;
 }
 
 std::vector<std::string> Pool::Ids() const {
