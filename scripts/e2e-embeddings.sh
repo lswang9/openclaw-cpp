@@ -40,5 +40,18 @@ echo "$R" | grep -q '"backend": "hybrid-openai"' || { echo "[e2e-emb] wrong back
 echo "$R" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["results"][0]["start_line"]==4, r'
 "$BIN" memory search coffee >/dev/null
 python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["inputs"]==4, c' "$T/calls.json"   # 2 chunks once + 2 queries
-[[ -f "$T/data/memory/main.index.json" ]]
-echo "[e2e-emb] openai-compatible embeddings + persisted index (chunks embedded once): PASS"
+[[ -f "$T/data/memory/main.sqlite" ]]
+python3 - "$T/data/memory/main.sqlite" <<'PY2'
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); n=c.execute("select count(*), min(dims) from embedding_cache where provider='openai' and model='fake-embed'").fetchone()
+assert n==(2,16), n
+PY2
+# edit MEMORY.md: the replaced chunk is re-embedded, the stale row pruned
+printf '# Prefs\nUser prefers green tea now.\n\n# Infra\nDeploys on kubernetes clusters.\n' > "$T/ws/MEMORY.md"
+"$BIN" memory search tea | python3 -c 'import json,sys; r=json.load(sys.stdin); i=r["index"]; assert i["misses"]==1 and i["pruned"]==1, i'
+# legacy JSON cache is imported into SQLite on first open
+rm -f "$T/data/memory/main.sqlite"*
+python3 -c "import json;json.dump({'version':1,'key':'openai:fake-embed','entries':{}},open('$T/data/memory/main.index.json','w'))"
+"$BIN" memory search tea >/dev/null
+[[ -f "$T/data/memory/main.index.json.migrated" ]] || { echo "[e2e-emb] legacy json not migrated" >&2; exit 1; }
+echo "[e2e-emb] openai-compatible embeddings + SQLite vector store (embedded once, prune, legacy import): PASS"

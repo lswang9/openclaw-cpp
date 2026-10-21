@@ -123,8 +123,8 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
             if (idx.empty()) {
                 const char* d = std::getenv("OPENCLAW_DATA_DIR");
                 const char* h = std::getenv("HOME");
-                idx = (d && *d) ? std::filesystem::path(d) / "memory" / "main.index.json"
-                                : std::filesystem::path(h && *h ? h : "/tmp") / ".openclaw" / "memory" / "main.index.json";
+                idx = (d && *d) ? std::filesystem::path(d) / "memory" / "main.sqlite"
+                                : std::filesystem::path(h && *h ? h : "/tmp") / ".openclaw" / "memory" / "main.sqlite";
             }
             ws->SetEmbedder(emb, idx);
         }

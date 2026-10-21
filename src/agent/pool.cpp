@@ -90,9 +90,9 @@ AgentIsolation ResolveIsolation(const nlohmann::json& raw, const std::string& ag
 
     if (id == "main") {
         if (const char* d = std::getenv("OPENCLAW_DATA_DIR"); d && *d)
-            iso.memory_index = fs::path(d) / "memory" / "main.index.json";
-        else iso.memory_index = root / "memory" / "index.json";
-    } else iso.memory_index = root / "memory" / "index.json";
+            iso.memory_index = fs::path(d) / "memory" / "main.sqlite";
+        else iso.memory_index = root / "memory" / "index.sqlite";
+    } else iso.memory_index = root / "memory" / "index.sqlite";
 
     iso.agent_files_root = root / "agent";
     return iso;

@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.58.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.59.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -28,6 +28,10 @@
 | `ImplementedMethods` | ~640（大量前缀桶/本地 store） |
 
 详见里程碑 [SERIES.md](SERIES.md)；发版流程 [docs/RELEASE.md](docs/RELEASE.md)；上手 [STATUS.md](STATUS.md)。
+
+## 1.59 Persisted vector store (sqlite-vec equivalent)
+- real: memory embeddings now persist in SQLite (`$OPENCLAW_DATA_DIR/memory/main.sqlite`, per-agent `agents/<id>/memory/index.sqlite`; supersedes the 1.47 `index.json` paths): table `embedding_cache(provider, model, hash, dims, embedding BLOB float32, updated_at)`, several provider/models side by side (switching models no longer wipes the cache), WAL, stale rows of the active model pruned when chunks change, legacy `*.index.json` auto-imported then renamed `.migrated`. SQL function `vec_distance_cosine(a, b)` + `VectorIndex::Knn` (ORDER BY distance LIMIT k). `memory search` reports `index.{hits,misses,pruned}`; `memory status` lists models/dims/entries.
+- real-sim: "equivalent", not the sqlite-vec extension — KNN is a brute-force scan through a C++ UDF (no `vec0` virtual table / ANN index); search still scores every chunk in-process; chunks/FTS tables are not persisted (BM25 recomputed per query). Tests: self-test (KNN), `scripts/e2e-embeddings.sh` (sqlite rows, prune, legacy import).
 
 ## 1.58 ClawHub client (skills + plugins)
 - real (fake-server tested): ClawHub `/api/v1` client — `CLAWHUB_REGISTRY` (legacy `CLAWDHUB_REGISTRY`), optional `CLAWHUB_TOKEN` Bearer, 429 `Retry-After`/`RateLimit-Reset` retry. `openclaw skills search|install <@owner/slug> [--version] [--force]|update [<slug>|--all]|uninstall|sync|installed|inspect` (also `openclaw clawhub …`). Skills land in `<workdir>/skills/<slug>` (`CLAWHUB_WORKDIR` or workspace), versions in `.clawhub/lock.json`, per-skill `.clawhub/origin.json`; moderation `isMalwareBlocked` refused; zip symlinks refused; update refuses to clobber locally modified installs.

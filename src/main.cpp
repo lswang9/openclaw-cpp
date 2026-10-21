@@ -88,7 +88,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.58.0-dev";
+constexpr const char* kVersion = "1.59.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1824,7 +1824,7 @@ int CmdSelfTest() {
         bool ok = iso_m.sessions_root == tmp / "main" / "sessions" &&
                   iso_c.sessions_root == tmp / "coder" / "sessions" &&
                   iso_c.workspace_root == tmp / "coder-ws" &&
-                  iso_c.memory_index == tmp / "coder" / "memory" / "index.json" &&
+                  iso_c.memory_index == tmp / "coder" / "memory" / "index.sqlite" &&
                   iso_c.tools.profile == "coding" && iso_c.sandbox.value("mode", "") == "all";
         ok = ok && agent::ToolAllowed(iso_c.tools, "exec") && agent::ToolAllowed(iso_c.tools, "read") &&
              !agent::ToolAllowed(iso_c.tools, "browser_screenshot") &&
@@ -2314,6 +2314,25 @@ int CmdSelfTest() {
         }
         if (!keys || !pty_ok) { std::cerr << "FAIL pty/send-keys keys=" << keys << "\n"; ++failures; }
         else std::cerr << "PASS PTY exec + send-keys (isatty, line input)\n";
+    }
+
+    {  // 1.59: SQLite vector store KNN (vec_distance_cosine)
+        auto f = std::filesystem::temp_directory_path() / ("oc-vec-selftest-" + std::to_string(::getpid()) + ".sqlite");
+        std::filesystem::remove(f);
+        auto loc = workspace::MakeLocalEmbedder(64);
+        bool ok = false;
+        {
+            workspace::VectorIndex vi(f);
+            std::vector<std::string> docs = {"kubernetes cluster deploy", "dark roast coffee beans", "green tea leaves"};
+            vi.Get(*loc, docs);
+            auto again = vi.Get(*loc, docs);
+            auto knn = vi.Knn(loc->Id(), loc->Model(), loc->Embed({"coffee roast"}).at(0), 2);
+            ok = vi.last_misses == 0 && again.size() == 3 && knn.size() == 2 && knn[0].first == workspace::Sha256Hex(docs[1]) &&
+                 knn[0].second <= knn[1].second && vi.Stats()["backend"] == "sqlite";
+        }
+        std::filesystem::remove(f);
+        if (!ok) { std::cerr << "FAIL sqlite vector store knn\n"; ++failures; }
+        else std::cerr << "PASS sqlite vector store (cache, KNN via vec_distance_cosine)\n";
     }
 
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }

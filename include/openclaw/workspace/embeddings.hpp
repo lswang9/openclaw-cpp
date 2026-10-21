@@ -28,23 +28,35 @@ std::shared_ptr<EmbeddingProvider> MakeOpenAiEmbedder(std::string base_url, std:
 // falls back to OPENAI_API_KEY). auto = openai when a key is available, else local. Disabled → nullptr.
 std::shared_ptr<EmbeddingProvider> MakeEmbedderFromConfig(const nlohmann::json& raw);
 
-// Persistent vector index + embedding cache (JSON file). Entries keyed by sha256(text) per provider/model,
-// so unchanged chunks are never re-embedded across searches or restarts.
+// Persistent vector index + embedding cache, keyed by sha256(text) per provider/model so unchanged chunks are
+// never re-embedded. Backend by file extension:
+//  *.sqlite → SQLite store (sqlite-vec-equivalent: float32 BLOB vectors, `vec_distance_cosine()` SQL function,
+//             multiple provider/models side by side, stale-row pruning, legacy *.index.json auto-import);
+//  else     → legacy JSON file.
 class VectorIndex {
 public:
     explicit VectorIndex(std::filesystem::path file);
+    ~VectorIndex();
+    VectorIndex(const VectorIndex&) = delete;
+    VectorIndex& operator=(const VectorIndex&) = delete;
     // Returns vectors for texts, embedding only cache misses; persists when anything new was added.
-    std::vector<Vec> Get(EmbeddingProvider& prov, const std::vector<std::string>& texts);
+    // prune=true drops rows of this provider/model whose hash is not in `texts` (texts = full chunk set).
+    std::vector<Vec> Get(EmbeddingProvider& prov, const std::vector<std::string>& texts, bool prune = false);
+    // Brute-force KNN in SQL (ORDER BY vec_distance_cosine) — SQLite backend only.
+    std::vector<std::pair<std::string, double>> Knn(const std::string& provider, const std::string& model, const Vec& q, int k);
     nlohmann::json Stats() const;
-    std::size_t last_misses = 0, last_hits = 0;
+    std::size_t last_misses = 0, last_hits = 0, last_pruned = 0;
 
 private:
     void LoadLocked();
     void SaveLocked() const;
+    bool OpenSqliteLocked();
     std::filesystem::path file_;
     mutable std::mutex mu_;
     bool loaded_ = false;
-    std::string key_;  // provider:model of loaded cache
+    bool sqlite_ = false;
+    void* db_ = nullptr;  // sqlite3*
+    std::string key_;  // provider:model of loaded cache (JSON backend)
     std::unordered_map<std::string, Vec> cache_;
 };
 

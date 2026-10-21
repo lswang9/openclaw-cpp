@@ -257,11 +257,11 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
             try {
                 std::vector<std::string> texts;
                 for (auto& c : chunks) texts.push_back(c.text);
-                auto vs = index_->Get(*embedder_, texts);
+                auto vs = index_->Get(*embedder_, texts, /*prune=*/true);
                 auto qv = embedder_->Embed({query}).at(0);
                 for (std::size_t i = 0; i < chunks.size(); ++i) vec[i] = std::max(0.0, Cosine(qv, vs[i]));
                 vec_backend = embedder_->Id();
-                index_info = {{"hits", index_->last_hits}, {"misses", index_->last_misses}};
+                index_info = {{"hits", index_->last_hits}, {"misses", index_->last_misses}, {"pruned", index_->last_pruned}};
                 done = true;
             } catch (const std::exception& e) {
                 fallback = e.what();  // remote provider failed → local embeddings
