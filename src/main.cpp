@@ -77,7 +77,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.39.0-dev";
+constexpr const char* kVersion = "1.40.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1476,6 +1476,16 @@ int CmdSelfTest() {
         ok = ok && config::Load(d / "openclaw2.json").error.find("cycle") != std::string::npos;
         auto bad = config::ValidateSchema({{"gateway", {{"port", 70000}}}, {"session", {{"reset", {{"atHour", 25}}}}}, {"bogus", 1}});
         ok = ok && bad.errors.size() == 2 && bad.warnings.size() == 1;
+        auto bad2 = config::ValidateSchema(nlohmann::json::parse(R"({"session":{"dmScope":"weird"},"tools":{"allow":"x","profile":"coding"},
+            "agents":{"list":[{"id":"main","default":true},{"workspace":3}],"defaults":{"memorySearch":{"provider":"openai","query":{"hybrid":{"vectorWeight":2}}}}},
+            "bindings":[{"agentId":"main","match":{"channel":"slack"}},{"match":1}],
+            "channels":{"slack":{"dmPolicy":"pairing","allowFrom":["U1"]},"telegram":{"dmPolicy":"bogus","botToken":5}},
+            "plugins":{"entries":{"x":{"enabled":"yes"}}},"models":{"providers":{"ds":{"baseUrl":"u","api":"openai-completions","models":[]}}},
+            "logging":{"level":"loud"}})"));
+        // expected errors: dmScope, tools.allow, agents.list[1].id, agents.list[1].workspace, vectorWeight,
+        // bindings[1].agentId, bindings[1].match, telegram.dmPolicy, telegram.botToken, plugins.entries.x.enabled, logging.level
+        ok = ok && bad2.errors.size() == 11;
+        if (bad2.errors.size() != 11) for (auto& e : bad2.errors) std::cerr << "   schema: " << e << "\n";
         std::ofstream(d / "bad.json") << "{ gateway: { port: 'x' } }";
         ok = ok && config::Load(d / "bad.json").error.find("gateway.port") != std::string::npos;
         if (!ok) { std::cerr << "FAIL config include/schema " << lr.error << " " << lr.snap.raw.dump() << "\n"; ++failures; }

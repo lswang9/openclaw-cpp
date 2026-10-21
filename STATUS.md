@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.39.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.40.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.40.0-dev 新增
+
+- 配置校验覆盖面扩大：`session.dmScope`、`gateway.auth`、`logging.level`、`tools.allow/deny/profile/exec`、`agents.defaults.memorySearch`、`agents.list`、`bindings`、`channels.<渠道>`（dmPolicy/groupPolicy/allowFrom/各类 token）、`plugins.entries`、`models.providers`、`cron`/`hooks` 等都会检查类型和取值，错误会指出具体路径。
 
 ## 1.39.0-dev 新增
 

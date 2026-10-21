@@ -315,6 +315,105 @@ SchemaReport ValidateSchema(const nlohmann::json& raw) {
                 for (auto& x : v) if (!x.is_string()) return false;
                 return true; }, "object of strings");
         }
+    auto isstrarr = [](const nlohmann::json& v) {
+        if (!v.is_array()) return false;
+        for (auto& x : v) if (!x.is_string() && !x.is_number()) return false;
+        return true;
+    };
+    auto oneof = [](std::initializer_list<const char*> opts) {
+        std::vector<std::string> o(opts.begin(), opts.end());
+        return [o](const nlohmann::json& v) { return v.is_string() && std::find(o.begin(), o.end(), v.get<std::string>()) != o.end(); };
+    };
+    auto isobj = [](const nlohmann::json& v) { return v.is_object(); };
+    auto ispos = [](const nlohmann::json& v) { return v.is_number_unsigned() && v.get<long>() > 0; };
+    // session
+    expect("session.dmScope", oneof({"main", "per-peer", "per-channel-peer", "per-account-channel-peer"}), "main|per-peer|per-channel-peer|per-account-channel-peer");
+    expect("session.keyFormat", oneof({"upstream", "legacy"}), "upstream|legacy");
+    // gateway auth
+    expect("gateway.auth", isobj, "object");
+    expect("gateway.auth.mode", oneof({"token", "password", "none", "trusted-proxy"}), "token|password|none|trusted-proxy");
+    expect("gateway.auth.token", isstr, "string");
+    expect("gateway.auth.password", isstr, "string");
+    // logging
+    expect("logging.level", oneof({"silent", "fatal", "error", "warn", "info", "debug", "trace"}), "silent|fatal|error|warn|info|debug|trace");
+    // tools
+    expect("tools.allow", isstrarr, "array of strings");
+    expect("tools.deny", isstrarr, "array of strings");
+    expect("tools.profile", oneof({"minimal", "coding", "messaging", "full"}), "minimal|coding|messaging|full");
+    expect("tools.exec.host", oneof({"sandbox", "gateway", "node"}), "sandbox|gateway|node");
+    expect("tools.exec.security", oneof({"deny", "allowlist", "full"}), "deny|allowlist|full");
+    expect("tools.exec.timeoutSec", ispos, "positive integer");
+    // memory search
+    expect("agents.defaults.memorySearch.enabled", isbool, "boolean");
+    expect("agents.defaults.memorySearch.provider", oneof({"local", "openai", "gemini", "voyage", "mistral", "ollama", "auto"}), "local|openai|gemini|voyage|mistral|ollama|auto");
+    expect("agents.defaults.memorySearch.model", isstr, "string");
+    expect("agents.defaults.memorySearch.remote.baseUrl", isstr, "string");
+    expect("agents.defaults.memorySearch.remote.apiKey", isstr, "string");
+    expect("agents.defaults.memorySearch.query.hybrid.vectorWeight", [](const nlohmann::json& v) { return v.is_number() && v.get<double>() >= 0 && v.get<double>() <= 1; }, "number 0-1");
+    expect("agents.defaults.memorySearch.query.hybrid.textWeight", [](const nlohmann::json& v) { return v.is_number() && v.get<double>() >= 0 && v.get<double>() <= 1; }, "number 0-1");
+    expect("agents.defaults.memorySearch.cache.enabled", isbool, "boolean");
+    expect("agents.defaults.timeoutSeconds", ispos, "positive integer");
+    expect("agents.defaults.maxConcurrent", ispos, "positive integer");
+    // agents.list / bindings
+    if (auto al = GetPath(raw, "agents.list")) {
+        if (!al->is_array()) r.errors.push_back("agents.list: expected array");
+        else for (std::size_t i = 0; i < al->size(); ++i) {
+            const auto& a = (*al)[i];
+            auto b = "agents.list[" + std::to_string(i) + "]";
+            if (!a.is_object() || !a.contains("id") || !a["id"].is_string() || a["id"].get<std::string>().empty())
+                r.errors.push_back(b + ".id: required non-empty string");
+            if (a.is_object() && a.contains("default") && !a["default"].is_boolean()) r.errors.push_back(b + ".default: expected boolean");
+            if (a.is_object() && a.contains("workspace") && !a["workspace"].is_string()) r.errors.push_back(b + ".workspace: expected string");
+        }
+    }
+    if (auto bl = GetPath(raw, "bindings")) {
+        if (!bl->is_array()) r.errors.push_back("bindings: expected array");
+        else for (std::size_t i = 0; i < bl->size(); ++i) {
+            const auto& b = (*bl)[i];
+            auto p = "bindings[" + std::to_string(i) + "]";
+            if (!b.is_object() || !b.contains("agentId") || !b["agentId"].is_string()) r.errors.push_back(p + ".agentId: required string");
+            if (b.is_object() && b.contains("match") && !b["match"].is_object()) r.errors.push_back(p + ".match: expected object");
+        }
+    }
+    // channels.<id>
+    if (auto ch = GetPath(raw, "channels"); ch && ch->is_object())
+        for (auto it = ch->begin(); it != ch->end(); ++it) {
+            auto b = "channels." + it.key();
+            if (it.key() == "defaults") continue;
+            if (!it.value().is_object()) { r.errors.push_back(b + ": expected object"); continue; }
+            expect(b + ".enabled", isbool, "boolean");
+            expect(b + ".dmPolicy", oneof({"pairing", "allowlist", "open", "disabled"}), "pairing|allowlist|open|disabled");
+            expect(b + ".groupPolicy", oneof({"open", "allowlist", "disabled"}), "open|allowlist|disabled");
+            expect(b + ".allowFrom", isstrarr, "array of strings");
+            expect(b + ".groupAllowFrom", isstrarr, "array of strings");
+            for (auto k : {"botToken", "appToken", "token", "signingSecret", "appId", "appSecret"}) expect(b + "." + k, isstr, "string");
+        }
+    // plugins
+    expect("plugins.enabled", isbool, "boolean");
+    expect("plugins.allow", isstrarr, "array of strings");
+    expect("plugins.deny", isstrarr, "array of strings");
+    if (auto pe = GetPath(raw, "plugins.entries"); pe) {
+        if (!pe->is_object()) r.errors.push_back("plugins.entries: expected object");
+        else for (auto it = pe->begin(); it != pe->end(); ++it) {
+            auto b = "plugins.entries." + it.key();
+            expect(b + ".enabled", isbool, "boolean");
+            expect(b + ".config", isobj, "object");
+        }
+    }
+    // models.providers
+    if (auto mp = GetPath(raw, "models.providers"); mp) {
+        if (!mp->is_object()) r.errors.push_back("models.providers: expected object");
+        else for (auto it = mp->begin(); it != mp->end(); ++it) {
+            auto b = "models.providers." + it.key();
+            expect(b + ".baseUrl", isstr, "string");
+            expect(b + ".apiKey", isstr, "string");
+            expect(b + ".api", oneof({"openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"}), "openai-completions|openai-responses|anthropic-messages|google-generative-ai");
+            expect(b + ".models", [](const nlohmann::json& v) { return v.is_array(); }, "array");
+        }
+    }
+    expect("cron.enabled", isbool, "boolean");
+    expect("hooks.enabled", isbool, "boolean");
+    expect("hooks.token", isstr, "string");
     (void)isint;
     return r;
 }
