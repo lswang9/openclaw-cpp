@@ -3,6 +3,7 @@
 #include "openclaw/auth/oidc.hpp"
 #include "openclaw/auth/mfa.hpp"
 #include "openclaw/gateway/server.hpp"
+#include "openclaw/config/schema.hpp"
 #include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/gateway/node_hub.hpp"
 #include "openclaw/util.hpp"
@@ -53,7 +54,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.110.0-dev";
+constexpr const char* kVersion = "1.111.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2383,29 +2384,23 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
 
     if (method == "config.get") return ok(deps_.config.ToJson());
     if (method == "config.schema") {
-        auto schema = nlohmann::json{
-            {"type", "object"},
-            {"properties",
-             {{"gateway",
-               {{"type", "object"},
-                {"properties",
-                 {{"host", {{"type", "string"}}},
-                  {"port", {{"type", "integer"}, {"minimum", 1}, {"maximum", 65535}}}}}}},
-              {"agents",
-               {{"type", "object"},
-                {"properties",
-                 {{"defaults",
-                   {{"type", "object"},
-                    {"properties", {{"model", {{"type", "string"}}}}}}}}}}},
-              {"session_dir", {{"type", "string"}}}}},
-            {"validation", config::ValidateLightJson(deps_.config)},
-        };
-        return ok(schema);
+        nlohmann::json out = config::UpstreamSchemaResponse();
+        out["validation"] = config::ValidateLightJson(deps_.config);
+        return ok(out);
     }
     if (method == "config.schema.lookup") {
         const std::string path = params.value("path", params.value("key", ""));
-        auto v = config::ValidateLightJson(deps_.config);
-        return ok({{"path", path}, {"validation", v}, {"config", deps_.config.ToJson()}});
+        if (path.empty()) return err("path is required");
+        auto r = config::LookupSchema(path);
+        if (r.is_null()) return err("config schema path not found");
+        return ok(r);
+    }
+    if (method == "config.schema.validate") {
+        const auto& doc = params.contains("config") ? params["config"] : deps_.config.raw;
+        auto issues = config::ValidateAgainstSchema(doc);
+        nlohmann::json errors = nlohmann::json::array(), extensions = nlohmann::json::array();
+        for (auto& i : issues) (i["code"] == "unrecognized_key" && i["path"].get<std::string>().find('.') == std::string::npos ? extensions : errors).push_back(i);
+        return ok({{"valid", errors.empty()}, {"issues", errors}, {"cppExtensionKeys", extensions}, {"schemaPaths", config::SchemaPathCount()}});
     }
     if (method == "config.set" || method == "config.apply" || method == "config.patch") {
         if (params.contains("gateway")) {
@@ -2481,7 +2476,8 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
 
     // agents (in-memory via config.raw["agents_list"])
     if (method == "agents.list") {
-        if (auto al = config::GetPath(deps_.config.raw, "agents.list"); al && al->is_array() && !al->empty()) {
+        if (auto al = config::GetPath(deps_.config.raw, "agents.list"), ae = config::GetPath(deps_.config.raw, "agents.entries");
+            (al && al->is_array() && !al->empty()) || (ae && ae->is_object() && !ae->empty())) {
             nlohmann::json out = nlohmann::json::array();
             for (auto& a : agent::routing::ListAgents(deps_.config.raw))
                 out.push_back({{"id", a.id}, {"name", a.name}, {"workspace", a.workspace.string()}, {"model", a.model}, {"default", a.is_default}});

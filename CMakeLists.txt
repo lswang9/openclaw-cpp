@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.110.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.111.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -75,6 +75,7 @@ set(OPENCLAW_SOURCES
   src/gateway/node_hub.cpp
   src/config/config.cpp
   src/config/validate.cpp
+  src/config/schema.cpp
   src/channels/registry.cpp
   src/channels/adapter.cpp
   src/channels/outbound.cpp

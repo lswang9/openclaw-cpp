@@ -25,6 +25,16 @@ std::vector<AgentDef> ListAgents(const nlohmann::json& raw) {
     const nlohmann::json* list = nullptr;
     if (raw.contains("agents") && raw["agents"].is_object() && raw["agents"].contains("list") && raw["agents"]["list"].is_array())
         list = &raw["agents"]["list"];
+    // Upstream v2026.10.5 shape: agents.entries {<id>: {...}}; legacy agents.list [{id,...}] still accepted.
+    nlohmann::json merged = list ? *list : nlohmann::json::array();
+    if (raw.contains("agents") && raw["agents"].is_object() && raw["agents"].contains("entries") && raw["agents"]["entries"].is_object())
+        for (auto& [id, e] : raw["agents"]["entries"].items()) {
+            if (!e.is_object()) continue;
+            bool dup = false; for (auto& x : merged) dup = dup || (x.is_object() && Low(Str(x, "id")) == Low(id));
+            if (dup) continue;
+            nlohmann::json a = e; a["id"] = id; merged.push_back(a);
+        }
+    if (!merged.empty()) list = &merged;
     if (list) {
         for (auto& a : *list) {
             if (!a.is_object() || Str(a, "id").empty()) continue;
