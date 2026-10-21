@@ -108,7 +108,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.106.0-dev";
+constexpr const char* kVersion = "1.107.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3394,6 +3394,27 @@ int CmdGateway(int argc, char** argv, int argi) {
     agent::Pool agent_pool(&tools, &approvals);
     agent_pool.SetConfig(cfg.raw);
 
+    {
+        using J = nlohmann::json;
+        auto obj = [](J props) { return J{{"type", "object"}, {"properties", props}}; };
+        const std::vector<std::tuple<std::string, std::string, J>> gw_tools{
+            {"sessions_list", "List gateway sessions (key + index entry). limit ≤ 200.", obj({{"limit", {{"type", "integer"}}}})},
+            {"sessions_history", "Read a session's recent transcript (default: this session). limit ≤ 200; includeTools adds tool results.",
+             obj({{"sessionKey", {{"type", "string"}}}, {"limit", {{"type", "integer"}}}, {"includeTools", {{"type", "boolean"}}}})},
+            {"session_status", "Status of a session (default: this session): index entry, message count, worker placement.", obj({{"sessionKey", {{"type", "string"}}}})},
+            {"agents_list", "List configured agents.", obj(J::object())},
+            {"nodes", "Connected node hosts. action: list | describe {nodeId} | invoke {nodeId, command, params, timeoutMs}.",
+             obj({{"action", {{"type", "string"}, {"enum", {"list", "describe", "invoke"}}}}, {"nodeId", {{"type", "string"}}}, {"command", {{"type", "string"}}}, {"params", {{"type", "object"}}}, {"timeoutMs", {{"type", "integer"}}}})},
+        };
+        for (auto& [name, desc, schema] : gw_tools)
+            tools.Register({name, desc, schema, [name](const J& a) { const auto& ctx = tools::exec::CurrentContext(); return gateway::GatewayTool(name, a, ctx.agent_id, ctx.session_key); }});
+        tools.Register({"web_fetch", "Fetch a URL (http/https) and return its text (maxChars, default 20000). SSRF-guarded like http_get.",
+                        obj({{"url", {{"type", "string"}}}, {"maxChars", {{"type", "integer"}}}}),
+                        [&tools](const J& a) {
+                            auto r = tools.Invoke("http_get", {{"url", a.value("url", std::string())}, {"max_bytes", std::clamp(a.value("maxChars", 20000), 256, 2000000)}});
+                            return r;
+                        }});
+    }
     tools.Register({"github_publish", "Publish this session's workspace changes to GitHub: commits the workspace onto branch openclaw/<session>, pushes it and opens (or reuses) a pull request with the gateway's GitHub identity. Session participants with a linked GitHub account are credited as co-authors. Changes to .github/workflows need an operator to publish.",
                     {{"type", "object"}, {"properties", {{"title", {{"type", "string"}}}, {"body", {{"type", "string"}}}, {"idempotencyKey", {{"type", "string"}}}}}},
                     [](const nlohmann::json& a) {

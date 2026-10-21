@@ -79,6 +79,9 @@ std::string ClosedCheck(const json& p, std::initializer_list<const char*> allowe
 std::mutex g_mu;  // guards the small JSON ledgers below
 
 // ---------------------------------------------------------------- process helper
+thread_local std::string t_principal = "operator";  // current RPC requester (SetRpcRequester)
+thread_local bool t_full_write = true;
+std::string Trim(std::string s) { while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back(); auto a = s.find_first_not_of(" \t\r\n"); return a == std::string::npos ? std::string() : s.substr(a); }
 struct Proc { int code = -1; std::string out, err; };
 Proc Run(const std::vector<std::string>& argv, const fs::path& cwd, const std::vector<std::string>& env = {},
          const std::string& input = {}) {
@@ -474,6 +477,89 @@ ExtraResult RemovalJournal(ServerDeps& d, const fs::path& root, const json& p) {
     return Ok({{"ok", true}, {"journal", journal}});
 }
 
+
+// ---------------------------------------------------------------- projects.{list,register,add,remove}
+fs::path ProjectsPath(const fs::path& root) { return root / "projects.json"; }
+std::string ProjectId(const json& db, std::string base) {
+    std::string id;
+    for (char c : base) { c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); if (std::isalnum(static_cast<unsigned char>(c))) id += c; else if (!id.empty() && id.back() != '-') id += '-'; }
+    while (!id.empty() && id.back() == '-') id.pop_back();
+    if (id.empty()) id = "project";
+    if (id.size() > 56) id.resize(56);
+    std::string out = id;
+    for (int n = 2; db["projects"].contains(out) || out == "workspace"; ++n) out = id + "-" + std::to_string(n);
+    return out;
+}
+ExtraResult Projects(ServerDeps& d, const fs::path& root, const std::string& method, const json& p) {
+    std::lock_guard<std::mutex> l(g_mu);
+    auto db = ReadJsonFile(ProjectsPath(root), json{{"projects", json::object()}});
+    if (!db.contains("projects") || !db["projects"].is_object()) db["projects"] = json::object();
+    if (method == "projects.list") {
+        if (auto bad = ClosedCheck(p, {"includeObserved"}); !bad.empty()) return Fail(bad);
+        json out = json::array();
+        const auto ws = WorkspaceOf(d, "main");
+        json w{{"id", "workspace"}, {"displayName", ws.filename().string().empty() ? std::string("workspace") : ws.filename().string()}, {"source", "workspace"}, {"agentId", "main"}};
+        if (t_full_write) w["repoRoot"] = ws.string();
+        out.push_back(w);
+        for (auto& [id, rec] : db["projects"].items()) {
+            json r = rec;
+            if (!t_full_write) { r.erase("repoRoot"); r.erase("originUrl"); }
+            out.push_back(r);
+        }
+        return Ok({{"projects", out}, {"githubHost", GitHubHost(d.config.raw)}});
+    }
+    if (method == "projects.register") {
+        if (auto bad = ClosedCheck(p, {"path", "name"}); !bad.empty()) return Fail(bad);
+        if (!NonEmpty(p, "path")) return Fail("invalid params: path required");
+        const fs::path path = fs::absolute(p["path"].get<std::string>());
+        auto top = Run({"git", "rev-parse", "--show-toplevel"}, path);
+        if (top.code != 0) return Fail("not a git repository: " + path.string());
+        const auto repo = Trim(top.out);
+        for (auto& [id, rec] : db["projects"].items()) if (rec.value("repoRoot", "") == repo) return Ok(rec);  // idempotent
+        const auto name = p.value("name", fs::path(repo).filename().string());
+        json rec{{"id", ProjectId(db, name)}, {"displayName", name}, {"repoRoot", repo}, {"source", "registered"}};
+        if (auto o = Run({"git", "remote", "get-url", "origin"}, repo); o.code == 0 && !Trim(o.out).empty()) rec["originUrl"] = Trim(o.out);
+        db["projects"][rec["id"].get<std::string>()] = rec;
+        WriteJsonFile(ProjectsPath(root), db);
+        return Ok(rec);
+    }
+    if (method == "projects.add") {
+        if (auto bad = ClosedCheck(p, {"gitUrl", "name"}); !bad.empty()) return Fail(bad);
+        if (!NonEmpty(p, "gitUrl")) return Fail("invalid params: gitUrl required");
+        const auto url = p["gitUrl"].get<std::string>();
+        if (url.size() > 2048 || url.rfind("-", 0) == 0 || !(url.rfind("https://", 0) == 0 || url.rfind("git@", 0) == 0 || url.rfind("ssh://", 0) == 0 || url.rfind("file://", 0) == 0))
+            return Fail("invalid params: gitUrl must be an https, ssh or file git URL");
+        std::string base = url;
+        while (!base.empty() && base.back() == '/') base.pop_back();
+        base = base.substr(base.find_last_of("/:") + 1);
+        if (base.size() > 4 && base.substr(base.size() - 4) == ".git") base.resize(base.size() - 4);
+        const auto name = p.value("name", base);
+        const auto id = ProjectId(db, name);
+        const fs::path dest = root / "projects" / id;
+        std::error_code ec; fs::create_directories(dest.parent_path(), ec);
+        auto c = Run({"git", "clone", "--quiet", "--", url, dest.string()}, root, {"GIT_TERMINAL_PROMPT=0"});
+        if (c.code != 0) { fs::remove_all(dest, ec); return Fail("git clone failed: " + Trim(c.err).substr(0, 500)); }
+        json rec{{"id", id}, {"displayName", name}, {"repoRoot", dest.string()}, {"originUrl", url}, {"source", "cloned"}};
+        db["projects"][id] = rec;
+        WriteJsonFile(ProjectsPath(root), db);
+        return Ok(rec);
+    }
+    if (method == "projects.remove") {
+        if (auto bad = ClosedCheck(p, {"id", "deleteCheckout"}); !bad.empty()) return Fail(bad);
+        const auto id = p.value("id", std::string());
+        if (!db["projects"].contains(id)) return Ok({{"removed", false}});
+        const auto rec = db["projects"][id];
+        if (p.value("deleteCheckout", false)) {
+            if (rec.value("source", "") != "cloned") return Fail("deleteCheckout applies only to projects cloned by the gateway");
+            std::error_code ec; fs::remove_all(rec.value("repoRoot", ""), ec);
+        }
+        db["projects"].erase(id);
+        WriteJsonFile(ProjectsPath(root), db);
+        return Ok({{"removed", true}});
+    }
+    return Fail("unknown projects method");
+}
+
 // ---------------------------------------------------------------- projects.searchRemote
 struct SearchCacheEntry { std::int64_t expires = 0; json result; };
 std::map<std::string, SearchCacheEntry> g_search_cache;
@@ -586,8 +672,6 @@ std::string Slug(const std::string& s) {
 // ---------------------------------------------------------------- personal GitHub sign-in (users.github.*)
 // Per-principal GitHub device-flow authorizations: <data>/github-personal.json (0600)
 //   {accounts: {principal: {generation, account{accountId,login}, token, connectedAtMs}}, pending: {requestId: {...}}}
-thread_local std::string t_principal = "operator";
-thread_local bool t_full_write = true;
 fs::path PersonalPath(const fs::path& root) { return root / "github-personal.json"; }
 json PersonalRead(const fs::path& root) {
     auto j = ReadJsonFile(PersonalPath(root), json::object());
@@ -1063,6 +1147,7 @@ std::string AgentGitHubPublish(const json& args, const std::string& agent, const
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
+        if (method == "projects.list" || method == "projects.register" || method == "projects.add" || method == "projects.remove") return Projects(deps, root, method, params);
         if (method == "sessions.companion.ask" || method == "sessions.companion.state" || method == "sessions.companion.reset")
             return Companion(deps, method, params);
         if (method == "sessions.dispatch" || method == "sessions.move" || method == "sessions.reclaim")
@@ -1157,4 +1242,62 @@ std::optional<json> RunTurnOnPlacedWorker(ServerDeps& d, const fs::path& root, c
                 {"worker", {{"deviceId", device}, {"launchId", launch}, {"runId", run}, {"placementGeneration", rec.value("generation", 0)}}}};
 }
 
+}  // namespace openclaw::gateway
+
+// ---------------------------------------------------------------- upstream agent tools backed by gateway state
+namespace openclaw::gateway {
+std::string GatewayTool(const std::string& name, const nlohmann::json& a, const std::string& agent, const std::string& session_key) {
+    using nlohmann::json;
+    auto fail = [](const std::string& e) { return json{{"ok", false}, {"error", e}}.dump(); };
+    if (!g_tool_deps) return fail("gateway not running");
+    auto& d = *g_tool_deps;
+    if (name == "sessions_list") {
+        const int limit = std::clamp(a.value("limit", 50), 1, 200);
+        json out = json::array();
+        for (auto& k : d.sessions.List()) { if (static_cast<int>(out.size()) >= limit) break; out.push_back({{"key", k}, {"entry", d.sessions.IndexEntry(k)}}); }
+        return json{{"sessions", out}}.dump();
+    }
+    if (name == "sessions_history") {
+        const auto key = a.value("sessionKey", session_key);
+        if (key.empty() || !d.sessions.Exists(key)) return fail("session not found: " + key);
+        const int limit = std::clamp(a.value("limit", 20), 1, 200);
+        const bool tools = a.value("includeTools", false);
+        auto msgs = d.sessions.Load(key);
+        json out = json::array();
+        for (auto it = msgs.rbegin(); it != msgs.rend() && static_cast<int>(out.size()) < limit; ++it) {
+            if (it->role == "system" || (!tools && it->role == "tool")) continue;
+            out.insert(out.begin(), json{{"role", it->role}, {"content", it->content.substr(0, 4000)}});
+        }
+        return json{{"sessionKey", key}, {"messages", out}}.dump();
+    }
+    if (name == "session_status") {
+        const auto key = a.value("sessionKey", session_key);
+        if (key.empty() || !d.sessions.Exists(key)) return fail("session not found: " + key);
+        json out{{"sessionKey", key}, {"entry", d.sessions.IndexEntry(key)}, {"messageCount", d.sessions.Load(key).size()}, {"agentId", agent}};
+        auto db = ReadJsonFile(PlacementsPath(g_tool_root), json::object());
+        if (db.contains(agent + ":" + key)) out["placement"] = PlacementView(db[agent + ":" + key]);
+        return out.dump();
+    }
+    if (name == "agents_list") {
+        json out = json::array();
+        for (auto& ag : agent::routing::ListAgents(d.config.raw)) out.push_back({{"id", ag.id}, {"name", ag.name}, {"model", ag.model}, {"default", ag.is_default}});
+        if (out.empty()) out.push_back({{"id", "main"}, {"default", true}});
+        return json{{"agents", out}}.dump();
+    }
+    if (name == "nodes") {
+        const auto action = a.value("action", std::string("list"));
+        auto& hub = NodeHub::Global();
+        if (action == "list") return json{{"nodes", hub.List()}}.dump();
+        const auto nid = a.value("nodeId", std::string());
+        if (action == "describe") { auto x = hub.Describe(nid); return x.is_null() ? fail("node not connected: " + nid) : x.dump(); }
+        if (action == "invoke") {
+            const auto cmd = a.value("command", std::string());
+            if (cmd.rfind("worker.", 0) == 0) return fail("worker commands are gateway-owned");
+            auto r = hub.Invoke(nid, cmd, a.value("params", json::object()), std::clamp(a.value("timeoutMs", 30000), 1, 120000));
+            return r.dump();
+        }
+        return fail("action must be list, describe or invoke");
+    }
+    return fail("unknown gateway tool " + name);
+}
 }  // namespace openclaw::gateway

@@ -19,6 +19,7 @@ public:
     // Returns the node id that went offline ("" when conn was not a node).
     std::string Detach(int conn);
     bool Connected(const std::string& node_id) const;
+    std::string NodeOf(int conn) const;  // "" when conn is not a node connection
     bool HasCommand(const std::string& node_id, const std::string& command) const;
     nlohmann::json Describe(const std::string& node_id) const;  // null when unknown
     nlohmann::json List() const;

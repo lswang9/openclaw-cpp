@@ -31,7 +31,7 @@ const std::unordered_set<std::string>& ImplementedSet() {
     // IMPORTANT: do not call ImplementedMethods().begin()/end() as two temporaries —
     // that is UB (iterators from different vectors) and segfaulted browser/computer RPC.
     static const auto* s = [] {
-        const auto methods = ImplementedMethods();
+        const auto methods = DispatchableMethods();
         return new std::unordered_set<std::string>(methods.begin(), methods.end());
     }();
     return *s;
@@ -90,7 +90,23 @@ std::filesystem::path DataRoot(ServerDeps& deps) {
 
 }  // namespace
 
-ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
+ExtraResult TryExtraDispatchImpl(ServerDeps& deps, const std::string& method, const nlohmann::json& params);
+
+// Family catch-alls below answer any method of a prefix with generic state (payload.method == method). That is not
+// the upstream method's behaviour, so it is reported as an honest error instead of a misleading success.
+ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method, const nlohmann::json& params) {
+    auto r = TryExtraDispatchImpl(deps, method, params);
+    if (r.handled && r.ok && r.payload.is_object() && r.payload.value("method", std::string()) == method) {
+        ExtraResult u;
+        u.handled = true;
+        u.ok = false;
+        u.error = method + " is not implemented in the C++ runtime (UNAVAILABLE)";
+        return u;
+    }
+    return r;
+}
+
+ExtraResult TryExtraDispatchImpl(ServerDeps& deps, const std::string& method,
                              const nlohmann::json& params) {
     ExtraResult r;
     if (!ImplementedSet().count(method)) return r;

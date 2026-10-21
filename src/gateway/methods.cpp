@@ -1,8 +1,9 @@
+#include <algorithm>
 #include "openclaw/gateway/methods.hpp"
 
 namespace openclaw::gateway {
 
-std::vector<std::string> ImplementedMethods() {
+std::vector<std::string> DispatchableMethods() {
     return {
         "device.pair.setupCode",
         "device.pair.setupStatus",
@@ -748,6 +749,19 @@ std::vector<std::string> ImplementedMethods() {
         "worker.desktop.launch",
         "worker.desktop.observe",
     };
+}
+
+std::vector<std::string> UnimplementedMethods() {
+    return {
+#include "unimplemented_generated.inc"
+    };
+}
+
+std::vector<std::string> ImplementedMethods() {
+    const auto un = UnimplementedMethods();
+    std::vector<std::string> out;
+    for (auto& m : DispatchableMethods()) if (std::find(un.begin(), un.end(), m) == un.end()) out.push_back(m);
+    return out;
 }
 
 }  // namespace openclaw::gateway

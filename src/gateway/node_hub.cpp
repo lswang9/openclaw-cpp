@@ -79,6 +79,7 @@ std::string NodeHub::Detach(int conn) {
     return Find(id) ? std::string() : id;
 }
 
+std::string NodeHub::NodeOf(int conn) const { std::lock_guard l(g_mu); auto it = g_conns.find(conn); return it == g_conns.end() ? std::string() : it->second.id; }
 bool NodeHub::Connected(const std::string& id) const { std::lock_guard l(g_mu); return Find(id) != nullptr; }
 bool NodeHub::HasCommand(const std::string& id, const std::string& cmd) const {
     std::lock_guard l(g_mu);

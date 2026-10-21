@@ -53,7 +53,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.106.0-dev";
+constexpr const char* kVersion = "1.107.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2187,6 +2187,40 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         }
         return ok({{"protocol", 1}, {"server", "openclaw-cpp"}, {"version", kVersion}});
     }
+    if (method == "node.event") {
+        const auto nid = NodeHub::Global().NodeOf(g_ws_conn);
+        if (nid.empty()) return err("node.event requires a connected node (connect with role \"node\")");
+        if (params.value("event", std::string()).empty()) return err("invalid params: event required");
+        nlohmann::json pl = params.contains("payload") ? params["payload"] : nlohmann::json(nullptr);
+        if (pl.is_null() && params.contains("payloadJSON") && params["payloadJSON"].is_string()) { try { pl = nlohmann::json::parse(params["payloadJSON"].get<std::string>()); } catch (...) { return err("invalid params: payloadJSON malformed JSON"); } }
+        Emit("node.event", {{"nodeId", nid}, {"event", params["event"]}, {"payload", pl}});
+        return ok({{"ok", true}});
+    }
+    if (method == "node.pair.approve" || method == "node.pair.reject") {
+        const auto rid = params.value("requestId", std::string());
+        if (rid.empty()) return err("invalid params: requestId required");
+        const bool done = method == "node.pair.approve" ? deps_.pairing.Approve(rid) : deps_.pairing.Dismiss(rid);
+        if (!done) return err("unknown pairing request: " + rid);
+        Emit("node.pair.resolved", {{"requestId", rid}, {"decision", method == "node.pair.approve" ? "approved" : "rejected"}});
+        return ok({{"requestId", rid}, {"decision", method == "node.pair.approve" ? "approved" : "rejected"}});
+    }
+    if (method == "node.pair.remove") {
+        const auto nid = params.value("nodeId", std::string());
+        if (nid.empty()) return err("invalid params: nodeId required");
+        if (NodeHub::Global().Connected(nid)) return err("node " + nid + " is connected; disconnect it before removing");
+        return ok({{"nodeId", nid}, {"removed", deps_.nodes.Remove(nid)}});
+    }
+    if (method == "sessions.describe") {
+        const auto key = params.value("key", std::string());
+        if (key.empty()) return err("invalid params: key required");
+        auto& st = deps_.sessions;
+        if (!st.Exists(key)) return err("session not found: " + key);
+        auto msgs = st.Load(key);
+        nlohmann::json out{{"key", key}, {"entry", st.IndexEntry(key)}, {"messageCount", msgs.size()}};
+        if (params.value("includeLastMessage", false) && !msgs.empty()) out["lastMessage"] = {{"role", msgs.back().role}, {"content", msgs.back().content.substr(0, 2000)}};
+        { std::lock_guard lock(session_ctrl_mu_); auto it = session_model_.find(key); if (it != session_model_.end()) out["model"] = it->second; }
+        return ok(out);
+    }
     if (method == "node.invoke.result") {
         std::string why;
         if (!NodeHub::Global().Result(g_ws_conn, params, &why)) return err(why);
@@ -2296,9 +2330,10 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
                    {"recent", deps_.bus.Recent(16, filt)},
                    {"listeners", deps_.bus.ListenerCount()}});
     }
-    if (method == "sessions.send" || method == "chat.send" || method == "chat.inject" || method == "sessions.steer") {
+    if (method == "sessions.send" || method == "chat.send" || method == "chat.inject" || method == "sessions.steer" || method == "agent") {
         const std::string text = params.value("message", params.value("text", ""));
-        const std::string session_key = params.value("sessionKey", params.value("session_id", params.value("key", "default")));
+        const std::string default_key = method == "agent" ? "agent:" + params.value("agentId", std::string("main")) + ":main" : std::string("default");
+        const std::string session_key = params.value("sessionKey", params.value("session_id", params.value("key", default_key)));
         if (text.empty()) return err("missing message");
         channels::InboundMessage im;
         im.channel = "rpc";
@@ -2312,8 +2347,14 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             if (worker) return werr.empty() ? ok(*worker) : err(werr);
         }
         if (deps_lock.owns_lock()) deps_lock.unlock();  // DeliverInbound may reload then LockDeps
+        if (method == "agent" && params.contains("model") && params["model"].is_string()) {
+            std::lock_guard lock(session_ctrl_mu_); session_model_[session_key] = params["model"].get<std::string>();
+        }
         auto reply = DeliverInbound(im);
         if (reply.rfind("error:", 0) == 0) return err(reply.substr(6));
+        if (method == "agent")
+            return ok({{"runId", "run-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())}, {"status", "ok"},
+                       {"sessionKey", session_key}, {"text", reply}, {"result", {{"payloads", nlohmann::json::array({{{"text", reply}}})}}}});
         return ok({{"sessionKey", session_key}, {"text", reply}});
     }
     if (method == "plugins.providers" || method == "plugins.channels") {
@@ -2772,10 +2813,12 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
 
     // channel outbound (telegram/feishu record)
-    if (method == "message.action" || method == "conversations.send") {
+    if (method == "message.action" || method == "conversations.send" || method == "send") {
         const std::string channel = params.value("channel", params.value("to_channel", ""));
         const std::string text = params.value("text", params.value("message", ""));
         const std::string chat_id = params.value("chat_id", params.value("to", ""));
+        if (method == "send" && (params.value("to", std::string()).empty() || channel.empty() || text.empty()))
+            return err("invalid params: send requires to, channel and message");
         if (channel.empty() || text.empty()) {
             // fall through if not an outbound send shape
         } else {
@@ -2953,7 +2996,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
     const auto advertised = AdvertisedMethods();
     if (std::find(advertised.begin(), advertised.end(), method) != advertised.end()) {
-        return ok(Stub(method, params));
+        return err(method + " is not implemented in the C++ runtime (UNAVAILABLE)");
     }
     return err("unknown method: " + method);
 }

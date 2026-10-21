@@ -42,6 +42,9 @@ std::string AgentGitHubPublish(const nlohmann::json& args, const std::string& ag
 std::optional<nlohmann::json> RunTurnOnPlacedWorker(ServerDeps& d, const std::filesystem::path& data_root, const std::string& agent,
                                                     const std::string& key, const std::string& text, std::string* err);
 
+// Upstream agent tools that read gateway state: sessions_list, sessions_history, session_status, agents_list, nodes.
+std::string GatewayTool(const std::string& name, const nlohmann::json& args, const std::string& agent, const std::string& session_key);
+
 // GitHub API base (gateway.github.apiBaseUrl / OPENCLAW_GITHUB_API_BASE_URL); https only unless loopback http.
 std::string GitHubApiBase(const nlohmann::json& raw_config);
 

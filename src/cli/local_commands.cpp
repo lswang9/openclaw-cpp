@@ -1216,6 +1216,11 @@ int MaybeLocalCommand(int argc, char** argv) {
     if (cmd == "completion") return CmdCompletion(argc, argv);
     if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "removal-journal") return CmdClawsRemovalJournal(argc, argv);
     if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "add") return CmdClawsAdd(argc, argv);
+    if (cmd == "claws" && (argc == 2 || (argc >= 3 && std::string(argv[2]) == "--json"))) {  // bare `claws` = status
+        std::vector<char*> v{argv[0], argv[1], const_cast<char*>("status")};
+        for (int i = 2; i < argc; ++i) v.push_back(argv[i]);
+        return CmdClawsStatus(static_cast<int>(v.size()), v.data());
+    }
     if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "status") return CmdClawsStatus(argc, argv);
     if (cmd == "claws" && argc >= 3 && std::string(argv[2]) == "remove") return CmdClawsRemove(argc, argv);
     if (cmd == "onboard") return CmdOnboard(argc, argv, 2);

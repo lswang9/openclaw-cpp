@@ -15,5 +15,7 @@ std::size_t AdvertisedEventCount();
 
 // Methods we implement with real or structured stub responses.
 std::vector<std::string> ImplementedMethods();
+std::vector<std::string> DispatchableMethods();   // every method with a dispatch path (incl. honest not-implemented)
+std::vector<std::string> UnimplementedMethods();  // upstream methods answering "not implemented" (generated)
 
 }  // namespace openclaw::gateway
