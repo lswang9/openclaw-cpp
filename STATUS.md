@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.122.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.123.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.123.0-dev 新增
+
+CLI 第4批：顶层命令防误入聊天、mcp 管理与 OAuth 登录、reset、uninstall、docs 搜索、clawbot/acp/resume 别名
 
 ## 1.122.0-dev 新增
 

@@ -1,3 +1,4 @@
+#include <set>
 #include "openclaw/cli/local_commands.hpp"
 #include <unordered_map>
 #include "openclaw/channels/feishu_frame.hpp"
@@ -108,7 +109,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.122.0-dev";
+constexpr const char* kVersion = "1.123.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -4216,6 +4217,24 @@ int main(int argc, char** argv) {
             std::cerr << "unknown option: " << cmd << " (try --help)\n";
             return 2;
         }
+        // 1.123: upstream top-level aliases
+        static std::vector<std::string> alias_store; static std::vector<char*> alias_argv;
+        if (cmd == "clawbot") {
+            if (argc < 3 || std::string(argv[2]) != "qr") { std::cerr << "usage: openclaw-cpp clawbot qr [options]  (legacy alias of `qr`)\n"; return argc < 3 ? 0 : 2; }
+            alias_store.assign(argv, argv + argc); alias_store.erase(alias_store.begin() + 1);
+            for (auto& x : alias_store) alias_argv.push_back(x.data()); alias_argv.push_back(nullptr);
+            argc -= 1; argv = alias_argv.data(); cmd = "qr";
+        } else if (cmd == "acp" && (argc == 2 || argv[2][0] == '-')) {
+            if (argc > 2 && (std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h")) { std::cout << "Usage: openclaw-cpp acp\nRun an ACP agent server over stdio (local runtime; session/model come from config).\n"; return 0; }
+            return CmdAcpStdio();
+        } else if (cmd == "acp" && std::string(argv[2]) == "client") {
+            std::cerr << "openclaw-cpp acp client: not implemented in the C++ port (use `acp run --agent <id>` to drive an ACP agent).\n"; return 2;
+        } else if (cmd == "resume") {
+            std::string q = "main";
+            for (int i = 2; i < argc; ++i) { std::string x = argv[i]; if (x == "--handoff") { std::cerr << "resume --handoff: Control UI handoff payloads are not supported by the C++ port; pass a session key.\n"; return 2; } if (x == "--help" || x == "-h") { std::cout << "Usage: openclaw-cpp resume [session]\nReopen a session in the terminal UI (default: main).\n"; return 0; } if (x[0] != '-') q = x; }
+            alias_store = {argv[0], "tui", "--session", q}; for (auto& x : alias_store) alias_argv.push_back(x.data()); alias_argv.push_back(nullptr);
+            argc = 4; argv = alias_argv.data(); cmd = "tui";
+        }
         if (int rc = openclaw::cli::MaybeLocalCommand(argc, argv); rc != -1) {
             if (rc != openclaw::cli::kDelegateChat) return rc;
             // setup -m TEXT / bare setup / tui --local [--session K] [--message TEXT]: embedded agent turn.
@@ -4233,6 +4252,10 @@ int main(int argc, char** argv) {
         }
         if (int rc = MaybeUpstreamGatewayCli(argc, argv); rc >= 0) return rc;
         if (int rc = MaybePluginCli(argc, argv); rc >= 0) return rc;
+        {   // never send an upstream command name to the chat model
+            static const std::set<std::string> kUpstreamTop = {"acp","agent","agents","approvals","attach","audit","backup","channels","clawbot","claws","completion","config","configure","connect","crestodian","cron","daemon","dashboard","database","devices","directory","dns","docs","doctor","exec-policy","gateway","health","hooks","infer","logs","mcp","memory","message","migrate","models","node","nodes","onboard","pairing","plugins","promos","proxy","qr","reset","resume","sandbox","secrets","security","sessions","setup","skills","status","storage","system","telemetry","transcripts","triage","tui","uninstall","update","users","webhooks","worker","worktrees"};
+            if (kUpstreamTop.count(cmd)) { std::cerr << "openclaw-cpp " << cmd << (argc > 2 && argv[2][0] != '-' ? std::string(" ") + argv[2] : std::string()) << ": not implemented in the C++ port (no matching command).\n(run `openclaw-cpp --help`; to chat, use `openclaw-cpp chat \"...\"`)\n"; return 2; }
+        }
         return CmdChat(argc, argv, 1);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';

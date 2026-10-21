@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -51,6 +52,11 @@ std::optional<A3> P3(int argc, char** argv, int from, const std::vector<std::str
     for (int i = from; i < argc; ++i) {
         std::string s = argv[i];
         if (s == "--") { for (++i; i < argc; ++i) a.pos.push_back(argv[i]); break; }
+        if (s == "--help" || s == "-h") {
+            std::cout << "Usage: openclaw-cpp " << cmd << " [args] [options]\n\nOptions:\n";
+            for (auto& o : allowed) std::cout << "  " << (o.back() == '=' ? o.substr(0, o.size() - 1) + " <value>" : o) << "\n";
+            std::cout << "  -h, --help\n"; std::exit(0);
+        }
         if (s.size() > 2 && s.rfind("--", 0) == 0) {
             std::string val; bool inl = false;
             if (auto eq = s.find('='); eq != std::string::npos) { val = s.substr(eq + 1); s = s.substr(0, eq); inl = true; }
@@ -676,15 +682,356 @@ int CmdUpdate(int argc, char** argv) {
     }
     return -1;
 }
+// ============================================================ 1.123: mcp / reset / uninstall / docs
+Resp HttpPost(const std::string& url, const std::vector<std::string>& headers, const std::string& body, long timeout_ms = 15000, std::map<std::string, std::string>* rh = nullptr) {
+    Resp r; CURL* c = curl_easy_init(); if (!c) { r.error = "curl init"; return r; }
+    curl_slist* h = nullptr; for (auto& x : headers) h = curl_slist_append(h, x.c_str());
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str()); if (h) curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str()); curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, timeout_ms); curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L); curl_easy_setopt(c, CURLOPT_PROXY, "");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, SinkS); curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+    std::string hdrs; curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, SinkS); curl_easy_setopt(c, CURLOPT_HEADERDATA, &hdrs);
+    auto rc = curl_easy_perform(c); if (rc != CURLE_OK) r.error = curl_easy_strerror(rc);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(h); curl_easy_cleanup(c);
+    if (rh) { std::istringstream is(hdrs); std::string l; while (std::getline(is, l)) { auto p = l.find(':'); if (p == std::string::npos) continue; (*rh)[Lower(l.substr(0, p))] = Trim(l.substr(p + 1)); } }
+    return r;
+}
+std::string GwBase(const json& raw) {
+    if (const char* e = std::getenv("OPENCLAW_GATEWAY_URL"); e && *e) return NoSlash(e);
+    int port = 18789;
+    if (const char* p = std::getenv("OPENCLAW_GATEWAY_PORT")) port = std::atoi(p);
+    else if (raw.contains("gateway") && raw["gateway"].value("port", 0) > 0) port = raw["gateway"]["port"];
+    return "http://127.0.0.1:" + std::to_string(port);
+}
+json GwRpc(const json& raw, const std::string& method, const json& params, std::string* err) {
+    std::string tok; if (const char* t = std::getenv("OPENCLAW_GATEWAY_TOKEN")) tok = t;
+    if (tok.empty() && raw.contains("gateway") && raw["gateway"].contains("auth") && raw["gateway"]["auth"].value("token", "") != "") tok = raw["gateway"]["auth"]["token"];
+    std::vector<std::string> h{"Content-Type: application/json"}; if (!tok.empty()) h.push_back("Authorization: Bearer " + tok);
+    auto r = HttpPost(GwBase(raw) + "/v1/rpc", h, json{{"id", 1}, {"method", method}, {"params", params}}.dump(), 60000);
+    if (!r.error.empty()) { *err = "gateway unreachable at " + GwBase(raw) + ": " + r.error; return nullptr; }
+    try { auto j = json::parse(r.body); if (!j.value("ok", false)) { *err = j.contains("error") ? (j["error"].is_object() ? j["error"].value("message", j["error"].dump()) : j["error"].dump()) : r.body; return nullptr; } return j.value("payload", json::object()); }
+    catch (...) { *err = "bad gateway response (HTTP " + std::to_string(r.status) + ")"; return nullptr; }
+}
+fs::path McpTokPath() { return DataRoot() / "mcp-oauth-tokens.json"; }
+json McpServers(const json& raw) { return raw.contains("mcp") && raw["mcp"].is_object() && raw["mcp"].contains("servers") && raw["mcp"]["servers"].is_object() ? raw["mcp"]["servers"] : json::object(); }
+std::string McpTransport(const json& s) { if (s.contains("url")) return s.value("transport", std::string("streamable-http")); return "stdio"; }
+std::vector<std::string> Csv(const std::string& s) { std::vector<std::string> o; std::stringstream ss(s); std::string x; while (std::getline(ss, x, ',')) if (!Trim(x).empty()) o.push_back(Trim(x)); return o; }
+
+// JSON-RPC to a stdio MCP server: initialize + tools/list, bounded by timeout.
+json ProbeStdio(const json& s, int timeout_s) {
+    int in[2], out[2]; if (pipe(in) || pipe(out)) return {{"ok", false}, {"error", "pipe failed"}};
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(in[0], 0); dup2(out[1], 1); close(in[1]); close(out[0]);
+        int dn = open("/dev/null", 1); if (dn >= 0) dup2(dn, 2);
+        if (s.contains("env") && s["env"].is_object()) for (auto& [k, v] : s["env"].items()) setenv(k.c_str(), v.is_string() ? v.get<std::string>().c_str() : v.dump().c_str(), 1);
+        if (s.contains("cwd") && s["cwd"].is_string()) if (chdir(s["cwd"].get<std::string>().c_str())) _exit(126);
+        std::vector<std::string> av{s.value("command", "")}; if (s.contains("args") && s["args"].is_array()) for (auto& a : s["args"]) av.push_back(a.is_string() ? a.get<std::string>() : a.dump());
+        std::vector<char*> cv; for (auto& a : av) cv.push_back(a.data()); cv.push_back(nullptr);
+        execvp(cv[0], cv.data()); _exit(127);
+    }
+    close(in[0]); close(out[1]);
+    auto send = [&](const json& j) { auto l = j.dump() + "\n"; return write(in[1], l.data(), l.size()) == static_cast<ssize_t>(l.size()); };
+    std::string buf; const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+    auto recv = [&](int id) -> json {
+        for (;;) {
+            auto nl = buf.find('\n');
+            while (nl != std::string::npos) { auto line = buf.substr(0, nl); buf.erase(0, nl + 1); try { auto j = json::parse(line); if (j.value("id", -1) == id) return j; } catch (...) {} nl = buf.find('\n'); }
+            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count(); if (left <= 0) return nullptr;
+            pollfd p{out[0], POLLIN, 0}; if (poll(&p, 1, static_cast<int>(left)) <= 0) return nullptr;
+            char b[4096]; auto n = read(out[0], b, sizeof b); if (n <= 0) return nullptr; buf.append(b, n);
+        }
+    };
+    json res{{"ok", false}};
+    signal(SIGPIPE, SIG_IGN);
+    if (send({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"}, {"params", {{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()}, {"clientInfo", {{"name", "openclaw-cpp"}, {"version", "1"}}}}}})) {
+        auto init = recv(1);
+        if (init.is_null()) res["error"] = "no initialize response (server exited or timed out after " + std::to_string(timeout_s) + "s)";
+        else if (init.contains("error")) res["error"] = init["error"].dump();
+        else {
+            send({{"jsonrpc", "2.0"}, {"method", "notifications/initialized"}});
+            send({{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/list"}, {"params", json::object()}});
+            auto tl = recv(2); res["ok"] = true; res["serverInfo"] = init["result"].value("serverInfo", json::object());
+            json names = json::array(); if (tl.is_object() && tl.contains("result")) for (auto& t : tl["result"].value("tools", json::array())) names.push_back(t.value("name", ""));
+            res["tools"] = names;
+        }
+    } else res["error"] = "failed to start: " + s.value("command", "");
+    close(in[1]); close(out[0]);
+    int st = 0; for (int i = 0; i < 20 && waitpid(pid, &st, WNOHANG) == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (waitpid(pid, &st, WNOHANG) == 0) { kill(pid, SIGTERM); waitpid(pid, &st, 0); }
+    return res;
+}
+json ProbeHttp(const std::string& name, const json& s, int timeout_s) {
+    std::vector<std::string> h{"Content-Type: application/json", "Accept: application/json, text/event-stream"};
+    if (s.contains("headers") && s["headers"].is_object()) for (auto& [k, v] : s["headers"].items()) h.push_back(k + ": " + (v.is_string() ? v.get<std::string>() : v.dump()));
+    auto toks = ReadJ(McpTokPath()); bool authed = false;
+    if (toks.contains(name) && toks[name].value("access_token", "") != "") { h.push_back("Authorization: Bearer " + toks[name]["access_token"].get<std::string>()); authed = true; }
+    auto parse = [](const std::string& b) -> json { try { return json::parse(b); } catch (...) {} std::istringstream is(b); std::string l; while (std::getline(is, l)) if (l.rfind("data:", 0) == 0) try { return json::parse(Trim(l.substr(5))); } catch (...) {} return nullptr; };
+    std::map<std::string, std::string> rh;
+    auto r = HttpPost(s["url"].get<std::string>(), h, json{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "initialize"}, {"params", {{"protocolVersion", "2025-06-18"}, {"capabilities", json::object()}, {"clientInfo", {{"name", "openclaw-cpp"}, {"version", "1"}}}}}}.dump(), timeout_s * 1000L, &rh);
+    json res{{"ok", false}, {"authorized", authed}};
+    if (!r.error.empty()) { res["error"] = r.error; return res; }
+    if (r.status == 401) { res["error"] = "HTTP 401: authorization required (run `openclaw-cpp mcp login " + name + "`)"; res["needsLogin"] = true; return res; }
+    auto init = parse(r.body);
+    if (r.status >= 400 || !init.is_object() || init.contains("error")) { res["error"] = "initialize failed (HTTP " + std::to_string(r.status) + ")"; return res; }
+    if (rh.count("mcp-session-id")) h.push_back("Mcp-Session-Id: " + rh["mcp-session-id"]);
+    HttpPost(s["url"].get<std::string>(), h, json{{"jsonrpc", "2.0"}, {"method", "notifications/initialized"}}.dump(), timeout_s * 1000L);
+    auto t = parse(HttpPost(s["url"].get<std::string>(), h, json{{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/list"}, {"params", json::object()}}.dump(), timeout_s * 1000L).body);
+    res["ok"] = true; res["serverInfo"] = init.value("result", json::object()).value("serverInfo", json::object());
+    json names = json::array(); if (t.is_object() && t.contains("result")) for (auto& x : t["result"].value("tools", json::array())) names.push_back(x.value("name", ""));
+    res["tools"] = names; return res;
+}
+json Probe(const std::string& name, const json& s) {
+    const int to = s.contains("connectTimeout") && s["connectTimeout"].is_number() ? s["connectTimeout"].get<int>() : 10;
+    if (s.value("disabled", false) || s.value("enabled", true) == false) return {{"ok", false}, {"skipped", "disabled"}};
+    return s.contains("url") ? ProbeHttp(name, s, to) : ProbeStdio(s, to);
+}
+std::string McpValidate(const json& s) {
+    if (!s.is_object()) return "server entry must be an object";
+    const bool cmd = s.contains("command"), url = s.contains("url");
+    if (cmd == url) return "set exactly one of \"command\" (stdio) or \"url\" (HTTP)";
+    if (cmd && (!s["command"].is_string() || s["command"].get<std::string>().empty())) return "\"command\" must be a non-empty string";
+    if (url && (!s["url"].is_string() || (s["url"].get<std::string>().rfind("http://", 0) && s["url"].get<std::string>().rfind("https://", 0)))) return "\"url\" must be an http(s) URL";
+    if (s.contains("args") && !s["args"].is_array()) return "\"args\" must be an array";
+    if (s.contains("transport") && s["transport"] != "streamable-http" && s["transport"] != "sse") return "\"transport\" must be streamable-http or sse";
+    return "";
+}
+int CmdMcp(int argc, char** argv) {
+    const std::string sub = argv[2];
+    auto a = P3(argc, argv, 3, {"--json", "-v", "--verbose", "--command=", "--arg=", "--env=", "--cwd=", "--url=", "--transport=", "--header=", "--auth=", "--oauth-scope=",
+                               "--oauth-redirect-url=", "--oauth-client-metadata-url=", "--include=", "--exclude=", "--timeout=", "--connect-timeout=", "--parallel",
+                               "--approval=", "--disabled", "--ssl-verify=", "--client-cert=", "--client-key=", "--no-probe", "--code=", "--clear"}, "mcp " + sub);
+    if (!a) return 1;
+    const bool js = a->has("--json");
+    json raw = LoadRaw(); json servers = McpServers(raw);
+    auto need = [&](const char* what) -> std::string { if (a->pos.empty()) { std::cerr << "error: missing required argument '" << what << "'\n"; return ""; } return a->pos[0]; };
+    auto save = [&](const json& sv) { raw["mcp"]["servers"] = sv; SaveRaw(raw); };
+    if (sub == "list") {
+        json out = json::array();
+        for (auto& [k, v] : servers.items()) out.push_back({{"name", k}, {"transport", McpTransport(v)}, {"target", v.contains("url") ? v["url"] : v.value("command", json(""))}, {"enabled", !v.value("disabled", false)}});
+        Emit(js, {{"path", config::DefaultPath().string()}, {"servers", out}}, [&] {
+            if (out.empty()) { std::cout << "No OpenClaw-managed MCP servers configured in " << config::DefaultPath().string() << ". Add one with openclaw-cpp mcp set <name> '{\"command\":\"uvx\",\"args\":[\"context7-mcp\"]}'.\n"; return; }
+            for (auto& s : out) std::cout << s["name"].get<std::string>() << "  " << s["transport"].get<std::string>() << "  " << (s["target"].is_string() ? s["target"].get<std::string>() : s["target"].dump()) << (s["enabled"] ? "" : "  (disabled)") << "\n"; });
+        return 0;
+    }
+    if (sub == "show") {
+        if (a->pos.empty()) { Emit(js, servers, [&] { std::cout << servers.dump(2) << "\n"; }); return 0; }
+        if (!servers.contains(a->pos[0])) { std::cerr << "No MCP server named \"" << a->pos[0] << "\".\n"; return 1; }
+        std::cout << servers[a->pos[0]].dump(2) << "\n"; return 0;
+    }
+    if (sub == "set" || sub == "add") {
+        auto name = need("name"); if (name.empty()) return 1;
+        json s;
+        if (sub == "set") {
+            if (a->pos.size() < 2) { std::cerr << "error: missing required argument 'value'\n"; return 1; }
+            try { s = json::parse(a->pos[1]); } catch (const std::exception& e) { std::cerr << "Invalid JSON: " << e.what() << "\n"; return 1; }
+        } else {
+            s = json::object();
+            if (a->has("--command")) { s["command"] = a->get("--command"); s["args"] = a->all("--arg"); }
+            if (a->has("--url")) s["url"] = a->get("--url");
+            for (auto& kv : a->all("--env")) { auto p = kv.find('='); if (p == std::string::npos) { std::cerr << "--env expects KEY=VALUE\n"; return 1; } s["env"][kv.substr(0, p)] = kv.substr(p + 1); }
+            for (auto& kv : a->all("--header")) { auto p = kv.find('='); if (p == std::string::npos) { std::cerr << "--header expects KEY=VALUE\n"; return 1; } s["headers"][kv.substr(0, p)] = kv.substr(p + 1); }
+            if (a->has("--cwd")) s["cwd"] = a->get("--cwd");
+            if (a->has("--transport")) s["transport"] = a->get("--transport");
+            if (a->has("--auth")) { if (a->get("--auth") != "oauth") { std::cerr << "--auth supports only: oauth\n"; return 1; } s["oauth"] = json::object(); }
+            if (a->has("--oauth-scope")) s["oauth"]["scope"] = a->get("--oauth-scope");
+            if (a->has("--oauth-redirect-url")) s["oauth"]["redirectUrl"] = a->get("--oauth-redirect-url");
+            if (a->has("--oauth-client-metadata-url")) s["oauth"]["clientMetadataUrl"] = a->get("--oauth-client-metadata-url");
+            if (a->has("--include")) s["include"] = Csv(a->get("--include"));
+            if (a->has("--exclude")) s["exclude"] = Csv(a->get("--exclude"));
+            if (a->has("--timeout")) s["timeout"] = std::atoi(a->get("--timeout").c_str());
+            if (a->has("--connect-timeout")) s["connectTimeout"] = std::atoi(a->get("--connect-timeout").c_str());
+            if (a->has("--parallel")) s["parallel"] = true;
+            if (a->has("--approval")) { auto m = a->get("--approval"); if (m != "auto" && m != "prompt" && m != "approve") { std::cerr << "--approval must be auto, prompt, or approve\n"; return 1; } s["approval"] = m; }
+            if (a->has("--disabled")) s["disabled"] = true;
+            if (a->has("--ssl-verify")) s["sslVerify"] = a->get("--ssl-verify") != "false";
+            if (a->has("--client-cert")) s["clientCert"] = a->get("--client-cert");
+            if (a->has("--client-key")) s["clientKey"] = a->get("--client-key");
+        }
+        if (auto e = McpValidate(s); !e.empty()) { std::cerr << "Invalid MCP server \"" << name << "\": " << e << "\n"; return 1; }
+        json pr = nullptr;
+        if (sub == "add" && !a->has("--no-probe") && !s.value("disabled", false)) {
+            pr = Probe(name, s);
+            if (!pr.value("ok", false) && !pr.value("needsLogin", false)) { std::cerr << "MCP server \"" << name << "\" check failed: " << pr.value("error", std::string("unknown")) << "\nNot saved. Fix it or re-run with --no-probe.\n"; return 1; }
+        }
+        servers[name] = s; save(servers);
+        Emit(js, {{"ok", true}, {"name", name}, {"server", s}, {"probe", pr}}, [&] {
+            std::cout << "Saved MCP server \"" << name << "\" (" << McpTransport(s) << ").\n";
+            if (pr.is_object() && pr.value("ok", false)) std::cout << "Connected: " << pr["tools"].size() << " tool(s).\n";
+            if (pr.is_object() && pr.value("needsLogin", false)) std::cout << "Server needs authorization: openclaw-cpp mcp login " << name << "\n"; });
+        return 0;
+    }
+    if (sub == "unset") {
+        auto name = need("name"); if (name.empty()) return 1;
+        if (!servers.contains(name)) { std::cerr << "No MCP server named \"" << name << "\".\n"; return 1; }
+        servers.erase(name); save(servers); std::cout << "Removed MCP server \"" << name << "\".\n"; return 0;
+    }
+    if (sub == "tools") {
+        auto name = need("name"); if (name.empty()) return 1;
+        if (!servers.contains(name)) { std::cerr << "No MCP server named \"" << name << "\".\n"; return 1; }
+        auto& s = servers[name];
+        if (a->has("--clear")) { s.erase("include"); s.erase("exclude"); }
+        if (a->has("--include")) s["include"] = Csv(a->get("--include"));
+        if (a->has("--exclude")) s["exclude"] = Csv(a->get("--exclude"));
+        save(servers);
+        Emit(js, {{"name", name}, {"include", s.value("include", json::array())}, {"exclude", s.value("exclude", json::array())}}, [&] {
+            std::cout << name << ": include=" << s.value("include", json::array()).dump() << " exclude=" << s.value("exclude", json::array()).dump() << "\n"; });
+        return 0;
+    }
+    if (sub == "status" || sub == "probe" || sub == "doctor") {
+        json out = json::array(); int bad = 0;
+        const bool live = sub != "status" || a->has("-v") || a->has("--verbose");
+        auto toks = ReadJ(McpTokPath());
+        for (auto& [k, v] : servers.items()) {
+            if (sub == "probe" && !a->pos.empty() && a->pos[0] != k) continue;
+            json e{{"name", k}, {"transport", McpTransport(v)}, {"enabled", !v.value("disabled", false)}, {"oauth", v.contains("oauth")}, {"authorized", toks.contains(k)}};
+            if (auto err = McpValidate(v); !err.empty()) { e["error"] = err; ++bad; }
+            else if (live) { auto p = Probe(k, v); e["probe"] = p; if (!p.value("ok", false) && !p.contains("skipped")) ++bad; }
+            out.push_back(e);
+        }
+        if (sub == "probe" && !a->pos.empty() && out.empty()) { std::cerr << "No MCP server named \"" << a->pos[0] << "\".\n"; return 1; }
+        Emit(js, {{"servers", out}, {"problems", bad}}, [&] {
+            if (out.empty()) std::cout << "No MCP servers configured.\n";
+            for (auto& e : out) {
+                std::cout << e["name"].get<std::string>() << "  " << e["transport"].get<std::string>() << (e["enabled"] ? "" : "  disabled") << (e["oauth"] ? (e["authorized"] ? "  oauth:authorized" : "  oauth:not-authorized") : "");
+                if (e.contains("error")) std::cout << "  INVALID: " << e["error"].get<std::string>();
+                else if (e.contains("probe")) { auto& p = e["probe"]; if (p.contains("skipped")) std::cout << "  skipped"; else if (p.value("ok", false)) std::cout << "  ok (" << p["tools"].size() << " tools)"; else std::cout << "  FAIL: " << p.value("error", std::string("")); }
+                std::cout << "\n";
+            } });
+        return sub == "status" ? 0 : (bad ? 1 : 0);
+    }
+    if (sub == "logout") {
+        auto name = need("name"); if (name.empty()) return 1;
+        auto toks = ReadJ(McpTokPath()); const bool had = toks.contains(name); toks.erase(name); WriteJ(McpTokPath(), toks);
+        std::filesystem::remove(StateRoot() / "mcp-login" / (name + ".json"));
+        std::cout << (had ? "Cleared OAuth credentials for \"" : "No stored OAuth credentials for \"") << name << "\".\n"; return 0;
+    }
+    if (sub == "login") {
+        auto name = need("name"); if (name.empty()) return 1;
+        if (!servers.contains(name)) { std::cerr << "No MCP server named \"" << name << "\".\n"; return 1; }
+        const auto pend = StateRoot() / "mcp-login" / (name + ".json");
+        std::string err;
+        if (a->has("--code")) {
+            auto p = ReadJ(pend); if (!p.contains("sessionId")) { std::cerr << "No pending login for \"" << name << "\". Run `openclaw-cpp mcp login " << name << "` first.\n"; return 1; }
+            auto w = GwRpc(raw, "wizard.next", {{"sessionId", p["sessionId"]}, {"answer", a->get("--code")}}, &err);
+            if (w.is_null()) { std::cerr << "Login failed: " << err << "\n"; return 1; }
+            if (w.value("status", "") != "done") { std::cerr << "Login failed: " << w.value("error", w.dump()) << "\n"; return 1; }
+            std::filesystem::remove(pend);
+            Emit(js, w, [&] { std::cout << "Authorized MCP server \"" << name << "\"" << (w["result"].value("verified", false) ? " (verified)" : "") << ".\n"; });
+            return 0;
+        }
+        const std::string sid = "cli-mcp-" + name + "-" + RandHex(4);
+        auto st = GwRpc(raw, "mcp.authLogin", {{"sessionId", sid}, {"serverName", name}}, &err);
+        if (st.is_null()) { std::cerr << "Login could not start: " << err << "\n(The OAuth callback is served by the gateway; start it with `openclaw-cpp gateway`.)\n"; return 1; }
+        WriteJ(pend, {{"sessionId", sid}, {"createdAt", IsoNow()}});
+        Emit(js, {{"sessionId", sid}, {"url", st["step"]["url"]}}, [&] {
+            std::cout << "Open this URL to authorize \"" << name << "\":\n  " << st["step"]["url"].get<std::string>() << "\n"
+                      << "The gateway finishes automatically on redirect. Otherwise run: openclaw-cpp mcp login " << name << " --code <code-or-redirected-url>\n"; });
+        return 0;
+    }
+    if (sub == "reload") {
+        std::string err; auto r = GwRpc(raw, "config.get", json::object(), &err);
+        std::cout << (r.is_null() ? "Gateway not running; MCP config will be read at next start.\n" : "The gateway reads mcp.servers from config on each turn; new config is used on the next turn.\n");
+        return 0;
+    }
+    std::cerr << "openclaw-cpp mcp " << sub << ": not implemented in the C++ port (serve/configure are interactive or bridge modes; use `mcp add`/`mcp set`).\n";
+    return 2;
+}
+
+int CmdReset(int argc, char** argv) {
+    auto a = P3(argc, argv, 2, {"--scope=", "--yes", "--non-interactive", "--dry-run", "--json"}, "reset");
+    if (!a) return 1;
+    const auto scope = a->get("--scope", "config+creds+sessions");
+    if (scope != "config" && scope != "config+creds+sessions" && scope != "full") { std::cerr << "Invalid --scope. Use config, config+creds+sessions, or full.\n"; return 1; }
+    std::vector<fs::path> t{config::DefaultPath()};
+    if (scope != "config") { t.push_back(StateRoot() / "credentials"); t.push_back(StateRoot() / "agents"); t.push_back(DataRoot() / "sessions"); if (const char* s = std::getenv("OPENCLAW_SESSION_DIR")) t.push_back(s); }
+    if (scope == "full") { auto raw = LoadRaw(); if (raw.contains("agents") && raw["agents"].contains("defaults") && raw["agents"]["defaults"].value("workspace", "") != "") t.push_back(raw["agents"]["defaults"]["workspace"].get<std::string>()); t.push_back(DataRoot()); }
+    std::error_code ec; json items = json::array(); for (auto& p : t) if (fs::exists(p, ec)) items.push_back(p.string());
+    if (a->has("--dry-run")) { Emit(a->has("--json"), {{"scope", scope}, {"dryRun", true}, {"items", items}}, [&] { std::cout << "Would reset (" << scope << "):\n"; for (auto& i : items) std::cout << "  " << i.get<std::string>() << "\n"; }); return 0; }
+    if (!a->has("--yes")) {
+        if (a->has("--non-interactive") || !isatty(0)) { std::cerr << "Refusing to reset without --yes (non-interactive).\n"; return 1; }
+        std::cout << "Reset " << scope << " (" << items.size() << " item(s)); moved to trash. Continue? [y/N] " << std::flush; std::string l; std::getline(std::cin, l); if (Lower(Trim(l)) != "y" && Lower(Trim(l)) != "yes") { std::cout << "Cancelled.\n"; return 1; }
+    }
+    const fs::path trash = HomeDir() / ".openclaw-trash" / ("reset-" + std::to_string(NowMs()));
+    json moved = json::array();
+    for (auto& i : items) { fs::path p = i.get<std::string>(); fs::create_directories(trash, ec); auto dst = trash / (std::to_string(moved.size()) + "-" + p.filename().string()); fs::rename(p, dst, ec); if (ec) { fs::copy(p, dst, fs::copy_options::recursive, ec); fs::remove_all(p, ec); } moved.push_back(p.string()); }
+    Emit(a->has("--json"), {{"scope", scope}, {"moved", moved}, {"trash", trash.string()}}, [&] { std::cout << "Reset (" << scope << "): moved " << moved.size() << " item(s) to " << trash.string() << "\n"; });
+    return 0;
+}
+
+int CmdUninstall(int argc, char** argv) {
+    auto a = P3(argc, argv, 2, {"--service", "--state", "--workspace", "--app", "--all", "--yes", "--non-interactive", "--dry-run", "--json"}, "uninstall");
+    if (!a) return 1;
+    const bool all = a->has("--all");
+    const bool svc = all || a->has("--service"), st = all || a->has("--state"), ws = all || a->has("--workspace"), app = all || a->has("--app");
+    if (!svc && !st && !ws && !app) { std::cerr << "Choose what to remove: --service, --state, --workspace, --app, or --all.\n"; return 1; }
+    json plan = json::array(); std::error_code ec;
+    const fs::path unitdir = HomeDir() / ".config" / "systemd" / "user";
+    std::vector<fs::path> units;
+    if (svc && fs::is_directory(unitdir, ec)) for (auto& e : fs::directory_iterator(unitdir, ec)) { auto n = e.path().filename().string(); if (n.rfind("openclaw", 0) == 0 && n.size() > 8 && n.find(".service") != std::string::npos) { units.push_back(e.path()); plan.push_back({{"kind", "service"}, {"path", e.path().string()}}); } }
+    auto raw = LoadRaw();
+    if (ws && raw.contains("agents") && raw["agents"].contains("defaults") && raw["agents"]["defaults"].value("workspace", "") != "") { fs::path w = raw["agents"]["defaults"]["workspace"].get<std::string>(); if (fs::exists(w, ec)) plan.push_back({{"kind", "workspace"}, {"path", w.string()}}); }
+    if (st) for (auto p : {StateRoot(), DataRoot(), config::DefaultPath()}) if (fs::exists(p, ec)) plan.push_back({{"kind", "state"}, {"path", p.string()}});
+    json notes = json::array(); if (app) notes.push_back("--app: no desktop app bundle on this platform (macOS only); skipped");
+    if (a->has("--dry-run")) { Emit(a->has("--json"), {{"dryRun", true}, {"plan", plan}, {"notes", notes}}, [&] { std::cout << "Would remove:\n"; for (auto& p : plan) std::cout << "  [" << p["kind"].get<std::string>() << "] " << p["path"].get<std::string>() << "\n"; for (auto& n : notes) std::cout << "  " << n.get<std::string>() << "\n"; }); return 0; }
+    if (!a->has("--yes")) {
+        if (a->has("--non-interactive") || !isatty(0)) { std::cerr << "Refusing to uninstall without --yes (non-interactive).\n"; return 1; }
+        std::cout << "Permanently remove " << plan.size() << " item(s)? [y/N] " << std::flush; std::string l; std::getline(std::cin, l); if (Lower(Trim(l)) != "y" && Lower(Trim(l)) != "yes") { std::cout << "Cancelled.\n"; return 1; }
+    }
+    for (auto& u : units) { auto cmd = "systemctl --user disable --now '" + u.filename().string() + "' >/dev/null 2>&1"; if (std::system(cmd.c_str())) {} }
+    json removed = json::array();
+    for (auto& p : plan) { fs::remove_all(p["path"].get<std::string>(), ec); if (!ec) removed.push_back(p); }
+    if (!units.empty()) if (std::system("systemctl --user daemon-reload >/dev/null 2>&1")) {}
+    Emit(a->has("--json"), {{"removed", removed}, {"notes", notes}}, [&] { std::cout << "Removed " << removed.size() << " item(s).\n"; for (auto& n : notes) std::cout << n.get<std::string>() << "\n"; });
+    return 0;
+}
+
+int CmdDocs(int argc, char** argv) {
+    auto a = P3(argc, argv, 2, {"--json", "--limit="}, "docs");
+    if (!a) return 1;
+    const int limit = std::max(1, std::atoi(a->get("--limit", "8").c_str()));
+    std::string base = "https://docs.openclaw.ai"; if (const char* e = std::getenv("OPENCLAW_DOCS_URL"); e && *e) base = NoSlash(e);
+    std::string q; for (auto& p : a->pos) q += (q.empty() ? "" : " ") + p;
+    if (q.empty()) { std::cout << "OpenClaw docs: " << base << "\nSearch: openclaw-cpp docs <query>\n"; return 0; }
+    auto r = Http(base + "/llms.txt", {}, 15000);
+    if (!r.error.empty() || r.status != 200) { std::cerr << "Docs search unavailable (" << (r.error.empty() ? "HTTP " + std::to_string(r.status) : r.error) << "). Browse " << base << "\n"; return 1; }
+    std::vector<std::string> terms; { std::stringstream ss(Lower(q)); std::string t; while (ss >> t) terms.push_back(t); }
+    static const std::regex link(R"(^\s*[-*]\s*\[([^\]]+)\]\(([^)]+)\)\s*:?\s*(.*)$)");
+    std::vector<std::pair<int, json>> hits; std::istringstream is(r.body); std::string l;
+    while (std::getline(is, l)) {
+        std::smatch m; if (!std::regex_match(l, m, link)) continue;
+        const std::string title = m[1], url = m[2], desc = m[3]; int sc = 0;
+        for (auto& t : terms) { if (Lower(title).find(t) != std::string::npos) sc += 3; if (Lower(url).find(t) != std::string::npos) sc += 2; if (Lower(desc).find(t) != std::string::npos) sc += 1; }
+        if (sc) hits.push_back({sc, {{"title", title}, {"url", url.rfind("http", 0) == 0 ? url : base + (url[0] == '/' ? "" : "/") + url}, {"snippet", desc}}});
+    }
+    std::stable_sort(hits.begin(), hits.end(), [](auto& x, auto& y) { return x.first > y.first; });
+    json out = json::array(); for (size_t i = 0; i < hits.size() && static_cast<int>(i) < limit; ++i) out.push_back(hits[i].second);
+    Emit(a->has("--json"), {{"query", q}, {"results", out}}, [&] {
+        if (out.empty()) { std::cout << "No docs matched \"" << q << "\". Browse " << base << "\n"; return; }
+        for (auto& h : out) std::cout << h["title"].get<std::string>() << "\n  " << h["url"].get<std::string>() << (h["snippet"].get<std::string>().empty() ? "" : "\n  " + h["snippet"].get<std::string>()) << "\n"; });
+    return 0;
+}
 }  // namespace
 
 int MaybeLocalCommand3(int argc, char** argv) {
+    if (argc >= 2) { const std::string c1 = argv[1];
+        if (c1 == "reset") return CmdReset(argc, argv);
+        if (c1 == "uninstall") return CmdUninstall(argc, argv);
+        if (c1 == "docs") return CmdDocs(argc, argv);
+        if (c1 == "mcp" && (argc == 2 || std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h")) {
+            std::cout << "Usage: openclaw-cpp mcp <command>\n\nManage OpenClaw-managed MCP servers (config: mcp.servers)\n\nCommands:\n"
+                         "  list | show [name] | status [-v] | probe [name] | doctor\n  add <name> --command C [--arg A]... | --url U [--auth oauth]\n"
+                         "  set <name> <json> | unset <name> | tools <name> --include/--exclude/--clear\n  login <name> [--code CODE] | logout <name> | reload\n";
+            return 0;
+        } }
     if (argc < 3) return -1;
     const std::string cmd = argv[1], sub = argv[2];
     if (cmd == "directory" && (sub == "self" || sub == "peers" || sub == "groups")) return CmdDirectory(argc, argv);
     if (cmd == "proxy" && (sub == "start" || sub == "run" || sub == "validate" || sub == "coverage" || sub == "sessions" || sub == "query" || sub == "blob" || sub == "purge")) return CmdProxy(argc, argv);
     if (cmd == "database" && (sub == "preflight" || sub == "preflight-agent" || sub == "ownership" || sub == "claim")) return CmdDatabase(argc, argv);
     if (cmd == "update" && (sub == "wizard" || sub == "cleanup" || sub == "recover" || sub == "migration-plan" || sub == "admit" || sub == "adopt-immutable")) return CmdUpdate(argc, argv);
+    if (cmd == "mcp" && sub.rfind("-", 0) != 0) return CmdMcp(argc, argv);
     return -1;
 }
 
