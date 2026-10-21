@@ -25,6 +25,16 @@ nlohmann::json ClawRemovalBinding(const std::filesystem::path& data_root);
 nlohmann::json ClawStateIdentity(const std::filesystem::path& data_root);  // creates the state file if missing
 nlohmann::json ClawStateRead(const std::filesystem::path& data_root);
 
+std::filesystem::path SubsystemDataRoot(ServerDeps& deps);
+// Requester identity for the current RPC (thread-local): principal + whether it has full operator write.
+void SetRpcRequester(const std::string& principal, bool full_write);
+std::string CurrentRpcPrincipal();
+// chat.send / sessions.send record who prompted a session (co-author credit for GitHub publication).
+void RecordSessionParticipant(const std::filesystem::path& data_root, const std::string& agent, const std::string& key);
+// Lets in-process agent tools (github_publish) reach the subsystems; set by the Server constructor.
+void SetSubsystemContext(ServerDeps* deps, const std::filesystem::path& data_root);
+std::string AgentGitHubPublish(const nlohmann::json& args, const std::string& agent, const std::string& session_key);
+
 // GitHub API base (gateway.github.apiBaseUrl / OPENCLAW_GITHUB_API_BASE_URL); https only unless loopback http.
 std::string GitHubApiBase(const nlohmann::json& raw_config);
 

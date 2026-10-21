@@ -3,6 +3,7 @@
 #include "openclaw/auth/oidc.hpp"
 #include "openclaw/auth/mfa.hpp"
 #include "openclaw/gateway/server.hpp"
+#include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/util.hpp"
 #include "openclaw/net/safe_fetch.hpp"
 #include <openssl/evp.h>
@@ -27,6 +28,7 @@
 #include "openclaw/channels/whatsapp.hpp"
 #include <thread>
 
+#include <optional>
 #include <nlohmann/json.hpp>
 
 #include <arpa/inet.h>
@@ -50,7 +52,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.102.0-dev";
+constexpr const char* kVersion = "1.103.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -266,6 +268,7 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
 
 Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {
     deps_.emit = [this](const std::string& ev, const nlohmann::json& p) { Emit(ev, p); };
+    SetSubsystemContext(&deps_, SubsystemDataRoot(deps_));
     std::error_code ec;
     cfg_mtime_ = std::filesystem::last_write_time(config::DefaultPath(), ec);
     auto& broker = tools::exec::ApprovalBroker::Global();
@@ -1353,6 +1356,7 @@ namespace {
 // Role of the caller for the current client thread (each connection runs on its own thread).
 // admin = gateway token / auth off / in-process; operator|device = ocd_ device token role.
 thread_local std::string g_rpc_role = "admin";
+thread_local std::string g_rpc_principal = "operator";
 thread_local std::vector<std::string> g_rpc_scopes;  // ocd_ token scopes (empty = role default)
 thread_local bool g_rpc_role_pending_device = false;
 // Set by AuthRole: true when the only valid credential was the oc_session cookie (CSRF check required).
@@ -1432,6 +1436,7 @@ std::string Server::AuthRole(const std::string& req) const {
     g_auth_via_cookie = false;
     g_session_csrf.clear();
     g_rpc_scopes.clear();
+    g_rpc_principal = "operator";
     if (!deps_.auth.require_auth) return "admin";
     const auto authz = HeaderValue(req, "Authorization");
     const auto xtok = HeaderValue(req, "X-OpenClaw-Token");
@@ -1439,7 +1444,7 @@ std::string Server::AuthRole(const std::string& req) const {
     if (deps_.device_links) {
         for (const auto& tok : {BearerOf(authz), xtok}) {
             auto role = deps_.device_links->TokenRole(tok);
-            if (!role.empty()) { g_rpc_scopes = deps_.device_links->TokenScopes(tok); return role; }
+            if (!role.empty()) { g_rpc_scopes = deps_.device_links->TokenScopes(tok); g_rpc_principal = "device:" + auth::DeviceLinkStore::Sha256Hex(tok).substr(0, 16); return role; }
         }
         const auto sid = CookieValue(req, "oc_session");
         if (!sid.empty()) {
@@ -1457,6 +1462,7 @@ std::string Server::AuthRole(const std::string& req) const {
                 if (!rr.role.empty()) s.role = rr.role;
                 deps_.device_links->UpdateIdentitySession(sid, s.role, rr.refresh_token);
             }
+            if (!s.role.empty() && !s.oidc_sub.empty()) g_rpc_principal = "oidc:" + s.oidc_sub;
             if (!s.role.empty()) { g_auth_via_cookie = true; g_session_csrf = s.csrf; g_rpc_scopes = s.scopes; return s.role; }
         }
     }
@@ -2117,6 +2123,12 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         if (!id.is_null()) r["id"] = id;
         return r;
     }
+    SetRpcRequester(g_rpc_principal, g_rpc_scopes.empty() ? (g_rpc_role == "admin" || g_rpc_role == "operator")
+                                                          : auth::DeviceLinkStore::ScopeAllows(g_rpc_scopes, std::string("operator.write")));
+    if ((method == "chat.send" || method == "sessions.send") && params.is_object()) {
+        const auto key = params.value("sessionKey", params.value("key", std::string()));
+        if (!key.empty()) RecordSessionParticipant(SubsystemDataRoot(deps_), params.value("agentId", std::string("main")), key);
+    }
     if (!g_rpc_scopes.empty() && !auth::DeviceLinkStore::ScopeAllows(g_rpc_scopes, method, params)) {
         auto dyn = auth::DeviceLinkStore::DynamicScopes(method, params);
         nlohmann::json r{{"type", "res"}, {"ok", false}, {"error", "forbidden: token scopes do not allow " + method},
@@ -2156,6 +2168,9 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         if (name.empty()) return err("missing tool name");
         auto args = params.contains("args") ? params["args"] : params.value("arguments", nlohmann::json::object());
         try {
+            std::optional<tools::exec::ScopedRunContext> run_ctx;
+            if (params.contains("sessionKey") && params["sessionKey"].is_string())
+                run_ctx.emplace(tools::exec::RunContext{params.value("agentId", std::string("main")), params["sessionKey"].get<std::string>(), "", "", ""});
             auto result = deps_.tools.Invoke(name, args);
             nlohmann::json rj;
             try { rj = nlohmann::json::parse(result); } catch (...) { rj = result; }  // plain-text tool output

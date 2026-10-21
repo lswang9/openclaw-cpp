@@ -94,6 +94,7 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
                              const nlohmann::json& params) {
     ExtraResult r;
     if (!ImplementedSet().count(method)) return r;
+    if (auto sub = TrySubsystemDispatch(deps, DataRoot(deps), method, params); sub.handled) return sub;
     auto starts = [&](const char* p) { return method.rfind(p, 0) == 0; };
 
     // ---- Provider hot-switch (real) ----
@@ -155,7 +156,6 @@ ExtraResult TryExtraDispatch(ServerDeps& deps, const std::string& method,
         r.payload = Real({{"cancelled", true}, {"note", "no device-flow in progress is tracked server-side"}});
         return r;
     }
-    if (auto sub = TrySubsystemDispatch(deps, DataRoot(deps), method, params); sub.handled) return sub;
 
     // ---- device link / pairing codes (disk-backed; token issued once) ----
     if (starts("pairing.link.") || starts("pairing.token.") || method == "pairing.status") {

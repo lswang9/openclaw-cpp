@@ -581,10 +581,192 @@ std::string Slug(const std::string& s) {
     return o.empty() ? "session" : o;
 }
 
-json Execute(ServerDeps& d, json& rec) {
+// ---------------------------------------------------------------- personal GitHub sign-in (users.github.*)
+// Per-principal GitHub device-flow authorizations: <data>/github-personal.json (0600)
+//   {accounts: {principal: {generation, account{accountId,login}, token, connectedAtMs}}, pending: {requestId: {...}}}
+thread_local std::string t_principal = "operator";
+thread_local bool t_full_write = true;
+fs::path PersonalPath(const fs::path& root) { return root / "github-personal.json"; }
+json PersonalRead(const fs::path& root) {
+    auto j = ReadJsonFile(PersonalPath(root), json::object());
+    for (const char* k : {"accounts", "pending"}) if (!j.contains(k) || !j[k].is_object()) j[k] = json::object();
+    return j;
+}
+void PersonalWrite(const fs::path& root, const json& j) {
+    WriteJsonFile(PersonalPath(root), j);
+    std::error_code ec; fs::permissions(PersonalPath(root), fs::perms::owner_read | fs::perms::owner_write, ec);
+}
+std::string OAuthBase(const json& raw) {
+    if (const char* e = std::getenv("OPENCLAW_GITHUB_OAUTH_BASE_URL"); e && *e) return e;
+    return "https://" + GitHubHost(raw);
+}
+std::string OAuthClientId(const json& raw) {
+    if (auto v = config::GetPath(raw, "gateway.github.oauthClientId"); v && v->is_string() && !v->get<std::string>().empty()) return v->get<std::string>();
+    if (const char* e = std::getenv("OPENCLAW_GITHUB_OAUTH_CLIENT_ID"); e && *e) return e;
+    return {};
+}
+Http FormPost(const std::string& url, const std::string& form) {
+    Http r;
+    CURL* c = curl_easy_init(); if (!c) { r.error = "curl init failed"; return r; }
+    curl_slist* h = curl_slist_append(nullptr, "Accept: application/json");
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, form.c_str());
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "openclaw-cpp");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, Sink);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+    auto rc = curl_easy_perform(c);
+    if (rc != CURLE_OK) r.error = curl_easy_strerror(rc);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
+    curl_slist_free_all(h); curl_easy_cleanup(c);
+    return r;
+}
+json PersonalStatus(const json& db, const std::string& principal) {
+    json st{{"state", "disconnected"}, {"generation", nullptr}, {"account", nullptr}, {"accessExpiresAtMs", nullptr},
+            {"refreshState", "not_applicable"}, {"pending", nullptr}};
+    if (db["accounts"].contains(principal)) {
+        const auto& a = db["accounts"][principal];
+        st["state"] = "connected"; st["generation"] = a["generation"]; st["account"] = a["account"];
+        if (a.contains("accessExpiresAtMs")) { st["accessExpiresAtMs"] = a["accessExpiresAtMs"]; st["refreshState"] = a.value("accessExpiresAtMs", 0LL) > NowMs() ? "available" : "expired"; }
+    }
+    for (auto& [rid, p] : db["pending"].items())
+        if (p.value("principal", "") == principal && p.value("expiresAtMs", 0LL) > NowMs())
+            st["pending"] = {{"requestId", rid}, {"userCode", p["userCode"]}, {"verificationUri", p["verificationUri"]},
+                             {"expiresInMs", std::max<long long>(0, p.value("expiresAtMs", 0LL) - NowMs())}, {"pollAfterMs", p.value("intervalMs", 5000)}};
+    return st;
+}
+
+ExtraResult UsersGitHub(ServerDeps& d, const fs::path& root, const std::string& method, const json& p) {
+    const auto& principal = t_principal;
+    std::lock_guard<std::mutex> l(g_mu);
+    auto db = PersonalRead(root);
+    if (method == "users.github.status") {
+        if (auto bad = ClosedCheck(p, {}); !bad.empty()) return Fail(bad);
+        const auto tok = GitHubToken();
+        json system{{"configured", !tok.empty()}, {"source", tok.empty() ? "none" : "env"}};
+        return Ok({{"personal", PersonalStatus(db, principal)}, {"system", system}});
+    }
+    if (method == "users.github.disconnect") {
+        if (auto bad = ClosedCheck(p, {}); !bad.empty()) return Fail(bad);
+        db["accounts"].erase(principal);
+        PersonalWrite(root, db);
+        return Ok({{"disconnected", true}});
+    }
+    if (method == "users.github.authorize.start") {
+        if (auto bad = ClosedCheck(p, {}); !bad.empty()) return Fail(bad);
+        const auto cid = OAuthClientId(d.config.raw);
+        if (cid.empty()) return Fail("GitHub sign-in is not configured (gateway.github.oauthClientId)");
+        auto r = FormPost(OAuthBase(d.config.raw) + "/login/device/code", "client_id=" + UrlEncode(cid) + "&scope=" + UrlEncode("repo workflow read:user"));
+        json j; try { j = json::parse(r.body); } catch (...) {}
+        if (r.status != 200 || !j.contains("device_code")) return Fail("My GitHub authorization failed.");
+        const auto rid = Uuid();
+        const long long interval = std::clamp<long long>(j.value("interval", 5) * 1000LL, 1, 60000);
+        const long long expires = std::min<long long>(j.value("expires_in", 900) * 1000LL, 900000);
+        db["pending"][rid] = {{"principal", principal}, {"deviceCode", j["device_code"]}, {"userCode", j.value("user_code", "")},
+                              {"verificationUri", "https://github.com/login/device"}, {"intervalMs", interval}, {"expiresAtMs", NowMs() + expires}};
+        PersonalWrite(root, db);
+        return Ok({{"requestId", rid}, {"userCode", j.value("user_code", "")}, {"verificationUri", "https://github.com/login/device"},
+                   {"expiresInMs", expires}, {"pollAfterMs", interval}});
+    }
+    if (method == "users.github.authorize.poll" || method == "users.github.authorize.cancel") {
+        if (auto bad = ClosedCheck(p, {"requestId"}); !bad.empty()) return Fail(bad);
+        const auto rid = p.value("requestId", "");
+        if (!db["pending"].contains(rid) || db["pending"][rid].value("principal", "") != principal) {
+            if (method == "users.github.authorize.cancel") return Ok({{"cancelled", false}});
+            return Ok({{"status", "expired"}});
+        }
+        auto pend = db["pending"][rid];
+        if (method == "users.github.authorize.cancel") { db["pending"].erase(rid); PersonalWrite(root, db); return Ok({{"cancelled", true}}); }
+        if (pend.value("expiresAtMs", 0LL) <= NowMs()) { db["pending"].erase(rid); PersonalWrite(root, db); return Ok({{"status", "expired"}}); }
+        auto r = FormPost(OAuthBase(d.config.raw) + "/login/oauth/access_token",
+                          "client_id=" + UrlEncode(OAuthClientId(d.config.raw)) + "&device_code=" + UrlEncode(pend["deviceCode"].get<std::string>()) +
+                              "&grant_type=" + UrlEncode("urn:ietf:params:oauth:grant-type:device_code"));
+        json j; try { j = json::parse(r.body); } catch (...) {}
+        const long long iv = pend.value("intervalMs", 5000LL);
+        if (!r.error.empty() || r.status >= 500) return Ok({{"status", "network_error"}, {"retryAfterMs", iv}});
+        const auto e = j.value("error", std::string());
+        if (e == "authorization_pending") return Ok({{"status", "pending"}, {"retryAfterMs", iv}});
+        if (e == "slow_down") {
+            const long long niv = std::min<long long>(60000, j.value("interval", iv / 1000 + 5) * 1000LL);
+            db["pending"][rid]["intervalMs"] = niv; PersonalWrite(root, db);
+            return Ok({{"status", "slow_down"}, {"retryAfterMs", niv}});
+        }
+        if (e == "access_denied" || e == "expired_token" || e == "incorrect_device_code") {
+            db["pending"].erase(rid); PersonalWrite(root, db);
+            return Ok({{"status", e == "access_denied" ? "access_denied" : e == "expired_token" ? "expired" : "incorrect_device_code"}});
+        }
+        const auto token = j.value("access_token", std::string());
+        if (token.empty()) return Ok({{"status", "failed"}, {"reason", "setup_failed"}});
+        std::string api;
+        try { api = GitHubApiBase(d.config.raw); } catch (...) { return Ok({{"status", "failed"}, {"reason", "setup_failed"}}); }
+        auto u = GitHubRequest(api + "/user", "GET", token);
+        json acct;
+        try { auto uj = json::parse(u.body); acct = {{"accountId", uj.at("id")}, {"login", uj.at("login")}}; } catch (...) {}
+        if (u.status != 200 || acct.is_null()) return Ok({{"status", "failed"}, {"reason", "setup_failed"}});
+        // A reconnect to a different GitHub account is a new generation; pending confirmations bound to the old one fail.
+        json rec{{"generation", Uuid()}, {"account", acct}, {"token", token}, {"connectedAtMs", NowMs()}};
+        if (j.contains("expires_in")) rec["accessExpiresAtMs"] = NowMs() + j.value("expires_in", 0LL) * 1000;
+        db["accounts"][principal] = rec;
+        db["pending"].erase(rid);
+        PersonalWrite(root, db);
+        return Ok({{"status", "success"}, {"personal", PersonalStatus(db, principal)}});
+    }
+    return Fail("unknown users.github method");
+}
+
+// Session participants (principals that prompted the session) → GitHub co-author credit when they linked GitHub.
+fs::path ParticipantsPath(const fs::path& root) { return root / "session-participants.json"; }
+std::string ParticipantKey(const std::string& agent, std::string key) {
+    const auto pre = "agent:" + agent + ":";
+    if (key.rfind(pre, 0) == 0) key = key.substr(pre.size());
+    return agent + ":" + key;
+}
+
+json CoAuthors(const fs::path& root, const std::string& agent, const std::string& key, long long exclude_account) {
+    json logins = json::array(), trailers = json::array();
+    if (key.find(":incognito:") != std::string::npos) return {{"logins", logins}, {"trailers", trailers}};
+    auto parts = ReadJsonFile(ParticipantsPath(root), json::object());
+    const auto pk = ParticipantKey(agent, key);
+    if (!parts.contains(pk)) return {{"logins", logins}, {"trailers", trailers}};
+    auto db = PersonalRead(root);
+    std::vector<std::pair<long long, json>> ordered;  // first prompt order
+    for (auto& [principal, rec] : parts[pk].items()) {
+        if (!db["accounts"].contains(principal)) continue;
+        const auto& a = db["accounts"][principal]["account"];
+        if (a.value("accountId", 0LL) == exclude_account) continue;
+        ordered.push_back({rec.value("firstPromptedAt", 0LL), a});
+    }
+    std::sort(ordered.begin(), ordered.end(), [](auto& x, auto& y) { return x.first < y.first; });
+    std::set<long long> seen;
+    for (auto& [t, a] : ordered) {
+        if (!seen.insert(a.value("accountId", 0LL)).second) continue;
+        const std::string login = a.value("login", "");
+        logins.push_back(login);
+        trailers.push_back("Co-authored-by: " + login + " <" + std::to_string(a.value("accountId", 0LL)) + "+" + login + "@users.noreply.github.com>");
+    }
+    return {{"logins", logins}, {"trailers", trailers}};
+}
+
+bool IsWorkflowPath(const std::string& f) {
+    static const std::regex re("^\\.github/workflows/[^/]+\\.ya?ml$", std::regex::icase);
+    return std::regex_match(f, re);
+}
+
+json Execute(ServerDeps& d, const fs::path& root, json& rec) {
     const std::string id = rec["requestId"];
     const fs::path ws = rec["workspace"].get<std::string>();
-    const auto token = GitHubToken();
+    std::string token = GitHubToken();
+    const bool personal = rec.contains("account");
+    if (personal) {
+        auto pdb = PersonalRead(root);
+        const auto pr = rec.value("principal", "");
+        if (!pdb["accounts"].contains(pr)) return Failed(id, "identity_unavailable", "Your GitHub account is not connected.", "Connect GitHub with users.github.authorize.start, then request publication again.");
+        const auto& a = pdb["accounts"][pr];
+        if (a.value("generation", "") != rec.value("generation", "") || a["account"] != rec["account"])
+            return Failed(id, "identity_changed", "Your GitHub connection changed since publication was requested.", "Request publication again.");
+        token = a.value("token", "");
+    }
     std::string api, host;
     try { api = GitHubApiBase(d.config.raw); host = GitHubHost(d.config.raw); }
     catch (const std::exception& e) { return Failed(id, "unavailable", e.what(), "Fix gateway.github settings, then retry."); }
@@ -642,7 +824,15 @@ json Execute(ServerDeps& d, json& rec) {
     const std::string branch = "openclaw/" + Slug(rec.value("sessionKey", "session"));
     const std::string title = rec.value("title", "") .empty() ? "OpenClaw session " + rec.value("sessionKey", "") : rec.value("title", "");
     const std::string body = rec.value("body", "").empty() ? "Published by the Gateway after authoritative workspace reconciliation." : rec.value("body", "");
-    std::string msg = title + "\n\n" + body + "\n\nOpenClaw-Publication: " + id + "\n";
+    // Co-author credit: session participants with a linked personal GitHub account (excluding the publisher).
+    const auto credit = CoAuthors(root, rec.value("agentId", "main"), rec.value("sessionKey", ""), account.value("accountId", 0LL));
+    std::string credit_list;
+    for (auto& l : credit["logins"]) credit_list += "- @" + l.get<std::string>() + "\n";
+    if (!credit_list.empty()) credit_list.pop_back();
+    std::string msg = credit_list.empty() ? title : title + "\n\nWorked on by:\n" + credit_list;
+    msg += "\n\n";
+    for (auto& tr : credit["trailers"]) msg += tr.get<std::string>() + "\n";
+    msg += "OpenClaw-Publication: " + id + "\n";
     const std::string login = account["login"], email = account["accountId"].dump() + "+" + login + "@users.noreply.github.com";
     std::vector<std::string> aenv{"GIT_AUTHOR_NAME=" + login, "GIT_COMMITTER_NAME=" + login, "GIT_AUTHOR_EMAIL=" + email, "GIT_COMMITTER_EMAIL=" + email};
     // Publications stack on the session branch: an existing remote branch must already contain the local HEAD
@@ -658,6 +848,25 @@ json Execute(ServerDeps& d, json& rec) {
             return Failed(id, "no_changes", "GitHub publication has no changes beyond the published branch.", "Make a further repository change, then retry.");
         parent = remote_head;
     }
+    // Workflow guard: restricted requesters (agent tool calls) may not change .github/workflows/*.yml, except when
+    // the accepted definition only mirrors the target branch (before == merge-base and accepted == target).
+    if (!rec.value("fullWrite", true)) {
+        auto changed = Run({"git", "diff", "--name-only", "--no-renames", parent, tree}, ws).out;
+        std::istringstream ls_changed(changed);
+        std::string f;
+        const auto mb = base_sha.empty() ? std::string() : Run({"git", "merge-base", parent, base_sha}, ws).out;
+        auto blob = [&](const std::string& rev, const std::string& path) {
+            if (rev.empty()) return std::string("<none>");
+            auto r = Run({"git", "rev-parse", "--verify", "--quiet", rev + ":" + path}, ws);
+            return r.code == 0 ? r.out : std::string("<absent>");
+        };
+        while (std::getline(ls_changed, f)) {
+            if (!IsWorkflowPath(f)) continue;
+            if (base_sha.empty() || blob(parent, f) != blob(mb, f) || blob(tree, f) != blob(base_sha, f))
+                return Failed(id, "github_rejected", "Publishing GitHub workflow changes requires full operator write permission.",
+                              "Your saved changes are intact. Ask a maintainer with full write access to publish the GitHub workflow changes, or restore the workflow definitions and request publication again.");
+        }
+    }
     std::string commit = (parent == head && tree == Run({"git", "rev-parse", "HEAD^{tree}"}, ws).out) ? head
                         : Run({"git", "commit-tree", "--no-gpg-sign", tree, "-p", parent}, ws, aenv, msg).out;
     if (commit.empty()) return Failed(id, "workspace_changed", "Publication commit could not be created.", "Retry after resolving the workspace state.");
@@ -671,7 +880,8 @@ json Execute(ServerDeps& d, json& rec) {
     auto list = GitHubRequest(api + "/repos/" + repo + "/pulls?head=" + UrlEncode(owner + ":" + branch) + "&state=open&per_page=5", "GET", token);
     try { auto a = json::parse(list.body); if (a.is_array() && !a.empty()) url = a[0].value("html_url", ""); } catch (...) {}
     if (url.empty()) {
-        json req{{"title", title}, {"head", branch}, {"base", base}, {"body", body + "\n\n<!-- openclaw-publication:" + id + " -->"}};
+        json req{{"title", title}, {"head", branch}, {"base", base},
+                 {"body", body + (credit_list.empty() ? std::string() : "\n\n## Worked on by\n\n" + credit_list) + "\n\n<!-- openclaw-publication:" + id + " -->"}};
         auto pr = GitHubRequest(api + "/repos/" + repo + "/pulls", "POST", token, req.dump());
         try { url = json::parse(pr.body).value("html_url", ""); } catch (...) {}
         if (pr.status != 201 || url.empty())
@@ -706,6 +916,7 @@ ExtraResult GitHubPublish(ServerDeps& d, const fs::path& root, const std::string
         if (!db["requests"].contains(rid)) return Fail("GitHub publication request not found");
         auto& rec = db["requests"][rid];
         if (rec.value("sessionKey", "") != key || rec.value("agentId", "") != agent) return Fail("GitHub publication belongs to another session");
+        if (rec.value("principal", t_principal) != t_principal) return Fail("GitHub publication was requested by another user");
         if (rec["result"].value("status", "") != "needs_confirmation") return Ok(project(rec));  // already settled: idempotent
         if (rec.value("generation", json()) != p["generation"] || rec["account"] != p["account"] || rec.value("requestDigest", json()) != p["requestDigest"])
             return Fail("GitHub publication confirmation does not match the pending request");
@@ -713,7 +924,7 @@ ExtraResult GitHubPublish(ServerDeps& d, const fs::path& root, const std::string
         save();
         l.unlock();
         json copy = rec;
-        auto out = Execute(d, copy);
+        auto out = Execute(d, root, copy);
         l.lock();
         db = ReadJsonFile(PubPath(root), db);
         copy["result"] = out;
@@ -742,11 +953,18 @@ ExtraResult GitHubPublish(ServerDeps& d, const fs::path& root, const std::string
     }
     const auto rid = Uuid();
     json rec{{"requestId", rid}, {"sessionKey", key}, {"agentId", agent}, {"requestDigest", digest}, {"createdAtMs", NowMs()},
-             {"workspace", WorkspaceOf(d, agent).string()}, {"title", p.value("title", "")}, {"body", p.value("body", "")}};
+             {"workspace", WorkspaceOf(d, agent).string()}, {"title", p.value("title", "")}, {"body", p.value("body", "")},
+             {"principal", t_principal}, {"fullWrite", t_full_write}};
     const auto& sel = p.contains("selection") ? p["selection"] : json(nullptr);
     if (sel.is_object() && sel.value("source", "") == "personal") {
         if (!NonEmpty(sel, "generation") || !sel.contains("account") || !sel["account"].is_object())
             return Fail("invalid params: personal selection requires generation and account");
+        {
+            auto pdb = PersonalRead(root);
+            if (!pdb["accounts"].contains(t_principal) || pdb["accounts"][t_principal]["generation"] != sel["generation"] ||
+                pdb["accounts"][t_principal]["account"] != sel["account"])
+                return Ok(Failed(rid, "identity_changed", "The selected GitHub account is not your current connection.", "Refresh My GitHub and request publication again."));
+        }
         rec["generation"] = sel["generation"]; rec["account"] = sel["account"];
         rec["result"] = {{"requestId", rid}, {"status", "needs_confirmation"},
                          {"message", "Confirm publishing as @" + sel["account"].value("login", "") + " with sessions.github.confirm."}};
@@ -756,7 +974,7 @@ ExtraResult GitHubPublish(ServerDeps& d, const fs::path& root, const std::string
     rec["result"] = {{"requestId", rid}, {"status", "publishing"}, {"message", "Publishing to GitHub."}};
     db["requests"][rid] = rec; db["keys"][scope] = rid; save();
     l.unlock();
-    auto out = Execute(d, rec);
+    auto out = Execute(d, root, rec);
     l.lock();
     db = ReadJsonFile(PubPath(root), db);
     rec["result"] = out;
@@ -803,8 +1021,46 @@ std::string GitHubApiBase(const json& raw) {
     return m[1].str() + "://" + hostport + m[3].str();
 }
 
+fs::path SubsystemDataRoot(ServerDeps& deps) {
+    if (deps.persist) return deps.persist->Root();
+    const char* e = std::getenv("OPENCLAW_DATA_DIR");
+    if (e && *e) return e;
+    return deps.sessions.Root();
+}
+
+void SetRpcRequester(const std::string& principal, bool full_write) { t_principal = principal.empty() ? "operator" : principal; t_full_write = full_write; }
+std::string CurrentRpcPrincipal() { return t_principal; }
+
+void RecordSessionParticipant(const fs::path& root, const std::string& agent, const std::string& key) {
+    if (key.empty()) return;
+    std::lock_guard<std::mutex> l(g_mu);
+    auto parts = ReadJsonFile(ParticipantsPath(root), json::object());
+    auto& rec = parts[ParticipantKey(agent, key)][t_principal];
+    if (!rec.is_object()) rec = {{"firstPromptedAt", NowMs()}, {"count", 0}};
+    rec["count"] = rec.value("count", 0) + 1;
+    WriteJsonFile(ParticipantsPath(root), parts);
+}
+
+namespace { ServerDeps* g_tool_deps = nullptr; fs::path g_tool_root; }
+void SetSubsystemContext(ServerDeps* deps, const fs::path& root) { g_tool_deps = deps; g_tool_root = root; }
+
+std::string AgentGitHubPublish(const json& args, const std::string& agent, const std::string& session_key) {
+    if (!g_tool_deps) return json{{"ok", false}, {"error", "gateway not running"}}.dump();
+    json p{{"sessionKey", session_key.empty() ? std::string("main") : session_key}, {"agentId", agent},
+           {"idempotencyKey", args.value("idempotencyKey", "tool-" + RandomHex(8))}};
+    if (args.contains("title")) p["title"] = args["title"];
+    if (args.contains("body")) p["body"] = args["body"];
+    // The agent is a restricted requester: no operator write authority for workflow definitions.
+    const auto prev_p = t_principal; const bool prev_w = t_full_write;
+    t_principal = "agent:" + agent; t_full_write = false;
+    auto r = GitHubPublish(*g_tool_deps, g_tool_root, "sessions.github.publish", p);
+    t_principal = prev_p; t_full_write = prev_w;
+    return r.ok ? r.payload.dump() : json{{"ok", false}, {"error", r.error}}.dump();
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
+        if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
         if (method == "sessions.companion.ask" || method == "sessions.companion.state" || method == "sessions.companion.reset")
             return Companion(deps, method, params);
         if (method == "sessions.dispatch" || method == "sessions.move" || method == "sessions.reclaim")

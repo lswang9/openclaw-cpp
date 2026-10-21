@@ -27,6 +27,7 @@
 #include "openclaw/cron/scheduler.hpp"
 #include "openclaw/gateway/methods.hpp"
 #include "openclaw/gateway/server.hpp"
+#include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/memory/store.hpp"
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/plugins/js_host.hpp"
@@ -104,7 +105,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.102.0-dev";
+constexpr const char* kVersion = "1.103.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3219,6 +3220,12 @@ int CmdGateway(int argc, char** argv, int argi) {
     agent::Pool agent_pool(&tools, &approvals);
     agent_pool.SetConfig(cfg.raw);
 
+    tools.Register({"github_publish", "Publish this session's workspace changes to GitHub: commits the workspace onto branch openclaw/<session>, pushes it and opens (or reuses) a pull request with the gateway's GitHub identity. Session participants with a linked GitHub account are credited as co-authors. Changes to .github/workflows need an operator to publish.",
+                    {{"type", "object"}, {"properties", {{"title", {{"type", "string"}}}, {"body", {{"type", "string"}}}, {"idempotencyKey", {{"type", "string"}}}}}},
+                    [](const nlohmann::json& a) {
+                        const auto& ctx = tools::exec::CurrentContext();
+                        return gateway::AgentGitHubPublish(a, ctx.agent_id, ctx.session_key);
+                    }});
     tools.Register({"acp_agent", "Delegate a task to an external ACP coding agent (acpx): agent = codex | claude | gemini | openclaw | an id from config acp.agents. The agent runs as a subprocess in cwd; its file reads are confined to cwd, writes only when fs_write=true, tool permissions follow `permission` (deny by default). Returns the agent's reply text, tool calls and stop reason.",
                     {{"type", "object"}, {"properties", {{"agent", {{"type", "string"}}}, {"prompt", {{"type", "string"}}}, {"audio_path", {{"type", "string"}}},
                                                          {"cwd", {{"type", "string"}}}, {"permission", {{"type", "string"}, {"enum", {"deny", "allow_once", "allow_always"}}}},

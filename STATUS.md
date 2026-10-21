@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.102.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.103.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.103.0-dev 新增
+
+个人 GitHub 登录（设备授权流程，users.github.*）、会话参与者 Co-authored-by 署名、工作流文件守卫（代理工具受限）、github_publish 工具
 
 ## 1.102.0-dev 新增
 
