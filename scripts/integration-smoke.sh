@@ -131,6 +131,15 @@ DS=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/discord/inbound" -H '
   -d '{"type":2,"id":"1","token":"t","channel_id":"C7","guild_id":"G","member":{"user":{"id":"U7"}},"data":{"name":"status"}}')
 echo "$DS" | grep -q 'Session agent:main:discord:channel:C7' || { echo "[smoke] discord /status failed: $DS" >&2; exit 1; }
 echo "[smoke] discord slash /status (no model turn) + command specs"
+echo "$DC" | grep -q '"name": *"Ask OpenClaw"' || { echo "[smoke] message context menu spec missing" >&2; exit 1; }
+AC=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/discord/inbound" -H 'Content-Type: application/json' \
+  -d '{"type":4,"id":"2","token":"t","channel_id":"C7","data":{"name":"help","options":[{"name":"args","type":3,"value":"sta","focused":true}]}}')
+echo "$AC" | python3 -c 'import json,sys; r=json.load(sys.stdin); r=r.get("result",r); assert r["type"]==8 and [c["value"] for c in r["data"]["choices"]]==["status"], r' \
+  || { echo "[smoke] discord autocomplete failed: $AC" >&2; exit 1; }
+CM=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/discord/inbound" -H 'Content-Type: application/json' \
+  -d '{"type":2,"id":"3","token":"t","channel_id":"C8","guild_id":"G","member":{"user":{"id":"U8"}},"data":{"name":"Ask OpenClaw","type":3,"target_id":"M9","resolved":{"messages":{"M9":{"content":"what is 2+2","author":{"username":"zoe"}}}}}}')
+echo "$CM" | grep -q 'Discord message from zoe' || { echo "[smoke] discord message context menu failed: $CM" >&2; exit 1; }
+echo "[smoke] discord autocomplete (type 4 → 8 choices) + message context menu"
 
 echo "{ channels: { slack: { signingSecret: 'smoke-secret' } } }" > "$OPENCLAW_CONFIG_PATH"; sleep 1
 rpc '{"jsonrpc":"2.0","id":16,"method":"config.reload","params":{}}' >/dev/null

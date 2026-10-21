@@ -50,7 +50,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.84.0-dev";
+constexpr const char* kVersion = "1.85.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -349,6 +349,17 @@ void Server::RefreshDiscordCommands() {
     std::vector<channels::discord_commands::CommandDef> defs;
     for (auto& c : CommandCatalog()) defs.push_back({c.value("name", ""), c.value("description", ""), c.value("args", true)});
     dc->SetCommandSpecs(channels::discord_commands::BuildSpecs(defs));
+    dc->SetAutocomplete([this, defs](const std::string& cmd, const std::string&, const std::string&) {
+        std::vector<std::string> out;
+        if (cmd == "model") {
+            if (deps_.router) for (auto& n : deps_.router->Names()) out.push_back(n);
+            if (auto m = config::GetPath(deps_.config.raw, "agents.defaults.models"); m && m->is_object())
+                for (auto& [k, v] : m->items()) out.push_back(k);
+        } else if (cmd == "help") {
+            for (auto& d : defs) out.push_back(channels::discord_commands::SanitizeName(d.name));
+        }
+        return out;
+    });
 }
 
 void Server::RefreshPluginExtensions() {

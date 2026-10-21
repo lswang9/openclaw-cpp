@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "openclaw/channels/discord_gateway.hpp"
 #include "openclaw/channels/outbound.hpp"
 
@@ -23,6 +24,9 @@ public:
     nlohmann::json SyncCommands();
     // APPLICATION_COMMAND / component interaction. via_gateway → deferred ack (type 5) + PATCH @original.
     nlohmann::json HandleInteraction(const nlohmann::json& in, const DeliverFn& deliver, bool via_gateway);
+    // Autocomplete candidates for (command, option, partial). Set by the gateway (models, skills, ...).
+    using CompleteFn = std::function<std::vector<std::string>(const std::string&, const std::string&, const std::string&)>;
+    void SetAutocomplete(CompleteFn fn) { complete_ = std::move(fn); }
     nlohmann::json Api(const std::string& method, const std::string& path, const nlohmann::json& body);
 
     // Voice ops: action join | leave | play | status. play: {guild_id, channel_id, audio_path | audio_b64 | text,
@@ -38,6 +42,7 @@ private:
     static std::string ExtractText(const nlohmann::json& body);
     DiscordGateway gateway_;
     nlohmann::json specs_ = nlohmann::json::array();
+    CompleteFn complete_;
 };
 
 }  // namespace openclaw::channels

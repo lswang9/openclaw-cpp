@@ -1,6 +1,7 @@
 #include "openclaw/channels/discord_commands.hpp"
 
 #include <cctype>
+#include <functional>
 #include <set>
 
 namespace openclaw::channels::discord_commands {
@@ -38,10 +39,12 @@ nlohmann::json BuildSpecs(const std::vector<CommandDef>& defs) {
         nlohmann::json c{{"name", name}, {"description", desc}, {"type", 1}};
         if (d.takes_args)
             c["options"] = nlohmann::json::array(
-                {{{"type", 3}, {"name", "args"}, {"description", "Arguments"}, {"required", false}}});
+                {{{"type", 3}, {"name", "args"}, {"description", "Arguments"}, {"required", false}, {"autocomplete", true}}});
         out.push_back(c);
         if (out.size() >= 100) break;
     }
+    // Message context menu (right-click → Apps → "Ask OpenClaw"): type 3, no description/options.
+    out.push_back({{"name", kAskMenu}, {"type", 3}});
     return out;
 }
 
@@ -64,10 +67,47 @@ void CollectOptions(const nlohmann::json& opts, std::string& out) {
 std::string InteractionText(const nlohmann::json& in) {
     if (in.value("type", 0) != 2 || !in.contains("data")) return "";
     const auto& d = in["data"];
+    if (d.value("type", 1) == 3) {  // MESSAGE context menu: the target message becomes the prompt
+        const auto tid = d.value("target_id", std::string());
+        const auto msgs = d.value("resolved", nlohmann::json::object()).value("messages", nlohmann::json::object());
+        if (!msgs.contains(tid)) return "";
+        const auto& m = msgs[tid];
+        const auto author = m.value("author", nlohmann::json::object()).value("username", std::string("someone"));
+        return "[Discord message from " + author + ", via \"" + d.value("name", std::string()) + "\"]\n" + m.value("content", std::string());
+    }
+    if (d.value("type", 1) != 1) return "";  // USER menus not handled
     std::string text = "/" + d.value("name", "");
     if (text == "/") return "";
     CollectOptions(d.value("options", nlohmann::json::array()), text);
     return text;
+}
+
+std::optional<Focused> FocusedOption(const nlohmann::json& in) {
+    if (in.value("type", 0) != 4 || !in.contains("data")) return std::nullopt;
+    std::function<std::optional<Focused>(const nlohmann::json&)> walk = [&](const nlohmann::json& opts) -> std::optional<Focused> {
+        if (!opts.is_array()) return std::nullopt;
+        for (auto& o : opts) {
+            if (o.value("focused", false)) {
+                const auto& v = o.contains("value") ? o["value"] : nlohmann::json("");
+                return Focused{in["data"].value("name", std::string()), o.value("name", std::string()), v.is_string() ? v.get<std::string>() : v.dump()};
+            }
+            if (o.contains("options")) if (auto f = walk(o["options"])) return f;
+        }
+        return std::nullopt;
+    };
+    return walk(in["data"].value("options", nlohmann::json::array()));
+}
+
+nlohmann::json Choices(const std::vector<std::string>& candidates, const std::string& prefix) {
+    auto low = [](std::string x) { for (auto& c : x) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return x; };
+    const auto p = low(prefix);
+    nlohmann::json out = nlohmann::json::array();
+    for (auto& c : candidates) {
+        if (!p.empty() && low(c).find(p) == std::string::npos) continue;
+        out.push_back({{"name", c.size() > 100 ? c.substr(0, 100) : c}, {"value", c.size() > 100 ? c.substr(0, 100) : c}});
+        if (out.size() >= 25) break;  // Discord limit
+    }
+    return out;
 }
 
 }  // namespace openclaw::channels::discord_commands

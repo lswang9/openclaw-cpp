@@ -85,7 +85,7 @@ nlohmann::json DiscordAdapter::HandleHttpInbound(const nlohmann::json& body, con
         return {{"ok", true}, {"type", 1}, {"impl", "real"}, {"mode", "discord_ping"}};
     }
 
-    if (body.value("type", 0) == 2 || body.value("type", 0) == 3) return HandleInteraction(body, deliver, false);
+    if (body.value("type", 0) == 2 || body.value("type", 0) == 3 || body.value("type", 0) == 4) return HandleInteraction(body, deliver, false);
 
     std::string text = ExtractText(body);
     auto audio = voice::ExtractAudioRefs(body);
@@ -150,6 +150,15 @@ nlohmann::json DiscordAdapter::SyncCommands() {
 }
 
 nlohmann::json DiscordAdapter::HandleInteraction(const nlohmann::json& in, const DeliverFn& deliver, bool via_gateway) {
+    if (in.value("type", 0) == 4) {  // autocomplete: answer with choices, no agent turn
+        auto f = discord_commands::FocusedOption(in);
+        std::vector<std::string> cand;
+        if (f && complete_) cand = complete_(f->command, f->option, f->value);
+        nlohmann::json data{{"choices", discord_commands::Choices(cand, f ? f->value : std::string())}};
+        nlohmann::json out{{"ok", true}, {"type", 8}, {"data", data}, {"autocomplete", true}};
+        if (via_gateway) out["callback"] = Api("POST", "/interactions/" + in.value("id", std::string()) + "/" + in.value("token", std::string()) + "/callback", {{"type", 8}, {"data", data}});
+        return out;
+    }
     std::string text = discord_commands::InteractionText(in);
     if (text.empty() && in.value("type", 0) == 3 && in.contains("data"))  // message component
         text = "[Discord interaction] clicked " + in["data"].value("custom_id", "");
