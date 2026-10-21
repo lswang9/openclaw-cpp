@@ -2,6 +2,9 @@
 
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <optional>
+#include <openssl/bn.h>
+#include <openssl/ecdsa.h>
 #include <openssl/param_build.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -185,6 +188,72 @@ std::string ChainToAnchors(const std::vector<X509Ptr>& chain) {
     X509_STORE_CTX_free(ctx); sk_X509_free(inter); X509_STORE_free(st);
     return why;
 }
+// ---- DER (minimal TLV reader for attestation extensions) ----
+struct Tlv { int cls = 0; bool cons = false; unsigned tag = 0; std::string val; };
+bool ReadTlv(const std::string& s, std::size_t& i, Tlv& o) {
+    if (i >= s.size()) return false;
+    unsigned char b = static_cast<unsigned char>(s[i++]);
+    o.cls = b >> 6; o.cons = (b & 0x20) != 0; o.tag = b & 0x1f;
+    if (o.tag == 0x1f) { o.tag = 0; for (int n = 0; n < 4; ++n) { if (i >= s.size()) return false; unsigned char c = static_cast<unsigned char>(s[i++]); o.tag = (o.tag << 7) | (c & 0x7f); if (!(c & 0x80)) break; } }
+    if (i >= s.size()) return false;
+    std::size_t len = static_cast<unsigned char>(s[i++]);
+    if (len & 0x80) { int n = len & 0x7f; if (n == 0 || n > 4) return false; len = 0; for (int k = 0; k < n; ++k) { if (i >= s.size()) return false; len = (len << 8) | static_cast<unsigned char>(s[i++]); } }
+    if (i + len > s.size()) return false;
+    o.val = s.substr(i, len); i += len;
+    return true;
+}
+std::vector<Tlv> Children(const std::string& s) { std::vector<Tlv> v; std::size_t i = 0; Tlv t; while (ReadTlv(s, i, t)) v.push_back(t); return v; }
+long long DerInt(const std::string& v) { long long x = 0; for (unsigned char c : v) x = (x << 8) | c; return x; }
+std::optional<std::string> ExtData(X509* x, const char* oid_txt, bool* critical = nullptr) {
+    ASN1_OBJECT* oid = OBJ_txt2obj(oid_txt, 1);
+    const int idx = X509_get_ext_by_OBJ(x, oid, -1);
+    ASN1_OBJECT_free(oid);
+    if (idx < 0) return std::nullopt;
+    X509_EXTENSION* e = X509_get_ext(x, idx);
+    if (critical) *critical = X509_EXTENSION_get_critical(e) != 0;
+    ASN1_OCTET_STRING* v = X509_EXTENSION_get_data(e);
+    return std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(v)), ASN1_STRING_length(v));
+}
+// Does the certificate's public key equal the credential public key (stored JSON form)?
+bool SameKey(EVP_PKEY* pk, const nlohmann::json& key) {
+    if (!pk) return false;
+    const int alg = key.value("alg", 0);
+    if (alg == -7) {
+        unsigned char buf[133]; size_t n = 0;
+        if (EVP_PKEY_get_base_id(pk) != EVP_PKEY_EC || EVP_PKEY_get_octet_string_param(pk, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY, buf, sizeof buf, &n) != 1) return false;
+        return std::string(reinterpret_cast<char*>(buf), n) == "\x04" + B64UrlDecode(key.value("x", "")) + B64UrlDecode(key.value("y", ""));
+    }
+    if (alg == -8) {
+        unsigned char buf[64]; size_t n = sizeof buf;
+        return EVP_PKEY_get_base_id(pk) == EVP_PKEY_ED25519 && EVP_PKEY_get_raw_public_key(pk, buf, &n) == 1 && std::string(reinterpret_cast<char*>(buf), n) == B64UrlDecode(key.value("x", ""));
+    }
+    if (alg == -257) {
+        BIGNUM *n = nullptr, *e = nullptr;
+        if (EVP_PKEY_get_base_id(pk) != EVP_PKEY_RSA || !EVP_PKEY_get_bn_param(pk, OSSL_PKEY_PARAM_RSA_N, &n) || !EVP_PKEY_get_bn_param(pk, OSSL_PKEY_PARAM_RSA_E, &e)) { BN_free(n); BN_free(e); return false; }
+        auto bin = [](BIGNUM* b) { std::string s(BN_num_bytes(b), '\0'); BN_bn2bin(b, reinterpret_cast<unsigned char*>(s.data())); return s; };
+        auto strip = [](std::string s) { while (s.size() > 1 && s[0] == '\0') s.erase(0, 1); return s; };
+        const bool ok = bin(n) == strip(B64UrlDecode(key.value("n", ""))) && bin(e) == strip(B64UrlDecode(key.value("e", "")));
+        BN_free(n); BN_free(e);
+        return ok;
+    }
+    return false;
+}
+std::string Sha256Raw(const std::string& s) { unsigned char h[32]; SHA256(reinterpret_cast<const unsigned char*>(s.data()), s.size(), h); return std::string(reinterpret_cast<char*>(h), 32); }
+std::string ShaByAlg(int tpm_alg, const std::string& s) {
+    unsigned char h[64]; unsigned int n = 0;
+    const EVP_MD* md = tpm_alg == 0x0004 ? EVP_sha1() : tpm_alg == 0x000b ? EVP_sha256() : tpm_alg == 0x000c ? EVP_sha384() : tpm_alg == 0x000d ? EVP_sha512() : nullptr;
+    if (!md) return {};
+    EVP_Digest(s.data(), s.size(), h, &n, md, nullptr);
+    return std::string(reinterpret_cast<char*>(h), n);
+}
+std::string AaguidCheck(X509* leaf, const std::string& aaguid) {
+    bool crit = false;
+    auto ext = ExtData(leaf, "1.3.6.1.4.1.45724.1.1.4", &crit);
+    if (!ext) return {};
+    if (ext->size() != 18 || (*ext)[0] != 0x04 || (*ext)[1] != 16 || ext->substr(2) != aaguid) return "aaguid extension does not match authData";
+    if (crit) return "aaguid extension must not be critical";
+    return {};
+}
 // WebAuthn §8: verify attStmt. Returns {ok, type: none|self|basic, trusted?, error?}.
 nlohmann::json VerifyAttestation(const nlohmann::json& att, const std::string& auth_data, const AuthData& ad,
                                  const nlohmann::json& key, const std::string& client_hash) {
@@ -218,15 +287,7 @@ nlohmann::json VerifyAttestation(const nlohmann::json& att, const std::string& a
         if (SubjectField(leaf, NID_countryName).empty() || SubjectField(leaf, NID_organizationName).empty() || SubjectField(leaf, NID_commonName).empty())
             return bad("subject C/O/CN required");
         if (X509_get_extension_flags(leaf) & EXFLAG_CA) return bad("attestation certificate must not be a CA");
-        ASN1_OBJECT* oid = OBJ_txt2obj("1.3.6.1.4.1.45724.1.1.4", 1);
-        const int idx = X509_get_ext_by_OBJ(leaf, oid, -1);
-        ASN1_OBJECT_free(oid);
-        if (idx >= 0) {  // id-fido-gen-ce-aaguid: OCTET STRING { OCTET STRING aaguid }
-            ASN1_OCTET_STRING* v = X509_EXTENSION_get_data(X509_get_ext(leaf, idx));
-            const std::string raw(reinterpret_cast<const char*>(ASN1_STRING_get0_data(v)), ASN1_STRING_length(v));
-            if (raw.size() != 18 || raw[0] != 0x04 || raw[1] != 16 || raw.substr(2) != ad.aaguid) return bad("aaguid extension does not match authData");
-            if (X509_EXTENSION_get_critical(X509_get_ext(leaf, idx))) return bad("aaguid extension must not be critical");
-        }
+        if (auto e = AaguidCheck(leaf, ad.aaguid); !e.empty()) return bad(e);
         auto why = ChainToAnchors(chain);
         return {{"ok", true}, {"fmt", fmt}, {"type", "basic"}, {"trusted", why.empty()}, {"trust_note", why}};
     }
@@ -241,7 +302,147 @@ nlohmann::json VerifyAttestation(const nlohmann::json& att, const std::string& a
         auto why = ChainToAnchors(chain);
         return {{"ok", true}, {"fmt", fmt}, {"type", "basic"}, {"trusted", why.empty()}, {"trust_note", why}};
     }
-    return {{"ok", false}, {"fmt", fmt}, {"unsupported", true}, {"error", "attestation format '" + fmt + "' not supported (none|packed|fido-u2f)"}};
+    if (fmt == "android-key") {  // §8.4
+        if (chain.empty()) return bad("x5c required");
+        const int alg = stmt.value("alg", 0);
+        const auto sig = Bin(stmt.value("sig", nlohmann::json()));
+        X509* leaf = chain[0].get();
+        if (alg != -7 && alg != -257 && alg != -8) return bad("unsupported alg " + std::to_string(alg));
+        if (!VerifyWithPkey(X509_get0_pubkey(leaf), alg != -8, signed_data, sig)) return bad("signature does not verify with x5c[0]");
+        if (!SameKey(X509_get0_pubkey(leaf), key)) return bad("credential public key differs from x5c[0] public key");
+        auto kd = ExtData(leaf, "1.3.6.1.4.1.11129.2.1.17");
+        if (!kd) return bad("KeyDescription extension missing");
+        auto top = Children(*kd);
+        if (top.size() != 1 || top[0].tag != 16) return bad("KeyDescription malformed");
+        auto f = Children(top[0].val);
+        if (f.size() < 8) return bad("KeyDescription malformed");
+        if (f[4].tag != 4 || f[4].val != client_hash) return bad("attestationChallenge does not match clientDataHash");
+        auto authz = [&](const Tlv& list, unsigned tag) -> std::optional<std::string> {
+            for (auto& e : Children(list.val)) if (e.cls == 2 && e.tag == tag) { auto in = Children(e.val); return in.empty() ? std::string() : in[0].val; }
+            return std::nullopt;
+        };
+        const Tlv &sw = f[6], &tee = f[7];
+        if (authz(sw, 600) || authz(tee, 600)) return bad("allApplications must not be present");
+        const bool strict = std::getenv("OPENCLAW_WEBAUTHN_ANDROID_TEE_ONLY") != nullptr;
+        auto pick = [&](unsigned tag) { auto v = authz(tee, tag); if (!v && !strict) v = authz(sw, tag); return v; };
+        auto origin = pick(702);
+        if (!origin || DerInt(*origin) != 0) return bad("key origin must be KM_ORIGIN_GENERATED");
+        bool sign = false;
+        for (auto& e : Children(tee.val)) if (e.cls == 2 && e.tag == 1) for (auto& set : Children(e.val)) for (auto& v : Children(set.val)) sign |= DerInt(v.val) == 2;
+        if (!strict && !sign) for (auto& e : Children(sw.val)) if (e.cls == 2 && e.tag == 1) for (auto& set : Children(e.val)) for (auto& v : Children(set.val)) sign |= DerInt(v.val) == 2;
+        if (!sign) return bad("key purpose must include KM_PURPOSE_SIGN");
+        auto why = ChainToAnchors(chain);
+        return {{"ok", true}, {"fmt", fmt}, {"type", "basic"}, {"trusted", why.empty()}, {"trust_note", why}};
+    }
+    if (fmt == "apple") {  // §8.8 Apple Anonymous
+        if (chain.empty()) return bad("x5c required");
+        X509* leaf = chain[0].get();
+        auto ext = ExtData(leaf, "1.2.840.113635.100.8.2");
+        if (!ext) return bad("nonce extension 1.2.840.113635.100.8.2 missing");
+        auto seq = Children(*ext);
+        std::string nonce;
+        if (seq.size() == 1 && seq[0].tag == 16) for (auto& e : Children(seq[0].val)) if (e.cls == 2 && e.tag == 1) { auto in = Children(e.val); if (!in.empty() && in[0].tag == 4) nonce = in[0].val; }
+        if (nonce != Sha256Raw(signed_data)) return bad("nonce does not match SHA-256(authData || clientDataHash)");
+        if (!SameKey(X509_get0_pubkey(leaf), key)) return bad("credential public key differs from certificate public key");
+        auto why = ChainToAnchors(chain);
+        return {{"ok", true}, {"fmt", fmt}, {"type", "anonca"}, {"trusted", why.empty()}, {"trust_note", why}};
+    }
+    if (fmt == "tpm") {  // §8.3 (TPM 2.0)
+        if (stmt.value("ver", std::string()) != "2.0") return bad("ver must be 2.0");
+        if (chain.empty()) return bad("x5c (AIK certificate) required; ECDAA not supported");
+        const int alg = stmt.value("alg", 0);
+        const auto sig = Bin(stmt.value("sig", nlohmann::json())), ci = Bin(stmt.value("certInfo", nlohmann::json())), pa = Bin(stmt.value("pubArea", nlohmann::json()));
+        auto u16 = [](const std::string& s, std::size_t o) { return (static_cast<unsigned>(static_cast<unsigned char>(s[o])) << 8) | static_cast<unsigned char>(s[o + 1]); };
+        // pubArea (TPMT_PUBLIC)
+        if (pa.size() < 10) return bad("pubArea malformed");
+        const unsigned type = u16(pa, 0), name_alg = u16(pa, 2);
+        const unsigned pol = u16(pa, 8);
+        std::size_t o = 10 + pol;  // type, nameAlg, objectAttributes(4), authPolicy (TPM2B)
+        if (type == 0x0023) {  // ECC
+            if (pa.size() < o + 8) return bad("pubArea malformed");
+            const unsigned curve = u16(pa, o + 4); o += 8;
+            if (pa.size() < o + 2) return bad("pubArea malformed");
+            const unsigned xl = u16(pa, o); if (pa.size() < o + 2 + xl + 2) return bad("pubArea malformed");
+            std::string x = pa.substr(o + 2, xl); o += 2 + xl;
+            const unsigned yl = u16(pa, o); if (pa.size() < o + 2 + yl) return bad("pubArea malformed");
+            std::string y = pa.substr(o + 2, yl);
+            if (curve != 0x0003 || key.value("alg", 0) != -7 || x != B64UrlDecode(key.value("x", "")) || y != B64UrlDecode(key.value("y", ""))) return bad("pubArea key does not match credential public key");
+        } else if (type == 0x0001) {  // RSA
+            if (pa.size() < o + 10) return bad("pubArea malformed");
+            std::string exp = pa.substr(o + 6, 4); o += 10;
+            const unsigned nl = u16(pa, o); if (pa.size() < o + 2 + nl) return bad("pubArea malformed");
+            std::string n = pa.substr(o + 2, nl);
+            unsigned long e = 0; for (unsigned char c : exp) e = (e << 8) | c; if (e == 0) e = 65537;
+            std::string eb; for (unsigned long v = e; v; v >>= 8) eb.insert(eb.begin(), static_cast<char>(v & 0xff));
+            auto strip = [](std::string s) { while (s.size() > 1 && s[0] == '\0') s.erase(0, 1); return s; };
+            if (key.value("alg", 0) != -257 || strip(n) != strip(B64UrlDecode(key.value("n", ""))) || eb != strip(B64UrlDecode(key.value("e", "")))) return bad("pubArea key does not match credential public key");
+        } else return bad("unsupported pubArea type");
+        // certInfo (TPMS_ATTEST)
+        if (ci.size() < 10 || ci.substr(0, 4) != std::string("\xff\x54\x43\x47", 4)) return bad("certInfo magic invalid");
+        if (u16(ci, 4) != 0x8017) return bad("certInfo type must be TPM_ST_ATTEST_CERTIFY");
+        std::size_t c = 6;
+        auto tpm2b = [&](std::string* out) { if (ci.size() < c + 2) return false; const unsigned l = u16(ci, c); if (ci.size() < c + 2 + l) return false; *out = ci.substr(c + 2, l); c += 2 + l; return true; };
+        std::string signer, extra, name, qname;
+        if (!tpm2b(&signer) || !tpm2b(&extra)) return bad("certInfo malformed");
+        const int hash_alg = alg == -7 || alg == -257 || alg == -37 ? 0x000b : alg == -35 || alg == -258 ? 0x000c : alg == -36 || alg == -259 ? 0x000d : alg == -65535 ? 0x0004 : 0;
+        if (!hash_alg || extra != ShaByAlg(hash_alg, signed_data)) return bad("extraData does not match hash(authData || clientDataHash)");
+        c += 17 + 8;  // clockInfo + firmwareVersion
+        if (!tpm2b(&name) || !tpm2b(&qname)) return bad("certInfo malformed");
+        if (name.size() < 2 || u16(name, 0) != name_alg || name.substr(2) != ShaByAlg(static_cast<int>(name_alg), pa)) return bad("attested name does not match pubArea");
+        X509* aik = chain[0].get();
+        if (alg != -7 && alg != -257) return bad("unsupported alg " + std::to_string(alg));
+        if (!VerifyWithPkey(X509_get0_pubkey(aik), true, ci, sig)) return bad("sig does not verify over certInfo with AIK certificate");
+        if (X509_get_version(aik) != 2) return bad("AIK certificate must be X.509 v3");
+        if (X509_NAME_entry_count(X509_get_subject_name(aik)) != 0) return bad("AIK certificate subject must be empty");
+        if (!ExtData(aik, "2.5.29.17")) return bad("AIK certificate SubjectAlternativeName (TPM manufacturer) missing");
+        bool eku = false;
+        if (auto* ek = static_cast<EXTENDED_KEY_USAGE*>(X509_get_ext_d2i(aik, NID_ext_key_usage, nullptr, nullptr))) {
+            ASN1_OBJECT* want = OBJ_txt2obj("2.23.133.8.3", 1);
+            for (int i = 0; i < sk_ASN1_OBJECT_num(ek); ++i) eku |= OBJ_cmp(sk_ASN1_OBJECT_value(ek, i), want) == 0;
+            ASN1_OBJECT_free(want); EXTENDED_KEY_USAGE_free(ek);
+        }
+        if (!eku) return bad("AIK certificate EKU must contain tcg-kp-AIKCertificate (2.23.133.8.3)");
+        if (X509_get_extension_flags(aik) & EXFLAG_CA) return bad("AIK certificate must not be a CA");
+        if (auto e = AaguidCheck(aik, ad.aaguid); !e.empty()) return bad(e);
+        auto why = ChainToAnchors(chain);
+        return {{"ok", true}, {"fmt", fmt}, {"type", "attca"}, {"trusted", why.empty()}, {"trust_note", why}};
+    }
+    if (fmt == "android-safetynet") {  // §8.5 (deprecated by Google, still accepted)
+        const auto jws = Bin(stmt.value("response", nlohmann::json()));
+        auto d1 = jws.find('.'), d2 = jws.rfind('.');
+        if (stmt.value("ver", std::string()).empty() || d1 == std::string::npos || d2 == d1) return bad("response must be a JWS");
+        nlohmann::json hdr, pl;
+        try { hdr = nlohmann::json::parse(B64UrlDecode(jws.substr(0, d1))); pl = nlohmann::json::parse(B64UrlDecode(jws.substr(d1 + 1, d2 - d1 - 1))); } catch (...) { return bad("JWS unparsable"); }
+        if (!hdr.contains("x5c") || !hdr["x5c"].is_array() || hdr["x5c"].empty()) return bad("JWS x5c missing");
+        std::vector<X509Ptr> jc;
+        for (auto& c : hdr["x5c"]) {
+            std::string s = c.get<std::string>(), der;
+            for (auto& ch : s) { if (ch == '+') ch = '-'; else if (ch == '/') ch = '_'; }
+            while (!s.empty() && s.back() == '=') s.pop_back();
+            auto x = ParseDer(B64UrlDecode(s)); if (!x) return bad("JWS x5c unparsable"); jc.push_back(std::move(x));
+        }
+        const auto jalg = hdr.value("alg", std::string());
+        if (jalg != "RS256" && jalg != "ES256") return bad("JWS alg must be RS256/ES256");
+        std::string jsig = B64UrlDecode(jws.substr(d2 + 1));
+        if (jalg == "ES256") {  // JOSE raw r||s → DER
+            if (jsig.size() != 64) return bad("JWS signature length");
+            ECDSA_SIG* es = ECDSA_SIG_new();
+            ECDSA_SIG_set0(es, BN_bin2bn(reinterpret_cast<const unsigned char*>(jsig.data()), 32, nullptr), BN_bin2bn(reinterpret_cast<const unsigned char*>(jsig.data()) + 32, 32, nullptr));
+            unsigned char* der = nullptr; int dl = i2d_ECDSA_SIG(es, &der); jsig.assign(reinterpret_cast<char*>(der), dl); OPENSSL_free(der); ECDSA_SIG_free(es);
+        }
+        if (!VerifyWithPkey(X509_get0_pubkey(jc[0].get()), true, jws.substr(0, d2), jsig)) return bad("JWS signature invalid");
+        char host[256] = {0};
+        X509_NAME_get_text_by_NID(X509_get_subject_name(jc[0].get()), NID_commonName, host, sizeof host);
+        if (std::string(host) != "attest.android.com") return bad("leaf certificate must be issued to attest.android.com");
+        std::string want_nonce; { auto h = Sha256Raw(signed_data); static const char* tb = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; int val = 0, bits = -6; for (unsigned char ch : h) { val = (val << 8) + ch; bits += 8; while (bits >= 0) { want_nonce.push_back(tb[(val >> bits) & 0x3f]); bits -= 6; } } if (bits > -6) want_nonce.push_back(tb[((val << 8) >> (bits + 8)) & 0x3f]); while (want_nonce.size() % 4) want_nonce.push_back('='); }
+        if (pl.value("nonce", std::string()) != want_nonce) return bad("nonce does not match");
+        if (pl.value("ctsProfileMatch", false) != true) return bad("ctsProfileMatch is false");
+        const long long ts = pl.value("timestampMs", 0LL), now = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        if (ts <= 0 || ts > now + 60000 || now - ts > 600000) return bad("timestampMs out of range");
+        auto why = ChainToAnchors(jc);
+        return {{"ok", true}, {"fmt", fmt}, {"type", "basic"}, {"trusted", why.empty()}, {"trust_note", why}};
+    }
+    return {{"ok", false}, {"fmt", fmt}, {"unsupported", true}, {"error", "attestation format '" + fmt + "' not supported (none|packed|fido-u2f|android-key|android-safetynet|apple|tpm)"}};
 }
 }  // namespace
 
@@ -375,7 +576,7 @@ nlohmann::json Store::FinishRegistration(const Rp& rp, const nlohmann::json& cre
     auto av = VerifyAttestation(*att, Bin((*att)["authData"]), *ad, *key, Sha256(cdj));
     const auto policy = Policy();
     if (!av.value("ok", false) && !(av.value("unsupported", false) && policy == "none")) return fail(av.value("error", std::string("attestation invalid")));
-    if (policy == "required" && !(av.value("ok", false) && (av["type"] == "self" || av["type"] == "basic"))) return fail("attestation required (policy=required), got " + av.value("type", std::string("none")));
+    if (policy == "required" && !(av.value("ok", false) && (av["type"] == "self" || av["type"] == "basic" || av["type"] == "attca" || av["type"] == "anonca"))) return fail("attestation required (policy=required), got " + av.value("type", std::string("none")));
     if (policy == "trusted" && !av.value("trusted", false)) return fail("trusted attestation required: " + av.value("trust_note", av.value("error", std::string("type ") + av.value("type", std::string("none")))));
     nlohmann::json attestation{{"fmt", av.value("fmt", std::string())}, {"type", av.value("ok", false) ? av.value("type", std::string()) : std::string("unverified")}, {"trusted", av.value("trusted", false)}};
     data_["credentials"].push_back({{"id", id}, {"user", (*chal)["user"]}, {"role", (*chal)["role"]}, {"key", *key}, {"sign_count", ad->count},

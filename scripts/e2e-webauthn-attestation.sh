@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WebAuthn attestation verification (1.92): packed self / packed x5c (cert requirements, aaguid ext, chain to trust
+# WebAuthn attestation verification (1.92, 1.99): none, packed self/x5c, fido-u2f, android-key, apple, tpm, android-safetynet;
 # anchors) / fido-u2f / none, under OPENCLAW_WEBAUTHN_ATTESTATION=none (default) and =trusted. Software authenticator.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,7 +37,15 @@ reg es256 packed-self | grep -q '"type":"self"' || fail "packed self (es256)"
 reg ed25519 packed-self | grep -q '"type":"self"' || fail "packed self (ed25519)"
 R=$(reg es256 packed-x5c); grep -q '"type":"basic"' <<<"$R" && grep -q '"trusted":true' <<<"$R" || fail "packed x5c trusted: $R"
 R=$(reg es256 packed-x5c-rogue); grep -q '"type":"basic"' <<<"$R" && grep -q '"trusted":false' <<<"$R" || fail "rogue x5c accepted untrusted under none: $R"
-reg es256 tpm | grep -q '"type":"unverified"' || fail "unsupported fmt recorded as unverified"
+reg es256 unknown | grep -q '"type":"unverified"' || fail "unsupported fmt recorded as unverified"
+R=$(reg es256 android-key); grep -q '"fmt":"android-key"' <<<"$R" && grep -q '"trusted":true' <<<"$R" || fail "android-key: $R"
+reg es256 android-key-badchal | grep -q 'attestationChallenge' || fail "android-key challenge mismatch must be rejected"
+R=$(reg es256 apple); grep -q '"type":"anonca"' <<<"$R" && grep -q '"trusted":true' <<<"$R" || fail "apple: $R"
+reg es256 apple-badnonce | grep -q 'nonce does not match' || fail "apple nonce mismatch must be rejected"
+R=$(reg es256 tpm); grep -q '"type":"attca"' <<<"$R" && grep -q '"trusted":true' <<<"$R" || fail "tpm: $R"
+reg es256 tpm-badextra | grep -q 'extraData' || fail "tpm extraData mismatch must be rejected"
+R=$(reg es256 safetynet); grep -q '"fmt":"android-safetynet"' <<<"$R" && grep -q '"trusted":true' <<<"$R" || fail "safetynet: $R"
+reg es256 safetynet-wronghost | grep -q 'attest.android.com' || fail "safetynet wrong host must be rejected"
 reg es256 packed-x5c-badsig | grep -q 'does not verify' || fail "bad x5c signature must be rejected"
 reg es256 packed-x5c-wrongou | grep -q "OU must be" || fail "wrong OU must be rejected"
 reg es256 packed-x5c-aaguid | grep -q "aaguid" || fail "aaguid mismatch must be rejected"
@@ -47,7 +55,8 @@ start trusted
 reg es256 none | grep -q 'trusted attestation required' || fail "trusted policy must reject none"
 reg es256 packed-self | grep -q 'trusted attestation required' || fail "trusted policy must reject self"
 reg es256 packed-x5c-rogue | grep -q 'trusted attestation required' || fail "trusted policy must reject rogue CA"
-reg es256 tpm | grep -q 'not supported' || fail "trusted policy must reject unsupported fmt"
+reg es256 unknown | grep -q 'not supported' || fail "trusted policy must reject unsupported fmt"
+reg es256 tpm | grep -q '"ok":true' || fail "trusted policy accepts anchored tpm"
 reg es256 packed-x5c | grep -q '"ok":true' || fail "trusted policy accepts anchored x5c"
 grep -q '"attestation":"direct"' "$T/opts.json" || fail "policy trusted requests direct attestation"
 start required

@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.98.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.99.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.99.0-dev 新增
+
+- WebAuthn 注册 attestation 新增 4 种格式校验：`android-key`（KeyDescription 扩展：challenge、allApplications、KM_ORIGIN_GENERATED、SIGN 用途；`OPENCLAW_WEBAUTHN_ANDROID_TEE_ONLY` 只认 TEE）、`apple`（nonce 扩展 + 公钥一致）、`tpm`（TPM 2.0 pubArea/certInfo 解析、extraData、name 摘要、AIK 证书 v3/空 subject/SAN/EKU/非 CA/aaguid）、`android-safetynet`（JWS 签名、attest.android.com、nonce、ctsProfileMatch、时间戳）。都可链到 `OPENCLAW_WEBAUTHN_TRUST_ANCHORS`。仍无 FIDO MDS、无 ECDAA，未在真实设备上测试。
 
 ## 1.98.0-dev 新增
 
