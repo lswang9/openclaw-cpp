@@ -1,6 +1,7 @@
 // Upstream v2026.10.5 local commands (see include/openclaw/cli/local_commands.hpp).
 #include "openclaw/cli/local_commands.hpp"
 #include "openclaw/gateway/subsystems.hpp"
+#include "openclaw/cli/tui_screen.hpp"
 
 #include "openclaw/config/config.hpp"
 
@@ -752,7 +753,7 @@ int CmdMigrate(int argc, char** argv) {
 // ---------- tui (line mode over the gateway RPC) ----------
 int CmdTui(int argc, char** argv) {
     static const std::vector<std::string> kFlags = {"--url=", "--token=", "--password=", "--tls-fingerprint=", "--local", "--session=", "--deliver",
-                                                    "--thinking=", "--message=", "--timeout-ms=", "--history-limit="};
+                                                    "--thinking=", "--message=", "--timeout-ms=", "--history-limit=", "--plain", "--fullscreen"};
     auto a = Parse(argc, argv, 2, kFlags, "tui");
     if (!a) return 1;
     if (a->has("--local")) return kDelegateChat;
@@ -795,6 +796,18 @@ int CmdTui(int argc, char** argv) {
         std::cout << "agent: " << r.value("text", r.dump()) << '\n' << std::flush;
         return true;
     };
+    const bool full = a->has("--fullscreen") || (!a->has("--plain") && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO) &&
+                                                  std::getenv("TERM") && std::string(std::getenv("TERM")) != "dumb");
+    if (full) {
+        TuiBackend tb;
+        tb.rpc = [&](const std::string& m, const json& p, long t, std::string* e) { return Rpc(base, token, m, p, t, e); };
+        tb.base = base; tb.session = session; tb.timeout_s = timeout; tb.history_limit = hist;
+        if (a->has("--thinking")) tb.send_extra["thinking"] = a->get("--thinking");
+        if (a->has("--deliver")) tb.send_extra["deliver"] = true;
+        tb.initial_message = a->get("--message");
+        const int rc = RunFullscreenTui(tb);
+        if (rc >= 0) return rc;  // -1: not a terminal after all → line mode
+    }
     show_history();
     if (a->has("--message") && !send(a->get("--message"))) return 1;
     std::string line;

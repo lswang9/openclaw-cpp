@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.100.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.101.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -49,6 +49,10 @@
 
 - Scopes: upstream "dynamic" methods now derive required scopes from params like upstream `resolveDynamicLeastPrivilegeOperatorScopesForMethod`: `agent` with /new|/reset → admin (else write), `talk.config` includeSecrets → read+operator.talk.secrets, `environments.list` runtimeId → write, `channels.pairing.approve` bootstrapCommandOwner → pairing+admin, `fs.listDir` nodeId → admin, `sessions.delete` → admin. 403 carries `required_scopes`. 1.98: node.invoke admin commands, plugins.sessionAction, session-mutation narrowing (patch/patchMany/create/delete/dispatch/move, incognito) and operator.sessions.read/write grants also mirrored.
 
+## 1.101 Full-screen tui
+- real: `openclaw-cpp tui` on a terminal opens a full-screen UI (src/cli/tui_screen.cpp; ANSI alternate screen + raw termios, no curses): header (session, thinking spinner, gateway), word-wrapped transcript with CJK/emoji width, PgUp/PgDn scrolling, input line editing (←/→, Home/End, Ctrl+A/E/U, Backspace/Delete, UTF-8 aware), ↑/↓ history, background chat.send, Ctrl+C aborts a running turn (else quits), Ctrl+L redraw, SIGWINCH resize, `/session /sessions /history /new /abort /status /clear /exit`; restores the terminal on exit. Pipes and `--plain` keep line mode; `--fullscreen` forces it. Test: scripts/e2e-tui-fullscreen.sh drives it through a pty.
+- gaps vs upstream TUI (pi-tui): no token streaming into the pane (reply shown when chat.send returns), no tool-call/thinking blocks, no model/agent pickers or overlays, one message in flight at a time (extra input is refused, not queued), no mouse.
+
 ## 1.100 Six former RPC stubs are real (src/gateway/subsystems.cpp)
 - real: `sessions.companion.ask|state|reset` — read-only side chat per (agent, session): recent transcript + workspace path as context, prior exchanges replayed, question ≤400 / answer ≤1200 chars, ≤24 exchanges kept in memory (as upstream), never writes the session transcript; closed-object param validation.
 - real (ledger): `sessions.dispatch|move|reclaim` — persistent worker-placement records (`worker-placements.json`) with upstream's state vocabulary, generations, owner epochs, workerBundleHash, workspace manifest ref, runner. Device workers come from the node registry (online, non-stub); `autoDevice` picks one; cloud `profileId` requires `gateway.workers.profiles` and then reports the provider unavailable. move checks `expectedSource`; reclaim → `reclaimed`; an active placement whose device went offline becomes `failed` and needs `recoverToGateway.expectedGeneration` → `local`. **Gap:** no remote worker runtime — the session is not actually executed or synced on the device; this is the placement/ownership ledger only.
@@ -67,7 +71,7 @@
 - real: (cmd, sub) → method + positional names; flags validated against the extracted upstream commander tree and mapped to camelCase params; human table/key-value output, `--json` raw payload; upstream local-only subcommands exit 2 with an honest message; `logs --follow` polling. Gap: output formatting is generic, not byte-identical to upstream's per-command renderers.
 
 ## 1.96 Local commands
-- real: completion (from upstream tree), setup --baseline, onboard (interactive + --non-interactive --accept-risk), configure --section, migrate claude (list/plan/apply; MCP env omitted unless --include-secrets), tui (line mode over /v1/rpc), crestodian (deprecated alias). Gap: tui is line mode, not upstream's full-screen TUI.
+- real: completion (from upstream tree), setup --baseline, onboard (interactive + --non-interactive --accept-risk), configure --section, migrate claude (list/plan/apply; MCP env omitted unless --include-secrets), tui (line mode over /v1/rpc), crestodian (deprecated alias). (1.101: full-screen mode added.)
 
 ## 1.95 Feishu link previews + GGUF context/batching
 - real: `url.preview.get` callback answered with an inline title (page title fetched only with FEISHU_LINK_PREVIEW_FETCH=1; private hosts blocked). GGUF: larger context, multi-sequence batching, windowed long texts, `memory embed`. Gaps: no live Feishu tenant test; GGUF CPU only.

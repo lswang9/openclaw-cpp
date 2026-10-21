@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.100.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.101.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.101.0-dev 新增
+
+- `openclaw-cpp tui` 在终端下进入全屏界面（ANSI 备用屏幕 + raw termios，不依赖 curses）：标题栏（会话、思考动画、网关）、自动换行的对话区（中日韩/emoji 宽度）、PgUp/PgDn 滚动、输入行编辑与历史、后台发送、Ctrl+C 中止/退出、窗口缩放、斜杠命令；退出时恢复终端。管道和 `--plain` 仍是行模式。测试 e2e-tui-fullscreen.sh 用 pty 驱动。不足：无流式输出、无工具调用块和选择器、同一时间只能有一条消息在处理。
 
 ## 1.100.0-dev 新增
 
