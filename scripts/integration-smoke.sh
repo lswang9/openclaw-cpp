@@ -75,8 +75,8 @@ echo "$RPC_TOOLS" | grep -q 'tools'
 
 rpc() { curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" -H 'Content-Type: application/json' -d "$1"; }
 echo "[smoke] upstream gateway-backed CLI (health, devices list, gateway.restart.preflight via daemon)"
-OPENCLAW_GATEWAY_URL="http://${HOST}:${PORT}" "$BIN" health --json | grep -q '"payload"' || { echo "[smoke] cli health failed" >&2; exit 1; }
-OPENCLAW_GATEWAY_URL="http://${HOST}:${PORT}" "$BIN" devices setupCode device_name=cli | grep -q '# device.pair.setupCode' || { echo "[smoke] cli devices setupCode failed" >&2; exit 1; }
+OPENCLAW_GATEWAY_URL="http://${HOST}:${PORT}" "$BIN" health --json | grep -q '"version"' || { echo "[smoke] cli health failed" >&2; exit 1; }
+OPENCLAW_GATEWAY_URL="http://${HOST}:${PORT}" "$BIN" devices join-code device_name=cli --json | python3 -c 'import json,sys; j=json.load(sys.stdin); assert j and "error" not in j, j' || { echo "[smoke] cli devices setupCode failed" >&2; exit 1; }
 { OPENCLAW_GATEWAY_URL="http://127.0.0.1:1" "$BIN" devices list 2>&1 || true; } | grep -q 'not reachable' || { echo "[smoke] cli unreachable msg" >&2; exit 1; }
 echo "// hot reload test" > "$OPENCLAW_CONFIG_PATH.tmp"; echo "{ session: { reset: { mode: 'off' } }, skills: { entries: { 'hello-skill': { enabled: false } } }, }" >> "$OPENCLAW_CONFIG_PATH.tmp"
 mv "$OPENCLAW_CONFIG_PATH.tmp" "$OPENCLAW_CONFIG_PATH"
@@ -343,6 +343,7 @@ OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-embeddings-ollama-gguf.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-gguf-llama.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-voice-channels.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-local-commands.sh"
+OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-cli-routed.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-voice-providers.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-auth-agents-keychain.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-streaming-typing.sh"

@@ -9,6 +9,7 @@
 #include <openssl/bn.h>
 #include <memory>
 #include <thread>
+#include <map>
 #include "openclaw/agent/loop.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/channels/registry.hpp"
@@ -103,7 +104,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.96.0-dev";
+constexpr const char* kVersion = "1.97.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3380,51 +3381,237 @@ const std::unordered_map<std::string, std::string>& UpstreamCliPrefix() {
     return k;
 }
 std::size_t CurlSink(char* p, std::size_t s, std::size_t n, void* u) { static_cast<std::string*>(u)->append(p, s * n); return s * n; }
+// Per-subcommand routing for upstream gateway-backed commands: {cmd, sub} -> {method, positional param names}.
+// sub "" = the bare command. Subcommands upstream implements locally (no gateway RPC) are reported honestly.
+struct CliRoute { const char* method; std::vector<std::string> args; };
+const std::map<std::pair<std::string, std::string>, CliRoute>& CliRoutes() {
+    static const std::map<std::pair<std::string, std::string>, CliRoute> k = {
+        {{"devices", ""}, {"device.pair.list", {}}}, {{"devices", "list"}, {"device.pair.list", {}}},
+        {{"devices", "approve"}, {"device.pair.approve", {"requestId"}}}, {{"devices", "reject"}, {"device.pair.reject", {"requestId"}}},
+        {{"devices", "remove"}, {"device.pair.remove", {"deviceId"}}}, {{"devices", "rename"}, {"device.pair.rename", {"deviceId", "name"}}},
+        {{"devices", "rotate"}, {"device.token.rotate", {}}}, {{"devices", "revoke"}, {"device.token.revoke", {}}},
+        {{"devices", "join-code"}, {"device.pair.setupCode", {}}}, {{"devices", "setupCode"}, {"device.pair.setupCode", {}}},
+        {{"devices", "setupStatus"}, {"device.pair.setupStatus", {}}},
+        {{"nodes", ""}, {"node.list", {}}}, {{"nodes", "list"}, {"node.list", {}}}, {{"nodes", "describe"}, {"node.describe", {"nodeId"}}},
+        {{"nodes", "invoke"}, {"node.invoke", {"nodeId", "command"}}}, {{"nodes", "rename"}, {"node.rename", {"nodeId", "displayName"}}},
+        {{"nodes", "pending"}, {"node.pair.list", {}}}, {{"nodes", "approve"}, {"node.pair.approve", {"requestId"}}},
+        {{"nodes", "reject"}, {"node.pair.reject", {"requestId"}}}, {{"nodes", "remove"}, {"node.pair.remove", {"nodeId"}}},
+        {{"nodes", "status"}, {"node.list", {}}}, {{"node", "status"}, {"node.list", {}}},
+        {{"sessions", ""}, {"sessions.list", {}}}, {{"sessions", "list"}, {"sessions.list", {}}}, {{"sessions", "cleanup"}, {"sessions.cleanup", {}}},
+        {{"sessions", "compact"}, {"sessions.compact", {"key"}}}, {{"sessions", "tail"}, {"chat.history", {"sessionKey"}}},
+        {{"sessions", "delete"}, {"sessions.delete", {"key"}}}, {{"sessions", "reset"}, {"sessions.reset", {"key"}}},
+        {{"sessions", "get"}, {"sessions.get", {"key"}}}, {{"sessions", "search"}, {"sessions.search", {"query"}}},
+        {{"transcripts", ""}, {"sessions.list", {}}}, {{"transcripts", "list"}, {"sessions.list", {}}}, {{"transcripts", "show"}, {"chat.history", {"sessionKey"}}},
+        {{"logs", ""}, {"logs.tail", {}}}, {{"logs", "tail"}, {"logs.tail", {}}},
+        {{"health", ""}, {"health", {}}}, {{"health", "stability"}, {"diagnostics.stability", {}}},
+        {{"pairing", ""}, {"channels.pairing.list", {"channel"}}}, {{"pairing", "list"}, {"channels.pairing.list", {"channel"}}},
+        {{"pairing", "approve"}, {"channels.pairing.approve", {"channel", "code"}}},
+        {{"hooks", ""}, {"hooks.status", {}}}, {{"hooks", "list"}, {"hooks.status", {}}}, {{"hooks", "info"}, {"hooks.status", {"name"}}}, {{"hooks", "check"}, {"hooks.status", {}}},
+        {{"secrets", "reload"}, {"secrets.reload", {}}}, {{"secrets", "list"}, {"secrets.store.list", {}}},
+        {{"system", ""}, {"system.info", {}}}, {{"system", "info"}, {"system.info", {}}}, {{"system", "event"}, {"system-event", {"text"}}},
+        {{"system", "heartbeat"}, {"last-heartbeat", {}}},
+        {{"users", ""}, {"users.list", {}}}, {{"users", "list"}, {"users.list", {}}}, {{"users", "link-email"}, {"users.linkEmail", {"userId", "email"}}},
+        {{"users", "merge"}, {"users.merge", {"sourceUserId", "targetUserId"}}}, {{"users", "self"}, {"users.self", {}}},
+        {{"worktrees", ""}, {"worktrees.list", {}}}, {{"worktrees", "list"}, {"worktrees.list", {}}}, {{"worktrees", "create"}, {"worktrees.create", {"repoRoot"}}},
+        {{"worktrees", "remove"}, {"worktrees.remove", {"id"}}}, {{"worktrees", "retire-snapshot"}, {"worktrees.retireSnapshot", {"id"}}},
+        {{"worktrees", "recover-removal"}, {"worktrees.recoverRemoval", {"id"}}}, {{"worktrees", "restore"}, {"worktrees.restore", {"id"}}},
+        {{"worktrees", "gc"}, {"worktrees.gc", {}}},
+        {{"agents", ""}, {"agents.list", {}}}, {{"agents", "list"}, {"agents.list", {}}}, {{"agents", "add"}, {"agents.create", {"name"}}},
+        {{"agents", "create"}, {"agents.create", {"name"}}}, {{"agents", "delete"}, {"agents.delete", {"agentId"}}},
+        {{"agents", "set-identity"}, {"agents.update", {}}},
+        {{"agent", ""}, {"agent", {"message"}}},
+        {{"backup", ""}, {"backup.status", {}}}, {{"backup", "status"}, {"backup.status", {}}}, {{"backup", "record"}, {"backup.recordOutcome", {}}},
+        {{"usage", ""}, {"usage.status", {}}}, {{"usage", "status"}, {"usage.status", {}}}, {{"usage", "cost"}, {"usage.cost", {}}},
+        {{"claws", ""}, {"claws.monitors", {}}}, {{"claws", "status"}, {"claws.monitors", {}}}, {{"claws", "remove"}, {"claws.packages.remove", {"id"}}},
+        {{"audit", ""}, {"audit.list", {}}}, {{"audit", "list"}, {"audit.list", {}}}, {{"audit", "activity"}, {"audit.activity.list", {}}},
+        {{"message", "send"}, {"send", {}}}, {{"message", "poll"}, {"poll", {}}},
+        {{"message", "broadcast"}, {"message.action", {}}}, {{"message", "react"}, {"message.action", {}}}, {{"message", "reactions"}, {"message.action", {}}}, {{"message", "pin"}, {"message.action", {}}}, {{"message", "unpin"}, {"message.action", {}}}, {{"message", "pins"}, {"message.action", {}}}, {{"message", "emoji"}, {"message.action", {}}}, {{"message", "list"}, {"message.action", {}}}, {{"message", "upload"}, {"message.action", {}}}, {{"message", "sticker"}, {"message.action", {}}},
+        {{"storage", ""}, {"storage.locations.list", {}}}, {{"storage", "list"}, {"storage.locations.list", {}}},
+        {{"update", "status"}, {"update.status", {}}}, {{"update", "run"}, {"update.run", {}}},
+        {{"automations", ""}, {"cron.list", {}}}, {{"automations", "list"}, {"cron.list", {}}}, {{"automations", "status"}, {"cron.status", {}}},
+        {{"automations", "add"}, {"cron.add", {}}}, {{"automations", "remove"}, {"cron.remove", {"id"}}}, {{"automations", "run"}, {"cron.run", {"id"}}},
+        {{"automations", "runs"}, {"cron.runs", {"id"}}},
+        {{"exec-approvals", ""}, {"exec.approvals.get", {}}}, {{"exec-approvals", "get"}, {"exec.approvals.get", {}}}, {{"exec-approvals", "set"}, {"exec.approvals.set", {}}},
+        {{"exec-approvals", "list"}, {"exec.approval.list", {}}},
+        {{"daemon", "status"}, {"status", {}}}, {{"dashboard", ""}, {"status", {}}},
+        {{"doctor", ""}, {"doctor.memory.status", {}}},
+    };
+    return k;
+}
+std::string CamelFlag(const std::string& f) {  // --message-id -> messageId
+    std::string o; bool up = false;
+    for (size_t i = 2; i < f.size(); ++i) { if (f[i] == '-') { up = true; continue; } o.push_back(up ? static_cast<char>(std::toupper(static_cast<unsigned char>(f[i]))) : f[i]); up = false; }
+    return o;
+}
+std::string Cell(const nlohmann::json& v) {
+    if (v.is_string()) return v.get<std::string>();
+    if (v.is_null()) return "-";
+    std::string s = v.dump();
+    return s.size() > 60 ? s.substr(0, 57) + "..." : s;
+}
+// Human output: first array-of-objects field as a table (scalar columns), else "key: value" lines.
+void PrintHuman(const std::string& method, const nlohmann::json& p) {
+    const nlohmann::json* rows = nullptr; std::string label;
+    if (p.is_array()) rows = &p;
+    else if (p.is_object()) for (auto& [k, v] : p.items()) if (v.is_array() && (v.empty() || v[0].is_object())) { rows = &v; label = k; break; }
+    if (rows) {
+        if (p.is_object()) for (auto& [k, v] : p.items()) if (k != label && !v.is_array() && !v.is_object()) std::cout << k << ": " << Cell(v) << '\n';
+        if (p.is_object() && !label.empty()) std::cout << label << ":\n";
+        if (rows->empty()) { std::cout << "No " << (label.empty() ? "entries" : label) << ".\n"; }
+        else {
+            std::vector<std::string> cols;
+            for (auto& r : *rows) if (r.is_object()) for (auto& [k, v] : r.items()) if (!v.is_object() && !v.is_array() && std::find(cols.begin(), cols.end(), k) == cols.end() && cols.size() < 6) cols.push_back(k);
+            std::vector<size_t> w(cols.size());
+            for (size_t i = 0; i < cols.size(); ++i) { w[i] = cols[i].size(); for (auto& r : *rows) w[i] = std::max(w[i], Cell(r.value(cols[i], nlohmann::json())).size()); }
+            for (size_t i = 0; i < cols.size(); ++i) std::cout << cols[i] << std::string(w[i] - cols[i].size() + 2, ' ');
+            std::cout << '\n';
+            for (auto& r : *rows) { for (size_t i = 0; i < cols.size(); ++i) { auto c = Cell(r.value(cols[i], nlohmann::json())); std::cout << c << std::string(w[i] - c.size() + 2, ' '); } std::cout << '\n'; }
+        }
+        return;
+    }
+    if (p.is_object()) {
+        for (auto& [k, v] : p.items()) {
+            if (v.is_array() && !v.empty() && !v[0].is_object() && !v[0].is_array()) { std::cout << k << ":\n"; for (auto& x : v) std::cout << "  " << Cell(x) << '\n'; }
+            else std::cout << k << ": " << (v.is_object() || v.is_array() ? v.dump() : Cell(v)) << '\n';
+        }
+        return;
+    }
+    std::cout << "# " << method << '\n' << p.dump(2) << '\n';
+}
 int MaybeUpstreamGatewayCli(int argc, char** argv) {
     const std::string cmd = argv[1];
     auto it = UpstreamCliPrefix().find(cmd);
     if (it == UpstreamCliPrefix().end()) return -1;
-    std::string sub; nlohmann::json params = nlohmann::json::object(); bool raw = false;
+    const auto& tree = openclaw::cli::UpstreamCommandTree();
+    std::string sub; nlohmann::json params = nlohmann::json::object(); bool raw = false, follow = false;
+    std::vector<std::string> pos;
+    std::string url_flag, token_flag; long timeout_s = 30;
+    std::vector<std::pair<std::string, std::string>> flags;  // (flag, value or "\x01" for boolean)
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--params" && i + 1 < argc) { params = nlohmann::json::parse(argv[++i]); continue; }
         if (a == "--json") { raw = true; continue; }
+        if (a.rfind("--", 0) == 0 && a.size() > 2) {
+            std::string v = "\x01";
+            if (auto eq = a.find('='); eq != std::string::npos) { v = a.substr(eq + 1); a = a.substr(0, eq); }
+            else if (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0) {
+                // value-taking per upstream tree (flag listed with '='), else boolean
+                bool takes = a == "--url" || a == "--token" || a == "--password" || a == "--timeout";
+                if (tree.contains(cmd)) for (auto& [s, d] : tree[cmd].items()) for (auto& f : d["flags"]) if (f.get<std::string>() == a + "=") takes = true;
+                if (takes) v = argv[++i];
+            }
+            if (a == "--url") { url_flag = v; continue; }
+            if (a == "--token" || a == "--password") { token_flag = v; continue; }
+            if (a == "--timeout") { timeout_s = std::max(1L, std::atol(v.c_str()) / 1000); continue; }
+            if (a == "--follow") follow = true;
+            flags.push_back({a, v});
+            continue;
+        }
         if (auto eq = a.find('='); eq != std::string::npos && a[0] != '-') {
             auto v = a.substr(eq + 1); nlohmann::json jv;
             try { jv = nlohmann::json::parse(v); } catch (...) { jv = v; }
             params[a.substr(0, eq)] = jv; continue;
         }
-        if (sub.empty() && a[0] != '-') { sub = a; continue; }
-        if (a[0] != '-' && !params.contains("id")) params["id"] = a;
+        if (sub.empty() && pos.empty() && a[0] != '-' && (tree.contains(cmd) ? tree[cmd].contains(a) || CliRoutes().count({cmd, a}) : true)) { sub = a; continue; }
+        if (sub.empty() && pos.empty() && a[0] != '-' && CliRoutes().count({cmd, a})) { sub = a; continue; }
+        pos.push_back(a);
     }
+    // Resolve the method.
+    std::string method;
+    std::vector<std::string> argnames;
     const std::string& pre = it->second;
-    const bool single = pre.find('.') == std::string::npos && (pre == "health" || pre == "status" || pre == "agent");
-    std::string method = single && sub.empty() ? pre : pre + "." + (sub.empty() ? (pre == "logs" ? "tail" : "list") : sub);
-    if (cmd == "dashboard") method = "status";
-    const std::string base = openclaw::EnvOr("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:" + openclaw::EnvOr("OPENCLAW_GATEWAY_PORT", "18789"));
-    nlohmann::json req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", method}, {"params", params}};
-    const std::string body = req.dump();
-    std::string out;
-    CURL* h = curl_easy_init();
-    if (!h) return 1;
-    curl_slist* hdr = curl_slist_append(nullptr, "Content-Type: application/json");
-    std::string auth;
-    if (const char* tk = std::getenv("OPENCLAW_GATEWAY_TOKEN"); tk && *tk) { auth = std::string("Authorization: Bearer ") + tk; hdr = curl_slist_append(hdr, auth.c_str()); }
-    const std::string url = base + "/v1/rpc";
-    curl_easy_setopt(h, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdr);
-    curl_easy_setopt(h, CURLOPT_POSTFIELDS, body.c_str());
-    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, CurlSink);
-    curl_easy_setopt(h, CURLOPT_WRITEDATA, &out);
-    curl_easy_setopt(h, CURLOPT_TIMEOUT, 30L);
-    auto rc = curl_easy_perform(h);
-    long code = 0; curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
-    curl_slist_free_all(hdr); curl_easy_cleanup(h);
+    auto r = CliRoutes().find({cmd, sub});
+    if (r != CliRoutes().end() && sub.empty() && !pos.empty() && r->second.args.empty()) r = CliRoutes().end();  // `<cmd> <unknown>`
+    if (r != CliRoutes().end()) { method = r->second.method; argnames = r->second.args; }
+    else if (!sub.empty() && tree.contains(cmd) && tree[cmd].contains(sub)) {
+        std::cerr << "openclaw-cpp: `" << cmd << " " << sub << "` is an upstream local command with no gateway RPC; not implemented in openclaw-cpp.\n";
+        return 2;
+    } else {
+        if (sub.empty() && !pos.empty()) { sub = pos.front(); pos.erase(pos.begin()); }
+        const bool single = pre == "health" || pre == "status" || pre == "agent";
+        method = single && sub.empty() ? pre : pre + "." + (sub.empty() ? (pre == "logs" ? "tail" : "list") : sub);
+        auto known = openclaw::gateway::ImplementedMethods();
+        if (!sub.empty() && std::find(known.begin(), known.end(), method) == known.end()) {
+            std::cerr << "error: unknown command '" << sub << "' for '" << cmd << "'\n";
+            return 1;
+        }
+    }
+    // Validate flags against the upstream tree entry when we have one.
+    if (tree.contains(cmd) && tree[cmd].contains(sub)) {
+        const auto& allowed = tree[cmd][sub]["flags"];
+        for (auto& [f, v] : flags) {
+            bool ok = false;
+            for (auto& x : allowed) { auto s = x.get<std::string>(); if (s == f || s == f + "=") ok = true; }
+            if (!ok && f.rfind("--no-", 0) == 0) for (auto& x : allowed) if (x.get<std::string>() == f) ok = true;
+            if (!ok) { std::cerr << "error: unknown option '" << f << "'\n(run `openclaw-cpp " << cmd << (sub.empty() ? "" : " " + sub) << " --help`)\n"; return 1; }
+        }
+    }
+    for (auto& [f, v] : flags) {
+        if (f == "--follow") continue;
+        if (v == "\x01") { if (f.rfind("--no-", 0) == 0) params[CamelFlag("--" + f.substr(5))] = false; else params[CamelFlag(f)] = true; continue; }
+        nlohmann::json jv = v;
+        if (!v.empty() && (std::isdigit(static_cast<unsigned char>(v[0])) || v[0] == '-') && v.find_first_not_of("-0123456789") == std::string::npos) jv = std::stoll(v);
+        const auto key = CamelFlag(f);
+        if (params.contains(key)) { if (!params[key].is_array()) params[key] = nlohmann::json::array({params[key]}); params[key].push_back(jv); }
+        else params[key] = jv;
+    }
+    for (size_t i = 0; i < pos.size(); ++i) {
+        if (i < argnames.size()) params[argnames[i]] = pos[i];
+        else if (!params.contains("id")) params["id"] = pos[i];
+    }
+    if (method == "sessions.compact" || method == "sessions.delete" || method == "sessions.reset" || method == "sessions.get") if (params.contains("key")) params["sessionKey"] = params["key"];
+    if (method == "chat.history" && params.contains("tail")) params["limit"] = params["tail"];
+    if (cmd == "message" && (sub != "send" && sub != "poll") && !sub.empty()) { method = "message.action"; params["action"] = sub; }
+    const std::string base = !url_flag.empty() ? url_flag : openclaw::EnvOr("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:" + openclaw::EnvOr("OPENCLAW_GATEWAY_PORT", "18789"));
+    std::string token = token_flag.empty() ? openclaw::EnvOr("OPENCLAW_GATEWAY_TOKEN", "") : token_flag;
+    auto call = [&](const nlohmann::json& prm, long* code, std::string* out) -> CURLcode {
+        nlohmann::json req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", method}, {"params", prm}};
+        const std::string body = req.dump();
+        CURL* h = curl_easy_init();
+        if (!h) return CURLE_FAILED_INIT;
+        curl_slist* hdr = curl_slist_append(nullptr, "Content-Type: application/json");
+        std::string auth;
+        if (!token.empty()) { auth = "Authorization: Bearer " + token; hdr = curl_slist_append(hdr, auth.c_str()); }
+        const std::string url = base + "/v1/rpc";
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdr);
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, CurlSink);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, out);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT, timeout_s);
+        auto rc = curl_easy_perform(h);
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, code);
+        curl_slist_free_all(hdr); curl_easy_cleanup(h);
+        return rc;
+    };
+    long code = 0; std::string out;
+    auto rc = call(params, &code, &out);
     if (rc != CURLE_OK) { std::cerr << cmd << ": gateway not reachable at " << base << " (" << curl_easy_strerror(rc) << "); start it with `openclaw-cpp gateway`\n"; return 1; }
     nlohmann::json j; try { j = nlohmann::json::parse(out); } catch (...) { std::cout << out << '\n'; return code == 200 ? 0 : 1; }
-    if (raw) std::cout << j.dump() << '\n';
-    else std::cout << "# " << method << '\n' << (j.contains("payload") ? j["payload"] : j.contains("result") ? j["result"] : j).dump(2) << '\n';
-    return (code == 200 && j.value("ok", !j.contains("error"))) ? 0 : 1;
+    const bool ok = code == 200 && j.value("ok", !j.contains("error"));
+    auto payload = j.contains("payload") ? j["payload"] : j.contains("result") ? j["result"] : j;
+    if (!ok) {
+        if (raw) std::cout << j.dump() << '\n';
+        else std::cerr << cmd << (sub.empty() ? "" : " " + sub) << ": " << (j.contains("error") ? (j["error"].is_string() ? j["error"].get<std::string>() : j["error"].dump()) : out) << '\n';
+        return 1;
+    }
+    if (raw) std::cout << payload.dump() << '\n'; else PrintHuman(method, payload);
+    // logs --follow: poll logs.tail with the returned cursor (upstream follows until interrupted).
+    if (follow && method == "logs.tail") {
+        int rounds = std::atoi(openclaw::EnvOr("OPENCLAW_LOGS_FOLLOW_ROUNDS", "0").c_str());
+        long interval = params.value("interval", 1000);
+        for (int n = 0; rounds <= 0 || n < rounds; ++n) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+            if (payload.is_object() && payload.contains("cursor")) params["cursor"] = payload["cursor"];
+            out.clear();
+            if (call(params, &code, &out) != CURLE_OK) break;
+            try { j = nlohmann::json::parse(out); } catch (...) { break; }
+            payload = j.contains("payload") ? j["payload"] : j.contains("result") ? j["result"] : j;
+            for (auto& l : payload.value("lines", nlohmann::json::array())) std::cout << (l.is_string() ? l.get<std::string>() : l.dump()) << '\n';
+            std::cout.flush();
+        }
+    }
+    return 0;
 }
 }  // namespace
 

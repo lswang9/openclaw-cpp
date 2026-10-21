@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.96.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.97.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.97.0-dev 新增
+
+- 网关类 CLI 命令（devices/nodes/sessions/logs/health/pairing/hooks/secrets/system/users/worktrees/agents/backup/usage/claws/audit/message/storage/automations/exec-approvals 等）改为按子命令路由到正确的 RPC（如 `devices approve <requestId>`→device.pair.approve、`sessions tail <key>`→chat.history、`message react`→message.action），参数按上游 v2026.10.5 选项校验（未知选项报错），`--message-id` 等转为 camelCase 参数，位置参数按上游参数名填入；默认输出人类可读的表格/键值，`--json` 输出原始 payload；`logs --follow` 轮询。上游只在本地实现、没有网关 RPC 的子命令（如 `devices clear`、`backup create`）明确提示未实现并返回 2。
 
 ## 1.96.0-dev 新增
 
