@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.45.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.46.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -195,3 +195,7 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 
 ### 1.45.0-dev
 - Discord 斜杠命令：由内置命令、技能命令与插件命令生成命令定义并同步到 Discord；HTTP 与 Gateway 交互均进入智能体管线（Gateway 先延迟应答再编辑原消息）。新增 /status、/help、/stop、/model 内置命令。Ed25519 签名校验尚缺。
+
+### 1.46.0-dev
+- 插件 API 补全：TypeScript 插件（Node ≥ 22.6，已在盒子安装 Node 22.20 测试）、HTTP 路由、CLI 命令、工具调用前后钩子（可拦截/改参）、会话开始/结束钩子、插件渠道（入站解析 + 出站发送）、插件模型提供商（complete 接口）。
+- 渠道与提供商为简化契约，与上游完整 ChannelPlugin / 提供商认证目录不同；插件 npm 安装尚缺。

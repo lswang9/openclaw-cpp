@@ -20,6 +20,7 @@
 #include "openclaw/memory/store.hpp"
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/plugins/js_host.hpp"
+#include "openclaw/plugins/js_extensions.hpp"
 #include "openclaw/board/store.hpp"
 #include "openclaw/canvas/store.hpp"
 #include "openclaw/auth/device_link.hpp"
@@ -80,7 +81,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.45.0-dev";
+constexpr const char* kVersion = "1.46.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1859,6 +1860,50 @@ int CmdSelfTest() {
                                live.HasHook("before_agent_start") && !live.HasHook("agent_end");
             if (!up_ok) { std::cerr << "FAIL js upstream api " << pong.dump() << hk.dump() << gm.dump() << "\n"; ++failures; }
             else std::cerr << "PASS js upstream plugin api (command/hook/gateway method)\n";
+            {
+                // 1.46: http route, CLI, channel, provider, tool + session hooks
+                auto http = live.Rpc("http_request", {{"method", "POST"}, {"path", "/plugins/sample/hello"}, {"body", "{\"name\":\"Q\"}"}});
+                auto cli = live.Rpc("run_cli", {{"argv", {"sample", "greet", "Z"}}});
+                plugins::PluginChannelAdapter pch(&live, "echochan", "Echo");
+                std::string got;
+                auto inb = pch.HandleHttpInbound({{"user", "u1"}, {"msg", "yo"}},
+                                                 [&](const channels::InboundMessage& m) { got = m.sender + ":" + m.text; return std::string("ack"); });
+                plugins::PluginProvider pp(&live, "samplellm", "echo-1");
+                auto comp = pp.Complete({{.role = "user", .content = "ping me"}}, nlohmann::json::array());
+                struct OneTool : provider::Provider {
+                    int n = 0;
+                    agent::CompletionResult Complete(const std::vector<agent::Message>&, const nlohmann::json&) override {
+                        agent::CompletionResult r;
+                        r.message.role = "assistant";
+                        if (n++ == 0) {
+                            r.tool_calls.push_back({"c1", "js.sample_echo", R"({"text":"forbidden"})"});
+                            r.tool_calls.push_back({"c2", "js.sample_echo", R"({"text":"rewrite-me"})"});
+                            for (auto& t : r.tool_calls) r.message.tool_calls.push_back({{"id", t.id}, {"type", "function"}, {"function", {{"name", t.name}, {"arguments", t.arguments_json}}}});
+                            r.finish_reason = "tool_calls";
+                        } else { r.message.content = "done"; r.finish_reason = "stop"; }
+                        return r;
+                    }
+                } otp;
+                tools::Registry treg;
+                live.RegisterTools(treg);
+                agent::LoopOptions lo;
+                lo.before_tool_call = [&](const std::string& t, const nlohmann::json& p) {
+                    return live.EmitHook("before_tool_call", {{"toolName", t}, {"params", p}}).value("merged", nlohmann::json::object()); };
+                lo.after_tool_call = [&](const std::string& t, const nlohmann::json& p, const std::string& r, long long, const std::string&) {
+                    live.EmitHook("after_tool_call", {{"toolName", t}, {"params", p}, {"result", r}}); };
+                auto lr = agent::RunAgentLoop(otp, treg, {{.role = "user", .content = "x"}}, lo);
+                std::string toolout;
+                for (auto& m : lr.messages) if (m.role == "tool") toolout += m.content + "|";
+                live.EmitHook("session_start", {{"sessionKey", "k"}});
+                auto st = live.CallGatewayMethod("sample.status", {});
+                const bool ok46 = http.value("body", "").find("\"hello\":\"Q\"") != std::string::npos && http.value("status", 0) == 200 &&
+                    cli.value("output", "") == "hello, Z!\n" && got == "u1:yo" && inb["results"][0]["sent"].value("ok", false) &&
+                    comp.ok && comp.message.content == "samplellm/echo-1: ping me" &&
+                    toolout.find("blocked forbidden") != std::string::npos && toolout.find("js-echo:rewritten") != std::string::npos &&
+                    st.value("afterTool", 0) == 1 && st.value("sessionStart", 0) == 1 && st["sent"].size() == 1;
+                if (!ok46) { std::cerr << "FAIL js plugin ext " << http.dump() << cli.dump() << inb.dump() << comp.message.content << toolout << st.dump() << "\n"; ++failures; }
+                else std::cerr << "PASS js plugin http route/cli/channel/provider/tool+session hooks\n";
+            }
             live.Stop();
             const bool echo_ok = echo.value("content", "") == "js-echo:node";
             const bool add_ok = add.value("sum", 0.0) == 42.0 || add.value("content", "") == "42";
@@ -2075,6 +2120,61 @@ int CmdSelfTest() {
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
     return 1;
+}
+
+::openclaw::plugins::JsHost& StartCliJsHost() {
+    using namespace ::openclaw;
+    static ::openclaw::plugins::JsHost host;
+    if (!host.Running()) {
+        auto plr = config::Load(config::DefaultPath());
+        host.SetConfig(plr.snap.raw);
+        host.SetExtraDirs({std::filesystem::path(EnvOr("HOME", "/tmp")) / ".openclaw" / "extensions",
+                           workspace::Workspace::DefaultRoot() / ".openclaw" / "extensions"});
+        host.Start(RepoRoot() / "plugins");
+    }
+    return host;
+}
+
+int RunPluginCli(::openclaw::plugins::JsHost& host, const std::vector<std::string>& args) {
+    using namespace ::openclaw;
+    auto r = host.Rpc("run_cli", {{"argv", args}});
+    if (r.contains("error")) { std::cerr << "error: " << r["error"].value("message", r["error"].dump()) << "\n"; return 1; }
+    std::cout << r.value("output", std::string());
+    return r.value("exitCode", 0);
+}
+
+// Top-level `openclaw-cpp <cmd> ...` registered by a plugin via api.registerCli. -1 = not a plugin command.
+int MaybePluginCli(int argc, char** argv) {
+    using namespace ::openclaw;
+    if (argc < 2 || std::getenv("OPENCLAW_JS_FORCE_MOCK")) return -1;
+    std::string cmd = argv[1];
+    if (cmd.empty() || cmd.find(' ') != std::string::npos) return -1;
+    auto& host = StartCliJsHost();
+    bool found = false;
+    for (auto& c : host.InitList("cli")) found = found || c == cmd;
+    if (!found) return -1;
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) args.push_back(argv[i]);
+    int rc = RunPluginCli(host, args);
+    host.Stop();
+    return rc;
+}
+
+int CmdPlugins(int argc, char** argv) {
+    using namespace ::openclaw;
+    const std::string sub = argc > 2 ? argv[2] : "list";
+    auto& host = StartCliJsHost();
+    int rc = 0;
+    if (sub == "list") std::cout << host.Rpc("list_plugins", nlohmann::json::object()).dump(2) << "\n";
+    else if (sub == "info") std::cout << host.LastInit().dump(2) << "\n";
+    else if (sub == "cli") std::cout << host.Rpc("list_cli", nlohmann::json::object()).dump(2) << "\n";
+    else if (sub == "run") {
+        std::vector<std::string> args;
+        for (int i = 3; i < argc; ++i) args.push_back(argv[i]);
+        rc = RunPluginCli(host, args);
+    } else { std::cerr << "usage: plugins list|info|cli|run <cmd> [args]\n"; rc = 2; }
+    host.Stop();
+    return rc;
 }
 
 int CmdChat(int argc, char** argv, int argi) {
@@ -2685,6 +2785,7 @@ int main(int argc, char** argv) {
         if (cmd == "acp-stdio") return CmdAcpStdio();
         if (cmd == "gateway") return CmdGateway(argc, argv, 2);
         if (cmd == "chat") return CmdChat(argc, argv, 2);
+        if (cmd == "plugins") return CmdPlugins(argc, argv);
         if (cmd == "-h" || cmd == "--help" || cmd == "help") { PrintUsage(); return 0; }
         if (cmd == "-V" || cmd == "-v" || cmd == "--version" || cmd == "version") {
             std::cout << "openclaw-cpp " << kVersion << " (align OpenClaw 2026.10.5)\n";
@@ -2695,6 +2796,7 @@ int main(int argc, char** argv) {
             std::cerr << "unknown option: " << cmd << " (try --help)\n";
             return 2;
         }
+        if (int rc = MaybePluginCli(argc, argv); rc >= 0) return rc;
         return CmdChat(argc, argv, 1);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';

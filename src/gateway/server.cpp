@@ -10,6 +10,7 @@
 #include "openclaw/channels/slack.hpp"
 #include "openclaw/channels/discord.hpp"
 #include "openclaw/channels/discord_commands.hpp"
+#include "openclaw/plugins/js_extensions.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/whatsapp.hpp"
 #include <thread>
@@ -37,7 +38,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.45.0-dev";
+constexpr const char* kVersion = "1.46.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -235,6 +236,18 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
     int timeout_ms = override_body.value(
         "timeout_ms", agent.value("timeout_ms", raw.value("timeout_ms", 0)));
     if (timeout_ms > 0) o.timeout = std::chrono::milliseconds(timeout_ms);
+    if (auto* js = deps.js_host) {
+        if (js->HasHook("before_tool_call"))
+            o.before_tool_call = [js](const std::string& t, const nlohmann::json& p) {
+                return js->EmitHook("before_tool_call", {{"toolName", t}, {"params", p}}).value("merged", nlohmann::json::object());
+            };
+        if (js->HasHook("after_tool_call"))
+            o.after_tool_call = [js](const std::string& t, const nlohmann::json& p, const std::string& r, long long ms, const std::string& e) {
+                nlohmann::json ev{{"toolName", t}, {"params", p}, {"result", r}, {"durationMs", ms}};
+                if (!e.empty()) ev["error"] = e;
+                js->EmitHook("after_tool_call", ev);
+            };
+    }
     if (o.max_turns == 0) o.max_turns = 1;
     return o;
 }
@@ -248,6 +261,11 @@ void Server::Stop() {
     cancel_agents_.store(true);
     running_.store(false);
     if (listen_fd_ >= 0) shutdown(listen_fd_, SHUT_RDWR);
+}
+
+void Server::PluginSessionHook(const std::string& event, const std::string& key, const std::string& reason) {
+    if (deps_.js_host && deps_.js_host->HasHook(event))
+        deps_.js_host->EmitHook(event, {{"sessionKey", key}, {"reason", reason}}, {{"sessionKey", key}});
 }
 
 nlohmann::json Server::CommandCatalog() const {
@@ -274,7 +292,33 @@ void Server::RefreshDiscordCommands() {
     dc->SetCommandSpecs(channels::discord_commands::BuildSpecs(defs));
 }
 
+void Server::RefreshPluginExtensions() {
+    if (!deps_.js_host) return;
+    for (auto& id : plugin_channels_) deps_.adapters.Remove(id);
+    plugin_channels_.clear();
+    auto lc = deps_.js_host->Rpc("list_channels", nlohmann::json::object());
+    for (auto& c : lc.value("channels", nlohmann::json::array())) {
+        const auto id = c.value("id", "");
+        if (id.empty() || deps_.adapters.Get(id)) continue;  // never shadow a built-in channel
+        deps_.adapters.Add(std::make_unique<plugins::PluginChannelAdapter>(deps_.js_host, id, c.value("label", id)));
+        deps_.channels.Register({id, "plugin channel: " + c.value("label", id), true});
+        plugin_channels_.push_back(id);
+    }
+    if (deps_.router) {
+        auto lp = deps_.js_host->Rpc("list_providers", nlohmann::json::object());
+        for (auto& p : lp.value("providers", nlohmann::json::array())) {
+            const auto id = p.value("id", "");
+            if (id.empty() || !p.value("chat", false) || (deps_.router->Has(id) && !plugin_providers_.count(id))) continue;
+            std::string model = p.contains("models") && p["models"].is_array() && !p["models"].empty() && p["models"][0].is_string()
+                                    ? p["models"][0].get<std::string>() : "default";
+            deps_.router->Add(id, std::make_shared<plugins::PluginProvider>(deps_.js_host, id, model));
+            plugin_providers_.insert(id);
+        }
+    }
+}
+
 void Server::Run() {
+    RefreshPluginExtensions();
     RefreshDiscordCommands();
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
@@ -513,7 +557,6 @@ nlohmann::json Server::ReloadConfigNow() {
         restarted.push_back(id);
     }
     // 3) plugins: rescan registry; restart the JS host when the plugins subtree changed
-    RefreshDiscordCommands();
     bool plugins_restarted = false;
     if (sub(old_raw, "plugins") != sub(deps_.config.raw, "plugins")) {
         if (!deps_.plugins.Root().empty()) deps_.plugins.Scan(deps_.plugins.Root());
@@ -523,6 +566,8 @@ nlohmann::json Server::ReloadConfigNow() {
             plugins_restarted = true;
         }
     }
+    if (plugins_restarted) RefreshPluginExtensions();
+    RefreshDiscordCommands();
     Emit("config.reload", {{"ok", true}, {"restartRequired", restart}, {"warnings", lr.warnings},
                            {"systemPromptChanged", prompt_changed}, {"channelsRestarted", restarted},
                            {"pluginsRestarted", plugins_restarted}});
@@ -596,13 +641,17 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     {
         std::string rest;
         if (session::ParseResetCommand(text_in, rest)) {
+            PluginSessionHook("session_end", msg.session_key, "reset");
             auto e = deps_.sessions.Reset(msg.session_key, "command");
+            PluginSessionHook("session_start", msg.session_key, "reset");
             Emit("session.reset", {{"sessionKey", msg.session_key}, {"sessionId", e.value("sessionId", "")}, {"reason", "command"}});
             if (rest.empty()) return "✅ New session started.";
             text_in = rest;
         } else if (deps_.sessions.ResetIfStale(msg.session_key, session::PolicyFor(deps_.config.raw, msg.channel,
                                           msg.chat_type.empty() ? session::InferChatType(msg.session_key) : msg.chat_type))) {
             Emit("session.reset", {{"sessionKey", msg.session_key}, {"reason", "policy"}});
+            PluginSessionHook("session_end", msg.session_key, "policy");
+            PluginSessionHook("session_start", msg.session_key, "policy");
         }
     }
     provider::Provider* cprov = deps_.router ? static_cast<provider::Provider*>(deps_.router) : &deps_.provider;
@@ -671,6 +720,7 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         text_in = sc->prompt;
     }
     auto messages = deps_.sessions.Load(msg.session_key);
+    if (messages.empty()) PluginSessionHook("session_start", msg.session_key, "new");
     std::string content = text_in;
     if (!msg.sender.empty()) {
         content = "[" + msg.channel + "/" + msg.sender + "] " + text_in;
@@ -877,6 +927,10 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         }
     }
     if (path == "/login" || path == "/ui/login" || path == "/logout") public_ok = true;
+    if (!public_ok && deps_.js_host) {
+        auto route = deps_.js_host->MatchHttpRoute(path);
+        if (!route.is_null() && route.value("auth", "gateway") == "plugin") public_ok = true;
+    }
     if (public_ok) g_rpc_role = g_rpc_role_pending_device ? "device" : "admin";
     g_rpc_role_pending_device = false;
     if (!public_ok) {
@@ -1208,6 +1262,35 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         return;
     }
 
+    if (deps_.js_host) try {
+        auto route = deps_.js_host->MatchHttpRoute(path);
+        if (!route.is_null()) {
+            const auto q = path_raw.find('?');
+            auto r = deps_.js_host->Rpc("http_request", {{"method", method}, {"path", path},
+                                                         {"query", q == std::string::npos ? "" : path_raw.substr(q + 1)},
+                                                         {"body", BodyOf(req)}});
+            if (std::getenv("OPENCLAW_DEBUG_PLUGIN_HTTP")) std::cerr << "[plugin-http] " << route.dump() << " -> " << r.dump() << "\n";
+            if (r.value("handled", false)) {
+                std::string ctype = "text/plain";
+                std::string extra;
+                const auto hdrs = r.value("headers", nlohmann::json::object());
+                for (auto& [k, v] : hdrs.items()) {
+                    if (k == "content-type") ctype = v.get<std::string>();
+                    else if (k != "content-length") extra += k + ": " + v.get<std::string>() + "\r\n";
+                }
+                int code = r.value("status", 200);
+                send(HttpResponse(code, code < 400 ? "OK" : "Error", r.value("body", std::string()), ctype, extra));
+                return;
+            }
+            if (r.contains("error")) {
+                send(HttpResponse(500, "Internal Server Error", nlohmann::json{{"error", r["error"]}}.dump()));
+                return;
+            }
+        }
+    } catch (const std::exception& e) {
+        send(HttpResponse(500, "Internal Server Error", nlohmann::json{{"error", e.what()}}.dump()));
+        return;
+    }
     send(HttpResponse(404, "Not Found", nlohmann::json{{"error", "not found"}, {"path", path}}.dump()));
 }
 

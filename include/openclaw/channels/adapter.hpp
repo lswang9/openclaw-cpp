@@ -73,6 +73,7 @@ class AdapterHub {
 public:
     void Add(std::unique_ptr<Adapter> adapter);
     Adapter* Get(const std::string& id);
+    bool Remove(const std::string& id);
     std::vector<Adapter*> List();
     nlohmann::json StatusJson() const;
     static AdapterHub MakeDefault();

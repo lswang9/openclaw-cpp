@@ -21,5 +21,50 @@ export default function register(api) {
   api.on('message_sending', async (ev) =>
     ev.content && ev.content.includes('SECRET') ? { content: ev.content.replace(/SECRET/g, '[redacted]') } : undefined);
 
-  api.registerGatewayMethod('sample.status', ({ respond }) => respond(true, { ok: true, plugin: api.id }));
+  const stats = { beforeTool: 0, afterTool: 0, sessionStart: 0, sessionEnd: 0, sent: [] };
+  api.on('before_tool_call', (ev) => {
+    stats.beforeTool++;
+    if (ev.params && ev.params.text === 'forbidden') return { block: true, blockReason: 'sample-upstream blocked forbidden text' };
+    if (ev.params && ev.params.text === 'rewrite-me') return { params: { ...ev.params, text: 'rewritten' } };
+  });
+  api.on('after_tool_call', () => { stats.afterTool++; });
+  api.on('session_start', () => { stats.sessionStart++; });
+  api.on('session_end', () => { stats.sessionEnd++; });
+
+  api.registerGatewayMethod('sample.status', ({ respond }) => respond(true, { ok: true, plugin: api.id, ...stats }));
+
+  api.registerHttpRoute({
+    path: '/plugins/sample/hello',
+    handler: (req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ hello: (req.json && req.json.name) || 'world', method: req.method }));
+    },
+  });
+
+  api.registerCli(({ program }) => {
+    const cmd = program.command('sample').description('Sample upstream plugin CLI');
+    cmd.command('greet <name>').option('--shout', 'uppercase').action((name, opts) => {
+      const msg = `${greeting}, ${name}!`;
+      console.log(opts.shout ? msg.toUpperCase() : msg);
+    });
+  }, { commands: ['sample'] });
+
+  api.registerChannel({
+    plugin: {
+      id: 'echochan',
+      meta: { label: 'Echo channel (sample)' },
+      inbound: { parse: (body) => ({ from: body.user || 'anon', text: body.msg || '', chatType: 'direct' }) },
+      outbound: { sendText: async ({ to, text }) => { stats.sent.push({ to, text }); return { ok: true }; } },
+    },
+  });
+
+  api.registerProvider({
+    id: 'samplellm',
+    label: 'Sample LLM (deterministic)',
+    models: ['echo-1'],
+    complete: async ({ model, messages }) => {
+      const last = [...messages].reverse().find((m) => m.role === 'user');
+      return { content: `samplellm/${model}: ${last ? String(last.content).slice(-40) : ''}` };
+    },
+  });
 }

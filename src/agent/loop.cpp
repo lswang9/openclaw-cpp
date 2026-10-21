@@ -128,7 +128,27 @@ LoopResult RunAgentLoop(provider::Provider& provider,
                 std::cerr << "[agent] tool " << tc.name << " id=" << tc.id << '\n';
             }
 
-            const std::string result = registry.Invoke(tc.name, args);
+            std::string result;
+            bool blocked = false;
+            if (opts.before_tool_call) {
+                auto h = opts.before_tool_call(tc.name, args);
+                if (h.is_object() && h.value("block", false)) {
+                    blocked = true;
+                    result = nlohmann::json{{"error", h.value("blockReason", std::string("blocked by plugin hook"))},
+                                            {"blocked", true}}.dump();
+                } else if (h.is_object() && h.contains("params") && h["params"].is_object()) {
+                    args = h["params"];
+                }
+            }
+            if (!blocked) {
+                const auto t0 = std::chrono::steady_clock::now();
+                std::string err;
+                try { result = registry.Invoke(tc.name, args); }
+                catch (const std::exception& e) { err = e.what(); result = nlohmann::json{{"error", err}}.dump(); }
+                if (opts.after_tool_call)
+                    opts.after_tool_call(tc.name, args, result,
+                                         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(), err);
+            }
             Message tool_msg;
             tool_msg.role = "tool";
             tool_msg.tool_call_id = tc.id;

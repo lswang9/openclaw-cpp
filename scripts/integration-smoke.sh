@@ -94,6 +94,13 @@ if command -v node >/dev/null 2>&1 && [ -z "${OPENCLAW_JS_FORCE_MOCK:-}" ]; then
     -d '{"type":"event_callback","event":{"type":"message","text":"/ping hey","user":"U2","channel":"D2","channel_type":"im","ts":"3.0"}}')
   echo "$PING" | grep -q 'pong hey' || { echo "[smoke] plugin command /ping failed: $PING" >&2; exit 1; }
   echo "[smoke] upstream JS plugin: gateway method + /ping command"
+  HR=$(curl -sf -X POST "http://${HOST}:${PORT}/plugins/sample/hello" -H 'Content-Type: application/json' -d '{"name":"Al"}')
+  echo "$HR" | grep -q '"hello":"Al"' || { echo "[smoke] plugin http route failed: $HR" >&2; exit 1; }
+  EC=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/echochan/inbound" -H 'Content-Type: application/json' -d '{"user":"u9","msg":"hi plugin channel"}')
+  echo "$EC" | grep -q '"ok": *true' || { echo "[smoke] plugin channel inbound failed: $EC" >&2; exit 1; }
+  rpc '{"jsonrpc":"2.0","id":14,"method":"sample.status","params":{}}' | grep -q '"to": *"u9"' || { echo "[smoke] plugin channel outbound missing" >&2; exit 1; }
+  "$BIN" sample greet Smoke | grep -q 'hello, Smoke!' || { echo "[smoke] plugin CLI failed" >&2; exit 1; }
+  echo "[smoke] plugin http route + plugin channel (in/out) + plugin CLI"
 fi
 
 SI=$(curl -sf -X POST "http://${HOST}:${PORT}/api/channels/slack/inbound" -H 'Content-Type: application/json' \
@@ -244,4 +251,5 @@ echo "$OUT" | grep -q echoed && ! echo "$OUT" | grep -q mock-default || { echo "
 rm -rf "$SK"; echo "[smoke] skill command-dispatch: tool (no model turn) ok"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-memory-flush.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-embeddings.sh"
+OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-ts-plugin.sh"
 echo "[smoke] ALL PASS"

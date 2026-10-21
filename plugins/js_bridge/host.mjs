@@ -31,6 +31,10 @@ const commands = new Map();     // name -> {plugin, cmd}
 const hooks = new Map();        // event -> [{plugin, fn, priority}]
 const gwMethods = new Map();    // name -> {plugin, fn}
 const services = [];            // {plugin, svc}
+const channels = new Map();     // id -> {plugin, ch}
+const providers = new Map();    // id -> {plugin, p}
+const httpRoutes = [];          // {plugin, path, match, auth, handler}
+const cliCommands = new Map();  // top-level name -> {plugin, cmd}
 let hostConfig = {};
 let loadSeq = 0;
 
@@ -88,6 +92,47 @@ function isEsmPackage(dir) {
   return false;
 }
 
+// Minimal commander-compatible shim for api.registerCli.
+function makeProgram(pluginId) {
+  const mk = (name, parent) => {
+    const c = { _name: name, _desc: '', _opts: [], _action: null, _subs: [], _args: [] };
+    c.command = (spec) => {
+      const [n, ...rest] = String(spec).trim().split(/\s+/);
+      const sub = mk(n, c); sub._args = rest; c._subs.push(sub);
+      if (!parent) cliCommands.set(n, { plugin: pluginId, cmd: sub });
+      return sub;
+    };
+    c.description = (d) => { c._desc = d; return c; };
+    c.alias = () => c;
+    c.argument = (a) => { c._args.push(a); return c; };
+    c.option = (flags, desc, def) => { c._opts.push({ flags, desc, def }); return c; };
+    c.requiredOption = c.option;
+    c.action = (fn) => { c._action = fn; return c; };
+    return c;
+  };
+  return mk('openclaw', null);
+}
+
+function parseCliArgs(cmd, argv) {
+  const opts = {}, pos = [];
+  for (const o of cmd._opts) {
+    const long = (o.flags.match(/--([\w-]+)/) || [])[1];
+    if (long && o.def !== undefined) opts[long.replace(/-(\w)/g, (_, x) => x.toUpperCase())] = o.def;
+  }
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const [k, v] = a.slice(2).split('=');
+      const key = k.replace(/-(\w)/g, (_, x) => x.toUpperCase());
+      const spec = cmd._opts.find((o) => o.flags.includes('--' + k));
+      if (v !== undefined) opts[key] = v;
+      else if (spec && /[<[]/.test(spec.flags) && i + 1 < argv.length) opts[key] = argv[++i];
+      else opts[key] = true;
+    } else pos.push(a);
+  }
+  return { opts, pos };
+}
+
 function makeApi(rec) {
   const entryCfg = ((hostConfig.plugins || {}).entries || {})[rec.id] || {};
   const log = (lvl) => (...a) => process.stderr.write(`[plugin:${rec.id}] ${lvl}: ${a.map(String).join(' ')}\n`);
@@ -119,10 +164,26 @@ function makeApi(rec) {
     registerHook(events, fn, opts) { for (const e of [].concat(events)) api.on(e, fn, opts); },
     registerGatewayMethod(name, fn) { if (typeof fn === 'function') gwMethods.set(name, { plugin: rec.id, fn }); },
     registerService(svc) { if (svc && svc.id) services.push({ plugin: rec.id, svc }); },
-    registerChannel() { api.logger.warn('registerChannel not supported by openclaw-cpp host'); },
-    registerProvider() { api.logger.warn('registerProvider not supported by openclaw-cpp host'); },
-    registerHttpRoute() { api.logger.warn('registerHttpRoute not supported by openclaw-cpp host'); },
-    registerCli() {},
+    registerChannel(reg) {
+      const ch = reg && reg.plugin ? reg.plugin : reg;
+      if (!ch || !ch.id) return api.logger.warn('registerChannel: missing id');
+      channels.set(ch.id, { plugin: rec.id, ch });
+    },
+    registerProvider(p) {
+      if (!p || !p.id) return api.logger.warn('registerProvider: missing id');
+      providers.set(p.id, { plugin: rec.id, p });
+    },
+    registerHttpRoute(r) {
+      if (!r || !r.path || typeof r.handler !== 'function') return api.logger.warn('registerHttpRoute: need {path, handler}');
+      httpRoutes.push({ plugin: rec.id, path: r.path, match: r.match || 'exact', auth: r.auth || 'gateway', handler: r.handler });
+    },
+    registerHttpHandler(fn) { if (typeof fn === 'function') httpRoutes.push({ plugin: rec.id, path: '/', match: 'any', auth: 'gateway', handler: fn }); },
+    registerCli(fn, opts) {
+      if (typeof fn !== 'function') return;
+      const program = makeProgram(rec.id);
+      try { fn({ program, config: hostConfig, logger: api.logger, workspaceDir: process.cwd() }); }
+      catch (e) { api.logger.error('registerCli failed: ' + e); }
+    },
   };
   return api;
 }
@@ -159,6 +220,7 @@ async function loadPluginDir(dir) {
 
 async function scan(roots) {
   plugins.clear(); tools.clear(); commands.clear(); hooks.clear(); gwMethods.clear(); services.length = 0;
+  channels.clear(); providers.clear(); httpRoutes.length = 0; cliCommands.clear();
   for (const root of roots) {
     if (!root || !fs.existsSync(root)) continue;
     if (pluginEntries(root)) { await loadPluginDir(root); continue; }
@@ -201,6 +263,8 @@ async function handle(req) {
           ok: true, host: 'openclaw-cpp-js-host', version: '2', node: process.versions.node,
           plugins: [...plugins.keys()], tools: [...tools.keys()], commands: [...commands.keys()],
           hooks: [...hooks.keys()], gatewayMethods: [...gwMethods.keys()], services: services.map((s) => `${s.plugin}/${s.svc.id}`),
+          channels: [...channels.keys()], providers: [...providers.keys()], cli: [...cliCommands.keys()],
+          httpRoutes: httpRoutes.map((r) => ({ path: r.path, match: r.match, auth: r.auth, plugin: r.plugin })),
         });
       }
       case 'list_plugins':
@@ -253,6 +317,75 @@ async function handle(req) {
         const r = await ent.fn({ params: params.params || {}, respond: (ok, payload, err) => { if (ok) resolved = payload; else failed = err || payload; } });
         if (failed) return respond(id, null, { code: -32000, message: typeof failed === 'string' ? failed : JSON.stringify(failed) });
         return respond(id, resolved ?? r ?? {});
+      }
+      case 'http_request': {
+        const p = String(params.path || '/');
+        const route = httpRoutes.find((r) => r.match === 'any' ? false : (r.match === 'prefix' ? p.startsWith(r.path) : p === r.path))
+          || httpRoutes.find((r) => r.match === 'any');
+        if (!route) return respond(id, { handled: false });
+        const res = { statusCode: 200, headers: {}, body: '', ended: false,
+          setHeader(k, v) { this.headers[String(k).toLowerCase()] = String(v); },
+          writeHead(code, h) { this.statusCode = code; if (h) for (const k in h) this.setHeader(k, h[k]); return this; },
+          write(d) { this.body += String(d); return true; },
+          end(d) { if (d !== undefined) this.body += String(d); this.ended = true; } };
+        const req = { method: params.method || 'GET', url: p + (params.query ? '?' + params.query : ''), path: p,
+          headers: params.headers || {}, body: params.body ?? '' };
+        try { req.json = JSON.parse(req.body); } catch {}
+        const r = await route.handler(req, res);
+        if (route.match === 'any' && r === false && !res.ended) return respond(id, { handled: false });
+        return respond(id, { handled: true, status: res.statusCode, headers: res.headers, body: res.body, plugin: route.plugin });
+      }
+      case 'list_cli':
+        return respond(id, { commands: [...cliCommands.entries()].map(([n, v]) => ({ name: n, description: v.cmd._desc, plugin: v.plugin,
+          subcommands: v.cmd._subs.map((s) => s._name) })) });
+      case 'run_cli': {
+        const argv = Array.isArray(params.argv) ? params.argv.map(String) : [];
+        const ent = cliCommands.get(argv[0]);
+        if (!ent) return respond(id, null, { code: -32601, message: 'unknown cli command: ' + argv[0] });
+        let cmd = ent.cmd, rest = argv.slice(1);
+        while (rest.length && cmd._subs.find((s) => s._name === rest[0])) { cmd = cmd._subs.find((s) => s._name === rest[0]); rest = rest.slice(1); }
+        if (!cmd._action) {
+          const help = [`Usage: openclaw ${argv[0]} <command>`, ...cmd._subs.map((s) => `  ${s._name}  ${s._desc}`)].join('\n');
+          return respond(id, { output: help + '\n', exitCode: 1 });
+        }
+        const { opts, pos } = parseCliArgs(cmd, rest);
+        let out = '';
+        const orig = console.log;
+        console.log = (...a) => { out += a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ') + '\n'; };
+        let exitCode = 0;
+        try { await cmd._action(...pos, opts, cmd); } catch (e) { out += String(e && e.message ? e.message : e) + '\n'; exitCode = 1; }
+        finally { console.log = orig; }
+        return respond(id, { output: out, exitCode });
+      }
+      case 'list_channels':
+        return respond(id, { channels: [...channels.entries()].map(([cid, v]) => ({ id: cid, plugin: v.plugin,
+          label: (v.ch.meta && v.ch.meta.label) || cid, outbound: !!(v.ch.outbound && v.ch.outbound.sendText),
+          inbound: !!(v.ch.inbound && typeof v.ch.inbound.parse === 'function') })) });
+      case 'channel_send': {
+        const ent = channels.get(params.channel);
+        if (!ent || !ent.ch.outbound || typeof ent.ch.outbound.sendText !== 'function')
+          return respond(id, null, { code: -32601, message: 'channel has no outbound.sendText: ' + params.channel });
+        const r = await ent.ch.outbound.sendText({ to: params.to, text: params.text, cfg: hostConfig, accountId: params.accountId });
+        return respond(id, { ok: true, result: r ?? null });
+      }
+      case 'channel_inbound': {
+        const ent = channels.get(params.channel);
+        if (!ent || !ent.ch.inbound || typeof ent.ch.inbound.parse !== 'function')
+          return respond(id, null, { code: -32601, message: 'channel has no inbound.parse: ' + params.channel });
+        const r = await ent.ch.inbound.parse(params.body ?? {}, { cfg: hostConfig });
+        const list = r == null ? [] : [].concat(r);
+        return respond(id, { messages: list.filter((m) => m && typeof m.text === 'string') });
+      }
+      case 'list_providers':
+        return respond(id, { providers: [...providers.entries()].map(([pid, v]) => ({ id: pid, plugin: v.plugin,
+          label: v.p.label || pid, models: v.p.models || [], chat: typeof v.p.complete === 'function' })) });
+      case 'provider_complete': {
+        const ent = providers.get(params.provider);
+        if (!ent || typeof ent.p.complete !== 'function')
+          return respond(id, null, { code: -32601, message: 'provider has no complete(): ' + params.provider });
+        const r = await ent.p.complete({ model: params.model, messages: params.messages || [], tools: params.tools || [], config: hostConfig });
+        if (typeof r === 'string') return respond(id, { content: r, tool_calls: [] });
+        return respond(id, { content: (r && r.content) || '', tool_calls: (r && r.tool_calls) || [] });
       }
       case 'shutdown': {
         for (const { svc } of services) { try { if (typeof svc.stop === 'function') await svc.stop(); } catch {} }

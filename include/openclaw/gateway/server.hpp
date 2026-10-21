@@ -113,6 +113,9 @@ private:
     // Native + skill + plugin chat commands as {name, description} (for Discord slash sync, /help).
     nlohmann::json CommandCatalog() const;
     void RefreshDiscordCommands();
+    // Register plugin-provided channels (adapters) and providers (router routes).
+    void RefreshPluginExtensions();
+    void PluginSessionHook(const std::string& event, const std::string& key, const std::string& reason);
     void Emit(const std::string& event, const nlohmann::json& payload);
     void PersistAll() const;
     // Hot reload (gateway.reload.mode != off): re-read config when its mtime changes (checked ≤1/s).
@@ -123,6 +126,8 @@ public:
     nlohmann::json ReloadConfigNow();
 
 private:
+    std::vector<std::string> plugin_channels_;
+    std::set<std::string> plugin_providers_;
     std::mutex reload_mu_;
     std::filesystem::file_time_type cfg_mtime_{};
     std::chrono::steady_clock::time_point last_reload_check_{};

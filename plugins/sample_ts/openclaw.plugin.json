@@ -1,0 +1,1 @@
+{ "id": "sample-ts", "name": "Sample TypeScript plugin", "description": "Exercises TS loading (Node >= 22.6 strip-types or typescript package)", "configSchema": { "type": "object", "properties": {} } }

@@ -51,6 +51,11 @@ public:
     // {handlers, results, merged} — merged = payload with handler results shallow-merged in order
     nlohmann::json EmitHook(const std::string& event, const nlohmann::json& payload, const nlohmann::json& ctx = {});
     nlohmann::json CallGatewayMethod(const std::string& method, const nlohmann::json& params);
+    // Raw RPC (http_request, run_cli, channel_*, provider_complete, list_*).
+    nlohmann::json Rpc(const std::string& method, const nlohmann::json& params) { return Request(method, params); }
+    // Matching registered HTTP route ({path,match,auth,plugin}) or null.
+    nlohmann::json MatchHttpRoute(const std::string& path) const;
+    std::vector<std::string> InitList(const char* key) const;
     nlohmann::json LastInit() const { std::lock_guard l(mu_); return last_init_; }
 
     // In-process mock (no Node) — used when FORCE_MOCK or spawn fails in tests.

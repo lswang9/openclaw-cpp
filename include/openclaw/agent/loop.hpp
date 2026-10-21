@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include "openclaw/agent/types.hpp"
 #include "openclaw/provider/provider.hpp"
@@ -25,6 +26,10 @@ struct LoopOptions {
     std::chrono::milliseconds timeout{0};
     // Optional cooperative cancel flag (e.g. gateway shutdown).
     std::atomic<bool>* cancel = nullptr;
+    // Plugin hooks. before_tool_call may return {block, blockReason, params}; after is fire-and-forget.
+    std::function<nlohmann::json(const std::string& tool, const nlohmann::json& params)> before_tool_call;
+    std::function<void(const std::string& tool, const nlohmann::json& params, const std::string& result,
+                       long long duration_ms, const std::string& error)> after_tool_call;
 };
 
 class RateBucket {

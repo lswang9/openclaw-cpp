@@ -57,6 +57,12 @@ void AdapterHub::Add(std::unique_ptr<Adapter> adapter) {
     adapters_.push_back(std::move(adapter));
 }
 
+bool AdapterHub::Remove(const std::string& id) {
+    for (auto it = adapters_.begin(); it != adapters_.end(); ++it)
+        if ((*it)->Id() == id) { (*it)->Stop(); adapters_.erase(it); return true; }
+    return false;
+}
+
 Adapter* AdapterHub::Get(const std::string& id) {
     for (auto& a : adapters_) {
         if (a->Id() == id) {

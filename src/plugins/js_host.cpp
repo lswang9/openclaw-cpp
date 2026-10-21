@@ -19,7 +19,8 @@ bool ForceMock() {
 }
 
 std::filesystem::path FindNode() {
-    // Prefer PATH via execvp("node"); empty means use "node"
+    // OPENCLAW_NODE overrides (e.g. a Node >= 22.6 build for TypeScript plugins); else PATH "node".
+    if (const char* n = std::getenv("OPENCLAW_NODE"); n && *n) return n;
     return "node";
 }
 
@@ -27,7 +28,8 @@ bool NodeSupportsStripTypes() {
     static int cached = -1;
     if (cached >= 0) return cached == 1;
     cached = 0;
-    if (FILE* p = popen("node --version 2>/dev/null", "r")) {
+    const std::string cmd = "'" + FindNode().string() + "' --version 2>/dev/null";
+    if (FILE* p = popen(cmd.c_str(), "r")) {
         char buf[64] = {0};
         if (fgets(buf, sizeof buf, p)) {
             int maj = 0, min = 0;
@@ -236,6 +238,25 @@ bool InitListHas(const nlohmann::json& init, const char* key, const std::string&
     return false;
 }
 }  // namespace
+
+nlohmann::json JsHost::MatchHttpRoute(const std::string& path) const {
+    std::lock_guard l(mu_);
+    nlohmann::json any;
+    for (auto& r : last_init_.value("httpRoutes", nlohmann::json::array())) {
+        const auto p = r.value("path", ""), m = r.value("match", "exact");
+        if (m == "any") { if (any.is_null()) any = r; continue; }
+        if ((m == "prefix" && path.rfind(p, 0) == 0) || path == p) return r;
+    }
+    return any;
+}
+
+std::vector<std::string> JsHost::InitList(const char* key) const {
+    std::lock_guard l(mu_);
+    std::vector<std::string> out;
+    if (last_init_.contains(key) && last_init_[key].is_array())
+        for (auto& x : last_init_[key]) if (x.is_string()) out.push_back(x);
+    return out;
+}
 
 bool JsHost::HasCommand(const std::string& n) const {
     std::string low; for (char c : n) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

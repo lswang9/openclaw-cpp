@@ -1,6 +1,6 @@
 # OpenClaw 2026.10.5 → openclaw-cpp
 
-**Version: 1.45.0-dev · 未宣称与上游全量对齐。**
+**Version: 1.46.0-dev · 未宣称与上游全量对齐。**
 
 ## 执行摘要（今晚可用什么）
 
@@ -32,8 +32,7 @@
 ## 1.43 JS/TS plugin host (upstream API)
 - real: host.mjs v2 discovers openclaw.plugin.json / package.json `openclaw.extensions` / legacy plugin.json across repo plugins/, ~/.openclaw/extensions, <workspace>/.openclaw/extensions, plugins.load.paths; honours plugins.enabled/allow/deny and entries.<id>.enabled/config (api.pluginConfig).
 - real: api.registerTool (execute/handler, factory), registerCommand (gateway runs before skills, no model turn), api.on hooks: message_received, before_agent_start (prependContext/systemPrompt), message_sending (content rewrite / cancel), agent_end; registerGatewayMethod (DispatchRpc fallback); registerService (start/stop).
-- real-sim: TypeScript entries load only on Node >= 22.6 (--experimental-strip-types, auto-detected) or with the `typescript` package installed; box Node 20 has neither, so tests use an .mjs sample.
-- missing: registerChannel / registerProvider / registerHttpRoute (warn only), before_tool_call / after_tool_call / session hooks, plugin CLI commands, npm install of plugins.
+- (1.46: TS + channel/provider/http/CLI/tool & session hooks became real — see below.)
 
 ## 1.44 Slack interactive
 - real: reply directives `[[buttons: L|v,...]]`, `[[select: P|a,b]]`, `[[modal: Title|F1,F2]]` → Block Kit (section + actions); plain text keeps a fallback.
@@ -46,3 +45,12 @@
 - real: APPLICATION_COMMAND + message-component interactions via HTTP (type 4 response) and Gateway INTERACTION_CREATE (deferred type 5 ack + PATCH @original follow-up) → agent pipeline with upstream session keys.
 - real: native /status, /help, /stop, /model handled in gateway without a model turn.
 - real-sim: no live Discord test; Ed25519 request signature verification for the HTTP interactions endpoint missing; /stop does not abort an in-flight run; /model does not switch models.
+
+## 1.46 Plugin API completion
+- real: TypeScript plugin entries on Node >= 22.6 (`--experimental-strip-types` auto-added; OPENCLAW_NODE selects the binary) or with the `typescript` package; tested by scripts/e2e-ts-plugin.sh with Node 22.20 (skips honestly when no Node >= 22.6).
+- real: api.registerHttpRoute({path, handler, match: exact|prefix, auth: gateway|plugin}) / registerHttpHandler served by the gateway HTTP server (Node-style req/res shim).
+- real: api.registerCli (commander-compatible shim: command/description/option/argument/action) → `openclaw-cpp <cmd> ...` and `plugins run|cli`.
+- real: before_tool_call (block / blockReason / params rewrite) and after_tool_call (result, durationMs, error) in the agent loop; session_start / session_end on new, reset and policy reset.
+- real-sim: api.registerChannel — openclaw-cpp contract is `inbound.parse(body)` → messages + `outbound.sendText({to,text})`; upstream ChannelPlugin's full adapter surface (gateway start/stop, pairing, directory, actions, threading) is missing.
+- real-sim: api.registerProvider with `complete({model, messages, tools})` → router route `<id>`; upstream provider plugins are auth/catalog descriptors (OAuth flows, model catalogs) — not implemented; a route uses the provider's first model.
+- missing: npm-based `plugins install`, plugin runtime helpers (api.runtime.*), tool_result_persist / before_compaction hooks.
