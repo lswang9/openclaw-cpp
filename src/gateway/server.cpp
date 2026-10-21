@@ -35,7 +35,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.28.0-dev";
+constexpr const char* kVersion = "1.29.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -346,6 +346,7 @@ void Server::HandleChatCompletions(int client_fd, const nlohmann::json& body, bo
     }
     const std::string session_id = body.value("session_id", "");
     if (!session_id.empty()) {
+        deps_.sessions.ResetIfStale(session_id, session::PolicyFromConfig(deps_.config.raw));
         auto prior = deps_.sessions.Load(session_id);
         prior.insert(prior.end(), messages.begin(), messages.end());
         messages = std::move(prior);
@@ -465,10 +466,22 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
             return bound.reply;
         }
     }
+    std::string text_in = msg.text;
+    {
+        std::string rest;
+        if (session::ParseResetCommand(text_in, rest)) {
+            auto e = deps_.sessions.Reset(msg.session_key, "command");
+            Emit("session.reset", {{"sessionKey", msg.session_key}, {"sessionId", e.value("sessionId", "")}, {"reason", "command"}});
+            if (rest.empty()) return "✅ New session started.";
+            text_in = rest;
+        } else if (deps_.sessions.ResetIfStale(msg.session_key, session::PolicyFromConfig(deps_.config.raw))) {
+            Emit("session.reset", {{"sessionKey", msg.session_key}, {"reason", "policy"}});
+        }
+    }
     auto messages = deps_.sessions.Load(msg.session_key);
-    std::string content = msg.text;
+    std::string content = text_in;
     if (!msg.sender.empty()) {
-        content = "[" + msg.channel + "/" + msg.sender + "] " + msg.text;
+        content = "[" + msg.channel + "/" + msg.sender + "] " + text_in;
     }
     messages.push_back(agent::Message{.role = "user", .content = content});
     Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "user"}, {"text", msg.text},

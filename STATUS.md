@@ -1,6 +1,14 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.28.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.29.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.29.0-dev 新增
+
+- 会话索引 `sessions.json`：每个会话键记录 sessionId、创建/更新时间、重置次数。
+- 发送 `/new` 或 `/reset` 开启新会话（旧记录移到 `archive/`）；`/new 后面的话` 会在新会话里继续处理。
+- 自动重置：默认每天本地时间 4 点后开新会话（`session.reset.mode/atHour`），也支持 `idleMinutes` 空闲过期，`mode: "off"` 关闭。
+- 修复会话键 `agent:main:main` 与 `agentmainmain` 写到同一文件的问题（旧文件仍可读取）。
+- 仍缺：JSONL transcript 格式、按渠道的重置策略、自动压缩摘要。
 
 ## 1.28.0-dev 新增
 

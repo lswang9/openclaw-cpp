@@ -73,7 +73,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.28.0-dev";
+constexpr const char* kVersion = "1.29.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1327,6 +1327,43 @@ int CmdSelfTest() {
         else std::cerr << "PASS config JSON5 + ${ENV} + dot paths + round-trip\n";
     } catch (const std::exception& e) { std::cerr << "FAIL config exception: " << e.what() << "\n"; ++failures; }
 
+    // sessions: key encoding, sessions.json index, /new /reset, daily/idle reset policy
+    try {
+        namespace fs = std::filesystem;
+        auto root = fs::temp_directory_path() / "oc-sess-st";
+        fs::remove_all(root);
+        session::Store st(root);
+        st.Save("agent:main:main", {agent::Message{.role = "user", .content = "a"}});
+        st.Save("agentmainmain", {agent::Message{.role = "user", .content = "b"}, agent::Message{.role = "user", .content = "c"}});
+        bool ok = st.Load("agent:main:main").size() == 1 && st.Load("agentmainmain").size() == 2;
+        auto ids = st.List();
+        ok = ok && std::find(ids.begin(), ids.end(), "agent:main:main") != ids.end();
+        auto e1 = st.IndexEntry("agent:main:main");
+        auto e2 = st.Reset("agent:main:main", "command");
+        ok = ok && e1.contains("sessionId") && e2.value("previousSessionId", "") == e1.value("sessionId", "") &&
+             st.Load("agent:main:main").empty() && fs::exists(root / "archive") && e2.value("resets", 0) == 1;
+        std::string rest;
+        ok = ok && session::ParseResetCommand("  /new hello there", rest) && rest == "hello there" &&
+             session::ParseResetCommand("/reset", rest) && rest.empty() && !session::ParseResetCommand("/newx", rest) &&
+             !session::ParseResetCommand("hi /new", rest);
+        session::ResetPolicy p; // daily @4
+        std::tm t{}; t.tm_year = 126; t.tm_mon = 9; t.tm_mday = 21; t.tm_hour = 3; t.tm_min = 0; t.tm_isdst = -1;
+        auto ms = [](std::tm x) { return static_cast<std::int64_t>(std::mktime(&x)) * 1000; };
+        std::tm t2 = t; t2.tm_hour = 5;
+        std::tm t3 = t; t3.tm_hour = 3; t3.tm_min = 59;
+        ok = ok && session::IsStale(p, ms(t), ms(t2)) && !session::IsStale(p, ms(t), ms(t3));
+        session::ResetPolicy ip; ip.mode = "idle"; ip.idle_minutes = 30;
+        ok = ok && session::IsStale(ip, 0 + 1, 31 * 60000 + 2) && !session::IsStale(ip, 1, 10 * 60000);
+        session::ResetPolicy off; off.mode = "off";
+        ok = ok && !session::IsStale(off, 1, ms(t2));
+        ok = ok && session::PolicyFromConfig({{"session", {{"reset", {{"mode", "idle"}, {"idleMinutes", 15}}}}}}).idle_minutes == 15;
+        st.Save("old", {agent::Message{.role = "user", .content = "x"}});
+        ok = ok && st.ResetIfStale("old", p, st.IndexEntry("old").value("updatedAt", std::int64_t{0}) + 25LL * 3600 * 1000) &&
+             st.Load("old").empty();
+        if (!ok) { std::cerr << "FAIL sessions index/reset\n"; ++failures; }
+        else std::cerr << "PASS sessions index + /new,/reset + daily/idle reset policy\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL sessions reset exception: " << e.what() << "\n"; ++failures; }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -1734,6 +1771,16 @@ int CmdChat(int argc, char** argv, int argi) {
     if (use_mock) prov = std::make_unique<provider::MockProvider>();
     else prov = std::make_unique<provider::DeepSeekProvider>(api_key, EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
                                                              EnvOr("DEEPSEEK_MODEL", "deepseek-chat"));
+    {
+        std::string rest;
+        if (!session_id.empty() && session::ParseResetCommand(user_message, rest)) {
+            store.Reset(session_id, "command");
+            if (rest.empty()) { std::cout << "✅ New session started.\n"; return 0; }
+            user_message = rest;
+        } else if (!session_id.empty()) {
+            store.ResetIfStale(session_id, session::PolicyFromConfig(config::LoadOrDefault(config::DefaultPath()).raw));
+        }
+    }
     auto messages = store.Load(session_id.empty() ? "_" : session_id);
     if (!messages.empty() && messages.front().role == "system") messages.erase(messages.begin());
     messages.insert(messages.begin(), agent::Message{.role = "system", .content = BuildAgentSystemPrompt(registry)});
