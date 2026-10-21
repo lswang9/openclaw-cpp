@@ -102,7 +102,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.94.0-dev";
+constexpr const char* kVersion = "1.95.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3631,6 +3631,20 @@ int main(int argc, char** argv) {
                                                  {"files", r.value("files", 0)}, {"index", r.value("index", nlohmann::json())},
                                                  {"fallback", r.value("fallback", "")}}.dump(2) << '\n';
                 return r.value("ok", false) ? 0 : 1;
+            }
+            if (sub == "embed" && argc >= 4) {  // memory embed [--sequential] TEXT... → cosine matrix + backend stats
+                bool seq = false; std::vector<std::string> texts;
+                for (int i = 3; i < argc; ++i) { std::string a = argv[i]; if (a == "--sequential") seq = true; else texts.push_back(a); }
+                auto e = openclaw::workspace::MakeEmbedderFromConfig(openclaw::config::Load(openclaw::config::DefaultPath()).snap.raw);
+                if (!e) { std::cerr << "memory embed: memorySearch disabled\n"; return 1; }
+                std::vector<openclaw::workspace::Vec> v;
+                if (seq) for (auto& s : texts) v.push_back(e->Embed({s}).at(0)); else v = e->Embed(texts);
+                nlohmann::json cos = nlohmann::json::array();
+                for (auto& a : v) { nlohmann::json row = nlohmann::json::array(); for (auto& b : v) { double d = 0; for (size_t k = 0; k < a.size() && k < b.size(); ++k) d += a[k] * b[k]; row.push_back(d); } cos.push_back(row); }
+                nlohmann::json first = nlohmann::json::array(); if (!v.empty()) for (size_t k = 0; k < std::min<size_t>(8, v[0].size()); ++k) first.push_back(v[0][k]);
+                std::cout << nlohmann::json{{"provider", e->Id()}, {"model", e->Model()}, {"dims", v.empty() ? 0 : v[0].size()}, {"count", v.size()},
+                                            {"cosine", cos}, {"head", first}, {"stats", e->Stats()}}.dump() << '\n';
+                return 0;
             }
             if (sub == "set" && argc >= 5) { store.Set(argv[3], argv[4]); std::cout << "{\"ok\":true}\n"; return 0; }
             if (sub == "get" && argc >= 4) {

@@ -33,4 +33,22 @@ top = json.dumps(hits[0])
 assert "feline" in top, ("semantic top hit wrong", hits[:2])
 assert hits[0].get("vectorScore", 0) > 0.3 and all(h.get("vectorScore", 0) < 0.2 for h in hits[1:]), hits
 PY
+# Batching + long context: 20 texts in one call must match one-at-a-time embeddings; a text far longer than
+# the model's 512-token context is windowed (not truncated), so a needle at its end still moves the vector.
+LONG=$(python3 -c "print(' '.join(['the weather report mentions mild clouds.']*120))")
+NEEDLE="$LONG A kitten is sleeping on the carpet."
+ARGS=(); for i in $(seq 1 18); do ARGS+=("note number $i about topic $((i*7))"); done
+B=$("$BIN" memory embed "$LONG" "$NEEDLE" "${ARGS[@]}") && S=$("$BIN" memory embed --sequential "$LONG" "$NEEDLE" "${ARGS[@]}") || { echo "[e2e-gguf-llama] FAIL: embed"; exit 1; }
+python3 - "$B" "$S" <<'PY' || { echo "$B" | head -c 600; echo "[e2e-gguf-llama] FAIL: batching/long"; exit 1; }
+import json, sys
+b, s = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+assert b["count"] == 20 and b["dims"] == 384, b["count"]
+st = b["stats"]; assert st["n_ctx"] == 512 and st["windows"] > 20, st
+assert st["decodes"] < st["windows"], ("not batched", st)       # several sequences per decode
+assert s["stats"]["decodes"] >= 20, s["stats"]
+for x, y in zip(b["head"], s["head"]): assert abs(x - y) < 1e-3, (b["head"], s["head"])
+c = b["cosine"]
+assert 0.5 < c[0][1] < 0.9999, c[0][1]                            # needle beyond token 512 changed the vector
+for i in range(20): assert abs(c[i][i] - 1) < 1e-3
+PY
 echo "[e2e-gguf-llama] PASS (real llama.cpp embeddings, model $(basename "$M"))"

@@ -1,6 +1,11 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.94.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.95.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.95.0-dev 新增
+
+- 飞书长连接支持链接预览回调 `url.preview.get`：回包 inline 标题（默认 域名·路径；设 `FEISHU_LINK_PREVIEW_FETCH=1` 时抓取公网页面 <title>，3 秒/256KB 上限，内网地址拒绝）。
+- GGUF 本地 embedding：上下文取模型训练长度（上限 `OPENCLAW_GGUF_CTX`，默认 8192），多条文本打包成多序列批次一次推理（`OPENCLAW_GGUF_SEQ`，默认 16）；超长文本按 3/4 步长滑窗、加权平均，不再截断。新命令 `memory embed [--sequential] 文本...` 输出余弦矩阵和推理统计。
 
 ## 1.42.0-dev 新增
 

@@ -14,12 +14,12 @@ fail() { echo "[e2e-feishu-ws] FAIL: $*"; cat "$T/fake.log"; tail -5 "$T/gw.log"
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
 export OPENCLAW_SESSION_DIR="$T/s" OPENCLAW_CONFIG_PATH="$T/cfg.json"
 echo '{}' > "$OPENCLAW_CONFIG_PATH"
-FEISHU_APP_ID=cli_a FEISHU_APP_SECRET=sec FEISHU_API_BASE="http://127.0.0.1:$(cat "$T/fp")" \
+FEISHU_LINK_PREVIEW_FETCH=1 OPENCLAW_MEDIA_ALLOW_PRIVATE=1 FEISHU_APP_ID=cli_a FEISHU_APP_SECRET=sec FEISHU_API_BASE="http://127.0.0.1:$(cat "$T/fp")" \
   "$BIN" gateway --port "$PORT" --host 127.0.0.1 >"$T/gw.log" 2>&1 & GW=$!
 for _ in $(seq 80); do curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 0.1; done
 curl -s -X POST "http://127.0.0.1:$PORT/v1/rpc" -H 'Content-Type: application/json' -d '{"method":"feishu.longconn.start"}' >/dev/null
 for _ in $(seq 100); do
-  [[ -s "$T/report.json" ]] && python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));sys.exit(0 if len(r["pings"])>=2 and len(r["acks"])>=2 and r["replies"] and r["connections"]>=2 else 1)' "$T/report.json" && break
+  [[ -s "$T/report.json" ]] && python3 -c 'import json,sys;r=json.load(open(sys.argv[1]));sys.exit(0 if len(r["pings"])>=2 and len(r["acks"])>=3 and r["replies"] and r["connections"]>=2 else 1)' "$T/report.json" && break
   sleep 0.1
 done
 python3 - "$T/report.json" <<'PY' || fail "assertions"
@@ -40,6 +40,9 @@ assert card["payload"]["code"] == 200, card
 resp = json.loads(base64.b64decode(card["payload"]["data"]))
 assert resp["toast"]["type"] == "info" and resp["toast"]["content"], resp
 assert resp["card"]["data"]["schema"] == "2.0", resp
+pv = [x for x in r["acks"] if x["headers"].get("message_id") == "P1"][0]
+pr = json.loads(base64.b64decode(pv["payload"]["data"]))
+assert pr["inline"]["title"] == "Fake Page Title" and pr["inline"]["i18n_title"]["en_us"] == "Fake Page Title", pr
 assert r["connections"] >= 2 and r["endpoint_calls"] >= 2, ("no reconnect", r["connections"], r["endpoint_calls"])
 PY
 curl -s -X POST "http://127.0.0.1:$PORT/v1/rpc" -H 'Content-Type: application/json' -d '{"method":"feishu.longconn.status"}' | tee "$T/st.json" | grep -Eq '"binary_events": *1' || fail "status binary_events"

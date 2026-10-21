@@ -81,7 +81,10 @@ def ws(c, path):
             state["acks"].append({"headers": p["headers"], "payload": json.loads(p["payload"] or b"{}"), "seq": p.get("seq"), "conn": conn}); dump()
             if p["headers"].get("message_id") == "M1":   # then a gzip-encoded card callback
                 send_bin(c, frame(8, 33, 1, [("type", "card"), ("message_id", "C1"), ("sum", "1"), ("seq", "0")], gzip.compress(json.dumps(CARD).encode()), "gzip"))
-            elif p["headers"].get("message_id") == "C1":  # drop the connection: client must reconnect per ClientConfig
+            elif p["headers"].get("message_id") == "C1":  # then a link preview callback
+                pv = {"schema": "2.0", "header": {"event_type": "url.preview.get"}, "event": {"context": {"url": "http://127.0.0.1:%d/page/x" % PORT, "preview_token": "pt"}}}
+                send_bin(c, frame(9, 33, 1, [("type", "card"), ("message_id", "P1"), ("sum", "1"), ("seq", "0")], json.dumps(pv).encode()))
+            elif p["headers"].get("message_id") == "P1":  # drop the connection: client must reconnect per ClientConfig
                 c.sendall(b"\x88\x00"); c.close(); return
 def http(c, req, body):
     line = req.split(b"\r\n")[0].decode(); method, path = line.split(" ")[:2]
@@ -91,6 +94,9 @@ def http(c, req, body):
         state["endpoint_body"] = json.loads(body); state["endpoint_locale"] = hdr.get("locale"); state["endpoint_calls"] += 1
         out = {"code": 0, "data": {"URL": "ws://127.0.0.1:%d/ws?device_id=d1&service_id=33" % PORT,
                "ClientConfig": {"PingInterval": 30, "ReconnectCount": 3, "ReconnectInterval": 1, "ReconnectNonce": 0}}}
+    elif path.startswith("/page/"):
+        d = b"<html><head><title>\n  Fake Page  Title </title></head></html>"
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(d) + d); c.close(); return
     elif path.startswith("/open-apis/im/v1/messages"):
         state["replies"].append({"auth": hdr.get("authorization"), "path": path, "body": json.loads(body)}); out = {"code": 0}
     else: out = {"code": 404}

@@ -1,3 +1,6 @@
+#include <cctype>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <stdexcept>
 #include <random>
 #include "openclaw/channels/feishu_ws.hpp"
@@ -76,6 +79,7 @@ nlohmann::json FeishuLongConn::Status() const {
             {"reconnect", {{"count", reconnect_count_}, {"interval_s", reconnect_interval_s_}, {"nonce_s", reconnect_nonce_s_}}},
             {"card_callbacks", card_callbacks_},
             {"gzip_frames", gzip_frames_},
+            {"url_previews", url_previews_},
             {"app_id_set", !Env("FEISHU_APP_ID").empty()},
             {"app_secret_set", !Env("FEISHU_APP_SECRET").empty()},
             {"ws_url_override", !Env("FEISHU_WS_URL").empty()},
@@ -84,7 +88,7 @@ nlohmann::json FeishuLongConn::Status() const {
             {"last_error", last_error_},
             {"impl", (mode_ == "live") ? "real" : (mode_ == "mock" ? "real-sim" : "honest")},
             {"gaps", nlohmann::json::array(
-                         {"url.preview callbacks not answered (card.action is)",
+                         {"url.preview answered with an inline title only (no card preview)",
                           "enterprise self-built apps only (platform limit)",
                           "cluster mode — one of N clients receives each event",
                           "must ack/process within ~3s on live"})}};
@@ -377,6 +381,72 @@ nlohmann::json FeishuLongConn::HandleCardAction(const nlohmann::json& body, cons
     return resp;
 }
 
+namespace {
+bool PrivateHost(const std::string& host) {
+    if (host.empty() || host == "localhost") return true;
+    addrinfo* ai = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, nullptr, &ai) != 0 || !ai) return true;
+    bool priv = false;
+    for (auto* a = ai; a; a = a->ai_next) {
+        if (a->ai_family == AF_INET) {
+            const auto ip = ntohl(reinterpret_cast<sockaddr_in*>(a->ai_addr)->sin_addr.s_addr);
+            const unsigned b0 = ip >> 24, b1 = (ip >> 16) & 0xff;
+            if (b0 == 10 || b0 == 127 || b0 == 0 || (b0 == 169 && b1 == 254) || (b0 == 172 && b1 >= 16 && b1 < 32) || (b0 == 192 && b1 == 168) || (b0 == 100 && b1 >= 64 && b1 < 128)) priv = true;
+        } else priv = true;  // be conservative with v6
+    }
+    freeaddrinfo(ai);
+    return priv;
+}
+std::string HtmlTitle(const std::string& url) {
+    CURL* c = curl_easy_init();
+    std::string body;
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 3L);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, +[](char* p, size_t s, size_t n, void* u) -> size_t {
+        auto* b = static_cast<std::string*>(u); if (b->size() > (256u << 10)) return 0; b->append(p, s * n); return s * n; });
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
+    curl_easy_perform(c);
+    curl_easy_cleanup(c);
+    std::string low = body; for (auto& ch : low) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    auto a = low.find("<title"); if (a == std::string::npos) return {};
+    a = low.find('>', a); auto b = low.find("</title>", a);
+    if (a == std::string::npos || b == std::string::npos) return {};
+    std::string t = body.substr(a + 1, b - a - 1);
+    std::string out; bool sp = false;
+    for (char ch : t) { if (ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ') { if (!out.empty()) sp = true; continue; } if (sp) out.push_back(' '); sp = false; out.push_back(ch); }
+    return out.substr(0, 120);
+}
+}  // namespace
+
+nlohmann::json FeishuLongConn::HandleUrlPreview(const nlohmann::json& body) {
+    const nlohmann::json& ev = body.contains("event") && body["event"].is_object() ? body["event"] : body;
+    const auto ctx = ev.value("context", nlohmann::json::object());
+    const std::string url = ctx.value("url", ev.value("url", std::string()));
+    { std::lock_guard lock(mu_); ++url_previews_; }
+    std::string host, path;
+    if (auto s = url.find("://"); s != std::string::npos) {
+        auto rest = url.substr(s + 3);
+        auto slash = rest.find('/');
+        host = rest.substr(0, slash);
+        path = slash == std::string::npos ? "" : rest.substr(slash);
+        if (auto at = host.rfind('@'); at != std::string::npos) host = host.substr(at + 1);
+        if (auto colon = host.find(':'); colon != std::string::npos) host = host.substr(0, colon);
+    }
+    if (host.empty()) return {{"inline", {{"title", "link"}}}};
+    std::string title = host + (path.size() > 1 ? " · " + path.substr(0, 60) : "");
+    const char* f = std::getenv("FEISHU_LINK_PREVIEW_FETCH");
+    bool fetched = false;
+    if (f && std::string(f) == "1" && (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) &&
+        (!PrivateHost(host) || std::getenv("OPENCLAW_MEDIA_ALLOW_PRIVATE"))) {
+        auto t = HtmlTitle(url);
+        if (!t.empty()) { title = t; fetched = true; }
+    }
+    nlohmann::json out{{"inline", {{"title", title}, {"i18n_title", {{"zh_cn", title}, {"en_us", title}}}}}};
+    return out;
+}
+
 void FeishuLongConn::LiveLoop(DeliverFn deliver) {
     std::string token, err;
     auto set_err = [&](const std::string& m) { std::lock_guard lock(mu_); mode_ = "live-error"; last_error_ = m; };
@@ -495,7 +565,9 @@ void FeishuLongConn::LiveLoop(DeliverFn deliver) {
                     auto body = nlohmann::json::parse(raw);
                     std::string et;
                     if (body.contains("header") && body["header"].is_object()) et = body["header"].value("event_type", std::string());
-                    if (type == "card" || et == "card.action.trigger") {
+                    if (et == "url.preview.get") {
+                        data = HandleUrlPreview(body).dump();
+                    } else if (type == "card" || et == "card.action.trigger") {
                         data = HandleCardAction(body, deliver).dump();
                     } else {
                         auto route = HandleEventBody(body, deliver);

@@ -41,11 +41,14 @@ private:
     void LiveLoop(DeliverFn deliver);
     // Card action callback (type=card frame or card.action.trigger): returns card-response JSON (toast + optional card).
     nlohmann::json HandleCardAction(const nlohmann::json& body, const DeliverFn& deliver);
+    // url.preview.get (link preview callback): {inline:{title,i18n_title}} from host/path, plus the page <title>
+    // when channels.feishu.linkPreview.fetch / FEISHU_LINK_PREVIEW_FETCH=1 (public hosts only, 256 KiB, 3 s).
+    nlohmann::json HandleUrlPreview(const nlohmann::json& body);
 public:
     nlohmann::json CardActionForTest(const nlohmann::json& body, const DeliverFn& d) { return HandleCardAction(body, d); }
 private:
     int reconnect_count_ = -1, reconnect_interval_s_ = 120, reconnect_nonce_s_ = 30;
-    std::uint64_t reconnects_ = 0, card_callbacks_ = 0, gzip_frames_ = 0;
+    std::uint64_t reconnects_ = 0, card_callbacks_ = 0, gzip_frames_ = 0, url_previews_ = 0;
     nlohmann::json SendReply(const std::string& tenant_token, const std::string& chat_id, const std::string& text);
     int ping_interval_s_ = 120;
     std::uint64_t pings_ = 0, binary_events_ = 0, replies_sent_ = 0;

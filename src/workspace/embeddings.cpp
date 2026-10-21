@@ -239,9 +239,19 @@ public:
         mp.n_gpu_layers = 0;
         model_ = llama_model_load_from_file(path.string().c_str(), mp);
         if (!model_) throw std::runtime_error("gguf: llama.cpp failed to load " + path.string());
+        // Context: the model's training context (BERT-style 512, nomic/bge-m3 2k–8k), capped by
+        // OPENCLAW_GGUF_CTX (default 8192). Non-causal embedders need the whole sequence in one ubatch.
+        int want = 8192;
+        if (const char* e = std::getenv("OPENCLAW_GGUF_CTX")) want = std::max(64, std::atoi(e));
+        const int train = llama_model_n_ctx_train(model_);
+        n_ctx_ = std::max(64, train > 0 ? std::min(train, want) : want);
+        n_seq_ = 16;
+        if (const char* e = std::getenv("OPENCLAW_GGUF_SEQ")) n_seq_ = std::clamp(std::atoi(e), 1, 64);
         auto cp = llama_context_default_params();
         cp.embeddings = true;
-        cp.n_ctx = 512; cp.n_batch = 512; cp.n_ubatch = 512;
+        // Batch several texts per decode: the KV/ubatch holds n_seq sequences of up to n_ctx tokens in total.
+        cp.n_ctx = static_cast<uint32_t>(n_ctx_ * 2); cp.n_batch = cp.n_ubatch = static_cast<uint32_t>(n_ctx_ * 2);
+        cp.n_seq_max = static_cast<uint32_t>(n_seq_);
         cp.n_threads = cp.n_threads_batch = std::max(1u, std::min(4u, std::thread::hardware_concurrency()));
         ctx_ = llama_init_from_model(model_, cp);
         if (!ctx_) { llama_model_free(model_); throw std::runtime_error("gguf: llama.cpp context init failed"); }
@@ -250,48 +260,79 @@ public:
     ~LlamaEmbedder() override { if (ctx_) llama_free(ctx_); if (model_) llama_model_free(model_); }
     std::string Id() const override { return "gguf"; }
     std::string Model() const override { return model_name_ + "#llama" + std::to_string(dims_); }
+    nlohmann::json Stats() const override { return {{"n_ctx", n_ctx_}, {"n_seq", n_seq_}, {"decodes", decodes_}, {"windows", windows_}, {"dims", dims_}}; }
     std::vector<Vec> Embed(const std::vector<std::string>& texts) override {
         std::lock_guard lock(mu_);
-        std::vector<Vec> out;
         const auto* vocab = llama_model_get_vocab(model_);
-        const int n_ctx = static_cast<int>(llama_n_ctx(ctx_));
-        for (const auto& text : texts) {
+        // 1) tokenize; texts longer than n_ctx are split into overlapping windows (stride n_ctx*3/4) whose
+        //    pooled vectors are averaged weighted by window length — no silent truncation.
+        struct Win { std::size_t text; std::vector<llama_token> toks; };
+        std::vector<Win> wins;
+        for (std::size_t ti = 0; ti < texts.size(); ++ti) {
+            const auto& text = texts[ti];
             std::vector<llama_token> toks(text.size() + 16);
             int n = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()), toks.data(), static_cast<int32_t>(toks.size()), true, true);
             if (n < 0) { toks.resize(-n); n = llama_tokenize(vocab, text.data(), static_cast<int32_t>(text.size()), toks.data(), static_cast<int32_t>(toks.size()), true, true); }
             if (n <= 0) toks.assign(1, 0), n = 1;
-            n = std::min(n, n_ctx);
             toks.resize(n);
-            llama_memory_clear(llama_get_memory(ctx_), true);
-            llama_batch b = llama_batch_init(n, 0, 1);
-            for (int i = 0; i < n; ++i) {
-                b.token[i] = toks[i]; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+            if (n <= n_ctx_) { wins.push_back({ti, std::move(toks)}); continue; }
+            const int stride = std::max(1, n_ctx_ * 3 / 4);
+            for (int s = 0; s < n; s += stride) {
+                int e = std::min(n, s + n_ctx_);
+                wins.push_back({ti, std::vector<llama_token>(toks.begin() + s, toks.begin() + e)});
+                if (e == n) break;
             }
-            b.n_tokens = n;
-            int rc = llama_model_has_encoder(model_) && !llama_model_has_decoder(model_) ? llama_encode(ctx_, b) : llama_decode(ctx_, b);
-            if (rc != 0) { llama_batch_free(b); throw std::runtime_error("gguf: llama.cpp decode failed rc=" + std::to_string(rc)); }
-            Vec v(dims_, 0.0f);
-            if (llama_pooling_type(ctx_) != LLAMA_POOLING_TYPE_NONE) {
-                const float* e = llama_get_embeddings_seq(ctx_, 0);
-                if (!e) { llama_batch_free(b); throw std::runtime_error("gguf: no pooled embedding"); }
-                std::copy(e, e + dims_, v.begin());
-            } else {
-                for (int i = 0; i < n; ++i) {
-                    const float* e = llama_get_embeddings_ith(ctx_, i);
-                    if (e) for (int d = 0; d < dims_; ++d) v[d] += e[d] / n;
+        }
+        windows_ += wins.size();
+        std::vector<Vec> acc(texts.size(), Vec(dims_, 0.0f));
+        std::vector<double> wsum(texts.size(), 0.0);
+        // 2) pack windows into multi-sequence batches (≤ n_seq sequences, ≤ 2*n_ctx tokens) → one decode each.
+        std::size_t i = 0;
+        while (i < wins.size()) {
+            std::size_t j = i, tok = 0;
+            while (j < wins.size() && static_cast<int>(j - i) < n_seq_ && tok + wins[j].toks.size() <= static_cast<std::size_t>(n_ctx_ * 2)) tok += wins[j++].toks.size();
+            if (j == i) j = i + 1, tok = wins[i].toks.size();
+            llama_memory_clear(llama_get_memory(ctx_), true);
+            llama_batch b = llama_batch_init(static_cast<int32_t>(tok), 0, 1);
+            int k = 0;
+            for (std::size_t w = i; w < j; ++w)
+                for (std::size_t p = 0; p < wins[w].toks.size(); ++p, ++k) {
+                    b.token[k] = wins[w].toks[p]; b.pos[k] = static_cast<llama_pos>(p); b.n_seq_id[k] = 1;
+                    b.seq_id[k][0] = static_cast<llama_seq_id>(w - i); b.logits[k] = 1;
                 }
+            b.n_tokens = k;
+            int rc = llama_model_has_encoder(model_) && !llama_model_has_decoder(model_) ? llama_encode(ctx_, b) : llama_decode(ctx_, b);
+            ++decodes_;
+            if (rc != 0) { llama_batch_free(b); throw std::runtime_error("gguf: llama.cpp decode failed rc=" + std::to_string(rc)); }
+            const bool pooled = llama_pooling_type(ctx_) != LLAMA_POOLING_TYPE_NONE;
+            int off = 0;
+            for (std::size_t w = i; w < j; ++w) {
+                const int n = static_cast<int>(wins[w].toks.size());
+                Vec v(dims_, 0.0f);
+                if (pooled) {
+                    const float* e = llama_get_embeddings_seq(ctx_, static_cast<llama_seq_id>(w - i));
+                    if (!e) { llama_batch_free(b); throw std::runtime_error("gguf: no pooled embedding"); }
+                    std::copy(e, e + dims_, v.begin());
+                } else {
+                    for (int q = 0; q < n; ++q) if (const float* e = llama_get_embeddings_ith(ctx_, off + q)) for (int d = 0; d < dims_; ++d) v[d] += e[d] / n;
+                }
+                off += n;
+                Normalize(v);
+                for (int d = 0; d < dims_; ++d) acc[wins[w].text][d] += v[d] * n;
+                wsum[wins[w].text] += n;
             }
             llama_batch_free(b);
-            Normalize(v);
-            out.push_back(std::move(v));
+            i = j;
         }
-        return out;
+        for (auto& v : acc) Normalize(v);
+        return acc;
     }
 private:
     std::mutex mu_;
     llama_model* model_ = nullptr;
     llama_context* ctx_ = nullptr;
-    int dims_ = 0;
+    int dims_ = 0, n_ctx_ = 512, n_seq_ = 16;
+    std::uint64_t decodes_ = 0, windows_ = 0;
     std::string model_name_;
 };
 #endif
@@ -318,6 +359,7 @@ public:
     std::string Id() const override { return "gguf"; }
     std::string Model() const override { return real_ ? inner_->Model() : model_ + "#hash" + std::to_string(dims_); }
     std::vector<Vec> Embed(const std::vector<std::string>& texts) override { return inner_->Embed(texts); }
+    nlohmann::json Stats() const override { return inner_->Stats(); }
 private:
     fs::path path_;
     int dims_;

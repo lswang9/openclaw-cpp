@@ -20,6 +20,8 @@ public:
     virtual std::vector<Vec> Embed(const std::vector<std::string>& texts) = 0;
     // Query-side embedding (providers with task types: Gemini RETRIEVAL_QUERY, Voyage input_type=query).
     virtual Vec EmbedQuery(const std::string& text) { return Embed({text}).at(0); }
+    // Backend counters (llama.cpp: n_ctx, n_seq, decodes, windows); null when not applicable.
+    virtual nlohmann::json Stats() const { return nullptr; }
 };
 
 // Offline hashed-feature embeddings (LocalEmbed).
