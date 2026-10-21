@@ -1,17 +1,19 @@
 #include "openclaw/context/compaction.hpp"
 #include "openclaw/context/assemble.hpp"
+#include "openclaw/tokenizer/bpe.hpp"
 #include <cctype>
 #include <sstream>
 
 namespace openclaw::context {
 
 std::size_t EstimateTokens(const std::vector<agent::Message>& msgs) {
-    std::size_t chars = 0;
+    // Real BPE (cl100k_base) when the vocab file is installed; chars/4 heuristic otherwise.
+    std::size_t t = 0;
     for (const auto& m : msgs) {
-        chars += m.content.size() + 16;
-        if (!m.tool_calls.is_null()) chars += m.tool_calls.dump().size();
+        t += 4 + tokenizer::CountTokens(m.content);  // ~per-message framing overhead (OpenAI chat format)
+        if (!m.tool_calls.is_null() && !m.tool_calls.empty()) t += tokenizer::CountTokens(m.tool_calls.dump());
     }
-    return chars / 4;
+    return t;
 }
 
 CompactionPolicy CompactionFromConfig(const nlohmann::json& raw) {

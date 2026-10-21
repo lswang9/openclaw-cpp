@@ -1,6 +1,12 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.35.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.36.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.36.0-dev 新增
+
+- 真实 tokenizer：内置 BPE 实现，加载 cl100k_base 词表后与 tiktoken 计数一致（已在多种中英文/代码样例上核对）。用 `openclaw-cpp tokenizer fetch` 下载词表到 `~/.openclaw/tokenizers/`，`tokenizer status` 查看状态，`tokenizer count 文本` 计数。
+- 自动压缩阈值改用这个 tokenizer 计数；没有词表时仍按“字符数/4”估算。
+- 注意：DeepSeek 用的是自己的分词器，cl100k 计数只是更准确的近似。
 
 ## 1.35.0-dev 新增
 

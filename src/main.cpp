@@ -54,6 +54,7 @@
 #include "openclaw/context/assemble.hpp"
 #include "openclaw/context/system_prompt.hpp"
 #include "openclaw/context/compaction.hpp"
+#include "openclaw/tokenizer/bpe.hpp"
 #include "openclaw/workspace/workspace.hpp"
 #include "openclaw/mcp/stdio.hpp"
 
@@ -74,7 +75,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.35.0-dev";
+constexpr const char* kVersion = "1.36.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1386,7 +1387,7 @@ int CmdSelfTest() {
                   cr.messages[2].role == "assistant" && cr.messages.back().content == "latest" &&
                   cr.after_tokens < cr.before_tokens &&
                   mp.LastMessages().size() == 2 && mp.LastMessages()[0].content.find("focus") != std::string::npos;
-        context::CompactionPolicy pol; pol.context_tokens = 1000; pol.reserve_tokens = 200; pol.keep_recent = 4;
+        context::CompactionPolicy pol; pol.context_tokens = 100; pol.reserve_tokens = 20; pol.keep_recent = 4;
         ok = ok && context::NeedsCompaction(pol, h) && !context::NeedsCompaction(pol, {h[0], h[1]});
         pol.mode = "off"; ok = ok && !context::NeedsCompaction(pol, h);
         std::string ins;
@@ -1507,6 +1508,32 @@ int CmdSelfTest() {
         if (!ok) { std::cerr << "FAIL skills entries/slash\n"; ++failures; }
         else std::cerr << "PASS skills.entries (enabled/env/apiKey) + scoped env + skill slash commands\n";
     } catch (const std::exception& e) { std::cerr << "FAIL skills entries exception: " << e.what() << "\n"; ++failures; }
+
+    // BPE tokenizer: synthetic vocab (always) + real cl100k_base (when installed) vs tiktoken reference counts
+    try {
+        namespace tk = tokenizer;
+        auto pre = tk::PreTokenize("I'll   go 123456!!\n\n  x");
+        bool ok = pre == std::vector<std::string>{"I", "'ll", "  ", " go", " ", "123", "456", "!!\n\n", " ", " x"};
+        std::unordered_map<std::string, std::uint32_t> r;
+        for (int b = 0; b < 256; ++b) r[std::string(1, static_cast<char>(b))] = static_cast<std::uint32_t>(b);
+        r["ab"] = 256; r["abc"] = 257; r["bc"] = 258;
+        auto bpe = tk::Bpe::FromRanks(r);
+        auto ids = bpe->Encode("abcd");
+        ok = ok && ids == std::vector<std::uint32_t>{257, 'd'};  // ab(256) merges first, then abc(257)
+        std::string real = "skipped (no vocab)";
+        if (auto* d = tk::Default(); d && d->VocabSize() > 100000) {
+            const std::vector<std::pair<std::string, std::size_t>> ref = {
+                {"hello world", 2}, {"The user prefers dark roast coffee.\n\n", 7},
+                {"\u7528\u6237\u559c\u6b22\u4e4c\u9f99\u8336\uff0c\u90e8\u7f72\u5728 k8s \u4e0a\u3002", 21},
+                {"I'll   go  123456 times!!\n\n  x", 12}, {"def f(x):\n    return x**2  # ok", 12},
+                {"emoji \U0001F389\U0001F389 caf\u00e9 na\u00efve", 10}};
+            for (auto& [s, n] : ref) if (d->Count(s) != n) { ok = false; std::cerr << "  cl100k mismatch: " << s << " got " << d->Count(s) << " want " << n << "\n"; }
+            ok = ok && d->Encode("hello world") == std::vector<std::uint32_t>{15339, 1917};
+            real = "cl100k_base matches tiktoken";
+        }
+        if (!ok) { std::cerr << "FAIL tokenizer\n"; ++failures; }
+        else std::cerr << "PASS BPE tokenizer (pre-tokenizer, merges; " << real << ")\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL tokenizer exception: " << e.what() << "\n"; ++failures; }
 
     // canvas disk store + sim bridge
     try {
@@ -2376,6 +2403,42 @@ int main(int argc, char** argv) {
                 return 0;
             }
             std::cerr << "usage: skills [list|check|info <name>]\n"; return 2;
+        }
+        if (cmd == "tokenizer") {
+            namespace tk = openclaw::tokenizer;
+            std::string sub = argc > 2 ? argv[2] : "status";
+            if (sub == "status") {
+                std::cout << nlohmann::json{{"backend", tk::Backend()}, {"path", tk::DefaultPath().string()},
+                                            {"vocab", tk::Default() ? tk::Default()->VocabSize() : 0}}.dump(2) << '\n';
+                return 0;
+            }
+            if (sub == "count") {
+                std::string t = argc > 3 ? JoinArgs(argc, argv, 3) : ReadStdin();
+                std::cout << nlohmann::json{{"tokens", tk::CountTokens(t)}, {"backend", tk::Backend()}}.dump() << '\n';
+                return 0;
+            }
+            if (sub == "fetch") {
+                // Explicit user action: download the public cl100k_base rank file (not used by tests).
+                auto dst = tk::DefaultPath();
+                std::filesystem::create_directories(dst.parent_path());
+                std::string url = "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken";
+                CURL* h = curl_easy_init();
+                if (!h) return 1;
+                auto tmp = dst.string() + ".part";
+                FILE* f = std::fopen(tmp.c_str(), "wb");
+                if (!f) { curl_easy_cleanup(h); return 1; }
+                curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+                curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+                curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
+                curl_easy_setopt(h, CURLOPT_WRITEDATA, f);
+                auto rc = curl_easy_perform(h);
+                std::fclose(f); curl_easy_cleanup(h);
+                if (rc != CURLE_OK || !tk::Bpe::LoadTiktoken(tmp)) { std::remove(tmp.c_str()); std::cerr << "download failed\n"; return 1; }
+                std::filesystem::rename(tmp, dst);
+                std::cout << "saved " << dst.string() << '\n';
+                return 0;
+            }
+            std::cerr << "usage: tokenizer [status|count <text>|fetch]\n"; return 2;
         }
         if (cmd == "context") {
             std::string sub = argc > 2 ? argv[2] : "list";
