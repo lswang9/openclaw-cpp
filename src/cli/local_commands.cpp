@@ -1602,6 +1602,7 @@ int MaybeLocalCommand2(int argc, char** argv) {
 }
 
 int MaybeLocalCommand(int argc, char** argv) {
+    if (int r = MaybeLocalCommand3(argc, argv); r != -1) return r;
     if (int r = MaybeLocalCommand2(argc, argv); r != -1) return r;
     if (argc < 2) return -1;
     const std::string cmd = argv[1];

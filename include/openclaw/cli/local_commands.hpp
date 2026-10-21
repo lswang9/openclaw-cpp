@@ -11,6 +11,8 @@ namespace openclaw::cli {
 // kDelegateChat when the caller should run the chat REPL / one-shot instead (setup with an existing config).
 constexpr int kDelegateChat = -2;
 int MaybeLocalCommand(int argc, char** argv);
+// Batch 3 (local_commands3.cpp): directory, proxy, database preflight/ownership, update wizard/cleanup/recover/...
+int MaybeLocalCommand3(int argc, char** argv);
 
 // Upstream command tree (generated from v2026.10.5 commander registrations): {cmd: {sub: {flags, args}}}.
 const nlohmann::json& UpstreamCommandTree();

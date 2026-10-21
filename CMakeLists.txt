@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.121.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.122.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +18,7 @@ find_package(Opus QUIET)
 set(OPENCLAW_SOURCES
   src/main.cpp
   src/cli/local_commands.cpp
+  src/cli/local_commands3.cpp
   src/cli/tui_screen.cpp
   src/agent/loop.cpp
   src/agent/files.cpp
