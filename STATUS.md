@@ -1,6 +1,11 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.97.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.98.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.98.0-dev 新增
+
+- 补齐上游按参数决定的权限规则：`node.invoke`（browser.proxy/fs.listDir/terminal.upload 需 admin，被禁止的浏览器配置变更交给处理器精确拒绝）、`sessions.patch/patchMany/create/delete/dispatch/move`（按字段判断 write 还是 admin，如 permissionMode=full、sandboxMode、隐身会话、archivedOnly 删除、按 profile 调度）、`plugins.sessionAction`（参数不完整时任意 operator 权限可进入处理器）。
+- 新增窄权限 `operator.sessions.read` / `operator.sessions.write`：只对上游列出的会话类方法（chat.history、sessions.list、chat.send 等）可替代 read/write。
 
 ## 1.97.0-dev 新增
 

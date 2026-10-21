@@ -30,6 +30,8 @@ public:
     // Upstream "dynamic" methods: required scopes derived from params (method-scopes.ts
     // resolveDynamicLeastPrivilegeOperatorScopesForMethod). Empty → static MethodScope applies.
     static std::vector<std::string> DynamicScopes(const std::string& method, const nlohmann::json& params);
+    // Narrow session grant (operator.sessions.read|write) that may stand in for read/write on session-bound methods.
+    static std::string SessionScope(const std::string& method, const nlohmann::json& params);
     static std::string MethodScope(const std::string& method);  // the operator.* scope a method needs
     std::vector<std::string> TokenScopes(const std::string& token) const;
     nlohmann::json Deny(const std::string& id_or_code);

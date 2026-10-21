@@ -1,3 +1,5 @@
+#include <set>
+#include <regex>
 #include <unordered_map>
 #include "openclaw/auth/device_link.hpp"
 #include <openssl/rand.h>
@@ -143,7 +145,7 @@ nlohmann::json DeviceLinkStore::List() const {
 }
 
 bool DeviceLinkStore::ValidScope(const std::string& s) {
-    static const char* k[] = {"operator.read", "operator.write", "operator.approvals", "operator.pairing", "operator.admin", "operator.talk", "operator.questions", "operator.talk.secrets"};
+    static const char* k[] = {"operator.read", "operator.write", "operator.approvals", "operator.pairing", "operator.admin", "operator.talk", "operator.questions", "operator.talk.secrets", "operator.sessions.read", "operator.sessions.write"};
     for (auto* x : k) if (s == x) return true;
     return s.rfind("rpc:", 0) == 0 && s.size() > 4 && s.size() < 128;
 }
@@ -169,14 +171,108 @@ std::string DeviceLinkStore::MethodScope(const std::string& m) {
     return "operator.write";
 }
 
+namespace {
+// upstream packages/session-url-contract isIncognitoSessionKey
+bool Incognito(const std::string& k) {
+    static const std::regex re("^agent:[^:]+:(dashboard|subagent|internal-session-effects):incognito-[^:]+$");
+    std::string s = k;
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(0, 1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return !s.empty() && std::regex_match(s, re);
+}
+// upstream shared/session-method-scopes-base.ts resolveBaseSessionMutationRequiredScope (+dispatch/move)
+std::string SessionMutationScope(const std::string& m, const nlohmann::json& p) {
+    static const std::set<std::string> kPatch = {"label", "autoLabel", "icon", "color", "category", "boardFace", "boardPresentation", "pinned",
+                                                 "archived", "snoozedUntil", "unread", "model", "agentRuntime", "thinkingLevel", "fastMode", "permissionMode"};
+    static const std::set<std::string> kEnvelope = {"key", "agentId", "expectedSessionId", "expectedLifecycleRevision", "expectedPermissionMode", "expectedMarkedUnreadAt"};
+    static const std::set<std::string> kDelete = {"key", "agentId", "deleteTranscript", "expectedSessionId", "archivedOnly"};
+    const bool obj = p.is_object();
+    auto full = [](const nlohmann::json& o) { return o.is_object() && (o.value("permissionMode", nlohmann::json()) == "full" || o.contains("sandboxMode")); };
+    if (m == "sessions.recover") return "operator.write";
+    if (m == "sessions.create") {
+        if (!obj) return "operator.write";
+        auto s = [&](const char* k) { return p.contains(k) && p[k].is_string() && Incognito(p[k].get<std::string>()); };
+        if (p.value("incognito", false) == true || s("key") || s("parentSessionKey") || p.contains("execNode") || p.contains("toolOverrides") || full(p)) return "operator.admin";
+        return "operator.write";
+    }
+    if (m == "sessions.patch") {
+        if (!obj) return "operator.write";
+        if (full(p)) return "operator.admin";
+        for (auto& [k, _] : p.items()) if (!kEnvelope.count(k) && !kPatch.count(k)) return "operator.admin";
+        return "operator.write";
+    }
+    if (m == "sessions.patchMany") {
+        if (!obj || !p.contains("patch") || !p["patch"].is_object()) return "operator.write";
+        if (full(p["patch"])) return "operator.admin";
+        for (auto& [k, _] : p["patch"].items()) if (!kPatch.count(k)) return "operator.admin";
+        return "operator.write";
+    }
+    if (m == "sessions.delete") {
+        if (!obj || p.value("archivedOnly", false) != true) return "operator.admin";
+        for (auto& [k, _] : p.items()) if (!kDelete.count(k)) return "operator.admin";
+        return "operator.write";
+    }
+    if (m == "sessions.dispatch") {
+        if (!obj || !p.contains("key")) return "operator.write";  // invalid params: handler rejects precisely
+        return p.contains("deviceId") || p.value("autoDevice", false) == true ? "operator.write" : "operator.admin";
+    }
+    if (m == "sessions.move") {
+        const bool profile = obj && p.contains("target") && p["target"].is_object() && p["target"].value("kind", "") == "profile";
+        return profile ? "operator.admin" : "operator.write";
+    }
+    return {};
+}
+// upstream shared/session-method-scopes-base.ts SESSION_READ_METHODS / SESSION_WRITE_METHODS
+const std::set<std::string>& SessionReadMethods() {
+    static const std::set<std::string> k = {"agent.identity.get", "agents.list", "canvas.document.preview", "models.list", "progressCard.get", "projects.list",
+        "session.suggestions.list", "session.reactions.list", "sessions.groups.list", "sessions.processes.list", "sessions.list", "sessions.subscribe",
+        "sessions.messages.subscribe", "sessions.messages.unsubscribe", "sessions.viewers.set", "sessions.preview", "sessions.describe",
+        "sessions.branches.list", "sessions.get", "sessions.github.options", "sessions.github.status", "sessions.resolve", "sessions.search",
+        "sessions.files.list", "sessions.files.get", "sessions.files.assets", "sessions.setInvolvement", "chat.history", "chat.startup",
+        "chat.metadata", "chat.message.get", "session.members.list", "session.members.listEvidence", "themes.get", "themes.list",
+        "users.prefs.get", "users.self"};
+    return k;
+}
+const std::set<std::string>& SessionWriteMethods() {
+    static const std::set<std::string> k = {"question.request", "question.waitAnswer", "question.resolve", "question.get", "question.list", "chat.send",
+        "chat.abort", "sessions.create", "sessions.patch", "sessions.patchMany", "sessions.fork", "sessions.recover", "sessions.send", "sessions.steer",
+        "sessions.processes.stop", "sessions.abort", "sessions.goal.update", "sessions.goal.clear"};
+    return k;
+}
+}  // namespace
+
+std::string DeviceLinkStore::SessionScope(const std::string& m, const nlohmann::json& p) {
+    if (SessionReadMethods().count(m)) return "operator.sessions.read";
+    if (SessionWriteMethods().count(m) && SessionMutationScope(m, p) != "operator.admin") return "operator.sessions.write";
+    return {};
+}
+
 std::vector<std::string> DeviceLinkStore::DynamicScopes(const std::string& m, const nlohmann::json& p) {
     const bool obj = p.is_object();
     auto str = [&](const char* k) { return obj && p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    if (m == "plugins.sessionAction") return {"operator.write"};  // registered actions without requiredScopes default to write
     if (m == "agent") {
         auto msg = str("message");
         while (!msg.empty() && (msg.front() == ' ' || msg.front() == '\t')) msg.erase(0, 1);
         const bool reset = msg == "/new" || msg == "/reset" || msg.rfind("/new ", 0) == 0 || msg.rfind("/reset ", 0) == 0;
         return {reset ? "operator.admin" : "operator.write"};
+    }
+    if (m == "node.invoke") {
+        // upstream infra/node-commands.ts NODE_ADMIN_ONLY_INVOKE_COMMANDS; forbidden browser-proxy profile mutations stay
+        // write so the handler's precise fail-closed rejection is reported.
+        const auto cmd = str("command");
+        const bool proxy = cmd == "browser.proxy" || cmd == "browser.proxy.upload.v1";
+        if (proxy && obj && p.contains("params") && p["params"].is_object()) {
+            auto meth = p["params"].value("method", std::string()), path = p["params"].value("path", std::string());
+            for (auto& c : meth) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (!path.empty() && path[0] != '/') path = "/" + path;
+            while (path.size() > 1 && path.back() == '/') path.pop_back();
+            static const std::regex del("^/profiles/[^/]+$");
+            if (!meth.empty() && !path.empty() && ((meth == "POST" && (path == "/profiles/create" || path == "/reset-profile")) || (meth == "DELETE" && std::regex_match(path, del))))
+                return {"operator.write"};
+        }
+        return {proxy || cmd == "fs.listDir" || cmd == "terminal.upload" ? "operator.admin" : "operator.write"};
     }
     if (m == "talk.config") return obj && p.value("includeSecrets", false) == true ? std::vector<std::string>{"operator.read", "operator.talk.secrets"}
                                                                                  : std::vector<std::string>{"operator.read"};
@@ -185,29 +281,42 @@ std::vector<std::string> DeviceLinkStore::DynamicScopes(const std::string& m, co
                                                     ? std::vector<std::string>{"operator.pairing", "operator.admin"}
                                                     : std::vector<std::string>{"operator.pairing"};
     if (m == "fs.listDir") return {obj && p.contains("nodeId") ? "operator.admin" : "operator.write"};
-    if (m == "sessions.delete") return {"operator.admin"};
+    if (m == "sessions.patch" || m == "sessions.patchMany" || m == "sessions.create" || m == "sessions.dispatch" || m == "sessions.move")
+        return {SessionMutationScope(m, p)};
+    if (m == "sessions.delete") return {SessionMutationScope(m, p)};
     return {};
 }
 
 bool DeviceLinkStore::ScopeAllows(const std::vector<std::string>& scopes, const std::string& m, const nlohmann::json& params) {
     if (scopes.empty()) return true;
+    for (const auto& s : scopes) if (s == "operator.admin") return true;
+    const auto session_scope = SessionScope(m, params);
+    // upstream authorizeOperatorScopesForRequiredScope: read/write may be satisfied by the narrower
+    // operator.sessions.read / operator.sessions.write grant for session-bound methods.
+    auto has = [&](const std::string& need) {
+        for (const auto& s : scopes) {
+            if (s == need) return true;
+            if (s == "operator.write" && need == "operator.read") return true;
+            if (s == "operator.sessions.write" && need == "operator.sessions.read") return true;
+        }
+        if (!session_scope.empty() && (need == "operator.read" && session_scope == "operator.sessions.read" ||
+                                       ((need == "operator.write" || (need == "operator.questions" && m.rfind("question.", 0) == 0)) && session_scope == "operator.sessions.write")))
+            for (const auto& s : scopes) if (s == session_scope || (session_scope == "operator.sessions.read" && s == "operator.sessions.write")) return true;
+        return false;
+    };
+    if (m == "plugins.sessionAction") {
+        const bool malformed = !params.is_object() || !params.contains("pluginId") || !params.contains("actionId") ||
+                               !params["pluginId"].is_string() || !params["actionId"].is_string();
+        if (malformed) { for (const auto& s : scopes) if (s.rfind("operator.", 0) == 0) return true; return false; }
+    }
     if (auto dyn = DynamicScopes(m, params); !dyn.empty()) {
-        auto has = [&](const std::string& need) {
-            for (const auto& s : scopes) {
-                if (s == "operator.admin" || s == need) return true;
-                if (s == "operator.write" && need == "operator.read") return true;
-            }
-            return false;
-        };
         for (auto& need : dyn) if (!has(need)) return false;
         return true;
     }
     const auto need = MethodScope(m);
-    for (const auto& s : scopes) {
-        if (s == "operator.admin" || s == need) return true;
-        if (s == "operator.write" && need == "operator.read") return true;  // write implies read
+    if (has(need)) return true;
+    for (const auto& s : scopes)
         if (s.rfind("rpc:", 0) == 0 && m.rfind(s.substr(4), 0) == 0 && need != "operator.admin") return true;
-    }
     return false;
 }
 

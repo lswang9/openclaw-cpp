@@ -104,7 +104,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.97.0-dev";
+constexpr const char* kVersion = "1.98.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2654,6 +2654,36 @@ int CmdSelfTest() {
         } else std::cerr << "PASS waweb XEdDSA cert chain verify (root/intermediate/leaf, rejects wrong root/static/tamper)\n";
     }
 
+    {  // upstream params-dependent scope rules (method-scopes.ts / session-method-scopes-base.ts)
+        using D = openclaw::auth::DeviceLinkStore;
+        using J = nlohmann::json;
+        const std::vector<std::string> W{"operator.write"}, R{"operator.read"}, SR{"operator.sessions.read"}, SW{"operator.sessions.write"};
+        bool ok = true;
+        auto chk = [&](bool v, const char* what) { if (!v) { std::cerr << "  scope rule failed: " << what << '\n'; ok = false; } };
+        chk(!D::ScopeAllows(W, "node.invoke", J{{"command", "fs.listDir"}}), "node.invoke fs.listDir admin");
+        chk(D::ScopeAllows(W, "node.invoke", J{{"command", "system.run"}}), "node.invoke system.run write");
+        chk(D::ScopeAllows(W, "node.invoke", J{{"command", "browser.proxy"}, {"params", {{"method", "post"}, {"path", "profiles/create/"}}}}), "forbidden proxy mutation reaches handler");
+        chk(!D::ScopeAllows(W, "node.invoke", J{{"command", "browser.proxy"}, {"params", {{"method", "GET"}, {"path", "/tabs"}}}}), "browser.proxy admin");
+        chk(D::ScopeAllows(W, "sessions.patch", J{{"key", "k"}, {"label", "x"}}), "patch label write");
+        chk(!D::ScopeAllows(W, "sessions.patch", J{{"key", "k"}, {"permissionMode", "full"}}), "patch full admin");
+        chk(!D::ScopeAllows(W, "sessions.patch", J{{"key", "k"}, {"execHost", "x"}}), "patch unknown field admin");
+        chk(!D::ScopeAllows(W, "sessions.patchMany", J{{"patch", {{"sandboxMode", "off"}}}}), "patchMany sandbox admin");
+        chk(!D::ScopeAllows(W, "sessions.create", J{{"key", "agent:main:dashboard:incognito-1"}}), "create incognito admin");
+        chk(D::ScopeAllows(W, "sessions.create", J{{"key", "agent:main:x"}}), "create write");
+        chk(D::ScopeAllows(W, "sessions.delete", J{{"key", "k"}, {"archivedOnly", true}}), "delete archivedOnly write");
+        chk(!D::ScopeAllows(W, "sessions.delete", J{{"key", "k"}}), "delete admin");
+        chk(!D::ScopeAllows(W, "sessions.dispatch", J{{"key", "k"}, {"profile", "cloud"}}), "dispatch profile admin");
+        chk(D::ScopeAllows(W, "sessions.dispatch", J{{"key", "k"}, {"deviceId", "d"}}), "dispatch device write");
+        chk(!D::ScopeAllows(W, "sessions.move", J{{"key", "k"}, {"target", {{"kind", "profile"}}}}), "move profile admin");
+        chk(D::ScopeAllows(SR, "chat.history", J::object()) && !D::ScopeAllows(SR, "chat.send", J::object()), "sessions.read grant");
+        chk(D::ScopeAllows(SW, "chat.send", J::object()) && D::ScopeAllows(SW, "sessions.list", J::object()), "sessions.write grant");
+        chk(D::ScopeAllows(SW, "sessions.patch", J{{"key", "k"}, {"label", "x"}}) && !D::ScopeAllows(SW, "sessions.patch", J{{"key", "k"}, {"permissionMode", "full"}}), "sessions.write mutation bound");
+        chk(!D::ScopeAllows(SW, "config.set", J::object()) && !D::ScopeAllows(SR, "logs.tail", J::object()), "session grants stay narrow");
+        chk(D::ScopeAllows(R, "plugins.sessionAction", J::object()) && !D::ScopeAllows(R, "plugins.sessionAction", J{{"pluginId", "p"}, {"actionId", "a"}}), "sessionAction malformed/registered");
+        chk(D::ValidScope("operator.sessions.read") && D::ValidScope("operator.sessions.write"), "session scopes valid");
+        if (!ok) { std::cerr << "FAIL upstream dynamic scope rules\n"; ++failures; }
+        else std::cerr << "PASS upstream dynamic scope rules (node.invoke admin set, session mutations, operator.sessions.* grants, sessionAction)\n";
+    }
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
     return 1;
