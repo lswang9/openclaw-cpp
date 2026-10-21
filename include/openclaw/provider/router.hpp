@@ -2,7 +2,9 @@
 
 #include "openclaw/provider/provider.hpp"
 
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -30,8 +32,17 @@ public:
                                           const std::vector<agent::Message>& messages,
                                           const nlohmann::json& tools);
 
+    // 1.125: build providers on demand for "provider/model" routes (config models.providers + built-ins).
+    // Returning nullptr falls back to the provider registered under the route's prefix.
+    using Factory = std::function<std::shared_ptr<Provider>(const std::string& route)>;
+    void SetFactory(Factory f) { std::lock_guard<std::mutex> l(mu_); factory_ = std::move(f); }
+    void ClearDynamic() { std::lock_guard<std::mutex> l(mu_); dynamic_.clear(); }
+
 private:
     std::unordered_map<std::string, std::shared_ptr<Provider>> providers_;
+    mutable std::mutex mu_;
+    Factory factory_;
+    mutable std::unordered_map<std::string, std::shared_ptr<Provider>> dynamic_;
     std::string default_;
 };
 

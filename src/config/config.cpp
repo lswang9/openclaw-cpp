@@ -349,6 +349,9 @@ SchemaReport ValidateSchema(const nlohmann::json& raw) {
         "nodeHost", "agents", "tools", "bindings", "broadcast", "audio", "media", "messages", "commands", "approvals",
         "session", "cron", "hooks", "web", "channels", "discovery", "canvasHost", "talk", "gateway", "memory", "skills",
         "plugins", "acp", "secrets", "mcp",
+        // upstream v2026.10.5 root-shape keys added in 1.125 (accepted; shallow validation)
+        "accessGroups", "attachments", "cloudWorkers", "desktop", "proxy", "security", "storage", "surfaces", "telemetry",
+        "transcripts", "tts", "worktreeAcceleration", "worktreeMaxCount", "worktreeRoot",
         // openclaw-cpp extensions / gateway-managed state
         "session_dir", "align_target", "agents_list", "audit_log"};
     if (!raw.is_object()) { r.errors.push_back("<root>: must be an object"); return r; }

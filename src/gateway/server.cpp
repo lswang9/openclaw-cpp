@@ -1,3 +1,4 @@
+#include <openssl/crypto.h>
 #include <regex>
 #include "openclaw/auth/webauthn.hpp"
 #include "openclaw/voice/inbound_audio.hpp"
@@ -55,7 +56,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.124.0-dev";
+constexpr const char* kVersion = "1.125.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1498,12 +1499,157 @@ std::optional<std::string> Server::GatewayAuthDeny(const std::string& req) const
            "X-OpenClaw-Token, or log in at /login";
 }
 
+// ---------------------------------------------------------------- 1.125: webhook ingress (hooks.enabled + hooks.token)
+// POST <hooks.path>/wake {text, mode}, <hooks.path>/agent {message, name, agentId, sessionKey, deliver, channel, to,
+// model, waitForCompletion}, and mapped sub-paths (hooks.mappings + presets ["gmail"]). Upstream hooks-request-handler parity.
+namespace {
+std::string HookTemplate(const std::string& tpl, const nlohmann::json& payload) {
+    std::string out; size_t i = 0;
+    while (i < tpl.size()) {
+        auto a = tpl.find("{{", i); if (a == std::string::npos) { out += tpl.substr(i); break; }
+        auto b = tpl.find("}}", a); if (b == std::string::npos) { out += tpl.substr(i); break; }
+        out += tpl.substr(i, a - i);
+        std::string expr = tpl.substr(a + 2, b - a - 2); while (!expr.empty() && expr.front() == ' ') expr.erase(0, 1); while (!expr.empty() && expr.back() == ' ') expr.pop_back();
+        const nlohmann::json* cur = &payload; std::string tok; bool ok = true;
+        auto step = [&](const std::string& t) {
+            if (t.empty() || !ok) return;
+            if (cur->is_object() && cur->contains(t)) cur = &(*cur)[t];
+            else if (cur->is_array() && std::all_of(t.begin(), t.end(), ::isdigit) && std::stoul(t) < cur->size()) cur = &(*cur)[std::stoul(t)];
+            else ok = false;
+        };
+        for (char c : expr) { if (c == '.' || c == '[' || c == ']') { step(tok); tok.clear(); } else tok += c; }
+        step(tok);
+        if (ok) out += cur->is_string() ? cur->get<std::string>() : cur->is_null() ? std::string() : cur->dump();
+        i = b + 2;
+    }
+    return out;
+}
+nlohmann::json HookMappings(const nlohmann::json& hooks) {
+    nlohmann::json maps = hooks.value("mappings", nlohmann::json::array());
+    for (auto& p : hooks.value("presets", nlohmann::json::array()))
+        if (p == "gmail") maps.push_back({{"id", "gmail"}, {"match", {{"path", "gmail"}}}, {"action", "agent"}, {"wakeMode", "now"}, {"name", "Gmail"}, {"forEach", "messages"},
+                                          {"sessionKey", "hook:gmail:{{messages[0].id}}"},
+                                          {"messageTemplate", "New email from {{messages[0].from}}\nSubject: {{messages[0].subject}}\n{{messages[0].snippet}}\n{{messages[0].body}}"}});
+    return maps;
+}
+}  // namespace
+
+bool Server::HandleHooks(int client_fd, const std::string& method, const std::string& path_raw, const std::string& req) {
+    nlohmann::json hooks;
+    { std::lock_guard<std::mutex> lk(deps_mu_); hooks = config::GetPath(deps_.config.raw, "hooks").value_or(nlohmann::json::object()); }
+    if (!hooks.is_object() || !hooks.value("enabled", false)) return false;
+    std::string base = hooks.value("path", std::string("/hooks"));
+    if (base.empty()) base = "/hooks";
+    if (base[0] != '/') base = "/" + base;
+    while (base.size() > 1 && base.back() == '/') base.pop_back();
+    const std::string path = PathOnly(path_raw);
+    if (path != base && path.rfind(base + "/", 0) != 0) return false;
+    auto send = [&](int code, const std::string& status, const std::string& body, const std::string& ct = "application/json", const std::string& extra = "") {
+        const auto r = HttpResponse(code, status, body, ct, extra); (void)::send(client_fd, r.data(), r.size(), 0); return true; };
+    auto sendj = [&](int code, const nlohmann::json& j) { static const std::map<int, std::string> st{{200, "OK"}, {202, "Accepted"}, {400, "Bad Request"}, {404, "Not Found"}, {413, "Payload Too Large"}, {500, "Internal Server Error"}, {503, "Service Unavailable"}};
+        return send(code, st.count(code) ? st.at(code) : "OK", j.dump()); };
+    std::string token = hooks.value("token", std::string());
+    if (token.empty() || base == "/") return sendj(500, {{"ok", false}, {"error", token.empty() ? "hooks.enabled requires hooks.token" : "hooks.path may not be '/'"}});
+    if (path_raw.find("?token=") != std::string::npos || path_raw.find("&token=") != std::string::npos)
+        return send(400, "Bad Request", "Hook token must be provided via Authorization: Bearer <token> or X-OpenClaw-Token header (query parameters are not allowed).", "text/plain; charset=utf-8");
+    if (method != "POST") return send(405, "Method Not Allowed", "Method Not Allowed", "text/plain; charset=utf-8", "Allow: POST\r\n");
+    std::string got; { auto a = HeaderValue(req, "Authorization"); if (a.size() > 7 && (a.rfind("Bearer ", 0) == 0 || a.rfind("bearer ", 0) == 0)) got = a.substr(7); if (got.empty()) got = HeaderValue(req, "X-OpenClaw-Token"); }
+    while (!got.empty() && got.back() == ' ') got.pop_back();
+    if (got.size() != token.size() || CRYPTO_memcmp(got.data(), token.data(), token.size()) != 0) return send(401, "Unauthorized", "Unauthorized", "text/plain; charset=utf-8");
+    const std::string body_s = BodyOf(req);
+    const size_t max_bytes = hooks.value("maxBodyBytes", static_cast<size_t>(256 * 1024));
+    if (body_s.size() > max_bytes) return sendj(413, {{"ok", false}, {"error", "payload too large"}});
+    nlohmann::json payload = nlohmann::json::object();
+    if (!body_s.empty()) { try { payload = nlohmann::json::parse(body_s); } catch (...) { return sendj(400, {{"ok", false}, {"error", "invalid JSON body"}}); } }
+    if (!payload.is_object()) return sendj(400, {{"ok", false}, {"error", "body must be a JSON object"}});
+    const std::string sub = path.size() > base.size() ? path.substr(base.size() + 1) : "";
+    const std::string def_session = hooks.value("defaultSessionKey", std::string());
+    const bool allow_req_key = hooks.value("allowRequestSessionKey", false);
+    const auto prefixes = hooks.value("allowedSessionKeyPrefixes", nlohmann::json::array());
+    auto key_allowed = [&](const std::string& k) { if (prefixes.empty()) return true; for (auto& p : prefixes) if (p.is_string() && k.rfind(p.get<std::string>(), 0) == 0) return true; return false; };
+    auto run_agent = [this](nlohmann::json a, bool wait) -> nlohmann::json {
+        const std::string run_id = "hook-" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()) + "-" + std::to_string(std::rand() % 100000);
+        auto job = [this, a, run_id]() -> nlohmann::json {
+            nlohmann::json p = {{"sessionKey", a["sessionKey"]}, {"agentId", a["agentId"]}, {"message", "[" + a.value("name", std::string("Hook")) + "] " + a.value("message", std::string())}, {"idempotencyKey", run_id}};
+            if (a.contains("model") && a["model"].is_string()) p["model"] = a["model"];
+            auto r = DispatchRpc({{"id", run_id}, {"method", "chat.send"}, {"params", p}});
+            const std::string text = r.contains("payload") && r["payload"].is_object() ? r["payload"].value("text", std::string()) : std::string();
+            if (a.value("deliver", false) && !a.value("channel", std::string()).empty() && !a.value("to", std::string()).empty() && !text.empty())
+                DispatchRpc({{"id", run_id + "-d"}, {"method", "send"}, {"params", {{"channel", a["channel"]}, {"to", a["to"]}, {"message", text}, {"idempotencyKey", run_id + "-d"}}}});
+            deps_.logs.Append("info", "hook run " + run_id + " (" + a.value("sessionKey", std::string()) + ") " + (r.value("ok", false) ? "ok" : "failed"));
+            return {{"ok", r.value("ok", false)}, {"runId", run_id}, {"sessionKey", a["sessionKey"]}, {"text", text}, {"error", r.value("error", nlohmann::json(nullptr))}};
+        };
+        if (wait) return job();
+        std::thread([job]() { try { job(); } catch (...) {} }).detach();
+        return {{"ok", true}, {"runId", run_id}, {"sessionKey", a["sessionKey"]}, {"status", "accepted"}};
+    };
+    auto resolve_agent_req = [&](const nlohmann::json& in, std::string* err) -> nlohmann::json {
+        nlohmann::json a = in;
+        if (!a.contains("message") || !a["message"].is_string() || a["message"].get<std::string>().find_first_not_of(" \t\r\n") == std::string::npos) { *err = "message required"; return nullptr; }
+        if (a.contains("agentId") && (!a["agentId"].is_string() || a["agentId"].get<std::string>().empty())) { *err = "agentId must be a non-empty string"; return nullptr; }
+        const auto allowed_agents = hooks.value("allowedAgentIds", nlohmann::json::array());
+        const std::string agent = a.value("agentId", std::string("main"));
+        if (!allowed_agents.empty() && std::find(allowed_agents.begin(), allowed_agents.end(), agent) == allowed_agents.end()) { *err = "agentId \"" + agent + "\" is not allowed for hooks"; return nullptr; }
+        std::string key;
+        if (a.contains("sessionKey")) {
+            if (!a["sessionKey"].is_string() || a["sessionKey"].get<std::string>().empty()) { *err = "sessionKey must be a non-empty string"; return nullptr; }
+            if (!allow_req_key && !a.value("_mapped", false)) { *err = "sessionKey is not allowed (set hooks.allowRequestSessionKey=true)"; return nullptr; }
+            key = a["sessionKey"];
+        } else key = def_session.empty() ? "hook:" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()) : def_session;
+        if (!key_allowed(key)) { *err = "sessionKey \"" + key + "\" does not match hooks.allowedSessionKeyPrefixes"; return nullptr; }
+        if (a.contains("sessionMode") && a["sessionMode"] != "isolated" && a["sessionMode"] != "persistent") { *err = "sessionMode must be isolated or persistent"; return nullptr; }
+        a["agentId"] = agent; a["sessionKey"] = key.rfind("agent:", 0) == 0 ? key : "agent:" + agent + ":" + key;
+        a["deliver"] = a.value("deliver", true);
+        return a;
+    };
+    if (sub == "wake") {
+        const std::string text = payload.value("text", std::string());
+        if (text.find_first_not_of(" \t\r\n") == std::string::npos) return sendj(400, {{"ok", false}, {"error", "text required"}});
+        const std::string mode = payload.value("mode", std::string("now")) == "next-heartbeat" ? "next-heartbeat" : "now";
+        if (mode == "next-heartbeat" && payload.contains("sessionKey")) return sendj(400, {{"ok", false}, {"error", "sessionKey requires mode=now"}});
+        Emit("system.event", {{"text", text}, {"source", "hook"}, {"mode", mode}});
+        nlohmann::json p = {{"text", text}, {"mode", mode}}; if (payload.contains("agentId")) p["agentId"] = payload["agentId"]; if (payload.contains("sessionKey")) p["sessionKey"] = payload["sessionKey"];
+        if (mode == "now") { std::thread([this, p]() { try { DispatchRpc({{"id", "hook-wake"}, {"method", "wake"}, {"params", p}}); } catch (...) {} }).detach(); return sendj(200, {{"ok", true}, {"mode", mode}}); }
+        auto r = DispatchRpc({{"id", "hook-wake"}, {"method", "wake"}, {"params", p}});
+        return sendj(r.value("ok", false) ? 200 : 503, {{"ok", r.value("ok", false)}, {"mode", mode}});
+    }
+    if (sub == "agent") {
+        if (payload.contains("waitForCompletion") && !payload["waitForCompletion"].is_boolean()) return sendj(400, {{"ok", false}, {"error", "waitForCompletion must be boolean"}});
+        std::string err; auto a = resolve_agent_req(payload, &err); if (a.is_null()) return sendj(400, {{"ok", false}, {"error", err}});
+        const bool wait = payload.value("waitForCompletion", false);
+        auto r = run_agent(a, wait);
+        return sendj(wait ? (r.value("ok", false) ? 200 : 500) : 202, r);
+    }
+    for (auto& m : HookMappings(hooks)) {
+        const auto match = m.value("match", nlohmann::json::object());
+        if (match.contains("path") && match["path"].get<std::string>() != sub) continue;
+        if (match.contains("source") && payload.value("source", std::string()) != match["source"].get<std::string>()) continue;
+        std::vector<nlohmann::json> items;
+        if (m.contains("forEach")) { const auto arr = payload.value(m["forEach"].get<std::string>(), nlohmann::json::array()); for (auto& it : arr) { auto one = payload; one[m["forEach"].get<std::string>()] = nlohmann::json::array({it}); items.push_back(one); } if (items.empty()) return send(204, "No Content", "", "text/plain"); }
+        else items.push_back(payload);
+        const std::string action = m.value("action", std::string("agent"));
+        nlohmann::json results = nlohmann::json::array();
+        for (auto& item : items) {
+            const std::string text = HookTemplate(m.value(action == "wake" ? "textTemplate" : "messageTemplate", m.value("messageTemplate", std::string("{{message}}"))), item);
+            if (action == "wake") { Emit("system.event", {{"text", text}, {"source", "hook:" + m.value("id", sub)}}); DispatchRpc({{"id", "hook-wake"}, {"method", "wake"}, {"params", {{"text", text}, {"mode", m.value("wakeMode", std::string("now"))}}}}); results.push_back({{"ok", true}}); continue; }
+            nlohmann::json a = {{"message", text}, {"name", m.value("name", std::string("Hook"))}, {"_mapped", true}};
+            for (auto k : {"agentId", "deliver", "channel", "to", "model"}) if (m.contains(k)) a[k] = m[k];
+            if (m.contains("sessionKey")) a["sessionKey"] = HookTemplate(m["sessionKey"].get<std::string>(), item);
+            std::string err; auto ra = resolve_agent_req(a, &err); if (ra.is_null()) return sendj(400, {{"ok", false}, {"error", err}});
+            results.push_back(run_agent(ra, false));
+        }
+        return sendj(202, {{"ok", true}, {"mapping", m.value("id", sub)}, {"runs", results}});
+    }
+    return send(404, "Not Found", "Not Found", "text/plain; charset=utf-8");
+}
+
 void Server::HandleHttp(int client_fd, const std::string& req) {
     std::istringstream first(req);
     std::string method, path_raw, version;
     first >> method >> path_raw >> version;
     const std::string path = PathOnly(path_raw);
     auto send = [&](const std::string& resp) { (void)::send(client_fd, resp.data(), resp.size(), 0); };
+    if (path.rfind("/hooks", 0) == 0 || path.find("/", 1) != std::string::npos) { if (HandleHooks(client_fd, method, path_raw, req)) return; }
     // Deps locking: DeliverInbound / DispatchRpc / HandleChatCompletions take shared (or unique for
     // config.reload). Do not hold a shared lock across this whole handler — reload needs unique.
 
@@ -2805,6 +2951,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     if (method == "agents.files.get") {
         const std::string aid = params.value("agentId", params.value("id", "main"));
         const std::string name = params.value("name", params.value("path", ""));
+        if (name.empty() || name.find("..") != std::string::npos || name.back() == '/') return err("missing or invalid file name");
         auto v = deps_.agent_files.Get(aid, name);
         if (!v) return err("file not found");
         return ok({{"agentId", aid}, {"name", name}, {"content", *v}});

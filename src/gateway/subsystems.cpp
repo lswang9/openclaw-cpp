@@ -1788,7 +1788,7 @@ ExtraResult Batch3(ServerDeps& d, const fs::path& root, const std::string& m, co
         long long tin = 0, tout = 0, msgs = 0; double cost = 0; bool priced_all = true; json per = json::array();
         std::map<long long, long long> buckets;
         for (auto& k : store.List()) {
-            auto e = store.IndexEntry(k); auto ms = store.Load(k);
+            json e = store.IndexEntry(k); if (!e.is_object()) e = json::object(); auto ms = store.Load(k);
             long long in = 0, out = 0;
             for (auto& x : ms) { const auto n = static_cast<long long>(tokenizer::CountTokens(x.content)); (x.role == "assistant" ? out : in) += n; }
             msgs += static_cast<long long>(ms.size()); tin += in; tout += out;
@@ -1887,7 +1887,7 @@ ExtraResult Batch3(ServerDeps& d, const fs::path& root, const std::string& m, co
     }
     if (m == "sessions.catalog.list") {
         json out = json::array();
-        for (auto& k : d.sessions.List()) { auto e = d.sessions.IndexEntry(k); out.push_back({{"catalogId", "local"}, {"sessionKey", k}, {"updatedAt", e.value("updatedAt", 0LL)}, {"messages", e.value("messages", 0)}}); }
+        for (auto& k : d.sessions.List()) { json e = d.sessions.IndexEntry(k); if (!e.is_object()) e = json::object(); out.push_back({{"catalogId", "local"}, {"sessionKey", k}, {"updatedAt", e.value("updatedAt", 0LL)}, {"messages", e.value("messages", 0)}}); }
         json ar = json::array(); std::error_code aec;
         for (auto it = fs::directory_iterator(root / "session-archive", aec); !aec && it != fs::directory_iterator(); it.increment(aec)) {
             auto a = ReadJsonFile(it->path(), json()); if (a.is_object()) ar.push_back({{"catalogId", "archive"}, {"archiveId", a["archiveId"]}, {"sessionKey", a["sessionKey"]}, {"archivedAt", a["archivedAt"]}, {"messages", a["messages"].size()}}); }

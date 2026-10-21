@@ -31,7 +31,7 @@ std::vector<std::string> FileStore::List(const std::string& agent_id) const {
 
 std::optional<std::string> FileStore::Get(const std::string& agent_id, const std::string& name) const {
     auto path = DirFor(agent_id) / name;
-    if (!fs::exists(path)) return std::nullopt;
+    if (!fs::is_regular_file(path)) return std::nullopt;
     std::ifstream in(path);
     std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     return s;

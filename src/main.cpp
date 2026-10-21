@@ -71,6 +71,7 @@
 #include "openclaw/persist/store.hpp"
 #include "openclaw/provider/openai_compat.hpp"
 #include "openclaw/provider/router.hpp"
+#include "openclaw/provider/native.hpp"
 #include "openclaw/agent/files.hpp"
 #include "openclaw/logging/tail.hpp"
 #include "openclaw/context/assemble.hpp"
@@ -109,7 +110,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.124.0-dev";
+constexpr const char* kVersion = "1.125.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2877,12 +2878,24 @@ int CmdChat(int argc, char** argv, int argi) {
     if (user_message.empty()) { std::cerr << "empty message\n"; return 1; }
     const bool use_mock = EnvOr("OPENCLAW_DEFAULT_PROVIDER", "") == "mock";
     std::string api_key = EnvOr("DEEPSEEK_API_KEY", "");
-    if (!use_mock && api_key.empty()) { std::cerr << "set DEEPSEEK_API_KEY (or OPENCLAW_DEFAULT_PROVIDER=mock)\n"; return 1; }
+    // 1.125: a "provider/model" primary (agents.defaults.model or OPENCLAW_MODEL) uses the native config-driven provider.
+    std::shared_ptr<provider::Provider> native;
+    if (!use_mock) {
+        std::string primary = EnvOr("OPENCLAW_MODEL", "");
+        const auto craw = config::LoadOrDefault(config::DefaultPath()).raw;
+        if (primary.empty()) { if (auto v = config::GetPath(craw, "agents.defaults.model"); v && v->is_string()) primary = v->get<std::string>(); else if (v && v->is_object()) primary = v->value("primary", std::string()); }
+        if (primary.find('/') != std::string::npos) {
+            std::string why; native = provider::MakeConfiguredProvider(craw, primary, &why);
+            if (!native) { std::cerr << "model " << primary << ": " << why << "\n"; return 1; }
+        }
+    }
+    if (!use_mock && !native && api_key.empty()) { std::cerr << "set DEEPSEEK_API_KEY, configure agents.defaults.model as provider/model (or OPENCLAW_DEFAULT_PROVIDER=mock)\n"; return 1; }
     auto registry = tools::MakeDefaultRegistry();
     session::Store store(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
-    std::unique_ptr<provider::Provider> prov;
-    if (use_mock) prov = std::make_unique<provider::MockProvider>();
-    else prov = std::make_unique<provider::DeepSeekProvider>(api_key, EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+    std::shared_ptr<provider::Provider> prov;
+    if (use_mock) prov = std::make_shared<provider::MockProvider>();
+    else if (native) prov = native;
+    else prov = std::make_shared<provider::DeepSeekProvider>(api_key, EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
                                                              EnvOr("DEEPSEEK_MODEL", "deepseek-chat"));
     {
         std::string rest;
@@ -3262,6 +3275,29 @@ int CmdGateway(int argc, char** argv, int argi) {
         nlohmann::json raw = lr.exists ? lr.snap.raw : config::LoadOrDefault(config::DefaultPath()).raw;
         ds_rot->SetConfig(raw);
         oai_rot->SetConfig(raw);
+    }
+    // 1.125: "provider/model" routes build native providers from models.providers.* + built-ins (fresh config per build).
+    router.SetFactory([&router](const std::string& route) -> std::shared_ptr<provider::Provider> {
+        auto lr = config::Load(config::DefaultPath());
+        const nlohmann::json raw = lr.exists ? lr.snap.raw : nlohmann::json::object();
+        // Built-ins registered above (deepseek/openai with auth-profile rotation, mock, plugins) keep their prefix
+        // unless models.providers.<id> explicitly configures that provider.
+        const std::string pid = route.substr(0, route.find('/'));
+        const bool configured = config::GetPath(raw, "models.providers." + pid).has_value();
+        if (router.Has(pid) && !configured) return nullptr;
+        std::string why;
+        auto p = provider::MakeConfiguredProvider(raw, route, &why);
+        if (!p) std::cerr << "[gateway] model route " << route << ": " << why << " (falling back to provider prefix)\n";
+        return p;
+    });
+    if (!std::getenv("OPENCLAW_DEFAULT_PROVIDER")) {
+        auto lr = config::Load(config::DefaultPath());
+        if (lr.exists) {
+            std::string primary;
+            if (auto v = config::GetPath(lr.snap.raw, "agents.defaults.model"); v && v->is_string()) primary = v->get<std::string>();
+            else if (v && v->is_object()) primary = v->value("primary", std::string());
+            if (primary.find('/') != std::string::npos && router.Resolve(primary)) { router.SetDefault(primary); std::cerr << "[gateway] default model route: " << primary << "\n"; }
+        }
     }
 
 

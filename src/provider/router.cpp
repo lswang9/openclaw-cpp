@@ -12,7 +12,7 @@ bool Router::Has(const std::string& name) const {
 }
 
 void Router::SetDefault(const std::string& name) {
-    if (Has(name)) default_ = name;
+    if (Has(name) || name.find('/') != std::string::npos) default_ = name;
 }
 
 std::vector<std::string> Router::Names() const {
@@ -23,11 +23,17 @@ std::vector<std::string> Router::Names() const {
 
 Provider* Router::Resolve(const std::string& route) const {
     if (route.empty()) {
+        if (default_.find('/') != std::string::npos) return Resolve(default_);
         auto it = providers_.find(default_);
         return it == providers_.end() ? nullptr : it->second.get();
     }
     if (auto exact = providers_.find(route); exact != providers_.end()) return exact->second.get();  // "plugin/model"
     auto slash = route.find('/');
+    if (slash != std::string::npos) {
+        std::lock_guard<std::mutex> l(mu_);
+        if (auto d = dynamic_.find(route); d != dynamic_.end()) return d->second.get();
+        if (factory_) if (auto p = factory_(route)) { dynamic_[route] = p; return p.get(); }
+    }
     const std::string name = slash == std::string::npos ? route : route.substr(0, slash);
     auto it = providers_.find(name);
     if (it != providers_.end()) return it->second.get();
