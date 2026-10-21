@@ -345,7 +345,7 @@ SchemaReport ValidateSchema(const nlohmann::json& raw) {
     expect("tools.exec.timeoutSec", ispos, "positive integer");
     // memory search
     expect("agents.defaults.memorySearch.enabled", isbool, "boolean");
-    expect("agents.defaults.memorySearch.provider", oneof({"local", "openai", "gemini", "voyage", "mistral", "ollama", "auto"}), "local|openai|gemini|voyage|mistral|ollama|auto");
+    expect("agents.defaults.memorySearch.provider", oneof({"local", "openai", "gemini", "voyage", "mistral", "ollama", "gguf", "local-gguf", "auto"}), "local|openai|gemini|voyage|mistral|ollama|auto");
     expect("agents.defaults.memorySearch.model", isstr, "string");
     expect("agents.defaults.memorySearch.remote.baseUrl", isstr, "string");
     expect("agents.defaults.memorySearch.remote.apiKey", isstr, "string");
@@ -505,5 +505,62 @@ void SaveRaw(const fs::path& path, const nlohmann::json& file_json) {
 }
 
 void Save(const fs::path& path, const Snapshot& snap) { SaveRaw(path, ToFileDoc(snap, ToFileJson(snap))); }
+
+
+nlohmann::json SavePreserving(const fs::path& path, const nlohmann::json& effective) {
+    nlohmann::json out{{"ok", true}, {"path", path.string()}, {"preservedInclude", false}, {"preservedComments", false},
+                       {"warnings", nlohmann::json::array()}};
+    if (!effective.is_object()) return {{"ok", false}, {"error", "effective config must be an object"}};
+    auto rep = ValidateSchema(effective);
+    if (!rep.errors.empty()) return {{"ok", false}, {"error", "rejected: " + rep.errors.front()}, {"warnings", rep.warnings}};
+    out["warnings"] = rep.warnings;
+    std::error_code ec;
+    std::string leading_comments;
+    Snapshot snap;
+    if (fs::exists(path, ec)) {
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) {
+            auto first = line.find_first_not_of(" \t");
+            if (first == std::string::npos) { leading_comments += line + "\n"; continue; }
+            if (line.compare(first, 2, "//") == 0) { leading_comments += line + "\n"; continue; }
+            break;
+        }
+        try { snap = Load(path).snap; } catch (...) {}
+    }
+    nlohmann::json file_doc = ToFileDoc(snap, effective);
+    if (!snap.include_spec.is_null()) out["preservedInclude"] = true;
+
+    auto indent_dump = [](const nlohmann::json& val) {
+        std::string dumped = val.dump(2), out;
+        for (std::size_t i = 0; i < dumped.size(); ++i) {
+            out.push_back(dumped[i]);
+            if (dumped[i] == '\n' && i + 1 < dumped.size()) out += "  ";
+        }
+        return out;
+    };
+    std::string body = leading_comments;
+    if (!leading_comments.empty()) out["preservedComments"] = true;
+    body += "{\n";
+    bool first = true;
+    auto emit = [&](const std::string& key, const nlohmann::json& val) {
+        if (!first) body += ",\n";
+        first = false;
+        if (key == "$include") body += "  $include: " + val.dump();
+        else body += "  \"" + key + "\": " + indent_dump(val);
+    };
+    if (file_doc.contains("$include")) emit("$include", file_doc["$include"]);
+    for (auto it = file_doc.begin(); it != file_doc.end(); ++it)
+        if (it.key() != "$include") emit(it.key(), it.value());
+    body += "\n}\n";
+
+    if (path.has_parent_path()) fs::create_directories(path.parent_path(), ec);
+    if (fs::exists(path, ec)) fs::copy_file(path, fs::path(path.string() + ".bak"), fs::copy_options::overwrite_existing, ec);
+    auto tmp = fs::path(path.string() + ".tmp");
+    { std::ofstream o(tmp); o << body; }
+    fs::rename(tmp, path, ec);
+    return out;
+}
+
 
 }  // namespace openclaw::config

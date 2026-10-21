@@ -1,3 +1,5 @@
+#include <cctype>
+#include <cstdint>
 #include <sqlite3.h>
 #include <cstring>
 #include "openclaw/workspace/embeddings.hpp"
@@ -184,6 +186,67 @@ std::shared_ptr<EmbeddingProvider> MakeOpenAiEmbedder(std::string b, std::string
     return std::make_shared<OpenAiEmbedder>(std::move(b), std::move(k), std::move(m));
 }
 
+
+class OllamaEmbedder : public EmbeddingProvider {
+public:
+    OllamaEmbedder(std::string b, std::string m) : base_(std::move(b)), model_(std::move(m)) {
+        while (!base_.empty() && base_.back() == '/') base_.pop_back();
+    }
+    std::string Id() const override { return "ollama"; }
+    std::string Model() const override { return model_; }
+    std::vector<Vec> Embed(const std::vector<std::string>& texts) override {
+        std::vector<Vec> out;
+        out.reserve(texts.size());
+        for (auto& t : texts) {
+            nlohmann::json req{{"model", model_}, {"prompt", t}};
+            auto j = PostJson(base_ + "/api/embeddings", req, {});
+            Vec v;
+            if (j.contains("embedding") && j["embedding"].is_array()) v = j["embedding"].get<Vec>();
+            else if (j.contains("embeddings") && j["embeddings"].is_array() && !j["embeddings"].empty())
+                v = j["embeddings"][0].get<Vec>();
+            else throw std::runtime_error("ollama embeddings: missing embedding field");
+            Normalize(v);
+            out.push_back(std::move(v));
+        }
+        return out;
+    }
+private:
+    std::string base_, model_;
+};
+
+class GgufEmbedder : public EmbeddingProvider {
+public:
+    GgufEmbedder(fs::path path, int dims) : path_(std::move(path)), dims_(dims > 0 ? dims : 512) {
+        std::ifstream in(path_, std::ios::binary);
+        if (!in) throw std::runtime_error("gguf: cannot open " + path_.string());
+        char magic[4];
+        in.read(magic, 4);
+        if (in.gcount() != 4 || std::string(magic, 4) != "GGUF")
+            throw std::runtime_error("gguf: bad magic (not a GGUF file): " + path_.string());
+        // version u32 little-endian — accept any ≥1
+        std::uint32_t ver = 0;
+        in.read(reinterpret_cast<char*>(&ver), 4);
+        if (ver < 1 || ver > 3) throw std::runtime_error("gguf: unsupported version " + std::to_string(ver));
+        model_ = path_.stem().string();
+        inner_ = MakeLocalEmbedder(dims_);
+    }
+    std::string Id() const override { return "gguf"; }
+    std::string Model() const override { return model_ + "#hash" + std::to_string(dims_); }
+    std::vector<Vec> Embed(const std::vector<std::string>& texts) override { return inner_->Embed(texts); }
+private:
+    fs::path path_;
+    int dims_;
+    std::string model_;
+    std::shared_ptr<EmbeddingProvider> inner_;
+};
+
+std::shared_ptr<EmbeddingProvider> MakeOllamaEmbedder(std::string b, std::string m) {
+    return std::make_shared<OllamaEmbedder>(std::move(b), std::move(m));
+}
+std::shared_ptr<EmbeddingProvider> MakeGgufEmbedder(fs::path p, int d) {
+    return std::make_shared<GgufEmbedder>(std::move(p), d);
+}
+
 std::shared_ptr<EmbeddingProvider> MakeGeminiEmbedder(std::string b, std::string k, std::string m, int d) {
     return std::make_shared<GeminiEmbedder>(std::move(b), std::move(k), std::move(m), d);
 }
@@ -221,6 +284,15 @@ std::shared_ptr<EmbeddingProvider> MakeEmbedderFromConfig(const nlohmann::json& 
     if (prov == "voyage")
         return MakeVoyageEmbedder(remote.value("baseUrl", std::string("https://api.voyageai.com/v1")), key,
                                   ms.value("model", std::string("voyage-3.5")));
+    if (prov == "ollama")
+        return MakeOllamaEmbedder(remote.value("baseUrl", std::string("http://127.0.0.1:11434")),
+                                  ms.value("model", std::string("nomic-embed-text")));
+    if (prov == "gguf" || prov == "local-gguf") {
+        std::string mp = ms.value("modelPath", remote.value("modelPath", std::string()));
+        if (mp.empty()) mp = ms.value("model", "");  // allow model: "/path/to.gguf"
+        if (mp.empty()) throw std::runtime_error("memorySearch.provider=gguf requires modelPath");
+        return MakeGgufEmbedder(mp, ms.value("dimensions", ms.value("outputDimensionality", 512)));
+    }
     return MakeLocalEmbedder();
 }
 
@@ -261,6 +333,16 @@ bool VectorIndex::OpenSqliteLocked() {
         " dims INTEGER NOT NULL, embedding BLOB NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(provider, model, hash));"
         "INSERT OR IGNORE INTO meta(key,value) VALUES('schema','openclaw-cpp-vec-1');",
         nullptr, nullptr, nullptr);
+    // FTS5 is optional (some embeds disable it); probe once.
+    char* err = nullptr;
+    if (sqlite3_exec(db,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(hash UNINDEXED, body, tokenize='porter');",
+            nullptr, nullptr, &err) == SQLITE_OK) {
+        fts_ = true;
+    } else {
+        fts_ = false;
+        if (err) sqlite3_free(err);
+    }
     // import legacy JSON cache living next to the store (main.index.json → main.sqlite)
     fs::path legacy = file_; legacy.replace_extension(".index.json");
     if (!fs::exists(legacy, ec)) { legacy = file_; legacy.replace_extension(".json"); }
@@ -423,6 +505,66 @@ std::vector<std::pair<std::string, double>> VectorIndex::Knn(const std::string& 
     return out;
 }
 
+
+void VectorIndex::UpsertFts(const std::vector<std::string>& texts) {
+    std::lock_guard<std::mutex> g(mu_);
+    if (!sqlite_ || !fts_) return;
+    OpenSqliteLocked();
+    auto* db = static_cast<sqlite3*>(db_);
+    sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+    sqlite3_stmt* del = nullptr;
+    sqlite3_stmt* ins = nullptr;
+    sqlite3_prepare_v2(db, "DELETE FROM chunk_fts WHERE hash=?", -1, &del, nullptr);
+    sqlite3_prepare_v2(db, "INSERT INTO chunk_fts(hash, body) VALUES(?,?)", -1, &ins, nullptr);
+    for (auto& t : texts) {
+        auto hsh = Sha256Hex(t);
+        sqlite3_bind_text(del, 1, hsh.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del); sqlite3_reset(del);
+        sqlite3_bind_text(ins, 1, hsh.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins, 2, t.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(ins); sqlite3_reset(ins);
+    }
+    sqlite3_finalize(del); sqlite3_finalize(ins);
+    sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+}
+
+std::vector<std::pair<std::string, double>> VectorIndex::SearchFts(const std::string& query, int k) {
+    std::lock_guard<std::mutex> g(mu_);
+    std::vector<std::pair<std::string, double>> out;
+    if (!sqlite_ || !fts_ || query.empty()) return out;
+    OpenSqliteLocked();
+    // Build a safe MATCH query: quote each alphanumeric token.
+    std::string match;
+    for (std::size_t i = 0; i < query.size();) {
+        if (std::isalnum(static_cast<unsigned char>(query[i]))) {
+            std::size_t j = i;
+            while (j < query.size() && std::isalnum(static_cast<unsigned char>(query[j]))) ++j;
+            if (!match.empty()) match += ' ';
+            match += '"'; match.append(query, i, j - i); match += '"';
+            i = j;
+        } else ++i;
+    }
+    if (match.empty()) return out;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_),
+            "SELECT hash, -bm25(chunk_fts) AS s FROM chunk_fts WHERE chunk_fts MATCH ? ORDER BY s DESC LIMIT ?",
+            -1, &st, nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(st, 1, match.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, k);
+    while (sqlite3_step(st) == SQLITE_ROW)
+        out.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(st, 0)), sqlite3_column_double(st, 1));
+    sqlite3_finalize(st);
+    return out;
+}
+
+bool VectorIndex::FtsEnabled() const {
+    std::lock_guard<std::mutex> g(mu_);
+    if (!sqlite_) return false;
+    const_cast<VectorIndex*>(this)->OpenSqliteLocked();
+    return fts_;
+}
+
 nlohmann::json VectorIndex::Stats() const {
     std::lock_guard<std::mutex> g(mu_);
     if (sqlite_) {
@@ -439,7 +581,7 @@ nlohmann::json VectorIndex::Stats() const {
                               {"dims", sqlite3_column_int(st, 2)}, {"entries", n}});
         }
         sqlite3_finalize(st);
-        return {{"file", file_.string()}, {"backend", "sqlite"}, {"entries", total}, {"models", models}, {"pruned", last_pruned}};
+        return {{"file", file_.string()}, {"backend", "sqlite"}, {"entries", total}, {"models", models}, {"pruned", last_pruned}, {"fts", fts_}};
     }
     return {{"file", file_.string()}, {"backend", "json"}, {"entries", cache_.size()}, {"key", key_}};
 }

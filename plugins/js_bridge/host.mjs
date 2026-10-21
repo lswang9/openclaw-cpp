@@ -140,12 +140,13 @@ function parseCliArgs(cmd, argv) {
 // api.runtime.* subset. Host side effects are queued and drained by the gateway (drain_events RPC):
 //   system.enqueueSystemEvent, channel.sendMessage (outbound), agent.dispatchInbound (agent turn).
 // Plugin → host reverse calls: {"hostCall":id,method,params} on stdout; host answers {"hostReply":id,result|error}.
+// Streaming: {"hostEvent":id,type,...} may arrive before the final hostReply (e.g. reply.block).
 const pendingHost = new Map();
 let hostSeq = 0;
-function hostCall(rec, method, params) {
+function hostCall(rec, method, params, onEvent) {
   return new Promise((resolve, reject) => {
     const id = ++hostSeq;
-    pendingHost.set(id, { resolve, reject });
+    pendingHost.set(id, { resolve, reject, onEvent: typeof onEvent === 'function' ? onEvent : null });
     process.stdout.write(JSON.stringify({ hostCall: id, method, params: { ...(params || {}), plugin: rec.id } }) + '\n');
   });
 }
@@ -169,20 +170,34 @@ function makeRuntime(rec) {
     channel: {
       sendMessage: ({ channel, to, text, accountId }) => push({ type: 'outbound', channel, to, text: String(text ?? ''), accountId }),
       reply: {
-        // Buffered block dispatcher: run the agent for an inbound message, then deliver the reply as blocks.
+        // Streamed block dispatcher: host emits reply.block events as paragraphs become available, then a final hostReply.
+        // Safe to call from tools/commands (deferred on a gateway thread; write lock is separate from the RPC lock).
         dispatchReplyWithBufferedBlockDispatcher: async ({ ctx = {}, dispatcherOptions = {} } = {}) => {
           const d = dispatcherOptions;
+          const counts = { block: 0, final: 0 };
           try {
             if (typeof d.onReplyStart === 'function') await d.onReplyStart();
             const r = await hostCall(rec, 'agent.reply', {
               channel: ctx.channel || ctx.Provider, from: ctx.from || ctx.From || ctx.SenderId, text: ctx.text ?? ctx.Body ?? '',
               conversationId: ctx.conversationId || ctx.To, sessionKey: ctx.sessionKey || ctx.SessionKey, accountId: ctx.accountId || ctx.AccountId,
-              chatType: ctx.chatType || ctx.ChatType, blockLimit: d.blockLimit || 2000 });
-            const blocks = r.blocks || [];
-            for (let i = 0; i < blocks.length; i++)
-              await d.deliver({ text: blocks[i] }, { kind: i === blocks.length - 1 ? 'final' : 'block' });
+              chatType: ctx.chatType || ctx.ChatType, blockLimit: d.blockLimit || 2000, stream: d.stream !== false },
+              async (ev) => {
+                if (ev.type !== 'reply.block') return;
+                const kind = ev.kind || 'block';
+                await d.deliver({ text: ev.text || '' }, { kind });
+                if (kind === 'final') counts.final++; else counts.block++;
+              });
+            // Fallback: non-streaming host (or empty stream) delivers from the final payload.
+            if (!r.streamed && counts.block + counts.final === 0) {
+              const blocks = r.blocks || [];
+              for (let i = 0; i < blocks.length; i++) {
+                const kind = i === blocks.length - 1 ? 'final' : 'block';
+                await d.deliver({ text: blocks[i] }, { kind });
+                if (kind === 'final') counts.final++; else counts.block++;
+              }
+            }
             if (typeof d.onIdle === 'function') await d.onIdle();
-            return { queuedFinal: blocks.length > 0, counts: { block: Math.max(0, blocks.length - 1), final: blocks.length ? 1 : 0 } };
+            return { queuedFinal: counts.final > 0, counts, streamed: !!(r && r.streamed) };
           } catch (e) {
             if (typeof d.onError === 'function') { await d.onError(e, { kind: 'final' }); return { queuedFinal: false, counts: { block: 0, final: 0 } }; }
             throw e;
@@ -595,9 +610,21 @@ rl.on('line', (line) => {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: String(e) } }) + '\n');
     return;
   }
+  if (req && req.hostEvent !== undefined) {
+    const p = pendingHost.get(req.hostEvent);
+    if (p && p.onEvent) {
+      p._events = (p._events || Promise.resolve()).then(() => p.onEvent(req)).catch(() => {});
+      p._streamed = true;
+    }
+    return;
+  }
   if (req && req.hostReply !== undefined) {  // answer to a plugin→host call: never queued behind the chain
     const p = pendingHost.get(req.hostReply);
-    if (p) { pendingHost.delete(req.hostReply); req.error ? p.reject(new Error(String(req.error))) : p.resolve(req.result); }
+    if (p) {
+      pendingHost.delete(req.hostReply);
+      const finish = () => req.error ? p.reject(new Error(String(req.error))) : p.resolve(req.result);
+      if (p._events) p._events.then(finish, finish); else finish();
+    }
     return;
   }
   chain = chain.then(() => handle(req));

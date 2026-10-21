@@ -67,6 +67,7 @@
 #include "openclaw/tools/exec.hpp"
 #include "openclaw/clawhub/client.hpp"
 #include "openclaw/auth/profiles.hpp"
+#include "openclaw/provider/auth_resolve.hpp"
 #include "openclaw/net/safe_fetch.hpp"
 #include "openclaw/channels/waweb/noise.hpp"
 #include "openclaw/workspace/embeddings.hpp"
@@ -91,7 +92,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.63.0-dev";
+constexpr const char* kVersion = "1.64.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2399,6 +2400,63 @@ int CmdSelfTest() {
         else std::cerr << "PASS SSRF guard (private ranges, resolve+pin, scheme)\n";
     }
 
+    {  // 1.64+: PTY resize, SavePreserving, WA stubs
+        auto h = tools::StartBackground("sleep 2", "/tmp", true);
+        bool rz = h.pid > 0 && tools::ResizePty(h, 40, 120);
+        tools::KillBackground(h);
+        if (h.read_fd >= 0) ::close(h.read_fd);
+        if (h.write_fd >= 0) ::close(h.write_fd);
+        if (!rz) { std::cerr << "FAIL pty resize\n"; ++failures; }
+        else std::cerr << "PASS PTY resize (TIOCSWINSZ)\n";
+
+        auto dir = std::filesystem::temp_directory_path() / ("oc-cfg-" + std::to_string(::getpid()));
+        std::filesystem::create_directories(dir);
+        { std::ofstream o(dir / "shared.json"); o << "{ \"meta\": { \"fromInclude\": true } }\n"; }
+        auto cfg = dir / "openclaw.json";
+        { std::ofstream o(cfg); o << "// keep me\n{\n  $include: \"./shared.json\",\n  gateway: { port: 18789 }\n}\n"; }
+        nlohmann::json eff = {{"meta", {{"fromInclude", true}}}, {"gateway", {{"port", 18789}}},
+                              {"plugins", {{"entries", {{"x", {{"config", {{"n", 1}}}}}}}}}};
+        auto wr = config::SavePreserving(cfg, eff);
+        std::string text;
+        { std::ifstream in(cfg); text.assign((std::istreambuf_iterator<char>(in)), {}); }
+        bool pok = wr.value("ok", false) && text.find("keep me") != std::string::npos && text.find("$include") != std::string::npos;
+        std::filesystem::remove_all(dir);
+        if (!pok) { std::cerr << "FAIL SavePreserving " << wr.dump() << "\n" << text << "\n"; ++failures; }
+        else std::cerr << "PASS SavePreserving ($include + comments)\n";
+
+        namespace ww = channels::waweb;
+        ww::Bytes details = ww::FromString("leaf-details"), sig = ww::FromString("sig-bytes-here!!");
+        auto field = [](int num, const ww::Bytes& v) {
+            ww::Bytes o;
+            auto var = [&](std::uint64_t x) {
+                while (x >= 0x80) { o.push_back(static_cast<std::uint8_t>(x | 0x80)); x >>= 7; }
+                o.push_back(static_cast<std::uint8_t>(x));
+            };
+            var((std::uint64_t(num) << 3) | 2); var(v.size()); o.insert(o.end(), v.begin(), v.end());
+            return o;
+        };
+        ww::Bytes leaf = field(1, details);
+        auto fs = field(2, sig);
+        leaf.insert(leaf.end(), fs.begin(), fs.end());
+        ww::Bytes chain = field(1, leaf);
+        auto ci = ww::DecodeCertChain(chain);
+        ww::BinaryNode node{"message", {{"to", "123@s.whatsapp.net"}}, ww::FromString("hi"), {}};
+        auto enc = ww::EncodeBinaryNode(node);
+        auto dec = ww::DecodeBinaryNode(enc);
+        auto id = ww::GenerateSignalIdentity();
+        auto peer = ww::GenerateSignalIdentity();
+        auto sess = ww::SignalX3dhInitiate(id, peer.identity.pub, peer.signed_prekey.pub);
+        auto sess2 = sess;
+        auto peer_recv = sess.send_chain;  // peer decrypts with initiator's send chain (stub X3DH)
+        auto ct = ww::SignalRatchetEncrypt(sess, ww::FromString("ping"));
+        sess2.recv_chain = peer_recv;
+        auto pt = ww::SignalRatchetDecrypt(sess2, ct);
+        bool wok = ci && ci->structurally_ok && dec && dec->tag == "message" && dec->attrs.size() == 1 &&
+                   sess.established && pt && *pt == ww::FromString("ping");
+        if (!wok) { std::cerr << "FAIL waweb stubs\n"; ++failures; }
+        else std::cerr << "PASS waweb cert decode + binary node + signal stubs\n";
+    }
+
     if (failures == 0) { std::cerr << "self-test: ALL PASS\n"; return 0; }
     std::cerr << "self-test: " << failures << " failure(s)\n";
     return 1;
@@ -2727,16 +2785,31 @@ int CmdGateway(int argc, char** argv, int argi) {
     auto mcp_n = mcp::RegisterMcpTools(tools, mcp_client);
     std::cerr << "[gateway] bridged " << mcp_n << " mcp tools\n";
 
-    // Multi-provider router (DeepSeek + OpenAI-compat + mock)
+    // Multi-provider router (DeepSeek + OpenAI-compat + mock). Built-ins resolve keys from
+    // auth-profiles.json (with env fallback) and rotate on 401/429 when auth.order lists several.
     provider::Router router;
     const std::string ds_key = api_key;
     const std::string ds_base = EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com");
     const std::string ds_model = EnvOr("DEEPSEEK_MODEL", "deepseek-chat");
-    router.Add("deepseek", std::make_shared<provider::OpenAiCompatProvider>("deepseek", ds_key, ds_base, ds_model));
+    auto ds_rot = std::make_shared<provider::AuthRotatingProvider>(
+        "deepseek",
+        [ds_base, ds_model](const std::string& tok) {
+            return std::shared_ptr<provider::Provider>(
+                std::make_shared<provider::OpenAiCompatProvider>("deepseek", tok, ds_base, ds_model));
+        },
+        ds_key);
+    router.Add("deepseek", ds_rot);
     const std::string oai_key = EnvOr("OPENAI_API_KEY", ds_key);
     const std::string oai_base = EnvOr("OPENAI_BASE_URL", "https://api.openai.com");
     const std::string oai_model = EnvOr("OPENAI_MODEL", "gpt-4o-mini");
-    router.Add("openai", std::make_shared<provider::OpenAiCompatProvider>("openai", oai_key, oai_base, oai_model));
+    auto oai_rot = std::make_shared<provider::AuthRotatingProvider>(
+        "openai",
+        [oai_base, oai_model](const std::string& tok) {
+            return std::shared_ptr<provider::Provider>(
+                std::make_shared<provider::OpenAiCompatProvider>("openai", tok, oai_base, oai_model));
+        },
+        oai_key);
+    router.Add("openai", oai_rot);
     auto mock_prov = std::make_shared<provider::MockProvider>();
     // seed a trivial stop response for mock route health
     {
@@ -2775,6 +2848,13 @@ int CmdGateway(int argc, char** argv, int argi) {
     }
     router.Add("mock", mock_prov);
     router.SetDefault(EnvOr("OPENCLAW_DEFAULT_PROVIDER", "deepseek"));
+    {
+        auto lr = config::Load(config::DefaultPath());
+        nlohmann::json raw = lr.exists ? lr.snap.raw : config::LoadOrDefault(config::DefaultPath()).raw;
+        ds_rot->SetConfig(raw);
+        oai_rot->SetConfig(raw);
+    }
+
 
     auto channels = channels::MakeDefaultChannels();
     auto adapters = channels::AdapterHub::MakeDefault();

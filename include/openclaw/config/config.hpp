@@ -70,6 +70,10 @@ Snapshot LoadOrDefault(const std::filesystem::path& path);
 // Write raw file JSON atomically (tmp + rename), keeping a .bak of the previous file.
 void SaveRaw(const std::filesystem::path& path, const nlohmann::json& file_json);
 void Save(const std::filesystem::path& path, const Snapshot& snap);
+// Write `effective` while keeping on-disk `$include` (via ToFileDoc) and, when possible, JSON5 comments /
+// formatting by overlaying changed top-level values into the original text. Falls back to SaveRaw.
+// Returns {ok, path, preservedInclude, preservedComments, warnings[]}.
+nlohmann::json SavePreserving(const std::filesystem::path& path, const nlohmann::json& effective);
 // OPENCLAW_CONFIG_PATH > ~/.openclaw/openclaw.json > legacy ~/.openclaw-cpp/config.json (if only it exists).
 std::filesystem::path DefaultPath();
 

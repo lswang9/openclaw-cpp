@@ -251,6 +251,28 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
     }
     std::string vec_backend = "local", fallback;
     nlohmann::json index_info;
+    bool fts_bm = false;
+    if (index_ && index_->FtsEnabled() && mode != "vector") {
+        try {
+            std::vector<std::string> texts;
+            for (auto& c : chunks) texts.push_back(c.text);
+            index_->UpsertFts(texts);
+            auto hits = index_->SearchFts(query, static_cast<int>(chunks.size()));
+            if (!hits.empty()) {
+                std::unordered_map<std::string, double> by;
+                double mx = 0;
+                for (auto& [hsh, sc] : hits) { by[hsh] = sc; mx = std::max(mx, sc); }
+                for (std::size_t i = 0; i < chunks.size(); ++i) {
+                    auto hsh = workspace::Sha256Hex(chunks[i].text);
+                    bm[i] = by.count(hsh) ? by[hsh] : 0;
+                }
+                bmax = mx;
+                fts_bm = true;
+                index_info["fts"] = true;
+                index_info["textBackend"] = "fts5";
+            }
+        } catch (...) {}
+    }
     if (mode != "bm25") {
         bool done = false;
         if (embedder_ && index_) {
@@ -258,10 +280,12 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
                 std::vector<std::string> texts;
                 for (auto& c : chunks) texts.push_back(c.text);
                 auto vs = index_->Get(*embedder_, texts, /*prune=*/true);
+                if (index_->FtsEnabled()) index_->UpsertFts(texts);
                 auto qv = embedder_->EmbedQuery(query);
                 for (std::size_t i = 0; i < chunks.size(); ++i) vec[i] = std::max(0.0, Cosine(qv, vs[i]));
                 vec_backend = embedder_->Id();
-                index_info = {{"hits", index_->last_hits}, {"misses", index_->last_misses}, {"pruned", index_->last_pruned}};
+                index_info = {{"hits", index_->last_hits}, {"misses", index_->last_misses}, {"pruned", index_->last_pruned},
+                              {"fts", index_->FtsEnabled()}};
                 done = true;
             } catch (const std::exception& e) {
                 fallback = e.what();  // remote provider failed → local embeddings
@@ -296,8 +320,10 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
                            {"textScore", std::round(bm[scored[k].second] * 1000) / 1000},
                            {"vectorScore", std::round(vec[scored[k].second] * 1000) / 1000}, {"snippet", snip}});
     }
+    std::string be = mode == "bm25" ? (fts_bm ? "bm25-fts5" : backend)
+                    : (mode == "vector" ? "vector-" : "hybrid-") + vec_backend + (fts_bm ? "+fts5" : "");
     nlohmann::json out{{"ok", true}, {"results", results}, {"files", files.size()}, {"chunks", chunks.size()},
-                       {"backend", mode == "bm25" ? backend : (mode == "vector" ? "vector-" : "hybrid-") + vec_backend}};
+                       {"backend", be}};
     if (!fallback.empty()) out["fallback"] = fallback;
     if (!index_info.is_null()) out["index"] = index_info;
     return out;

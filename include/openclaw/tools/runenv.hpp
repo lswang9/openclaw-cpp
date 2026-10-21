@@ -51,5 +51,7 @@ ProcessResult WaitBackground(BackgroundHandle& h, int timeout_ms, std::size_t ma
 // Like WaitBackground but on timeout leaves the process running (pid/read_fd stay set).
 ProcessResult CollectBackground(BackgroundHandle& h, int timeout_ms, std::size_t max_out = 200 * 1024);
 void KillBackground(BackgroundHandle& h);
+// Resize a PTY session (ioctl TIOCSWINSZ on the master). No-op / false when not a pty.
+bool ResizePty(BackgroundHandle& h, int rows, int cols);
 
 }  // namespace openclaw::tools

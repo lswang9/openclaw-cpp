@@ -64,7 +64,8 @@ void SaveInstallRecord(const std::string& id, const nlohmann::json& rec) {
     if (!rec.is_null() && !config::GetPath(raw, "plugins.entries." + id + ".enabled"))
         config::SetPath(raw, "plugins.entries." + id + ".enabled", true);
     if (rec.is_null()) config::UnsetPath(raw, "plugins.entries." + id);
-    config::SaveRaw(path, config::ToFileDoc(lr.snap, raw));
+    auto wr = config::SavePreserving(path, raw);
+    if (!wr.value("ok", false)) config::SaveRaw(path, config::ToFileDoc(lr.snap, raw));
 }
 }  // namespace
 

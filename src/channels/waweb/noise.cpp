@@ -365,4 +365,185 @@ std::string QrPayload(const std::string& ref, const Bytes& noise_pub, const Byte
     return ref + "," + Base64(noise_pub) + "," + Base64(identity_pub) + "," + Base64(adv_secret);
 }
 
+
+// ---- cert / binary / signal stubs ----
+
+std::optional<CertChainInfo> DecodeCertChain(const Bytes& payload) {
+    std::vector<std::pair<int, Bytes>> top;
+    if (!Fields(payload, top)) return std::nullopt;
+    CertChainInfo info;
+    auto take = [&](const Bytes& cert, Bytes& details, Bytes& sig) {
+        std::vector<std::pair<int, Bytes>> f;
+        if (!Fields(cert, f)) return false;
+        for (auto& [n, v] : f) { if (n == 1) details = v; else if (n == 2) sig = v; }
+        return !details.empty() && !sig.empty();
+    };
+    for (auto& [n, v] : top) {
+        if (n == 1) { if (!take(v, info.leaf_details, info.leaf_signature)) return std::nullopt; }
+        else if (n == 2) { if (!take(v, info.intermediate_details, info.intermediate_signature)) return std::nullopt; }
+    }
+    info.structurally_ok = !info.leaf_details.empty() && !info.leaf_signature.empty();
+    return info;
+}
+
+CertChainInfo VerifyCertChain(const Bytes& payload, const Bytes& wa_root_pub) {
+    CertChainInfo info;
+    auto d = DecodeCertChain(payload);
+    if (!d) return info;
+    info = *d;
+    // Full Ed25519 verification of NoiseCertificate is not wired (needs XEdDSA). We expose the
+    // structural decode and record that a root was supplied for a future check.
+    if (!wa_root_pub.empty() && wa_root_pub.size() == 32 && !info.intermediate_details.empty()) {
+        info.signature_checked = false;  // stub: do not claim validity
+        info.signature_valid = false;
+    }
+    return info;
+}
+
+namespace {
+void PutByte(Bytes& o, std::uint8_t v) { o.push_back(v); }
+void PutInt20(Bytes& o, std::uint32_t n) {  // WA list size packing (simplified: always 3-byte)
+    PutByte(o, 248);  // LIST_8 replaced with fixed INT20-ish marker 248 / size
+    PutByte(o, static_cast<std::uint8_t>((n >> 16) & 0xff));
+    PutByte(o, static_cast<std::uint8_t>((n >> 8) & 0xff));
+    PutByte(o, static_cast<std::uint8_t>(n & 0xff));
+}
+void PutString(Bytes& o, const std::string& s) {
+    if (s.size() < 256) { PutByte(o, 252); PutByte(o, static_cast<std::uint8_t>(s.size())); }
+    else { PutByte(o, 253); PutByte(o, (s.size() >> 8) & 0xff); PutByte(o, s.size() & 0xff); }
+    o.insert(o.end(), s.begin(), s.end());
+}
+}  // namespace
+
+Bytes EncodeBinaryNode(const BinaryNode& n) {
+    // Simplified WABinary without token dictionary: LIST | tag | attrCount | attrs | content/children.
+    Bytes o;
+    const std::size_t parts = 1 + 1 + n.attrs.size() * 2 + (n.children.empty() ? (n.content.empty() ? 0 : 1) : n.children.size());
+    PutInt20(o, static_cast<std::uint32_t>(parts));
+    PutString(o, n.tag);
+    PutByte(o, static_cast<std::uint8_t>(std::min<std::size_t>(n.attrs.size(), 255)));
+    for (auto& [k, v] : n.attrs) { PutString(o, k); PutString(o, v); }
+    if (!n.children.empty()) {
+        for (auto& ch : n.children) {
+            auto enc = EncodeBinaryNode(ch);
+            o.insert(o.end(), enc.begin(), enc.end());
+        }
+    } else if (!n.content.empty()) {
+        if (n.content.size() < 256) { PutByte(o, 252); PutByte(o, static_cast<std::uint8_t>(n.content.size())); }
+        else { PutByte(o, 253); PutByte(o, (n.content.size() >> 8) & 0xff); PutByte(o, n.content.size() & 0xff); }
+        o.insert(o.end(), n.content.begin(), n.content.end());
+    }
+    return o;
+}
+
+std::optional<BinaryNode> DecodeBinaryNode(const Bytes& b) {
+    std::size_t i = 0;
+    auto need = [&](std::size_t n) { return i + n <= b.size(); };
+    auto rdstr = [&](std::string& out) -> bool {
+        if (!need(1)) return false;
+        std::uint8_t t = b[i++];
+        std::size_t n = 0;
+        if (t == 252) { if (!need(1)) return false; n = b[i++]; }
+        else if (t == 253) { if (!need(2)) return false; n = (std::size_t(b[i]) << 8) | b[i + 1]; i += 2; }
+        else return false;
+        if (!need(n)) return false;
+        out.assign(reinterpret_cast<const char*>(&b[i]), n); i += n;
+        return true;
+    };
+    if (!need(4) || b[i] != 248) return std::nullopt;
+    i += 1;
+    std::uint32_t parts = (std::uint32_t(b[i]) << 16) | (std::uint32_t(b[i + 1]) << 8) | b[i + 2];
+    i += 3;
+    BinaryNode n;
+    if (!rdstr(n.tag)) return std::nullopt;
+    if (!need(1)) return std::nullopt;
+    std::uint8_t ac = b[i++];
+    for (std::uint8_t a = 0; a < ac; ++a) {
+        std::string k, v;
+        if (!rdstr(k) || !rdstr(v)) return std::nullopt;
+        n.attrs.emplace_back(k, v);
+    }
+    // Remaining bytes: either raw content or nested nodes (we try nested first if marker present).
+    while (i < b.size()) {
+        if (b[i] == 248) {
+            // nested — decode one child from remaining (size unknown; recursive consume via trial)
+            // For stub purposes, treat rest as opaque content if nested decode is ambiguous.
+            auto child = DecodeBinaryNode(Bytes(b.begin() + static_cast<std::ptrdiff_t>(i), b.end()));
+            if (!child) { n.content.assign(b.begin() + static_cast<std::ptrdiff_t>(i), b.end()); break; }
+            // We don't know child encoded size cheaply; re-encode to advance.
+            auto enc = EncodeBinaryNode(*child);
+            n.children.push_back(*child);
+            i += enc.size();
+        } else if (b[i] == 252 || b[i] == 253) {
+            std::string tmp;
+            std::size_t save = i;
+            if (!rdstr(tmp)) { i = save; n.content.assign(b.begin() + static_cast<std::ptrdiff_t>(i), b.end()); break; }
+            n.content.assign(tmp.begin(), tmp.end());
+        } else {
+            n.content.assign(b.begin() + static_cast<std::ptrdiff_t>(i), b.end());
+            break;
+        }
+    }
+    (void)parts;
+    return n;
+}
+
+SignalIdentity GenerateSignalIdentity() {
+    SignalIdentity id;
+    id.identity = GenerateKeyPair();
+    id.signed_prekey = GenerateKeyPair();
+    id.registration_id = (RandomBytes(4)[0] << 24) | (RandomBytes(1)[0] << 16) | (RandomBytes(1)[0] << 8) | RandomBytes(1)[0];
+    id.registration_id &= 0x3fff;
+    // spk_signature left empty — Ed25519/XEdDSA not linked in this stub layer.
+    return id;
+}
+
+SignalSession SignalX3dhInitiate(const SignalIdentity& self, const Bytes& peer_ik, const Bytes& peer_spk,
+                                 const Bytes& peer_opk) {
+    SignalSession s;
+    s.peer_identity = peer_ik;
+    auto ek = GenerateKeyPair();
+    Bytes ikm = SharedKey(self.identity.priv, peer_spk);
+    auto a = SharedKey(ek.priv, peer_ik);
+    auto b = SharedKey(ek.priv, peer_spk);
+    ikm.insert(ikm.end(), a.begin(), a.end());
+    ikm.insert(ikm.end(), b.begin(), b.end());
+    if (!peer_opk.empty()) {
+        auto c = SharedKey(ek.priv, peer_opk);
+        ikm.insert(ikm.end(), c.begin(), c.end());
+    }
+    auto root = Hkdf(ikm, 96, {}, "OpenClawWASignalStubV1");
+    s.root_key.assign(root.begin(), root.begin() + 32);
+    s.send_chain.assign(root.begin() + 32, root.begin() + 64);
+    s.recv_chain.assign(root.begin() + 64, root.end());
+    s.established = true;
+    return s;
+}
+
+Bytes SignalRatchetEncrypt(SignalSession& s, const Bytes& plaintext) {
+    if (!s.established) throw std::runtime_error("signal session not established");
+    // Derive message key then advance send chain (stub — not the Signal Double Ratchet).
+    auto mk = Hkdf(s.send_chain, 64, s.root_key, "stub-msg-key");
+    Bytes ct(plaintext.size() + 8);
+    for (std::size_t i = 0; i < plaintext.size(); ++i) ct[i] = plaintext[i] ^ mk[i % 32];
+    // trailer: first 8 bytes of mk[32..] as a tag stand-in
+    for (int i = 0; i < 8; ++i) ct[plaintext.size() + i] = mk[32 + i];
+    s.send_chain.assign(mk.begin() + 32, mk.end());
+    ++s.send_n;
+    return ct;
+}
+
+std::optional<Bytes> SignalRatchetDecrypt(SignalSession& s, const Bytes& ciphertext) {
+    if (!s.established || ciphertext.size() < 8) return std::nullopt;
+    auto mk = Hkdf(s.recv_chain, 64, s.root_key, "stub-msg-key");
+    const std::size_t n = ciphertext.size() - 8;
+    for (int i = 0; i < 8; ++i) if (ciphertext[n + i] != mk[32 + i]) return std::nullopt;
+    Bytes pt(n);
+    for (std::size_t i = 0; i < n; ++i) pt[i] = ciphertext[i] ^ mk[i % 32];
+    s.recv_chain.assign(mk.begin() + 32, mk.end());
+    ++s.recv_n;
+    return pt;
+}
+
+
 }  // namespace openclaw::channels::waweb

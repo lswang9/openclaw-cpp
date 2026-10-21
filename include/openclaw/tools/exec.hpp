@@ -3,6 +3,7 @@
 // tools.exec.mode), per-agent allowlists in an approvals document, strict inline-eval, safe bins,
 // approval broker (exec.approval.requested / exec.approval.resolve), allow-always persistence.
 #include "openclaw/provider/provider.hpp"
+#include "openclaw/provider/router.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -107,6 +108,9 @@ private:
 // mode=auto reviewer against any Provider (no tools). Parses a strict JSON verdict; malformed/failed → escalate
 // (or deny when on_error=="deny"). allow with risk=high is downgraded to escalate.
 nlohmann::json ReviewWithProvider(provider::Provider& prov, const nlohmann::json& request, const std::string& on_error = "escalate");
+// Like ReviewWithProvider but routes through Router::CompleteRoute (honours tools.exec.autoReview.model).
+nlohmann::json ReviewWithProviderRoute(provider::Router& router, const std::string& route, const nlohmann::json& request,
+                                       const std::string& on_error = "escalate");
 
 // Per-run context (thread-local) set by the gateway around agent runs.
 struct RunContext {

@@ -11,11 +11,11 @@ Meta Business number. That is a different product.
 |---|---|---|
 | Transport | `wss://web.whatsapp.com/ws/chat`, binary frames: `WA 6 3` intro, then 3-byte BE length | **real** framing (`NoiseState::EncodeFrame/DecodeFrames`). The WebSocket client exists elsewhere (Slack/Discord) but is not wired here yet. |
 | Noise handshake | `Noise_XX_25519_AESGCM_SHA256`; HandshakeMessage protobuf (clientHello/serverHello/clientFinish) | **real**: both roles, tested in-process; tampering is rejected. Not yet tested against the real WA server. |
-| Server cert check | Verify the serverHello payload `CertChain` (WA root key, intermediate) | **missing** |
+| Server cert check | Verify the serverHello payload `CertChain` (WA root key, intermediate) | **partial (1.64+)**: `DecodeCertChain` / `VerifyCertChain` structural decode; Ed25519/XEdDSA verify against WA root still missing |
 | ClientPayload | Protobuf: `UserAgent`, `WebInfo`, `DevicePairingRegistrationData` (reg id, signed pre-key, identity) for the first login, `username`/`device` afterwards | **missing**. Needs the WAProto schema (≈ 3k lines of .proto); we have only a varint/len-delimited codec. |
-| WABinary nodes | XMPP-like `<iq>`/`<message>`/`<receipt>` trees, token dictionary v3 (single- and double-byte), JID encodings, nibble/hex packing | **missing**. Needs the token tables (Baileys `WAM/constants`). |
+| WABinary nodes | XMPP-like `<iq>`/`<message>`/`<receipt>` trees, token dictionary v3 (single- and double-byte), JID encodings, nibble/hex packing | **partial (1.64+)**: `EncodeBinaryNode` / `DecodeBinaryNode` without the token dictionary (string tags only). Dictionary v3 still missing. |
 | Pairing | `pair-device` refs → QR `ref,noisePub,identityPub,advSecret`; `pair-success` → verify ADV HMAC, sign the device identity, reply `pair-device-sign` | QR payload format **real**. ADV signature/verification **missing**. |
-| Signal protocol | X3DH session setup with pre-key bundles (`encrypt` iq), Double Ratchet (`pkmsg`/`msg`), group SenderKeys (`skmsg`), XEdDSA signatures | **missing**. This is the biggest piece. libsignal-protocol-c (GPL-3) could be linked, or we write our own (Curve25519/XEdDSA, AES-CBC, HMAC chains). |
+| Signal protocol | X3DH session setup with pre-key bundles (`encrypt` iq), Double Ratchet (`pkmsg`/`msg`), group SenderKeys (`skmsg`), XEdDSA signatures | **stub (1.64+)**: `GenerateSignalIdentity`, `SignalX3dhInitiate`, `SignalRatchetEncrypt/Decrypt` — HKDF-based stand-ins, **not** interoperable with WhatsApp. Real Double Ratchet / XEdDSA / SenderKeys still missing. |
 | Pre-key management | Upload 30+ one-time pre-keys, rotate the signed pre-key, `count` iq | **missing** |
 | App state sync | `app-state-sync-key-share`, LTHash mutations (contacts, mute, pin, archive) | **missing**. Not required for messaging. |
 | History sync | Compressed `HistorySyncNotification` blobs | **missing**. Optional. |

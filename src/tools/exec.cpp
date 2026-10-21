@@ -277,6 +277,7 @@ struct BgSession {
     BackgroundHandle handle;
     int write_fd = -1;
     bool pty = false;
+    int pty_rows = 24, pty_cols = 80;
     std::thread waiter;
 };
 std::mutex g_bg_mu;
@@ -804,7 +805,8 @@ nlohmann::json ProcessTool(const nlohmann::json& args) {
             if (s->agent_id != ctx.agent_id && !ctx.agent_id.empty()) continue;
             std::lock_guard lk(s->mu);
             arr.push_back({{"sessionId", id}, {"command", s->command}, {"cwd", s->cwd}, {"pid", s->pid},
-                           {"done", s->done.load()}, {"pty", s->pty}, {"status", s->done.load() ? (s->result.timed_out ? "timeout" : "exited") : "running"}});
+                           {"done", s->done.load()}, {"pty", s->pty},
+                           {"rows", s->pty_rows}, {"cols", s->pty_cols}, {"status", s->done.load() ? (s->result.timed_out ? "timeout" : "exited") : "running"}});
         }
         return {{"sessions", arr}};
     }
@@ -823,6 +825,19 @@ nlohmann::json ProcessTool(const nlohmann::json& args) {
         KillBackground(s->handle);
         s->killed.store(true);
         return {{"ok", true}, {"sessionId", sid}, {"killed", true}};
+    }
+    if (action == "resize") {
+        int rows = args.value("rows", args.value("height", 24));
+        int cols = args.value("cols", args.value("width", 80));
+        std::lock_guard lk(s->mu);
+        if (!s->pty || s->write_fd < 0)
+            return {{"ok", false}, {"error", "session is not a pty (start exec with pty:true)"}};
+        // Resize via the live handle's write_fd (same as master).
+        BackgroundHandle tmp;
+        tmp.pty = true; tmp.write_fd = s->write_fd; tmp.pid = s->pid;
+        bool ok = ResizePty(tmp, rows, cols);
+        if (ok) { s->pty_rows = rows; s->pty_cols = cols; }
+        return {{"ok", ok}, {"sessionId", sid}, {"rows", rows}, {"cols", cols}};
     }
     if (action == "write" || action == "send-keys" || action == "submit" || action == "paste") {
         std::string bytes;
@@ -867,7 +882,7 @@ nlohmann::json ProcessTool(const nlohmann::json& args) {
         }
         return out;
     }
-    return {{"ok", false}, {"error", "unknown action (list|poll|log|write|send-keys|submit|paste|kill)"}};
+    return {{"ok", false}, {"error", "unknown action (list|poll|log|write|send-keys|submit|paste|resize|kill)"}};
 }
 
 nlohmann::json ReviewWithProvider(provider::Provider& prov, const nlohmann::json& request, const std::string& on_error) {
@@ -904,5 +919,49 @@ nlohmann::json ReviewWithProvider(provider::Provider& prov, const nlohmann::json
     if (dec == "allow" && request.value("inlineEval", false) && risk != "low") dec = "escalate";
     return {{"decision", dec}, {"risk", risk}, {"reason", v.value("reason", "")}, {"reviewer", "provider"}};
 }
+
+nlohmann::json ReviewWithProviderRoute(provider::Router& router, const std::string& route, const nlohmann::json& request,
+                                       const std::string& on_error) {
+    const std::string fallback = on_error == "deny" ? "deny" : "escalate";
+    std::vector<agent::Message> msgs;
+    agent::Message sys;
+    sys.role = "system";
+    sys.content =
+        "You are the OpenClaw exec auto-reviewer. Decide whether a shell command requested by an AI agent may run "
+        "without a human. Allow only clearly read-only or low-risk, workspace-scoped commands. Deny destructive, "
+        "exfiltrating, privilege-escalating or credential-reading commands. If unsure, escalate to a human. "
+        "Reply with ONLY a JSON object: {\"decision\":\"allow|deny|escalate\",\"risk\":\"low|medium|high\",\"reason\":\"...\"}";
+    agent::Message user;
+    user.role = "user";
+    user.content = "Command: " + request.value("command", "") + "\ncwd: " + request.value("cwd", "") +
+                   "\nagent: " + request.value("agentId", "") + "\npolicy reason: " + request.value("reason", "") +
+                   (request.value("inlineEval", false) ? "\nnote: inline interpreter eval detected" : "");
+    msgs.push_back(sys);
+    msgs.push_back(user);
+    agent::CompletionResult r;
+    try { r = router.CompleteRoute(route, msgs, nlohmann::json::array()); }
+    catch (const std::exception& e) {
+        return {{"decision", fallback}, {"reason", std::string("reviewer error: ") + e.what()},
+                {"reviewer", "provider"}, {"model", route}};
+    }
+    if (!r.ok) return {{"decision", fallback}, {"reason", "reviewer call failed: " + r.error},
+                       {"reviewer", "provider"}, {"model", route}};
+    const std::string& t = r.message.content;
+    auto a = t.find('{'), b = t.rfind('}');
+    nlohmann::json v;
+    if (a != std::string::npos && b != std::string::npos && b > a)
+        v = nlohmann::json::parse(t.substr(a, b - a + 1), nullptr, false);
+    if (!v.is_object() || !v.contains("decision") || !v["decision"].is_string())
+        return {{"decision", fallback}, {"reason", "reviewer reply was not a JSON verdict"},
+                {"raw", t.substr(0, 200)}, {"reviewer", "provider"}, {"model", route}};
+    std::string dec = v["decision"];
+    std::string risk = v.value("risk", "");
+    if (dec != "allow" && dec != "deny") dec = "escalate";
+    if (dec == "allow" && risk == "high") dec = "escalate";
+    if (dec == "allow" && request.value("inlineEval", false) && risk != "low") dec = "escalate";
+    return {{"decision", dec}, {"risk", risk}, {"reason", v.value("reason", "")},
+            {"reviewer", "provider"}, {"model", route}};
+}
+
 
 }  // namespace openclaw::tools::exec

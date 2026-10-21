@@ -49,7 +49,7 @@ cat > "$OPENCLAW_CONFIG_PATH" <<J
 { agents: { defaults: { memorySearch: { provider: 'gemini', outputDimensionality: 24, remote: { baseUrl: 'http://127.0.0.1:$PORT/gemini/v1beta', apiKey: 'g-key' } } } } }
 J
 R=$("$BIN" memory search kubernetes clusters)
-echo "$R" | grep -q '"backend": "hybrid-gemini"' || fail "gemini backend: $R"
+echo "$R" | grep -Eq '"backend": "hybrid-gemini(\+fts5)?"' || fail "gemini backend: $R"
 echo "$R" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["results"][0]["start_line"]==4, r'
 grep -q '"tasks": \["RETRIEVAL_DOCUMENT"\]' "$T/log.jsonl" && grep -q '"tasks": \["RETRIEVAL_QUERY"\]' "$T/log.jsonl" || fail "gemini task types"
 grep -q '"dims": \[24\]' "$T/log.jsonl" || fail "outputDimensionality not sent"
@@ -58,7 +58,7 @@ cat > "$OPENCLAW_CONFIG_PATH" <<J
 { agents: { defaults: { memorySearch: { provider: 'auto', model: 'voyage-3.5-lite', remote: { baseUrl: 'http://127.0.0.1:$PORT/voyage/v1' } } } } }
 J
 R=$(VOYAGE_API_KEY=v-key "$BIN" memory search dark roast coffee)
-echo "$R" | grep -q '"backend": "hybrid-voyage"' || fail "voyage backend: $R"
+echo "$R" | grep -Eq '"backend": "hybrid-voyage(\+fts5)?"' || fail "voyage backend: $R"
 echo "$R" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["results"][0]["start_line"]==1, r'
 grep -q '"type": "document"' "$T/log.jsonl" && grep -q '"type": "query"' "$T/log.jsonl" || fail "voyage input_type"
 # both models persisted side by side

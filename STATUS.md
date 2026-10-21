@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.63.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.64.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,13 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.64.0-dev
+- 插件 `dispatchReplyWithBufferedBlockDispatcher` 现可收到流式 `reply.block`（`hostEvent`），命令/工具内发起 agent.reply 不再死锁（写锁与请求锁分离 + 重入 hook 跳过 + 嵌套前释放 deps 锁）。
+- `writeConfigFile` 保留文件头 `//` 注释与 `$include`（`SavePreserving`）；插件安装写回同样走该路径。
+- 内置 DeepSeek/OpenAI-compat 走 auth-profiles + 多 profile 轮换（401/429）；`autoReview.model` 按路由选模型；PTY 支持 resize。
+- 本地 Ollama / GGUF embedding（离线 e2e）+ memory SQLite FTS5；WhatsApp Web 仅补证书/二进制节点/Signal 离线桩，**不**做真机登录。
+- 仍缺：专用 TTS/STT 客户端；Baileys 真机；WA 证书根密钥校验与 dictionary v3；可互操作的 Signal。
 
 ### 1.63.0-dev
 - Provider 鉴权：`models auth login/paste-token/list/remove`，插件 OAuth/API-key 流程（终端提示、openUrl），auth-profiles.json（0600），调用时注入凭证，过期前自动刷新 OAuth。

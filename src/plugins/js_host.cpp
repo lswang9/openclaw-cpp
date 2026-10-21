@@ -67,7 +67,7 @@ bool JsHost::Start(const std::filesystem::path& plugins_dir,
         } else {
             last_error_ = "FORCE_MOCK";
         }
-        last_init_ = MockHandle("initialize", {{"plugins_dir", plugins_dir_.string()}});
+        { std::lock_guard sl(state_mu_); last_init_ = MockHandle("initialize", {{"plugins_dir", plugins_dir_.string()}}); }
         return true;
     }
 
@@ -78,7 +78,7 @@ bool JsHost::Start(const std::filesystem::path& plugins_dir,
     if (!proc->Spawn(argv)) {
         last_error_ = "failed to spawn node bridge — falling back to mock";
         EnableMock();
-        last_init_ = MockHandle("initialize", {{"plugins_dir", plugins_dir_.string()}});
+        { std::lock_guard sl(state_mu_); last_init_ = MockHandle("initialize", {{"plugins_dir", plugins_dir_.string()}}); }
         return true;
     }
     {
@@ -88,9 +88,11 @@ bool JsHost::Start(const std::filesystem::path& plugins_dir,
         started_ = true;
         last_error_.clear();
     }
-    last_init_ = Initialize();
-    if (last_init_.contains("error")) {
-        last_error_ = last_init_["error"].dump();
+    {
+        auto init = Initialize();
+        std::lock_guard sl(state_mu_);
+        last_init_ = std::move(init);
+        if (last_init_.contains("error")) last_error_ = last_init_["error"].dump();
     }
     return true;
 }
@@ -121,6 +123,8 @@ bool JsHost::Running() const {
 }
 
 nlohmann::json JsHost::Status() const {
+    nlohmann::json init;
+    { std::lock_guard sl(state_mu_); init = last_init_; }
     std::lock_guard lock(mu_);
     return {{"running", started_},
             {"mock", mock_},
@@ -128,7 +132,7 @@ nlohmann::json JsHost::Status() const {
             {"bridge", bridge_js_.string()},
             {"force_mock", ForceMock()},
             {"last_error", last_error_},
-            {"init", last_init_},
+            {"init", init},
             {"impl", mock_ ? "real-sim" : "real"},
             {"gaps", nlohmann::json::array({"registerChannel/registerProvider/registerHttpRoute unsupported",
                                             "no hook lifecycle / channel bindings",
@@ -202,9 +206,17 @@ nlohmann::json JsHost::Request(const std::string& method, const nlohmann::json& 
     }
     const int id = next_id_++;
     inflight_ = method;
+    in_request_.store(true, std::memory_order_release);
+    struct ClearInflight {
+        JsHost* self;
+        ~ClearInflight() { self->inflight_.clear(); self->in_request_.store(false, std::memory_order_release); }
+    } clear{this};
     nlohmann::json req{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}};
     try {
-        proc_->WriteLine(req.dump());
+        {
+            std::lock_guard w(write_mu_);
+            proc_->WriteLine(req.dump());
+        }
         nlohmann::json resp;
         for (int guard = 0; guard < 1000; ++guard) {  // skip any stray/non-matching lines
             const auto line = proc_->ReadLine();
@@ -220,7 +232,10 @@ nlohmann::json JsHost::Request(const std::string& method, const nlohmann::json& 
                 if (out.is_object() && out.value("__deferred", false)) { guard = 0; continue; }
                 nlohmann::json reply{{"hostReply", hid}};
                 if (!err.empty()) reply["error"] = err; else reply["result"] = out;
-                proc_->WriteLine(reply.dump());
+                {
+                    std::lock_guard w(write_mu_);
+                    proc_->WriteLine(reply.dump());
+                }
                 guard = 0;
                 continue;
             }
@@ -235,18 +250,29 @@ nlohmann::json JsHost::Request(const std::string& method, const nlohmann::json& 
 }
 
 void JsHost::SendHostReply(long long id, const nlohmann::json& result, const std::string& error) {
-    std::lock_guard lock(mu_);
-    if (mock_ || !proc_) return;
+    if (mock_) return;
     nlohmann::json reply{{"hostReply", id}};
     if (!error.empty()) reply["error"] = error; else reply["result"] = result;
+    std::lock_guard w(write_mu_);
+    if (!proc_) return;
     try { proc_->WriteLine(reply.dump()); } catch (...) {}
+}
+
+void JsHost::SendHostEvent(long long id, const std::string& type, const nlohmann::json& payload) {
+    if (mock_) return;
+    nlohmann::json ev{{"hostEvent", id}, {"type", type}};
+    if (payload.is_object()) for (auto& [k, v] : payload.items()) ev[k] = v;
+    else ev["payload"] = payload;
+    std::lock_guard w(write_mu_);
+    if (!proc_) return;
+    try { proc_->WriteLine(ev.dump()); } catch (...) {}
 }
 
 nlohmann::json JsHost::Initialize() {
     nlohmann::json dirs = nlohmann::json::array({plugins_dir_.string()});
     nlohmann::json cfg;
     {
-        std::lock_guard l(mu_);
+        std::lock_guard l(state_mu_);
         for (auto& d : extra_dirs_) dirs.push_back(d.string());
         cfg = config_;
     }
@@ -264,7 +290,7 @@ bool InitListHas(const nlohmann::json& init, const char* key, const std::string&
 }  // namespace
 
 nlohmann::json JsHost::MatchHttpRoute(const std::string& path) const {
-    std::lock_guard l(mu_);
+    std::lock_guard l(state_mu_);
     nlohmann::json any;
     for (auto& r : last_init_.value("httpRoutes", nlohmann::json::array())) {
         const auto p = r.value("path", ""), m = r.value("match", "exact");
@@ -275,7 +301,7 @@ nlohmann::json JsHost::MatchHttpRoute(const std::string& path) const {
 }
 
 std::vector<std::string> JsHost::InitList(const char* key) const {
-    std::lock_guard l(mu_);
+    std::lock_guard l(state_mu_);
     std::vector<std::string> out;
     if (last_init_.contains(key) && last_init_[key].is_array())
         for (auto& x : last_init_[key]) if (x.is_string()) out.push_back(x);
@@ -284,10 +310,10 @@ std::vector<std::string> JsHost::InitList(const char* key) const {
 
 bool JsHost::HasCommand(const std::string& n) const {
     std::string low; for (char c : n) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    std::lock_guard l(mu_); return InitListHas(last_init_, "commands", low);
+    std::lock_guard l(state_mu_); return InitListHas(last_init_, "commands", low);
 }
-bool JsHost::HasHook(const std::string& e) const { std::lock_guard l(mu_); return InitListHas(last_init_, "hooks", e); }
-bool JsHost::HasGatewayMethod(const std::string& m) const { std::lock_guard l(mu_); return InitListHas(last_init_, "gatewayMethods", m); }
+bool JsHost::HasHook(const std::string& e) const { std::lock_guard l(state_mu_); return InitListHas(last_init_, "hooks", e); }
+bool JsHost::HasGatewayMethod(const std::string& m) const { std::lock_guard l(state_mu_); return InitListHas(last_init_, "gatewayMethods", m); }
 
 nlohmann::json JsHost::RunCommand(const std::string& name, const std::string& args, const nlohmann::json& ctx) {
     nlohmann::json p = ctx.is_object() ? ctx : nlohmann::json::object();
@@ -296,6 +322,8 @@ nlohmann::json JsHost::RunCommand(const std::string& name, const std::string& ar
 }
 
 nlohmann::json JsHost::EmitHook(const std::string& event, const nlohmann::json& payload, const nlohmann::json& ctx) {
+    if (RequestInFlight())
+        return {{"handlers", 0}, {"results", nlohmann::json::array()}, {"merged", payload}, {"skipped", "reentrant"}};
     return Request("emit_hook", {{"event", event}, {"payload", payload}, {"ctx", ctx.is_null() ? nlohmann::json::object() : ctx}});
 }
 

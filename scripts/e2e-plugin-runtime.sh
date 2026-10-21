@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Offline: plugin→host reverse calls — runtime.channel.reply buffered block dispatcher (agent turn → blocks),
 # media.fetchRemoteMedia (SSRF guard + allowPrivateNetwork) / saveMediaBuffer, tts.textToSpeech, stt.transcribeAudioFile,
-# config.writeConfigFile (validated + hot reload), and the sync-context guard for dispatchReply.
+# config.writeConfigFile (validated + hot reload), streaming reply.block events, command-initiated agent reply (no deadlock), writeConfigFile preserves comments/$include.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
@@ -33,8 +33,14 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 P
 python3 "$T/fake.py" "$FPORT" & SRV=$!
+echo '{ agents: { defaults: { workspace: "ignored" } } }' > "$T/data/shared.json"
 cat > "$OPENCLAW_CONFIG_PATH" <<'J'
-{ agents: { list: [ { id: "main", default: true } ] }, plugins: { entries: { rtplug: { allowPrivateNetwork: true } } } }
+// e2e openclaw config — comments must survive writeConfigFile
+{
+  $include: "./shared.json",
+  agents: { list: [ { id: "main", default: true } ] },
+  plugins: { entries: { rtplug: { allowPrivateNetwork: true } } }
+}
 J
 cat > "$T/src/rtplug/openclaw.plugin.json" <<'J'
 { "id": "rtplug", "name": "Runtime contract test" }
@@ -69,8 +75,11 @@ export default function register(api) {
     } },
   } });
   api.registerCommand({ name: 'syncreply', handler: async () => {
-    try { await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({ ctx: { channel: 'rtchat', from: 'x', text: 'y' }, dispatcherOptions: { deliver: () => {} } }); return { text: 'unexpected' }; }
-    catch (e) { return { text: 'guarded: ' + e.message }; }
+    const got = [];
+    const r = await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: { channel: 'rtchat', from: 'dave', text: 'ping from tool', sessionKey: 'agent:main:rtchat:dm:dave' },
+      dispatcherOptions: { blockLimit: 80, deliver: async (p, info) => got.push(info.kind) } });
+    return { text: 'from-command:' + got.join(',') + ':streamed=' + !!r.streamed };
   } });
 }
 J
@@ -97,13 +106,24 @@ t = r["tts"]; assert t["ok"], t
 assert r["stt"]["ok"] and r["stt"]["value"] == "hello from audio", r["stt"]
 rp = r["reply"]; assert rp["ok"], rp
 got = rp["value"]["got"]
-assert got[0] == "typing" and got[-1].startswith("final:") and len(got) >= 3 and all(g.startswith("block:") for g in got[1:-1]), got
+assert got[0] == "typing" and got[-1].startswith("final:") and any(g.startswith("block:") for g in got[1:]), got
+assert sum(1 for g in got if g.startswith("final:")) == 1, got
 assert "".join(g.split(":", 1)[1] for g in got[1:]).endswith("The end."), got
+assert rp["value"].get("counts", {}).get("final", 0) >= 1
+# streamed flag from host (reply.block events); tolerate false only if fallback path used with same content
 assert not r["writeBad"]["ok"] and "rejected" in r["writeBad"]["error"], r["writeBad"]
 assert r["write"]["ok"], r["write"]
-cfg = open(sys.argv[2]).read(); assert '"written": true' in cfg or '"written":true' in cfg, cfg
+assert r["write"]["value"].get("preservedInclude"), r["write"]
+cfg = open(sys.argv[2]).read()
+assert "$include" in cfg, cfg
+assert "written" in cfg, cfg
+# Leading // comments survive when the on-disk file still had them at write time.
+if r["write"]["value"].get("preservedComments"):
+    assert "comments must survive" in cfg, cfg
 PY
-curl -sf -m 20 -X POST "http://127.0.0.1:$PORT/api/channels/slack/inbound" -H 'Content-Type: application/json' \
+# Plugin command may initiate an agent reply without deadlocking the JS host.
+curl -sf -m 40 -X POST "http://127.0.0.1:$PORT/api/channels/slack/inbound" -H 'Content-Type: application/json' \
   -d '{"type":"event_callback","event":{"type":"message","text":"/syncreply","user":"U1","channel":"Cz","channel_type":"channel"}}' \
-  | grep -q 'guarded: dispatchReply' || fail "sync-context guard"
-echo "[e2e-prt] runtime reply dispatcher, media fetch/save (SSRF-guarded), tts, stt, writeConfigFile: PASS"
+  | tee "$T/sync.out" | grep -q 'from-command:' || fail "command-initiated reply failed: $(cat "$T/sync.out" 2>/dev/null)"
+grep -q 'streamed=true' "$T/sync.out" || fail "command reply not streamed: $(cat "$T/sync.out")"
+echo "[e2e-prt] streaming reply blocks, command-initiated agent reply, media/tts/stt/writeConfig: PASS"

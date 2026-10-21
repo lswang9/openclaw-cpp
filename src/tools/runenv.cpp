@@ -243,6 +243,18 @@ void KillBackground(BackgroundHandle& h) {
     if (h.pid > 0) kill(-h.pid, SIGTERM);
 }
 
+bool ResizePty(BackgroundHandle& h, int rows, int cols) {
+    if (!h.pty || h.write_fd < 0) return false;
+    if (rows < 1) rows = 1;
+    if (cols < 1) cols = 1;
+    if (rows > 500) rows = 500;
+    if (cols > 1000) cols = 1000;
+    winsize ws{};
+    ws.ws_row = static_cast<unsigned short>(rows);
+    ws.ws_col = static_cast<unsigned short>(cols);
+    return ioctl(h.write_fd, TIOCSWINSZ, &ws) == 0;
+}
+
 std::string KeysToBytes(const std::vector<std::string>& keys) {
     static const std::map<std::string, std::string> named = {
         {"Enter", "\r"}, {"Return", "\r"}, {"Tab", "\t"}, {"Escape", "\x1b"}, {"Esc", "\x1b"}, {"Space", " "},

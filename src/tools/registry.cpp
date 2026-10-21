@@ -224,12 +224,13 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
 
         ToolSpec proc;
         proc.name = "process";
-        proc.description = "Manage background exec sessions: list|poll|log|write|send-keys|submit|paste|kill (scoped per agent). send-keys takes tmux-style keys (Enter, C-c, Up, Tab, Escape).";
+        proc.description = "Manage background exec sessions: list|poll|log|write|send-keys|submit|paste|resize|kill (scoped per agent). send-keys takes tmux-style keys (Enter, C-c, Up, Tab, Escape).";
         proc.parameters = nlohmann::json{{"type", "object"},
             {"properties", {{"action", {{"type", "string"}}}, {"sessionId", {{"type", "string"}}},
                             {"timeout", {{"type", "integer"}, {"description", "poll wait ms"}}},
                             {"data", {{"type", "string"}}}, {"keys", {{"type", "array"}, {"items", {{"type", "string"}}}}},
-                            {"literal", {{"type", "string"}}}}},
+                            {"literal", {{"type", "string"}}},
+                            {"rows", {{"type", "integer"}}}, {"cols", {{"type", "integer"}}}}},
             {"required", nlohmann::json::array({"action"})}};
         proc.handler = [](const nlohmann::json& a) { return exec::ProcessTool(a).dump(); };
         r.Register(std::move(proc));

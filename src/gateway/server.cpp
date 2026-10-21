@@ -45,7 +45,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.63.0-dev";
+constexpr const char* kVersion = "1.64.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -269,9 +269,16 @@ Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), de
         return !ctx.channel.empty() && deps_.adapters.Get(ctx.channel) != nullptr;  // chat /approve surface
     };
     broker.auto_review = [this](const nlohmann::json& req) {
-        provider::Provider* p = deps_.router ? static_cast<provider::Provider*>(deps_.router) : &deps_.provider;
-        nlohmann::json v = tools::exec::ReviewWithProvider(*p, req, req.value("onError", "escalate"));
-        Emit("exec.autoreview", {{"command", req.value("command", "")}, {"verdict", v}});
+        nlohmann::json v;
+        const std::string model = req.value("model", "");
+        if (!model.empty() && deps_.router) {
+            // tools.exec.autoReview.model as "provider" or "provider/model" route
+            v = tools::exec::ReviewWithProviderRoute(*deps_.router, model, req, req.value("onError", "escalate"));
+        } else {
+            provider::Provider* p = deps_.router ? static_cast<provider::Provider*>(deps_.router) : &deps_.provider;
+            v = tools::exec::ReviewWithProvider(*p, req, req.value("onError", "escalate"));
+        }
+        Emit("exec.autoreview", {{"command", req.value("command", "")}, {"model", model}, {"verdict", v}});
         return v;
     };
     broker.on_requested = [this](const nlohmann::json& r) {
@@ -464,17 +471,16 @@ nlohmann::json Server::PluginHostCall(long long id, const std::string& method, c
     if (method == "config.write") {
         const auto cfg = p.value("config", nlohmann::json());
         if (!cfg.is_object()) throw std::runtime_error("writeConfigFile: config must be an object");
-        auto rep = config::ValidateSchema(cfg);
-        if (!rep.errors.empty()) throw std::runtime_error("writeConfigFile rejected: " + rep.errors.front());
         std::lock_guard l(host_call_mu_);
-        config::SaveRaw(config::DefaultPath(), cfg);
-        Emit("config.written", {{"plugin", plugin}});
-        return {{"ok", true}, {"path", config::DefaultPath().string()}, {"warnings", rep.warnings}};
+        auto wr = config::SavePreserving(config::DefaultPath(), cfg);
+        if (!wr.value("ok", false)) throw std::runtime_error("writeConfigFile " + wr.value("error", std::string("failed")));
+        Emit("config.written", {{"plugin", plugin}, {"preservedInclude", wr.value("preservedInclude", false)},
+                                {"preservedComments", wr.value("preservedComments", false)}});
+        return wr;
     }
     if (method == "agent.reply") {
-        if (deps_.js_host && deps_.js_host->InflightMethod() != "drain_events")
-            throw std::runtime_error("dispatchReply* must be called from a channel gateway/background task, not inside a synchronous "
-                                     "plugin call (" + deps_.js_host->InflightMethod() + ")");
+        // Always deferred onto a gateway thread. JsHost write_mu_ lets SendHostEvent/Reply proceed while the
+        // originating tool/command/drain_events Request still holds the request mutex (no deadlock).
         channels::InboundMessage m;
         m.channel = p.value("channel", std::string("plugin"));
         m.sender = p.value("from", std::string("unknown"));
@@ -486,13 +492,17 @@ nlohmann::json Server::PluginHostCall(long long id, const std::string& method, c
         m.session_key = p.value("sessionKey", m.channel + "-" + (m.conversation_id.empty() ? m.sender : m.conversation_id));
         m.explicit_key = p.contains("sessionKey");
         const std::size_t limit = std::clamp<std::size_t>(p.value("blockLimit", std::size_t{2000}), 16, 100000);
+        const bool stream = p.value("stream", true);
         std::lock_guard l(host_threads_mu_);
-        host_threads_.emplace_back([this, id, m, limit] {
+        host_threads_.emplace_back([this, id, m, limit, stream] {
             std::string reply;
             std::string err;
-            try { reply = DeliverInbound(m); } catch (const std::exception& e) { err = e.what(); }
+            try {
+                reply = DeliverInbound(m);
+            } catch (const std::exception& e) {
+                err = e.what();
+            }
             nlohmann::json blocks = nlohmann::json::array();
-            // paragraph-aware block chunking
             std::size_t i = 0;
             while (i < reply.size()) {
                 std::size_t n = std::min(limit, reply.size() - i);
@@ -503,7 +513,15 @@ nlohmann::json Server::PluginHostCall(long long id, const std::string& method, c
                 blocks.push_back(reply.substr(i, n));
                 i += n;
             }
-            if (deps_.js_host) deps_.js_host->SendHostReply(id, {{"text", reply}, {"blocks", blocks}}, err);
+            if (stream && deps_.js_host && err.empty()) {
+                for (std::size_t b = 0; b < blocks.size(); ++b) {
+                    const bool last = b + 1 == blocks.size();
+                    deps_.js_host->SendHostEvent(id, "reply.block",
+                        {{"text", blocks[b]}, {"kind", last ? "final" : "block"}, {"index", b}});
+                }
+            }
+            if (deps_.js_host)
+                deps_.js_host->SendHostReply(id, {{"text", reply}, {"blocks", blocks}, {"streamed", stream && err.empty()}}, err);
         });
         return {{"__deferred", true}};
     }
@@ -1097,6 +1115,8 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         std::string name = text_in.substr(1, sp == std::string::npos ? std::string::npos : sp - 1);
         std::string args = sp == std::string::npos ? "" : text_in.substr(sp + 1);
         if (deps_.js_host->HasCommand(name)) {
+            // Drop deps_mu_ before run_command: handler may hostCall agent.reply → nested DeliverInbound.
+            if (deps_lock.owns_lock()) deps_lock.unlock();
             auto r = deps_.js_host->RunCommand(name, args, {{"senderId", msg.sender}, {"channel", msg.channel},
                                                              {"sessionKey", msg.session_key}});
             Emit("plugin.command", {{"sessionKey", msg.session_key}, {"command", name}});
@@ -1104,9 +1124,10 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
             return r.value("text", std::string());
         }
     }
-    if (deps_.js_host && deps_.js_host->HasHook("message_received"))
+    if (deps_.js_host && deps_.js_host->HasHook("message_received")) {
         deps_.js_host->EmitHook("message_received", {{"from", msg.sender}, {"content", text_in}, {"channel", msg.channel}},
                                 {{"sessionKey", msg.session_key}, {"channelId", msg.channel}});
+    }
     if (auto sc = skills::MatchSkillCommand(deps_.skills.List(), text_in)) {
         Emit("skill.command", {{"sessionKey", msg.session_key}, {"skill", sc->skill}, {"dispatch", sc->dispatch_tool.empty() ? "model" : "tool"}});
         if (!sc->dispatch_tool.empty()) {
@@ -1125,7 +1146,9 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         text_in = sc->prompt;
     }
     auto messages = sessions.Load(msg.session_key);
-    if (messages.empty()) PluginSessionHook("session_start", msg.session_key, "new");
+    if (messages.empty()) {
+        PluginSessionHook("session_start", msg.session_key, "new");
+    }
     std::string content = text_in;
     if (!msg.sender.empty()) {
         content = "[" + msg.channel + "/" + msg.sender + "] " + text_in;

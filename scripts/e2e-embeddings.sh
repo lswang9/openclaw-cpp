@@ -36,7 +36,7 @@ cat > "$T/data/openclaw.json" <<J
 J
 export OPENCLAW_CONFIG_PATH="$T/data/openclaw.json" OPENCLAW_WORKSPACE="$T/ws" OPENCLAW_DATA_DIR="$T/data"
 R=$("$BIN" memory search kubernetes clusters)
-echo "$R" | grep -q '"backend": "hybrid-openai"' || { echo "[e2e-emb] wrong backend: $R" >&2; exit 1; }
+echo "$R" | grep -Eq '"backend": "hybrid-openai(\+fts5)?"' || { echo "[e2e-emb] wrong backend: $R" >&2; exit 1; }
 echo "$R" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["results"][0]["start_line"]==4, r'
 "$BIN" memory search coffee >/dev/null
 python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); assert c["inputs"]==4, c' "$T/calls.json"   # 2 chunks once + 2 queries
