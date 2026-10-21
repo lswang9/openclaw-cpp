@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.26.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.27.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,6 +41,7 @@ set(OPENCLAW_SOURCES
   src/provider/router.cpp
   src/tools/registry.cpp
   src/workspace/workspace.cpp
+  src/context/system_prompt.cpp
   src/session/store.cpp
   src/gateway/server.cpp
   src/gateway/methods.cpp

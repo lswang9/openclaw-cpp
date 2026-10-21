@@ -187,4 +187,7 @@ kill "$GW2" 2>/dev/null; wait "$GW2" 2>/dev/null || true; rm -rf "$SESS2"
 
 "$BIN" --version | grep -q "openclaw-cpp" && echo "[smoke] --version ok"
 if "$BIN" --definitely-unknown >/dev/null 2>&1; then echo "[smoke] unknown flag accepted" >&2; exit 1; fi; echo "[smoke] unknown flag rejected"
+OPENCLAW_DEFAULT_PROVIDER=mock "$BIN" chat "hello" | grep -q . && echo "[smoke] chat (mock) ok"
+"$BIN" skills check | grep -q eligible && echo "[smoke] skills check ok"
+"$BIN" context | grep -q systemPromptChars && echo "[smoke] context ok"
 echo "[smoke] ALL PASS"

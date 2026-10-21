@@ -1,6 +1,13 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.26.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.27.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.27.0-dev 新增
+
+- 系统提示词按上游方式组装：注入工作区 `AGENTS.md`/`SOUL.md`/`TOOLS.md`/`IDENTITY.md`/`USER.md`/`HEARTBEAT.md`/`BOOTSTRAP.md`/`MEMORY.md`（单文件超 20000 字符截断），并附带 `<available_skills>` 列表；网关和 `chat` 都会使用。
+- 技能加载优先级：工作区 `skills/` > `~/.openclaw/skills` > 内置示例 > `OPENCLAW_SKILLS_DIR`；支持 `metadata.openclaw.requires`（bins/anyBins/env）、`os` 与 `disable-model-invocation` 过滤。
+- 新 CLI：`skills list|check|info <名称>`、`context`（查看注入情况）、`context prompt`（打印完整系统提示词）；`OPENCLAW_DEFAULT_PROVIDER=mock openclaw-cpp chat ...` 可离线测试。
+- 仍缺：ClawHub 安装、技能级配置/环境变量注入、技能斜杠命令。
 
 ## 1.26.0-dev 新增
 

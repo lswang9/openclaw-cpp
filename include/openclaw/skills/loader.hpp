@@ -14,12 +14,30 @@ struct Skill {
     std::string description;
     std::filesystem::path path;  // directory containing SKILL.md
     std::string body;            // markdown body after frontmatter
+    std::string source;          // workspace | managed | bundled | extra
+    nlohmann::json metadata = nlohmann::json::object();  // frontmatter `metadata` (JSON), e.g. {"openclaw":{"requires":{...}}}
+    bool disable_model_invocation = false;               // frontmatter disable-model-invocation
+    bool eligible = true;                                // gating result
+    std::vector<std::string> missing;                    // unmet requirements ("bin:x", "env:Y", "os:z")
 };
+
+struct ScanRoot {
+    std::filesystem::path path;
+    std::string source;
+};
+
+// OpenClaw gating: metadata.openclaw.requires.{bins,anyBins,env} and metadata.openclaw.os.
+void EvaluateGating(Skill& s);
+
+// Upstream-style XML block listing eligible, model-invocable skills (name/description/location).
+std::string FormatSkillsForPrompt(const std::vector<Skill>& skills);
 
 class Library {
 public:
     // Scan roots for */SKILL.md (OpenClaw skill layout).
     void Scan(const std::vector<std::filesystem::path>& roots);
+    // Precedence scan: earlier roots win on name collision (workspace > managed > bundled).
+    void ScanRoots(const std::vector<ScanRoot>& roots);
     std::vector<Skill> List() const { return skills_; }
     std::optional<Skill> Find(const std::string& name) const;
     nlohmann::json ListJson() const;

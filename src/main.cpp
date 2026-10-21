@@ -1,3 +1,4 @@
+#include <memory>
 #include "openclaw/agent/loop.hpp"
 #include "openclaw/auth/gateway_auth.hpp"
 #include "openclaw/channels/registry.hpp"
@@ -51,6 +52,8 @@
 #include "openclaw/agent/files.hpp"
 #include "openclaw/logging/tail.hpp"
 #include "openclaw/context/assemble.hpp"
+#include "openclaw/context/system_prompt.hpp"
+#include "openclaw/workspace/workspace.hpp"
 #include "openclaw/mcp/stdio.hpp"
 
 #include <curl/curl.h>
@@ -70,7 +73,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.26.0-dev";
+constexpr const char* kVersion = "1.27.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -103,19 +106,31 @@ std::filesystem::path RepoRoot() {
 }
 
 openclaw::skills::Library LoadSkills() {
+    namespace fs = std::filesystem;
     openclaw::skills::Library lib;
-    std::vector<std::filesystem::path> roots = {
-        RepoRoot() / "skills" / "examples",
-        std::filesystem::path(openclaw::EnvOr("OPENCLAW_SKILLS_DIR", "")),
-        std::filesystem::path(openclaw::EnvOr("HOME", "/tmp")) / ".openclaw-cpp" / "skills",
+    const fs::path home = openclaw::EnvOr("HOME", "/tmp");
+    const fs::path ws = openclaw::workspace::Workspace::DefaultRoot();
+    // Upstream precedence: <workspace>/skills > ~/.openclaw/skills (managed) > bundled > extraDirs.
+    std::vector<openclaw::skills::ScanRoot> roots = {
+        {ws / "skills", "workspace"},
+        {home / ".openclaw" / "skills", "managed"},
+        {home / ".openclaw-cpp" / "skills", "managed"},
+        {RepoRoot() / "skills" / "examples", "bundled"},
     };
-    // drop empty
-    std::vector<std::filesystem::path> cleaned;
-    for (auto& r : roots) {
-        if (!r.empty()) cleaned.push_back(r);
-    }
-    lib.Scan(cleaned);
+    std::string extra = openclaw::EnvOr("OPENCLAW_SKILLS_DIR", "");
+    if (!extra.empty()) roots.push_back({fs::path(extra), "extra"});
+    lib.ScanRoots(roots);
     return lib;
+}
+
+std::string BuildAgentSystemPrompt(const openclaw::tools::Registry& reg) {
+    openclaw::context::SystemPromptOptions o;
+    o.base = openclaw::EnvOr("OPENCLAW_SYSTEM_PROMPT",
+                             "You are OpenClaw (C++ rewrite), a personal assistant. Be concise and helpful.");
+    o.workspace = openclaw::workspace::Workspace::DefaultRoot();
+    o.skills = LoadSkills().List();
+    o.tool_names = reg.Names();
+    return openclaw::context::BuildSystemPrompt(o);
 }
 
 int CmdSelfTest() {
@@ -1253,6 +1268,35 @@ int CmdSelfTest() {
         std::cerr << "FAIL workspace exception: " << e.what() << "\n"; ++failures;
     }
 
+    // skills gating/precedence + system prompt (bootstrap files + <available_skills>)
+    try {
+        namespace fs = std::filesystem;
+        auto root = fs::temp_directory_path() / "oc-sp-st";
+        fs::remove_all(root);
+        auto mk = [](const fs::path& d, const std::string& body) { fs::create_directories(d); std::ofstream(d / "SKILL.md") << body; };
+        mk(root / "ws/skills/dup", "---\nname: dup\ndescription: workspace wins\n---\nbody\n");
+        mk(root / "bundled/dup", "---\nname: dup\ndescription: bundled loses\n---\n");
+        mk(root / "bundled/needbin", "---\nname: needbin\ndescription: needs bin\nmetadata: {\"openclaw\":{\"requires\":{\"bins\":[\"definitely-not-a-bin-xyz\"],\"env\":[\"OC_NOPE_ENV_XYZ\"]}}}\n---\n");
+        mk(root / "bundled/hidden", "---\nname: hidden\ndescription: manual only\ndisable-model-invocation: true\n---\n");
+        mk(root / "bundled/shok", "---\nname: shok\ndescription: needs sh <&>\nmetadata: {\"openclaw\":{\"requires\":{\"bins\":[\"sh\"]}}}\n---\n");
+        skills::Library lib;
+        lib.ScanRoots({{root / "ws/skills", "workspace"}, {root / "bundled", "bundled"}});
+        auto d = lib.Find("dup"); auto nb = lib.Find("needbin");
+        std::ofstream(root / "ws/AGENTS.md") << "Always answer in haiku.";
+        std::ofstream(root / "ws/SOUL.md") << std::string(30000, 'z');
+        context::SystemPromptOptions so; so.base = "BASE"; so.workspace = root / "ws"; so.skills = lib.List();
+        so.tool_names = {"read", "write"};
+        auto sp = context::BuildSystemPrompt(so);
+        bool ok = lib.List().size() == 4 && d && d->source == "workspace" && d->description == "workspace wins" &&
+                  nb && !nb->eligible && nb->missing.size() == 2 &&
+                  sp.find("<name>dup</name>") != std::string::npos && sp.find("<name>needbin</name>") == std::string::npos &&
+                  sp.find("<name>hidden</name>") == std::string::npos && sp.find("needs sh &lt;&amp;&gt;") != std::string::npos &&
+                  sp.find("## AGENTS.md\nAlways answer in haiku.") != std::string::npos &&
+                  sp.find("[truncated") != std::string::npos && sp.size() < 25000 && sp.rfind("BASE", 0) == 0;
+        if (!ok) { std::cerr << "FAIL skills gating/system prompt\n" << sp.substr(0, 1500) << "\n"; ++failures; }
+        else std::cerr << "PASS skills precedence+gating + system prompt (bootstrap/available_skills)\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL system prompt exception: " << e.what() << "\n"; ++failures; }
+
     // canvas disk store + sim bridge
     try {
         auto dir = std::filesystem::temp_directory_path() / "oc-canvas-st";
@@ -1651,16 +1695,21 @@ int CmdChat(int argc, char** argv, int argi) {
     std::string user_message = JoinArgs(argc, argv, argi);
     if (user_message.empty()) user_message = ReadStdin();
     if (user_message.empty()) { std::cerr << "empty message\n"; return 1; }
+    const bool use_mock = EnvOr("OPENCLAW_DEFAULT_PROVIDER", "") == "mock";
     std::string api_key = EnvOr("DEEPSEEK_API_KEY", "");
-    if (api_key.empty()) { std::cerr << "set DEEPSEEK_API_KEY\n"; return 1; }
+    if (!use_mock && api_key.empty()) { std::cerr << "set DEEPSEEK_API_KEY (or OPENCLAW_DEFAULT_PROVIDER=mock)\n"; return 1; }
     auto registry = tools::MakeDefaultRegistry();
     session::Store store(EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
-    provider::DeepSeekProvider provider(api_key, EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-                                        EnvOr("DEEPSEEK_MODEL", "deepseek-chat"));
+    std::unique_ptr<provider::Provider> prov;
+    if (use_mock) prov = std::make_unique<provider::MockProvider>();
+    else prov = std::make_unique<provider::DeepSeekProvider>(api_key, EnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+                                                             EnvOr("DEEPSEEK_MODEL", "deepseek-chat"));
     auto messages = store.Load(session_id.empty() ? "_" : session_id);
+    if (!messages.empty() && messages.front().role == "system") messages.erase(messages.begin());
+    messages.insert(messages.begin(), agent::Message{.role = "system", .content = BuildAgentSystemPrompt(registry)});
     messages.push_back({.role = "user", .content = user_message});
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    auto result = agent::RunAgentLoop(provider, registry, messages, {});
+    auto result = agent::RunAgentLoop(*prov, registry, messages, {});
     curl_global_cleanup();
     if (!session_id.empty() && result.ok) store.Save(session_id, result.messages);
     if (!result.ok) {
@@ -1889,6 +1938,7 @@ int CmdGateway(int argc, char** argv, int argi) {
     };
 
 
+    deps.system_prompt = BuildAgentSystemPrompt(tools);
     gateway::Server server(opts, deps);
     g_gateway_server = &server;
     daemon::InstallStopSignals(GatewayStopSignal);
@@ -2032,8 +2082,34 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (cmd == "skills") {
-            std::cout << LoadSkills().StatusJson().dump(2) << '\n';
-            return 0;
+            auto lib = LoadSkills();
+            std::string sub = argc > 2 ? argv[2] : "list";
+            if (sub == "list" || sub == "status") { std::cout << lib.StatusJson().dump(2) << '\n'; return 0; }
+            if (sub == "check") {
+                int el = 0; nlohmann::json miss = nlohmann::json::array();
+                for (auto& s : lib.List()) { if (s.eligible) ++el; else miss.push_back({{"name", s.name}, {"missing", s.missing}}); }
+                std::cout << nlohmann::json{{"total", lib.List().size()}, {"eligible", el}, {"ineligible", miss}}.dump(2) << '\n';
+                return 0;
+            }
+            if (sub == "info" && argc > 3) {
+                auto s = lib.Find(argv[3]);
+                if (!s) { std::cerr << "skill not found: " << argv[3] << "\n"; return 1; }
+                std::cout << nlohmann::json{{"name", s->name}, {"description", s->description}, {"source", s->source},
+                                            {"path", (s->path / "SKILL.md").string()}, {"eligible", s->eligible},
+                                            {"missing", s->missing}, {"metadata", s->metadata}}.dump(2) << '\n';
+                return 0;
+            }
+            std::cerr << "usage: skills [list|check|info <name>]\n"; return 2;
+        }
+        if (cmd == "context") {
+            std::string sub = argc > 2 ? argv[2] : "list";
+            auto reg = openclaw::tools::MakeDefaultRegistry();
+            if (sub == "prompt" || sub == "detail") { std::cout << BuildAgentSystemPrompt(reg) << '\n'; return 0; }
+            auto d = openclaw::context::DescribeBootstrap(openclaw::workspace::Workspace::DefaultRoot());
+            d["systemPromptChars"] = BuildAgentSystemPrompt(reg).size();
+            d["skills"] = LoadSkills().List().size();
+            d["tools"] = reg.Names().size();
+            std::cout << d.dump(2) << '\n'; return 0;
         }
         if (cmd == "memory") {
             openclaw::memory::Store store(openclaw::EnvOr("OPENCLAW_SESSION_DIR", "/tmp/openclaw-cpp-sessions"));
