@@ -53,6 +53,7 @@
 #include "openclaw/logging/tail.hpp"
 #include "openclaw/context/assemble.hpp"
 #include "openclaw/context/system_prompt.hpp"
+#include "openclaw/context/compaction.hpp"
 #include "openclaw/workspace/workspace.hpp"
 #include "openclaw/mcp/stdio.hpp"
 
@@ -73,7 +74,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.29.0-dev";
+constexpr const char* kVersion = "1.30.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1363,6 +1364,36 @@ int CmdSelfTest() {
         if (!ok) { std::cerr << "FAIL sessions index/reset\n"; ++failures; }
         else std::cerr << "PASS sessions index + /new,/reset + daily/idle reset policy\n";
     } catch (const std::exception& e) { std::cerr << "FAIL sessions reset exception: " << e.what() << "\n"; ++failures; }
+
+    // compaction: model summary replaces older turns; tail never starts on orphan tool result
+    try {
+        provider::MockProvider mp;
+        agent::CompletionResult sr; sr.ok = true; sr.finish_reason = "stop"; sr.message.role = "assistant";
+        sr.message.content = "User likes oolong; task: ship 1.30";
+        mp.Enqueue(sr);
+        std::vector<agent::Message> h = {{.role = "system", .content = "sys"}};
+        for (int i = 0; i < 10; ++i) {
+            h.push_back({.role = "user", .content = "u" + std::to_string(i) + std::string(400, 'x')});
+            h.push_back({.role = "assistant", .content = "a" + std::to_string(i)});
+        }
+        h.push_back({.role = "tool", .content = "toolres", .tool_call_id = "t"});
+        h.push_back({.role = "user", .content = "latest"});
+        auto cr = context::CompactWithSummary(mp, h, 2, "focus");
+        bool ok = cr.compacted && cr.summarized && cr.messages.front().role == "system" &&
+                  cr.messages[1].content.find("oolong") != std::string::npos &&
+                  cr.messages[2].role == "assistant" && cr.messages.back().content == "latest" &&
+                  cr.after_tokens < cr.before_tokens &&
+                  mp.LastMessages().size() == 2 && mp.LastMessages()[0].content.find("focus") != std::string::npos;
+        context::CompactionPolicy pol; pol.context_tokens = 1000; pol.reserve_tokens = 200; pol.keep_recent = 4;
+        ok = ok && context::NeedsCompaction(pol, h) && !context::NeedsCompaction(pol, {h[0], h[1]});
+        pol.mode = "off"; ok = ok && !context::NeedsCompaction(pol, h);
+        std::string ins;
+        ok = ok && context::ParseCompactCommand("/compact keep todos", ins) && ins == "keep todos" &&
+             !context::ParseCompactCommand("/compactx", ins);
+        ok = ok && context::CompactionFromConfig({{"agents", {{"defaults", {{"contextTokens", 8000u}, {"compaction", {{"reserveTokens", 1000u}}}}}}}}).reserve_tokens == 1000;
+        if (!ok) { std::cerr << "FAIL compaction\n"; ++failures; }
+        else std::cerr << "PASS compaction (model summary, tool-boundary safe, /compact, auto threshold)\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL compaction exception: " << e.what() << "\n"; ++failures; }
 
     // canvas disk store + sim bridge
     try {

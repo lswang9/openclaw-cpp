@@ -1,6 +1,12 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.29.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.30.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.30.0-dev 新增
+
+- 自动压缩：会话估算 token 超过 `agents.defaults.contextTokens - agents.defaults.compaction.reserveTokens`（默认 64000 / 16000）时，用当前模型把较早的对话总结为一条摘要，保留最近消息；模型失败时退化为截断。`compaction.mode: "off"` 可关闭。
+- 手动命令 `/compact [额外要求]`。
+- 仍缺：压缩前自动写入记忆（memory flush）、精确 tokenizer。
 
 ## 1.29.0-dev 新增
 

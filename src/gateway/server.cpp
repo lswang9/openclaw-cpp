@@ -1,4 +1,5 @@
 #include "openclaw/gateway/server.hpp"
+#include "openclaw/context/compaction.hpp"
 #include "openclaw/gateway/methods.hpp"
 #include "openclaw/gateway/extra.hpp"
 #include "openclaw/diagnostics/doctor.hpp"
@@ -35,7 +36,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.29.0-dev";
+constexpr const char* kVersion = "1.30.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -478,12 +479,37 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg) {
             Emit("session.reset", {{"sessionKey", msg.session_key}, {"reason", "policy"}});
         }
     }
+    provider::Provider* cprov = deps_.router ? static_cast<provider::Provider*>(deps_.router) : &deps_.provider;
+    {
+        std::string instr;
+        if (context::ParseCompactCommand(text_in, instr)) {
+            auto pol = context::CompactionFromConfig(deps_.config.raw);
+            auto cr = context::CompactWithSummary(*cprov, deps_.sessions.Load(msg.session_key), pol.keep_recent, instr);
+            if (!cr.compacted) return "Nothing to compact.";
+            deps_.sessions.Save(msg.session_key, cr.messages);
+            Emit("session.compacted", {{"sessionKey", msg.session_key}, {"before", cr.before_tokens},
+                                       {"after", cr.after_tokens}, {"summarized", cr.summarized}, {"manual", true}});
+            return "🧹 Compacted session: ~" + std::to_string(cr.before_tokens) + " → ~" +
+                   std::to_string(cr.after_tokens) + " tokens.";
+        }
+    }
     auto messages = deps_.sessions.Load(msg.session_key);
     std::string content = text_in;
     if (!msg.sender.empty()) {
         content = "[" + msg.channel + "/" + msg.sender + "] " + text_in;
     }
     messages.push_back(agent::Message{.role = "user", .content = content});
+    {
+        auto pol = context::CompactionFromConfig(deps_.config.raw);
+        if (context::NeedsCompaction(pol, messages)) {
+            auto cr = context::CompactWithSummary(*cprov, messages, pol.keep_recent);
+            if (cr.compacted) {
+                messages = std::move(cr.messages);
+                Emit("session.compacted", {{"sessionKey", msg.session_key}, {"before", cr.before_tokens},
+                                           {"after", cr.after_tokens}, {"summarized", cr.summarized}, {"manual", false}});
+            }
+        }
+    }
     Emit("session.message", {{"sessionKey", msg.session_key}, {"role", "user"}, {"text", msg.text},
                              {"channel", msg.channel}, {"sender", msg.sender}});
     context::AssembleOptions aopts;
