@@ -3,12 +3,18 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace openclaw::workspace {
 
 // Agent workspace (OpenClaw-style): files the agent may read/write/edit, plus Markdown memory
 // (MEMORY.md + memory/**/*.md) searchable with BM25 over line-ranged chunks.
 // Root: OPENCLAW_WORKSPACE, else $OPENCLAW_SESSION_DIR/workspace, else /tmp/openclaw-cpp-sessions/workspace.
+// Local, offline embedding: signed feature hashing of word tokens + char trigrams (+CJK unigrams), L2-normalised.
+// Not a neural model; gives fuzzy/morphological recall without network or credentials.
+std::vector<float> LocalEmbed(const std::string& text, int dims = 512);
+double Cosine(const std::vector<float>& a, const std::vector<float>& b);
+
 class Workspace {
 public:
     explicit Workspace(std::filesystem::path root);
@@ -24,7 +30,9 @@ public:
                         bool replace_all = false) const;
 
     // Memory
-    nlohmann::json MemorySearch(const std::string& query, int max_results = 6, double min_score = 0.0) const;
+    // mode: hybrid (default; 0.7 vector + 0.3 BM25) | bm25 | vector
+    nlohmann::json MemorySearch(const std::string& query, int max_results = 6, double min_score = 0.0,
+                                const std::string& mode = "hybrid") const;
     nlohmann::json MemoryGet(const std::string& path, int from = 1, int lines = 0) const;
     // Append "- key: value" under today's memory/YYYY-MM-DD.md (UTC); returns path written.
     nlohmann::json MemoryAppend(const std::string& text) const;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
@@ -53,6 +54,35 @@ std::vector<std::string> Tokens(const std::string& s) {
     out.insert(out.end(), extra.begin(), extra.end());
     return out;
 }
+}  // namespace
+
+std::vector<float> LocalEmbed(const std::string& text, int dims) {
+    std::vector<float> v(static_cast<std::size_t>(dims), 0.f);
+    auto add = [&](const std::string& f, float w) {
+        std::uint64_t h = 1469598103934665603ull;
+        for (unsigned char ch : f) { h ^= ch; h *= 1099511628211ull; }
+        v[h % dims] += ((h >> 32) & 1) ? w : -w;
+    };
+    for (const auto& t : Tokens(text)) {
+        add("w:" + t, 1.0f);
+        bool ascii = true;
+        for (unsigned char ch : t) if (ch >= 0x80) ascii = false;
+        if (ascii && t.size() >= 4) {
+            std::string p = "^" + t + "$";
+            for (std::size_t i = 0; i + 3 <= p.size(); ++i) add("g:" + p.substr(i, 3), 0.5f);
+        }
+    }
+    double n = 0; for (float x : v) n += double(x) * x;
+    if (n > 0) { float inv = static_cast<float>(1.0 / std::sqrt(n)); for (auto& x : v) x *= inv; }
+    return v;
+}
+
+double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
+    double s = 0; for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) s += double(a[i]) * b[i];
+    return s;
+}
+
+namespace {
 std::string Rel(const fs::path& root, const fs::path& p) { return fs::relative(p, root).generic_string(); }
 bool Within(const fs::path& root, const fs::path& p) {
     auto r = root.lexically_normal().generic_string();
@@ -152,7 +182,8 @@ bool Workspace::IsMemoryPath(const std::string& rel) const {
     return r == "MEMORY.md" || r == "memory.md" || (md && r.rfind("memory/", 0) == 0);
 }
 
-nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results, double min_score) const {
+nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results, double min_score,
+                                       const std::string& mode) const {
     std::vector<fs::path> files;
     std::error_code ec;
     for (const char* top : {"MEMORY.md", "memory.md"})
@@ -186,11 +217,12 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
         }
         flush(static_cast<int>(lines.size()));
     }
-    // BM25
+    // Hybrid: BM25 (keyword) + local hashed-feature embeddings (cosine), weights 0.3/0.7 (upstream defaults).
     auto q = Tokens(query);
     nlohmann::json results = nlohmann::json::array();
+    const std::string backend = mode == "bm25" ? "bm25" : mode == "vector" ? "vector-local" : "hybrid-local";
     if (q.empty() || chunks.empty())
-        return {{"ok", true}, {"results", results}, {"files", files.size()}, {"chunks", chunks.size()}, {"backend", "bm25"}};
+        return {{"ok", true}, {"results", results}, {"files", files.size()}, {"chunks", chunks.size()}, {"backend", backend}};
     std::vector<std::unordered_map<std::string, int>> tf(chunks.size());
     std::unordered_map<std::string, int> df;
     double avg = 0;
@@ -202,7 +234,8 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
     }
     avg /= chunks.size();
     const double k1 = 1.2, b = 0.75, N = static_cast<double>(chunks.size());
-    std::vector<std::pair<double, std::size_t>> scored;
+    std::vector<double> bm(chunks.size(), 0.0), vec(chunks.size(), 0.0);
+    double bmax = 0;
     for (std::size_t i = 0; i < chunks.size(); ++i) {
         double s = 0;
         for (auto& t : q) {
@@ -212,6 +245,21 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
             double idf = std::log(1 + (N - n + 0.5) / (n + 0.5));
             double f = it->second;
             s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * len[i] / std::max(1.0, avg)));
+        }
+        bm[i] = s; bmax = std::max(bmax, s);
+    }
+    if (mode != "bm25") {
+        auto qv = LocalEmbed(query);
+        for (std::size_t i = 0; i < chunks.size(); ++i) vec[i] = std::max(0.0, Cosine(qv, LocalEmbed(chunks[i].text)));
+    }
+    std::vector<std::pair<double, std::size_t>> scored;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        double s;
+        if (mode == "bm25") s = bm[i];
+        else if (mode == "vector") s = vec[i] >= 0.12 ? vec[i] : 0;
+        else {
+            double tn = bmax > 0 ? bm[i] / bmax : 0;
+            s = (bm[i] > 0 || vec[i] >= 0.12) ? 0.7 * vec[i] + 0.3 * tn : 0;
         }
         if (s > 0 && s >= min_score) scored.push_back({s, i});
     }
@@ -224,9 +272,11 @@ nlohmann::json Workspace::MemorySearch(const std::string& query, int max_results
         auto& c = chunks[scored[k].second];
         auto snip = c.text.size() > 700 ? c.text.substr(0, 700) + "…" : c.text;
         results.push_back({{"path", c.path}, {"start_line", c.start}, {"end_line", c.end},
-                           {"score", std::round(scored[k].first * 1000) / 1000}, {"snippet", snip}});
+                           {"score", std::round(scored[k].first * 1000) / 1000},
+                           {"textScore", std::round(bm[scored[k].second] * 1000) / 1000},
+                           {"vectorScore", std::round(vec[scored[k].second] * 1000) / 1000}, {"snippet", snip}});
     }
-    return {{"ok", true}, {"results", results}, {"files", files.size()}, {"chunks", chunks.size()}, {"backend", "bm25"}};
+    return {{"ok", true}, {"results", results}, {"files", files.size()}, {"chunks", chunks.size()}, {"backend", backend}};
 }
 
 nlohmann::json Workspace::MemoryGet(const std::string& path, int from, int lines) const {

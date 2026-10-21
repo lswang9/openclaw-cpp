@@ -1,6 +1,11 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.32.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.33.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.33.0-dev 新增
+
+- `memory_search` 改为混合检索：本地向量（离线特征哈希，不需要任何密钥）占 0.7，BM25 关键词占 0.3。能匹配词形变化，比如搜 “preferences” 能找到 “prefers”。可用 `mode: bm25|vector` 单独使用其中一种。
+- 说明：这不是神经网络 embedding，语义同义词（如 “汽车/轿车”）仍可能匹配不到；接入真实 embedding 模型还没做。
 
 ## 1.32.0-dev 新增
 

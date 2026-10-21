@@ -74,7 +74,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.32.0-dev";
+constexpr const char* kVersion = "1.33.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -1434,6 +1434,24 @@ int CmdSelfTest() {
         if (!ok) { std::cerr << "FAIL reset-by-type/channel\n"; ++failures; }
         else std::cerr << "PASS resetByChannel > resetByType > reset; memoryFlush config\n";
     }
+
+    // vector memory search (local embeddings, hybrid)
+    try {
+        namespace fs = std::filesystem;
+        auto root = fs::temp_directory_path() / "oc-vec-st";
+        fs::remove_all(root); fs::create_directories(root / "memory");
+        std::ofstream(root / "MEMORY.md") << "# Prefs\nThe user prefers dark roast coffee.\n\n# Infra\nDeployment runs on kubernetes clusters.\n";
+        workspace::Workspace ws(root);
+        auto bm = ws.MemorySearch("preferences", 3, 0, "bm25");      // no exact token -> BM25 finds nothing
+        auto hy = ws.MemorySearch("preferences", 3);                 // trigram overlap with "prefers"
+        auto hy2 = ws.MemorySearch("deploying to kubernetes", 3);
+        auto a = workspace::LocalEmbed("coffee"), b = workspace::LocalEmbed("coffee");
+        bool ok = bm["results"].empty() && !hy["results"].empty() && hy["results"][0]["start_line"] == 1 &&
+                  hy["backend"] == "hybrid-local" && hy2["results"][0]["start_line"] == 4 &&
+                  std::abs(workspace::Cosine(a, b) - 1.0) < 1e-5;
+        if (!ok) { std::cerr << "FAIL vector memory " << hy.dump() << "\n"; ++failures; }
+        else std::cerr << "PASS hybrid memory search (local embeddings + BM25)\n";
+    } catch (const std::exception& e) { std::cerr << "FAIL vector memory exception: " << e.what() << "\n"; ++failures; }
 
     // canvas disk store + sim bridge
     try {

@@ -122,12 +122,14 @@ Registry MakeDefaultRegistry(RegistryOptions opts) {
                 [ws](const nlohmann::json& a) {
                     return ws->Edit(a.value("path", ""), a.value("old_string", ""), a.value("new_string", ""),
                                     a.value("replace_all", false)).dump(); }});
-    r.Register({"memory_search", "Search MEMORY.md and memory/*.md (BM25 over line-ranged chunks). Returns path, lines, score, snippet.",
+    r.Register({"memory_search", "Semantically search MEMORY.md and memory/*.md (hybrid: local embeddings + BM25 over line-ranged chunks). Returns path, lines, score, snippet.",
                 {{"type", "object"}, {"properties", {{"query", str("what to recall")}, {"maxResults", num("default 6")},
+                                                     {"mode", str("hybrid | bm25 | vector")},
                                                      {"minScore", {{"type", "number"}}}}},
                  {"required", nlohmann::json::array({"query"})}},
                 [ws](const nlohmann::json& a) {
-                    return ws->MemorySearch(a.value("query", ""), a.value("maxResults", 6), a.value("minScore", 0.0)).dump(); }});
+                    return ws->MemorySearch(a.value("query", ""), a.value("maxResults", 6), a.value("minScore", 0.0),
+                                            a.value("mode", std::string("hybrid"))).dump(); }});
     r.Register({"memory_get", "Read lines from a memory file (MEMORY.md or memory/**/*.md). Legacy: {key} finds the latest '- ... key: value' note.",
                 {{"type", "object"}, {"properties", {{"path", str("memory file path")}, {"from", num("1-based start line")},
                                                      {"lines", num("line count")}, {"key", str("legacy note key")}}}},
