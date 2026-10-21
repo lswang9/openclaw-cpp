@@ -6,9 +6,9 @@ BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; wait 2>/dev/null; rm -rf "$T" 2>/dev/null || true' EXIT
 fail() { echo "[e2e-talk-mcpapp] FAIL: $*"; tail -8 "$T/gw.log"; exit 1; }
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
-mkdir -p "$T/home" "$T/ws" "$T/repo"
+echo mock-resource > "$T/res.txt"; mkdir -p "$T/home" "$T/ws" "$T/repo"
 ( cd "$T/repo" && git init -q -b main && echo a > a.txt && git add a.txt && git -c user.name=t -c user.email=t@t commit -qm init )
-export OPENCLAW_DEFAULT_PROVIDER=mock OPENCLAW_STT_PROVIDER=mock OPENCLAW_SESSION_DIR="$T/sess" OPENCLAW_DATA_DIR="$T/data" OPENCLAW_CONFIG_PATH="$T/none.json" \
+export OPENCLAW_DEFAULT_PROVIDER=mock OPENCLAW_STT_PROVIDER=mock OPENCLAW_MCP_APP_POLL_MS=100 OPENCLAW_MCP_MOCK_RESOURCE_FILE="$T/res.txt" OPENCLAW_SESSION_DIR="$T/sess" OPENCLAW_DATA_DIR="$T/data" OPENCLAW_CONFIG_PATH="$T/none.json" \
   HOME="$T/home" OPENCLAW_WORKSPACE="$T/ws" GIT_CONFIG_GLOBAL=/dev/null
 OPENCLAW_GATEWAY_PORT=$PORT "$BIN" gateway >"$T/gw.log" 2>&1 & GW=$!
 for i in $(seq 1 50); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.2; done
@@ -40,7 +40,7 @@ assert ok("talk.client.steer", {"sessionKey": "agent:main:tc", "text": "hi"})["r
 ok("talk.client.close", {"sessionKey": "agent:main:tc"})
 assert not rpc("talk.client.steer", {"sessionKey": "agent:main:tc", "text": "hi"}).get("ok")
 ok("mcp.app.discover", {})
-v = ok("mcp.app.launch", {"uri": "ui://x", "sessionKey": "agent:main:app"}); vid = v["viewId"]; assert v["resource"]["text"] == "mock-resource"
+v = ok("mcp.app.launch", {"uri": "ui://x", "sessionKey": "agent:main:app"}); vid = v["viewId"]; assert v["resource"]["text"].strip() == "mock-resource"
 assert ok("mcp.app.view", {"viewId": vid})["uri"] == "ui://x"
 u = ok("mcp.app.updateModelContext", {"viewId": vid, "content": [{"type": "text", "text": "ctx"}]})
 assert ok("mcp.app.modelContext", {"viewId": vid})["state"]["items"]
@@ -50,6 +50,12 @@ ok("mcp.app.writeResource", {"viewId": vid, "path": "a/b.txt", "content": "hi"})
 assert ok("mcp.app.openFile", {"viewId": vid, "path": "a/b.txt"})["content"] == "hi"
 assert not rpc("mcp.app.openFile", {"viewId": vid, "path": "../x"}).get("ok")
 assert ok("mcp.app.subscribeResource", {"viewId": vid, "uri": "ui://y"})["subscriptions"] == ["ui://y"]
+import time; time.sleep(0.4); open(os.environ["T"] + "/res.txt", "w").write("changed")
+seen = False
+for _ in range(40):
+    if any("mcp.app.resourceUpdated" in json.dumps(l) for l in ok("logs.tail", {"n": 400})["lines"]): seen = True; break
+    time.sleep(0.1)
+assert seen, "resourceUpdated event not emitted"
 assert ok("mcp.app.unsubscribeResource", {"viewId": vid, "uri": "ui://y"})["subscriptions"] == []
 ok("mcp.app.mention", {"viewId": vid})
 assert not rpc("mcp.app.view", {"viewId": "nope"}).get("ok")

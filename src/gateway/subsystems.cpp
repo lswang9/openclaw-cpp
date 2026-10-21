@@ -1,3 +1,5 @@
+#include <thread>
+#include "openclaw/plugins/registry.hpp"
 #include <optional>
 #include "openclaw/mcp/client.hpp"
 #include "openclaw/voice/tts.hpp"
@@ -1867,7 +1869,10 @@ ExtraResult Batch3(ServerDeps& d, const fs::path& root, const std::string& m, co
     if (m == "sessions.catalog.list") {
         json out = json::array();
         for (auto& k : d.sessions.List()) { auto e = d.sessions.IndexEntry(k); out.push_back({{"catalogId", "local"}, {"sessionKey", k}, {"updatedAt", e.value("updatedAt", 0LL)}, {"messages", e.value("messages", 0)}}); }
-        return Ok({{"catalogs", json::array({{{"id", "local"}, {"label", "This gateway"}, {"sessions", out}}})}});
+        json ar = json::array(); std::error_code aec;
+        for (auto it = fs::directory_iterator(root / "session-archive", aec); !aec && it != fs::directory_iterator(); it.increment(aec)) {
+            auto a = ReadJsonFile(it->path(), json()); if (a.is_object()) ar.push_back({{"catalogId", "archive"}, {"archiveId", a["archiveId"]}, {"sessionKey", a["sessionKey"]}, {"archivedAt", a["archivedAt"]}, {"messages", a["messages"].size()}}); }
+        return Ok({{"catalogs", json::array({{{"id", "local"}, {"label", "This gateway"}, {"sessions", out}}, {{"id", "archive"}, {"label", "Archived"}, {"sessions", ar}}})}});
     }
     if (m == "sessions.catalog.read") {
         const auto k = str("sessionKey");
@@ -1999,6 +2004,35 @@ ExtraResult Talk(ServerDeps& d, const fs::path& root, const std::string& m, cons
     return {};
 }
 
+// Subscribed ui:// resources are polled through the MCP client; a content change emits
+// "mcp.app.resourceUpdated" {viewId, uri} to connected clients (upstream: resources/updated relay).
+void StartMcpAppPoller(ServerDeps& d, const fs::path& root) {
+    static std::once_flag once;
+    std::call_once(once, [&d, root] {
+        std::thread([&d, root] {
+            std::map<std::string, size_t> last;
+            const char* ms = std::getenv("OPENCLAW_MCP_APP_POLL_MS");
+            const int period = ms ? std::max(50, std::atoi(ms)) : 2000;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(period));
+                auto cli = d.mcp_client; if (!cli) continue;
+                auto db = ReadJsonFile(MetaPath(root, "mcp-apps"), json::object());
+                const json views = db.value("views", json::object());
+                for (auto& [vid, v] : views.items()) {
+                    const json subs = v.value("subscriptions", json::array());
+                    for (auto& u : subs) {
+                        const auto uri = u.get<std::string>();
+                        size_t h = 0; try { h = std::hash<std::string>{}(cli->ReadResource(uri).dump()); } catch (...) { continue; }
+                        const auto k = vid + "|" + uri;
+                        auto it = last.find(k);
+                        if (it != last.end() && it->second != h) GatewayEmit("mcp.app.resourceUpdated", {{"viewId", vid}, {"uri", uri}, {"sessionKey", v.value("sessionKey", "")}});
+                        last[k] = h;
+                    }
+                }
+            }
+        }).detach();
+    });
+}
 ExtraResult McpApp(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
     auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
     auto cli = d.mcp_client;
@@ -2061,7 +2095,9 @@ ExtraResult McpApp(ServerDeps& d, const fs::path& root, const std::string& m, co
         const auto uri = str("uri"); if (uri.empty()) return Fail("uri is required");
         json next = json::array(); for (auto& x : v["subscriptions"]) if (x != uri) next.push_back(x);
         if (m == "mcp.app.subscribeResource") next.push_back(uri);
-        v["subscriptions"] = next; save(); return Ok({{"subscriptions", next}});
+        v["subscriptions"] = next; save();
+        if (!next.empty()) StartMcpAppPoller(d, root);
+        return Ok({{"subscriptions", next}});
     }
     if (m == "mcp.app.openFile") {
         auto pth = safe_path(str("path")); if (!pth) return Fail("invalid path");
@@ -2076,6 +2112,475 @@ ExtraResult McpApp(ServerDeps& d, const fs::path& root, const std::string& m, co
     return {};
 }
 
+
+// ---------------------------------------------------------------- plugins: catalog, install/uninstall, inspect, reload, controlUi, credentials, skills
+json PluginManifest(const fs::path& dir) {
+    for (auto n : {"openclaw.plugin.json", "plugin.json"}) { auto j = ReadJsonFile(dir / n, json()); if (j.is_object()) { j["__file"] = n; return j; } }
+    auto pk = ReadJsonFile(dir / "package.json", json());
+    if (pk.is_object()) { json j = pk.value("openclaw", json::object()); j["name"] = pk.value("name", ""); j["version"] = pk.value("version", ""); j["__file"] = "package.json"; return j; }
+    return json::object();
+}
+json PluginCatalog(const fs::path& base) {
+    json cat = json::array();
+    std::vector<fs::path> files;
+    if (const char* e = std::getenv("OPENCLAW_PLUGIN_CATALOG")) files.emplace_back(e);
+    files.push_back(base / "catalog.json");
+    for (auto& f : files) {
+        auto j = ReadJsonFile(f, json());
+        json items = j.is_array() ? j : j.value("plugins", json::array());
+        for (auto it : items) {
+            if (it.contains("source") && it["source"].is_string() && !it["source"].get<std::string>().empty() && it["source"].get<std::string>()[0] != '/' &&
+                it["source"].get<std::string>().find(':') == std::string::npos)
+                it["source"] = (f.parent_path() / it["source"].get<std::string>()).lexically_normal().string();
+            bool dup = false; for (auto& c : cat) dup = dup || c["id"] == it["id"];
+            if (!dup) cat.push_back(it);
+        }
+    }
+    return cat;
+}
+ExtraResult Plugins(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    const auto inst_root = root / "plugins";
+    const fs::path base = d.plugins.Root().empty() ? fs::path("/workspace/openclaw-cpp/plugins") : d.plugins.Root();
+    d.plugins.AddRoot(inst_root);
+    auto rescan = [&] { d.plugins.Scan(base); return d.plugins.LoadNatives(); };
+    auto ledger = ReadJsonFile(MetaPath(root, "plugin-installs"), json::object());
+    auto find = [&](const std::string& id) -> std::optional<plugins::Plugin> { for (auto& x : d.plugins.List()) if (x.id == id) return x; return std::nullopt; };
+    auto id = str("id").empty() ? (str("pluginId").empty() ? str("name") : str("pluginId")) : str("id");
+    auto cat = PluginCatalog(base);
+    auto installed = [&](const std::string& i) { return find(i).has_value(); };
+    auto decorate = [&](json c) {
+        bool on = installed(c.value("id", ""));
+        for (auto& x : d.plugins.List()) on = on || (c.contains("source") && fs::path(c.value("source", "")).lexically_normal() == x.path.lexically_normal());
+        c["installed"] = on; if (ledger.contains(c.value("id", ""))) c["install"] = ledger[c.value("id", "")]; return c; };
+    if (m == "plugins.catalog.categories") {
+        std::map<std::string, int> n; for (auto& c : cat) n[c.value("category", "other")]++;
+        json out = json::array(); for (auto& [k, v] : n) out.push_back({{"id", k}, {"count", v}});
+        return Ok({{"categories", out}});
+    }
+    if (m == "plugins.catalog.browse") {
+        const auto q = str("query").empty() ? str("q") : str("query"); const auto category = str("category");
+        json out = json::array();
+        for (auto& c : cat) {
+            if (!category.empty() && c.value("category", "other") != category) continue;
+            if (!q.empty() && c.dump().find(q) == std::string::npos) continue;
+            out.push_back(decorate(c));
+        }
+        return Ok({{"plugins", out}, {"total", out.size()}});
+    }
+    if (m == "plugins.catalog.get") {
+        for (auto& c : cat) if (c.value("id", "") == id) return Ok({{"plugin", decorate(c)}});
+        return Fail("plugin not in catalog: " + id);
+    }
+    if (m == "plugins.reload") { int n = rescan(); return Ok({{"plugins", d.plugins.ListJson()}, {"nativesLoaded", n}}); }
+    if (m == "plugins.install") {
+        std::string src = str("source").empty() ? str("spec") : str("source");
+        if (src.empty()) for (auto& c : cat) if (c.value("id", "") == id) src = c.value("source", "");
+        if (src.empty()) return Fail("source (path, .tgz, npm:<spec>) or a catalog id is required");
+        std::error_code ec; fs::create_directories(inst_root, ec);
+        const auto stage = root / "tmp" / Rid("plugin-stage");
+        fs::create_directories(stage, ec);
+        fs::path pkg;
+        std::string kind;
+        if (fs::is_directory(src, ec)) { kind = "path"; pkg = stage / "package"; fs::copy(src, pkg, fs::copy_options::recursive, ec); if (ec) return Fail("copy failed: " + ec.message()); }
+        else if (fs::is_regular_file(src, ec)) {
+            kind = "archive"; auto r = Run({"tar", "-xzf", src, "-C", stage.string()}, {}); if (r.code != 0) return Fail("extract failed: " + r.err);
+            for (auto& e : fs::directory_iterator(stage)) if (e.is_directory()) pkg = e.path();
+            if (pkg.empty()) pkg = stage;
+        } else if (src.rfind("npm:", 0) == 0) {
+            kind = "npm"; auto r = Run({"npm", "pack", src.substr(4), "--silent"}, stage);
+            if (r.code != 0) return Fail("npm pack failed (network/npm required): " + Trim(r.err));
+            auto tgz = stage / Trim(r.out); auto x = Run({"tar", "-xzf", tgz.string(), "-C", stage.string()}, {}); if (x.code != 0) return Fail("extract failed");
+            pkg = stage / "package";
+        } else return Fail("unsupported plugin source: " + src);
+        auto man = PluginManifest(pkg);
+        if (man.empty()) { fs::remove_all(stage, ec); return Fail("no plugin manifest (openclaw.plugin.json, plugin.json or package.json#openclaw)"); }
+        std::string pid = man.value("id", std::string());
+        if (pid.empty()) pid = id.empty() ? pkg.filename().string() : id;
+        if (pid.find('/') != std::string::npos) pid = pid.substr(pid.rfind('/') + 1);
+        if (pid.empty() || pid.find("..") != std::string::npos) return Fail("invalid plugin id");
+        const auto dest = inst_root / pid;
+        if (installed(pid) && !p.value("force", false)) { fs::remove_all(stage, ec); return Fail("plugin already installed: " + pid + " (pass force: true)"); }
+        fs::remove_all(dest, ec); fs::rename(pkg, dest, ec);
+        if (ec) { fs::copy(pkg, dest, fs::copy_options::recursive, ec); }
+        fs::remove_all(stage, ec);
+        if (p.value("enable", true)) { auto pj = ReadJsonFile(dest / "plugin.json", json::object()); pj["enabled"] = true; if (!pj.contains("name")) pj["name"] = man.value("name", pid); WriteJsonFile(dest / "plugin.json", pj); }
+        ledger[pid] = {{"source", src}, {"kind", kind}, {"path", dest.string()}, {"installedAt", NowMs()}, {"version", man.value("version", "")}};
+        WriteJsonFile(MetaPath(root, "plugin-installs"), ledger);
+        rescan();
+        GatewayEmit("plugins.changed", {{"id", pid}, {"action", "install"}});
+        return Ok({{"id", pid}, {"installed", true}, {"path", dest.string()}, {"kind", kind}});
+    }
+    if (m == "plugins.uninstall") {
+        if (!ledger.contains(id)) return Fail(installed(id) ? "plugin " + id + " is bundled, not installed; disable it instead" : "plugin not installed: " + id);
+        std::error_code ec; fs::path dest = ledger[id].value("path", std::string());
+        if (dest.parent_path() != inst_root) return Fail("refusing to remove plugin outside install root");
+        d.plugins.UnloadNatives(); fs::remove_all(dest, ec);
+        ledger.erase(id); WriteJsonFile(MetaPath(root, "plugin-installs"), ledger);
+        rescan();
+        GatewayEmit("plugins.changed", {{"id", id}, {"action", "uninstall"}});
+        return Ok({{"id", id}, {"removed", true}});
+    }
+    auto pl = find(id);
+    if (m == "plugins.controlUi.list") {
+        json out = json::array();
+        for (auto& x : d.plugins.List()) { auto man = PluginManifest(x.path); for (auto& u : man.value("controlUi", json::array())) { json e = u; e["pluginId"] = x.id; e["enabled"] = x.enabled; out.push_back(e); } }
+        return Ok({{"entries", out}});
+    }
+    if (m == "plugins.controlUi.status" || m == "plugins.controlUi.report") {
+        auto st = ReadJsonFile(MetaPath(root, "plugin-controlui"), json::object());
+        if (m == "plugins.controlUi.report") {
+            if (id.empty()) return Fail("pluginId is required");
+            st[id] = {{"status", str("status").empty() ? std::string("ok") : str("status")}, {"error", p.value("error", json())}, {"at", NowMs()}};
+            WriteJsonFile(MetaPath(root, "plugin-controlui"), st);
+            GatewayEmit("plugins.controlUi.changed", {{"pluginId", id}});
+            return Ok({{"ok", true}});
+        }
+        return Ok({{"status", id.empty() ? st : st.value(id, json(nullptr))}});
+    }
+    if (!pl) return Fail("unknown plugin: " + id);
+    auto man = PluginManifest(pl->path);
+    if (m == "plugins.inspect") {
+        json files = json::array(); std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(pl->path, ec); it != fs::recursive_directory_iterator() && files.size() < 200; it.increment(ec))
+            if (it->is_regular_file()) files.push_back(fs::relative(it->path(), pl->path).string());
+        json skills = json::array(); if (fs::is_directory(pl->path / "skills", ec)) for (auto& e : fs::directory_iterator(pl->path / "skills")) if (e.is_directory()) skills.push_back(e.path().filename().string());
+        return Ok({{"plugin", {{"id", pl->id}, {"name", pl->name}, {"enabled", pl->enabled}, {"path", pl->path.string()}, {"native", pl->native_lib}, {"nativeLoaded", pl->native_loaded}, {"js", pl->js_entry}}},
+                   {"manifest", man}, {"files", files}, {"skills", skills}, {"install", ledger.value(id, json(nullptr))}});
+    }
+    if (m == "plugins.credentials.inspect") {
+        json out = json::array();
+        auto want = man.value("credentials", json::array());
+        const json props = man.value("configSchema", json::object()).value("properties", json::object());
+        for (auto& [k, v] : props.items())
+            if (k.find("key") != std::string::npos || k.find("Key") != std::string::npos || k.find("token") != std::string::npos || k.find("Token") != std::string::npos) want.push_back({{"config", k}});
+        const auto pcfg = d.config.raw.value("plugins", json::object()).value("entries", json::object()).value(id, json::object()).value("config", json::object());
+        for (auto c : want) {
+            if (c.is_string()) c = {{"env", c}};
+            bool present = false;
+            if (c.contains("env")) { const char* e = std::getenv(c["env"].get<std::string>().c_str()); present = e && *e; }
+            if (c.contains("config")) present = present || pcfg.contains(c["config"].get<std::string>());
+            c["present"] = present; out.push_back(c);  // never echo values
+        }
+        return Ok({{"pluginId", id}, {"credentials", out}});
+    }
+    if (m == "plugins.skills.read") {
+        const auto sk = str("skill").empty() ? str("skillName") : str("skill");
+        if (sk.empty() || sk.find("..") != std::string::npos || sk.find('/') != std::string::npos) return Fail("skill is required");
+        const auto f = pl->path / "skills" / sk / "SKILL.md"; std::error_code ec;
+        if (!fs::is_regular_file(f, ec)) return Fail("skill not found: " + sk);
+        std::ifstream i(f); return Ok({{"pluginId", id}, {"skill", sk}, {"content", std::string(std::istreambuf_iterator<char>(i), {})}});
+    }
+    return {};
+}
+
+
+// ---------------------------------------------------------------- sessions: archive catalog, import/continue, terminal, reveal, github, plugin state, recover, activity summary
+ExtraResult Sessions2(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    const auto key = str("sessionKey").empty() ? str("key") : str("sessionKey");
+    const auto arch = root / "session-archive";
+    std::error_code ec;
+    auto agent_of = [&](const std::string& k) { if (!str("agentId").empty()) return str("agentId"); if (k.rfind("agent:", 0) == 0) { auto e = k.find(':', 6); return k.substr(6, e - 6); } return std::string("main"); };
+    if (m == "sessions.catalog.archive") {
+        if (str("catalogId") != "" && str("catalogId") != "local") return Fail("catalog cannot archive");
+        if (key.empty() || !d.sessions.Exists(key)) return Fail("session not found");
+        fs::create_directories(arch, ec);
+        json msgs = json::array(); for (auto& x : d.sessions.Load(key)) msgs.push_back(x.ToJson());
+        const auto id = SafeName(key) + "-" + std::to_string(NowMs());
+        WriteJsonFile(arch / (id + ".json"), {{"archiveId", id}, {"sessionKey", key}, {"archivedAt", NowMs()}, {"messages", msgs}});
+        d.sessions.Remove(key);
+        GatewayEmit("sessions.changed", {{"sessionKey", key}, {"reason", "archived"}});
+        return Ok({{"archived", true}, {"archiveId", id}, {"messages", msgs.size()}});
+    }
+    auto save_msgs = [&](const std::string& k, const json& msgs) {
+        std::vector<agent::Message> v; for (auto& x : msgs) v.push_back(agent::Message::FromJson(x)); d.sessions.Save(k, v); return v.size();
+    };
+    if (m == "sessions.catalog.import" || m == "sessions.catalog.continue") {
+        json msgs; std::string src_key;
+        const auto aid = str("archiveId").empty() ? str("entryId") : str("archiveId");
+        if (!aid.empty()) {
+            if (aid.find("..") != std::string::npos || aid.find('/') != std::string::npos) return Fail("invalid archiveId");
+            auto a = ReadJsonFile(arch / (aid + ".json"), json()); if (!a.is_object()) return Fail("unknown archive entry: " + aid);
+            msgs = a["messages"]; src_key = a.value("sessionKey", "");
+        } else if (p.contains("messages")) msgs = p["messages"];
+        else if (!str("path").empty()) {
+            std::ifstream in(str("path")); if (!in) return Fail("cannot read " + str("path"));
+            msgs = json::array(); std::string line;
+            while (std::getline(in, line)) { if (Trim(line).empty()) continue; try { auto j = json::parse(line); if (j.contains("message")) j = j["message"]; if (j.contains("role")) msgs.push_back(j); } catch (...) {} }
+        } else if (m == "sessions.catalog.continue" && !key.empty() && d.sessions.Exists(key)) src_key = key;
+        else return Fail("archiveId, messages or path is required");
+        std::string dest = str("targetSessionKey").empty() ? (key.empty() ? src_key : key) : str("targetSessionKey");
+        if (dest.empty()) dest = "agent:main:import-" + std::to_string(NowMs());
+        if (!msgs.is_null()) {
+            if (d.sessions.Exists(dest) && !p.value("overwrite", false)) {
+                if (m == "sessions.catalog.import") return Fail("session exists: " + dest + " (pass overwrite: true)");
+                dest = dest + "-" + std::to_string(NowMs());
+            }
+            auto n = save_msgs(dest, msgs);
+            if (!aid.empty() && p.value("removeArchive", m == "sessions.catalog.continue")) fs::remove(arch / (aid + ".json"), ec);
+            if (m == "sessions.catalog.import") return Ok({{"sessionKey", dest}, {"imported", n}});
+        }
+        json out{{"sessionKey", dest}};
+        if (!str("message").empty()) {
+            auto r = GatewayRpc("chat.send", {{"sessionKey", dest}, {"message", str("message")}});
+            if (!r.value("ok", false)) return Fail("continue turn failed");
+            out["reply"] = r["payload"].value("text", "");
+        }
+        return Ok(out);
+    }
+    if (m == "sessions.catalog.startTerminal") {
+        auto ws = str("cwd").empty() ? WorkspaceOf(d, agent_of(key)).string() : str("cwd");
+        auto r = GatewayRpc("terminal.open", {{"cwd", ws}, {"sessionKey", key}});
+        return r.value("ok", false) ? Ok(r["payload"]) : Fail("terminal open failed: " + r.value("error", json()).dump());
+    }
+    if (key.empty()) return Fail("sessionKey is required");
+    const auto ws = WorkspaceOf(d, agent_of(key));
+    if (m == "sessions.files.reveal") {
+        const auto rel = str("path");
+        if (rel.empty()) return Fail("path is required");
+        auto f = (fs::path(rel).is_absolute() ? fs::path(rel) : ws / rel).lexically_normal();
+        auto wsn = ws.lexically_normal().string();
+        if (f.string().rfind(wsn, 0) != 0) return Fail("path is outside the session workspace");
+        if (!fs::exists(f, ec)) return Fail("file not found");
+        bool opened = false;
+        if (const char* cmd = std::getenv("OPENCLAW_REVEAL_CMD")) opened = Run({cmd, f.string()}, {}).code == 0;  // desktop hook (e.g. xdg-open)
+        return Ok({{"path", f.string()}, {"directory", fs::is_directory(f, ec) ? f.string() : f.parent_path().string()}, {"opened", opened}});
+    }
+    if (m == "sessions.github.options" || m == "sessions.github.status") {
+        auto git = [&](std::vector<std::string> a) { a.insert(a.begin(), "git"); auto r = Run(a, ws); return r.code == 0 ? Trim(r.out) : std::string(); };
+        if (git({"rev-parse", "--is-inside-work-tree"}) != "true") return Ok({{"available", false}, {"reason", "workspace is not a git repository"}, {"workspace", ws.string()}});
+        const auto branch = git({"symbolic-ref", "--short", "HEAD"});
+        if (m == "sessions.github.options") {
+            json remotes = json::array(), branches = json::array();
+            std::istringstream rs(git({"remote", "-v"})); std::string l; while (std::getline(rs, l)) if (l.find("(push)") != std::string::npos) { std::istringstream ls(l); std::string n, u; ls >> n >> u; remotes.push_back({{"name", n}, {"url", u}}); }
+            std::istringstream bs(git({"branch", "--format=%(refname:short)"})); while (std::getline(bs, l)) branches.push_back(l);
+            auto accts = ReadJsonFile(MetaPath(root, "github-accounts"), json::object());
+            return Ok({{"available", true}, {"branch", branch}, {"remotes", remotes}, {"branches", branches}, {"accounts", accts.is_object() ? accts.size() : 0}});
+        }
+        std::istringstream ss(git({"status", "--porcelain"})); std::string l; json changed = json::array(); while (std::getline(ss, l)) changed.push_back({{"status", l.substr(0, 2)}, {"path", l.size() > 3 ? l.substr(3) : ""}});
+        json st{{"available", true}, {"branch", branch}, {"head", git({"rev-parse", "HEAD"})}, {"changed", changed}, {"dirty", !changed.empty()}};
+        auto up = git({"rev-list", "--left-right", "--count", "@{upstream}...HEAD"});
+        if (!up.empty()) { std::istringstream us(up); int b = 0, a = 0; us >> b >> a; st["behind"] = b; st["ahead"] = a; } else st["upstream"] = nullptr;
+        return Ok(st);
+    }
+    auto meta = ReadJsonFile(MetaPath(root, "session-meta"), json{{"sessions", json::object()}});
+    auto& sm = meta["sessions"][key]; if (!sm.is_object()) sm = json::object();
+    auto save_meta = [&] { WriteJsonFile(MetaPath(root, "session-meta"), meta); };
+    if (m == "sessions.pluginPatch") {
+        const auto pid = str("pluginId").empty() ? str("plugin") : str("pluginId");
+        bool known = false; for (auto& x : d.plugins.List()) known = known || x.id == pid;
+        if (!known) return Fail("unknown plugin: " + pid);
+        if (!p.contains("patch") || !p["patch"].is_object()) return Fail("patch object is required");
+        auto& st = sm["pluginState"][pid]; if (!st.is_object()) st = json::object();
+        st.merge_patch(p["patch"]); save_meta();
+        GatewayEmit("sessions.changed", {{"sessionKey", key}, {"reason", "pluginPatch"}, {"pluginId", pid}});
+        return Ok({{"sessionKey", key}, {"pluginId", pid}, {"state", st}});
+    }
+    if (m == "sessions.providerReview.continue") {
+        auto& rv = sm["providerReview"];
+        if (!rv.is_object() || rv.value("status", "") != "pending") return Fail("no provider review pending for this session; review the findings in chat");
+        if (!str("sessionId").empty() && rv.value("sessionId", str("sessionId")) != str("sessionId")) return Fail("The session changed; refresh its findings.");
+        rv["status"] = "acknowledged"; rv["acknowledgedAt"] = NowMs(); save_meta();
+        auto r = GatewayRpc("chat.send", {{"sessionKey", key}, {"message", str("message").empty() ? std::string("Continue after provider review.") : str("message")}});
+        return r.value("ok", false) ? Ok({{"continued", true}, {"reply", r["payload"].value("text", "")}}) : Fail("continue failed");
+    }
+    if (!d.sessions.Exists(key)) return Fail("session not found");
+    if (m == "sessions.recover") {
+        auto msgs = d.sessions.Load(key);
+        std::vector<agent::Message> keep; int dropped = 0;
+        std::set<std::string> answered; for (auto& x : msgs) if (x.role == "tool" && x.tool_call_id) answered.insert(*x.tool_call_id);
+        for (auto& x : msgs) {
+            if (x.role != "system" && x.role != "user" && x.role != "assistant" && x.role != "tool") { ++dropped; continue; }
+            if (x.role == "tool" && !x.tool_call_id) { ++dropped; continue; }
+            keep.push_back(x);
+        }
+        // close dangling tool calls so providers accept the transcript
+        int closed = 0;
+        for (auto& x : msgs) if (x.role == "assistant" && x.tool_calls.is_array()) for (auto& c : x.tool_calls) { auto id = c.value("id", std::string()); if (!id.empty() && !answered.count(id)) {
+            agent::Message t; t.role = "tool"; t.tool_call_id = id; t.content = "[recovered: tool call interrupted]"; keep.push_back(t); answered.insert(id); ++closed; } }
+        d.sessions.Save(key, keep);
+        sm["recoveredAt"] = NowMs(); save_meta();
+        return Ok({{"sessionKey", key}, {"messages", keep.size()}, {"dropped", dropped}, {"closedToolCalls", closed}});
+    }
+    if (m == "sessions.activitySummary.ensure") {
+        auto msgs = d.sessions.Load(key);
+        auto& cur = sm["activitySummary"];
+        if (cur.is_object() && cur.value("messages", -1) == static_cast<int>(msgs.size()) && !p.value("force", false)) return Ok({{"summary", cur}, {"cached", true}});
+        std::map<std::string, int> roles; json tools = json::array(); std::string last_user, last_assistant;
+        for (auto& x : msgs) { roles[x.role]++; if (x.role == "user") last_user = x.content; if (x.role == "assistant") last_assistant = x.content;
+            if (x.role == "tool" && x.name) tools.push_back(*x.name); }
+        json rc = json::object(); for (auto& [k, v] : roles) rc[k] = v;
+        cur = {{"messages", msgs.size()}, {"roles", rc}, {"tools", tools}, {"lastUser", Utf8Cut(last_user, 200)}, {"lastAssistant", Utf8Cut(last_assistant, 200)}, {"updatedAt", NowMs()},
+               {"text", std::to_string(roles["user"]) + " user turns, " + std::to_string(roles["assistant"]) + " replies, " + std::to_string(tools.size()) + " tool results"}};
+        save_meta();
+        return Ok({{"summary", cur}, {"cached", false}});
+    }
+    return {};
+}
+
+
+// ---------------------------------------------------------------- system agent (openclaw.setup/*, openclaw.chat) and the wizard step engine
+struct ProviderHint { const char* provider; const char* env; const char* model; };
+const ProviderHint kProviderHints[] = {
+    {"openai", "OPENAI_API_KEY", "gpt-4o-mini"}, {"anthropic", "ANTHROPIC_API_KEY", "claude-sonnet-4"}, {"deepseek", "DEEPSEEK_API_KEY", "deepseek-chat"},
+    {"google", "GEMINI_API_KEY", "gemini-2.5-flash"}, {"openrouter", "OPENROUTER_API_KEY", "openrouter/auto"}, {"xai", "XAI_API_KEY", "grok-4"},
+    {"mistral", "MISTRAL_API_KEY", "mistral-large-latest"}, {"groq", "GROQ_API_KEY", "llama-3.3-70b-versatile"}};
+json SetupDetect(ServerDeps& d) {
+    json cands = json::array();
+    for (auto& h : kProviderHints) { const char* v = std::getenv(h.env); if (v && *v) cands.push_back({{"provider", h.provider}, {"model", h.model}, {"source", "env"}, {"env", h.env}, {"authChoice", std::string(h.provider) + "-api-key"}}); }
+    const json provs = d.config.raw.value("models", json::object()).value("providers", json::object());
+    for (auto& [k, v] : provs.items()) {
+        bool dup = false; for (auto& c : cands) dup = dup || c["provider"] == k;
+        if (dup) continue;
+        std::string model; if (v.contains("models") && v["models"].is_array() && !v["models"].empty()) model = v["models"][0].is_string() ? v["models"][0].get<std::string>() : v["models"][0].value("id", "");
+        cands.push_back({{"provider", k}, {"model", model}, {"source", "config"}, {"hasKey", v.contains("apiKey")}});
+    }
+    if (d.router) for (auto& n : d.router->Names()) { bool dup = false; for (auto& c : cands) dup = dup || c["provider"] == n; if (!dup) cands.push_back({{"provider", n}, {"model", ""}, {"source", "runtime"}}); }
+    const auto cur = d.config.raw.value("agents", json::object()).value("defaults", json::object()).value("model", json());
+    return {{"candidates", cands}, {"currentModel", cur}, {"configured", !cur.is_null() || (d.router && !d.router->Names().empty())}};
+}
+json SetupVerify(ServerDeps& d, const std::string& provider, const std::string& model) {
+    if (!d.router) return {{"ok", false}, {"error", "no provider router"}};
+    if (!d.router->Has(provider)) return {{"ok", false}, {"error", "provider not available in this gateway: " + provider}};
+    agent::Message u; u.role = "user"; u.content = "Reply with the single word: ok";
+    const auto t0 = NowMs();
+    auto r = d.router->CompleteRoute(model.empty() ? provider : provider + "/" + model, {u}, json::array());
+    return {{"ok", r.ok}, {"provider", provider}, {"model", model}, {"latencyMs", NowMs() - t0}, {"error", r.ok ? json(nullptr) : json(r.error)}, {"sample", Utf8Cut(r.message.content, 80)}};
+}
+std::mutex g_setup_mu;
+ExtraResult SystemAgent(ServerDeps& d, const fs::path& root, const std::string& m, const json& p) {
+    auto str = [&](const char* k) { return p.contains(k) && p[k].is_string() ? p[k].get<std::string>() : std::string(); };
+    static const std::string kSys = "agent:main:openclaw-system";
+    auto led = ReadJsonFile(MetaPath(root, "system-agent"), json{{"changes", json::array()}, {"approvals", json::array()}});
+    auto wiz = ReadJsonFile(MetaPath(root, "wizard"), json::object());
+    auto save_wiz = [&] { WriteJsonFile(MetaPath(root, "wizard"), wiz); };
+    auto record_change = [&](const std::string& kind, const json& detail) {
+        led["changes"].push_back({{"id", Rid("chg")}, {"kind", kind}, {"detail", detail}, {"at", NowMs()}, {"by", t_principal}}); WriteJsonFile(MetaPath(root, "system-agent"), led); };
+    auto activate = [&](const std::string& provider, const std::string& model) -> ExtraResult {
+        std::unique_lock<std::mutex> l(g_setup_mu, std::try_to_lock);
+        if (!l.owns_lock()) return Fail("setup activation already in progress");
+        auto v = SetupVerify(d, provider, model);
+        if (!v.value("ok", false)) return Fail("verification failed; nothing saved: " + v["error"].dump());
+        const auto ref = model.empty() ? provider : provider + "/" + model;
+        auto r = GatewayRpc("config.patch", {{"agents", {{"defaults", {{"model", ref}}}}}});
+        if (!r.value("ok", false)) return Fail("verified but saving config failed");
+        if (d.router && d.router->Has(provider)) d.router->SetDefault(provider);
+        record_change("model.activate", {{"model", ref}});
+        return Ok({{"activated", true}, {"model", ref}, {"verify", v}});
+    };
+    // ---- wizard engine: a session is an ordered list of prompts; answers accumulate until done.
+    auto step_view = [&](const json& w) -> json {
+        json out{{"sessionId", w["sessionId"]}, {"status", w["status"]}, {"done", w["status"] != "running"}};
+        if (w["status"] == "running") { auto s = w["steps"][w["index"].get<size_t>()]; if (s.value("sensitive", false)) s["sensitive"] = true; out["step"] = s; }
+        if (w.contains("result")) out["result"] = w["result"];
+        if (w.contains("error")) out["error"] = w["error"];
+        return out;
+    };
+    auto new_wizard = [&](const std::string& kind, json steps, const json& ctx) {
+        auto id = str("sessionId").empty() ? Rid("wiz") : str("sessionId");
+        wiz[id] = {{"sessionId", id}, {"kind", kind}, {"steps", steps}, {"index", 0}, {"answers", json::object()}, {"status", "running"}, {"context", ctx}, {"createdAt", NowMs()}, {"owner", t_principal}};
+        save_wiz(); return id;
+    };
+    auto finish = [&](json& w) {  // apply a completed wizard
+        const auto kind = w["kind"].get<std::string>(); auto a = w["answers"]; auto ctx = w["context"];
+        try {
+            if (kind == "provider-auth" || kind == "prepare") {
+                const auto prov = ctx.value("provider", a.value("provider", std::string()));
+                json patch{{"models", {{"providers", {{prov, json::object()}}}}}};
+                if (a.contains("apiKey") && !a["apiKey"].get<std::string>().empty()) patch["models"]["providers"][prov]["apiKey"] = a["apiKey"];
+                if (a.contains("baseUrl") && !a["baseUrl"].get<std::string>().empty()) patch["models"]["providers"][prov]["baseUrl"] = a["baseUrl"];
+                auto r = GatewayRpc("config.patch", patch);
+                if (!r.value("ok", false)) throw std::runtime_error("config save failed");
+                record_change("provider.auth", {{"provider", prov}, {"credentialsSaved", patch["models"]["providers"][prov].contains("apiKey")}});
+                w["result"] = {{"provider", prov}, {"saved", true}, {"restartRequired", !(d.router && d.router->Has(prov))}};
+                if (kind == "prepare") w["result"]["preparedModel"] = prov + (ctx.value("model", std::string()).empty() ? "" : "/" + ctx.value("model", std::string()));
+            } else if (kind == "activate") {
+                auto r = activate(ctx.value("provider", a.value("provider", std::string())), ctx.value("model", a.value("model", std::string())));
+                if (!r.ok) throw std::runtime_error(r.error);
+                w["result"] = r.payload;
+            } else {  // onboard: workspace + agent name + model choice
+                json patch = json::object();
+                if (a.contains("workspace") && !a["workspace"].get<std::string>().empty()) patch["agents"]["defaults"]["workspace"] = a["workspace"];
+                if (a.contains("model") && !a["model"].get<std::string>().empty()) patch["agents"]["defaults"]["model"] = a["model"];
+                if (!patch.empty()) { auto r = GatewayRpc("config.patch", patch); if (!r.value("ok", false)) throw std::runtime_error("config save failed"); record_change("onboard", patch); }
+                w["result"] = {{"applied", patch}};
+            }
+            w["status"] = "done";
+        } catch (const std::exception& e) { w["status"] = "error"; w["error"] = e.what(); }
+    };
+    auto provider_steps = [&](const std::string& prov) {
+        std::string env; for (auto& h : kProviderHints) if (prov == h.provider) env = h.env;
+        return json::array({{{"id", "apiKey"}, {"type", "text"}, {"sensitive", true}, {"message", "API key for " + prov + (env.empty() ? "" : " (or set " + env + ")")}},
+                            {{"id", "baseUrl"}, {"type", "text"}, {"optional", true}, {"message", "Custom base URL (blank for default)"}}});
+    };
+    if (m == "wizard.start") {
+        const auto mode = str("mode").empty() ? (str("flow").empty() ? std::string("onboard") : str("flow")) : str("mode");
+        json steps = json::array({{{"id", "workspace"}, {"type", "text"}, {"optional", true}, {"message", "Workspace directory"}},
+                                  {{"id", "model"}, {"type", "select"}, {"optional", true}, {"message", "Default model"}, {"options", json::array()}}});
+        const json det = SetupDetect(d);
+        for (auto& c : det["candidates"]) steps[1]["options"].push_back(c.value("provider", "") + (c.value("model", "").empty() ? "" : "/" + c.value("model", "")));
+        if (mode == "provider-auth") steps = provider_steps(str("provider"));
+        auto id = new_wizard(mode, steps, {{"provider", str("provider")}});
+        return Ok(step_view(wiz[id]));
+    }
+    if (m == "openclaw.setup.auth.start" || m == "openclaw.setup.prepare.start" || m == "openclaw.setup.activate.start") {
+        if (!str("sessionId").empty() && wiz.contains(str("sessionId")) && wiz[str("sessionId")]["status"] == "running") return Fail("setup wizard session already running: " + str("sessionId"));
+        auto prov = str("provider"); const auto choice = str("authChoice");
+        if (prov.empty() && !choice.empty()) prov = choice.substr(0, choice.find('-'));
+        if (prov.empty()) return Fail("provider or authChoice is required");
+        const auto kind = m == "openclaw.setup.auth.start" ? "provider-auth" : m == "openclaw.setup.prepare.start" ? "prepare" : "activate";
+        json steps = std::string(kind) == "activate" ? json::array({{{"id", "confirm"}, {"type", "confirm"}, {"message", "Test and activate " + prov + (str("model").empty() ? "" : "/" + str("model")) + "?"}}}) : provider_steps(prov);
+        auto id = new_wizard(kind, steps, {{"provider", prov}, {"model", str("model")}, {"workspace", str("workspace")}, {"agentId", str("agentId")}});
+        return Ok(step_view(wiz[id]));
+    }
+    if (m.rfind("wizard.", 0) == 0) {
+        const auto id = str("sessionId");
+        if (!wiz.contains(id)) return Fail("unknown wizard session: " + id);
+        auto& w = wiz[id];
+        if (m == "wizard.status") return Ok(step_view(w));
+        if (m == "wizard.cancel") { if (w["status"] == "running") { w["status"] = "cancelled"; save_wiz(); } return Ok(step_view(w)); }
+        if (w["status"] != "running") return Fail("wizard session is " + w["status"].get<std::string>());
+        auto& step = w["steps"][w["index"].get<size_t>()];
+        json ans = p.contains("answer") ? p["answer"] : p.value("value", json());
+        if (ans.is_object() && ans.contains("value")) { if (ans.contains("stepId") && ans["stepId"] != step["id"]) return Fail("answer is for a different step"); ans = ans["value"]; }
+        if (step["type"] == "confirm") { if (!ans.is_boolean()) return Fail("confirm step needs a boolean"); if (!ans.get<bool>()) { w["status"] = "cancelled"; save_wiz(); return Ok(step_view(w)); } }
+        else { if (ans.is_null()) ans = ""; if (!ans.is_string()) return Fail("text answer expected");
+            if (ans.get<std::string>().empty() && !step.value("optional", false)) return Fail("an answer is required"); }
+        w["answers"][step["id"].get<std::string>()] = ans;
+        w["index"] = w["index"].get<int>() + 1;
+        if (w["index"].get<size_t>() >= w["steps"].size()) { save_wiz(); finish(w); }
+        save_wiz();
+        return Ok(step_view(w));
+    }
+    if (m == "openclaw.setup.detect") return Ok(SetupDetect(d));
+    if (m == "openclaw.setup.verify") { if (str("provider").empty()) return Fail("provider is required"); return Ok(SetupVerify(d, str("provider"), str("model"))); }
+    if (m == "openclaw.setup.activate") { if (str("provider").empty()) return Fail("provider is required"); return activate(str("provider"), str("model")); }
+    if (m == "openclaw.changes.list") return Ok({{"changes", led["changes"]}});
+    if (m == "openclaw.approval.list") {
+        json out = led["approvals"]; auto ex = GatewayRpc("exec.approvals.list", json::object());
+        if (ex.value("ok", false)) for (auto& a : ex["payload"].value("pending", json::array())) out.push_back({{"kind", "exec"}, {"approval", a}});
+        return Ok({{"approvals", out}});
+    }
+    if (m == "openclaw.chat.history") {
+        const size_t lim = std::clamp(p.value("limit", 50), 1, 500);
+        auto ms = d.sessions.Exists(kSys) ? d.sessions.Load(kSys) : std::vector<agent::Message>{};
+        json turns = json::array(); for (size_t i = ms.size() > lim ? ms.size() - lim : 0; i < ms.size(); ++i) if (ms[i].role == "user" || ms[i].role == "assistant") turns.push_back({{"role", ms[i].role}, {"text", ms[i].content}});
+        return Ok({{"turns", turns}});
+    }
+    if (m == "openclaw.chat") {
+        if (p.value("reset", false)) d.sessions.Remove(kSys);
+        if (p.contains("wizardAnswer") || p.value("wizardCancel", false)) {
+            auto r = GatewayRpc(p.value("wizardCancel", false) ? "wizard.cancel" : "wizard.next", {{"sessionId", str("sessionId")}, {"answer", p.value("wizardAnswer", json())}});
+            return r.value("ok", false) ? Ok({{"wizard", r["payload"]}}) : Fail(r.value("error", json("wizard failed")).dump());
+        }
+        if (str("message").empty()) return Ok({{"turns", json::array()}, {"welcome", "I'm OpenClaw. I can detect providers, verify a model and change settings."}});
+        auto r = GatewayRpc("chat.send", {{"sessionKey", kSys}, {"message", str("message")}});
+        return r.value("ok", false) ? Ok({{"reply", r["payload"].value("text", "")}, {"sessionKey", kSys}}) : Fail("system agent turn failed");
+    }
+    return {};
+}
+
 ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const std::string& method, const json& params) {
     try {
         if (method.rfind("users.github.", 0) == 0) return UsersGitHub(deps, root, method, params);
@@ -2086,6 +2591,14 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
         if (method == "message.action") return MessageAction(root, params);
         { auto r = LocalGroups(deps, root, method, params); if (r.handled) return r; }
         { auto r = Batch3(deps, root, method, params); if (r.handled) return r; }
+        { static const std::set<std::string> pm{"plugins.catalog.browse", "plugins.catalog.categories", "plugins.catalog.get", "plugins.controlUi.list", "plugins.controlUi.report",
+              "plugins.controlUi.status", "plugins.credentials.inspect", "plugins.inspect", "plugins.install", "plugins.reload", "plugins.skills.read", "plugins.uninstall"};
+          if (pm.count(method)) { auto r = Plugins(deps, root, method, params); if (r.handled) return r; } }
+        { static const std::set<std::string> sm{"sessions.activitySummary.ensure", "sessions.catalog.archive", "sessions.catalog.continue", "sessions.catalog.import",
+              "sessions.catalog.startTerminal", "sessions.files.reveal", "sessions.github.options", "sessions.github.status", "sessions.pluginPatch",
+              "sessions.providerReview.continue", "sessions.recover"};
+          if (sm.count(method)) { auto r = Sessions2(deps, root, method, params); if (r.handled) return r; } }
+        if (method.rfind("openclaw.", 0) == 0 || method.rfind("wizard.", 0) == 0) { auto r = SystemAgent(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("talk.", 0) == 0) { auto r = Talk(deps, root, method, params); if (r.handled) return r; }
         if (method.rfind("mcp.app.", 0) == 0 && method != "mcp.app.listTools" && method != "mcp.app.callTool" && method != "mcp.app.listResources" &&
             method != "mcp.app.listResourceTemplates" && method != "mcp.app.readResource") { auto r = McpApp(deps, root, method, params); if (r.handled) return r; }
@@ -2473,6 +2986,9 @@ namespace {
 std::function<nlohmann::json(const std::string&, const nlohmann::json&)> g_gw_rpc;
 std::mutex g_goals_mu;
 }
+std::function<void(const std::string&, const json&)> g_gw_emit;
+void SetGatewayEmitter(std::function<void(const std::string&, const json&)> fn) { g_gw_emit = std::move(fn); }
+void GatewayEmit(const std::string& e, const json& p) { if (g_gw_emit) g_gw_emit(e, p); }
 void SetGatewayRpc(std::function<nlohmann::json(const std::string&, const nlohmann::json&)> fn) { g_gw_rpc = std::move(fn); }
 nlohmann::json GatewayRpc(const std::string& m, const nlohmann::json& p) {
     if (!g_gw_rpc) return {{"ok", false}, {"error", {{"message", "gateway not running"}}}};

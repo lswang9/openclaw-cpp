@@ -13,8 +13,12 @@ void Registry::Scan(const fs::path& root) {
     UnloadNatives();
     plugins_.clear();
     root_ = root;
-    if (!fs::exists(root) || !fs::is_directory(root)) return;
-    for (const auto& e : fs::directory_iterator(root)) {
+    std::vector<fs::path> roots{root};
+    for (auto& x : extra_) roots.push_back(x);
+    for (const auto& rt : roots) {
+    std::error_code rec;
+    if (!fs::is_directory(rt, rec)) continue;
+    for (const auto& e : fs::directory_iterator(rt)) {
         if (!e.is_directory()) continue;
         Plugin p;
         p.id = e.path().filename().string();
@@ -35,7 +39,18 @@ void Registry::Scan(const fs::path& root) {
             } catch (...) {
             }
         }
-        plugins_.push_back(std::move(p));
+        if (!fs::exists(manifest)) {
+            // upstream-style manifest (openclaw.plugin.json / package.json "openclaw")
+            for (auto alt : {"openclaw.plugin.json"}) {
+                std::ifstream in(e.path() / alt);
+                if (!in) continue;
+                try { nlohmann::json j; in >> j; p.name = j.value("name", j.value("id", p.id)); p.enabled = j.value("enabled", false); } catch (...) {}
+            }
+        }
+        bool dup = false;
+        for (auto& q : plugins_) dup = dup || q.id == p.id;
+        if (!dup) plugins_.push_back(std::move(p));
+    }
     }
 }
 

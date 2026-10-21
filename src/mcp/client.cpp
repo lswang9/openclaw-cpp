@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <fstream>
 #include "openclaw/mcp/client.hpp"
 
 #include <stdexcept>
@@ -94,8 +96,12 @@ nlohmann::json Client::MockServerHandle(const nlohmann::json& req) {
     }
     if (method == "resources/read") {
         const auto params = req.value("params", nlohmann::json::object());
+        std::string text = "mock-resource";
+        if (const char* f = std::getenv("OPENCLAW_MCP_MOCK_RESOURCE_FILE")) {  // test hook: mutable resource body
+            std::ifstream in(f); if (in) text.assign(std::istreambuf_iterator<char>(in), {});
+        }
         return ok({{"contents", nlohmann::json::array({
-            {{"uri", params.value("uri", "")}, {"mimeType", "text/plain"}, {"text", "mock-resource"}}
+            {{"uri", params.value("uri", "")}, {"mimeType", "text/plain"}, {"text", text}}
         })}});
     }
     return nlohmann::json{{"jsonrpc", "2.0"},

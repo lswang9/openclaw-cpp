@@ -1,0 +1,5 @@
+{"plugins": [
+ {"id": "sample-echo", "name": "Sample Echo (native)", "category": "examples", "description": "Native C ABI echo plugin", "source": "sample_echo"},
+ {"id": "sample-upstream", "name": "Sample Upstream Plugin", "category": "examples", "description": "Upstream-style register(api) JS plugin", "source": "sample_upstream"},
+ {"id": "sample-js", "name": "Sample JS", "category": "examples", "description": "Node bridge plugin", "source": "sample_js"}
+]}

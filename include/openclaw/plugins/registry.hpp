@@ -33,8 +33,12 @@ public:
     std::vector<Plugin> List() const { return plugins_; }
     nlohmann::json ListJson() const;
     std::filesystem::path Root() const { return root_; }
+    // Additional install roots (e.g. <data>/plugins) scanned after the primary root.
+    void AddRoot(const std::filesystem::path& r) { for (auto& x : extra_) if (x == r) return; extra_.push_back(r); }
+    const std::vector<std::filesystem::path>& ExtraRoots() const { return extra_; }
 
 private:
+    std::vector<std::filesystem::path> extra_;
     struct NativeHandle {
         std::string id;
         void* dl = nullptr;

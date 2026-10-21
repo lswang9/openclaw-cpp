@@ -45,6 +45,8 @@ std::optional<nlohmann::json> RunTurnOnPlacedWorker(ServerDeps& d, const std::fi
 
 // Upstream agent tools that read gateway state: sessions_list, sessions_history, session_status, agents_list, nodes.
 // In-process RPC used by agent tools that wrap gateway methods (returns the response frame {ok,payload,error}).
+void SetGatewayEmitter(std::function<void(const std::string&, const nlohmann::json&)> fn);
+void GatewayEmit(const std::string& event, const nlohmann::json& payload);
 void SetGatewayRpc(std::function<nlohmann::json(const std::string&, const nlohmann::json&)> fn);
 nlohmann::json GatewayRpc(const std::string& method, const nlohmann::json& params);
 // Media generation provider interface (image|video|music). Mock provider writes deterministic files.

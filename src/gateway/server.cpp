@@ -55,7 +55,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.116.0-dev";
+constexpr const char* kVersion = "1.117.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -272,6 +272,7 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
 Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), deps_(std::move(deps)) {
     deps_.emit = [this](const std::string& ev, const nlohmann::json& p) { Emit(ev, p); };
     SetSubsystemContext(&deps_, SubsystemDataRoot(deps_));
+    SetGatewayEmitter([this](const std::string& e, const nlohmann::json& p) { Emit(e, p); });
     SetGatewayRpc([this](const std::string& m, const nlohmann::json& p) { return DispatchRpc({{"type", "req"}, {"id", "tool"}, {"method", m}, {"params", p}}); });
     std::error_code ec;
     cfg_mtime_ = std::filesystem::last_write_time(config::DefaultPath(), ec);
@@ -3003,7 +3004,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         // Subsystem handlers that call back into RPCs (GatewayRpc) must not run under the deps lock.
         static const std::set<std::string> reentrant{"taskSuggestions.accept", "sessions.patchMany", "wake", "node.invoke.progress", "mentions.list",
                                                      "message.action", "worktrees.create", "talk.speak", "talk.session.appendAudio", "talk.session.steer",
-                                                     "talk.session.submitToolResult", "talk.client.steer", "talk.client.toolCall", "talk.client.transcript", "mcp.app.mention"};
+                                                     "talk.session.submitToolResult", "talk.client.steer", "talk.client.toolCall", "talk.client.transcript", "mcp.app.mention", "sessions.catalog.continue", "sessions.catalog.startTerminal", "sessions.providerReview.continue", "openclaw.setup.activate", "openclaw.chat", "openclaw.approval.list", "wizard.next", "wizard.start"};
         if (reentrant.count(method) && deps_lock.owns_lock()) deps_lock.unlock();
         auto extra = TryExtraDispatch(deps_, method, params);
         if (extra.handled) {
