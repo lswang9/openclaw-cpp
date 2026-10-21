@@ -1,6 +1,6 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.77.0-dev.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.78.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
 
 ## 1.42.0-dev 新增
 
@@ -185,6 +185,9 @@ export OPENCLAW_DEFAULT_PROVIDER=deepseek   # 或 openai
 | [docs/BROWSER-CDP.md](docs/BROWSER-CDP.md) | CDP 浏览器路径 |
 | [docs/COMPUTER-CAPTURE.md](docs/COMPUTER-CAPTURE.md) | Linux 截图后端 |
 | [docs/ci-github-actions.yml](docs/ci-github-actions.yml) | CI 工作流草案 |
+
+### 1.78.0-dev
+- PARITY 审计：修正“明确缺失”行中已交付的 Slack interactive / Discord slash / JS-TS 插件宿主；GGUF 如实标注为替身。修正 1.77 版本字符串。
 
 ### 1.77.0-dev
 - Discord 语音出站播放：语音网关 v8、UDP IP 发现、RTP + rtpsize AEAD（AES-GCM / XChaCha20）、Ogg Opus 解封装；假服务器 e2e 已进 smoke。
