@@ -38,13 +38,13 @@
 - real: reply directives `[[buttons: L|v,...]]`, `[[select: P|a,b]]`, `[[modal: Title|F1,F2]]` → Block Kit (section + actions); plain text keeps a fallback.
 - real: block_actions (button/static_select), view_submission, shortcut/message_action over HTTP (`payload` form field or JSON) and Socket Mode `interactive` envelopes → agent turn with upstream-style session key; reply posted with blocks/thread_ts via chat.postMessage.
 - real: modal button → views.open with plain_text_input per field (live when SLACK_BOT_TOKEN, SLACK_API_BASE overridable; recorded otherwise).
-- real-sim: no live Slack test (no creds); response_url replies still missing (request signing added in 1.50).
+- real-sim: no live Slack test (no creds); response_url replies + signing covered in 1.50/1.54 (offline e2e).
 
 ## 1.45 Discord slash commands + native chat commands
 - real: application command specs built from native (/new /reset /status /help /compact /model /stop) + user-invocable skills + plugin commands (sanitized, dedup, ≤100, optional `args` string option); `discord.commands` / `discord.commands.sync` RPC; PUT /applications/{app}[/guilds/{g}]/commands live with DISCORD_BOT_TOKEN+DISCORD_APPLICATION_ID (auto on adapter start), recorded otherwise.
 - real: APPLICATION_COMMAND + message-component interactions via HTTP (type 4 response) and Gateway INTERACTION_CREATE (deferred type 5 ack + PATCH @original follow-up) → agent pipeline with upstream session keys.
 - real: native /status, /help, /stop, /model handled in gateway without a model turn.
-- real-sim: no live Discord test; Ed25519 verification added in 1.50; /stop does not abort an in-flight run; /model does not switch models.
+- real-sim: no live Discord test; Ed25519 in 1.50; /stop aborts in-flight session run and /model session override in 1.54.
 
 ## 1.46 Plugin API completion
 - real: TypeScript plugin entries on Node >= 22.6 (`--experimental-strip-types` auto-added; OPENCLAW_NODE selects the binary) or with the `typescript` package; tested by scripts/e2e-ts-plugin.sh with Node 22.20 (skips honestly when no Node >= 22.6).
@@ -58,7 +58,7 @@
 ## 1.47 Multi-agent bindings
 - real: agents.list (id, name, default, workspace, model string|{primary}, identity.name, systemPrompt) + bindings[{agentId, match:{channel, accountId, peer:{kind,id}, guildId, teamId}}]; most-specific wins (peer > guild > team > account > channel), first listed on ties; unknown agentIds ignored; missing accountId only matches the default account.
 - real: inbound session keys use the routed agent (`agent:<id>:...`); per-agent system prompt (agent workspace bootstrap files + identity/systemPrompt, cached, cleared on reload) and per-agent model route via the provider router; `agents.list` / `agents.route` RPC.
-- real-sim: all agents share one session store directory and one tool registry/memory index (upstream isolates ~/.openclaw/agents/<id>/{sessions,agent}); per-agent tool allow/deny and sandbox settings not applied.
+- real-sim (superseded by 1.51): per-agent sessions/workspace/memory/tools; skills + JS host still process-global.
 
 ## 1.48 exec tool: real by default + approvals/sandbox semantics
 - real: `exec` tool (legacy `shell` alias) runs for real by default (gateway host, security=full, ask=off — upstream gateway defaults); params command/workdir/env/timeout/host/ask; host env overrides of PATH/LD_*/DYLD_*/NODE_OPTIONS rejected. OPENCLAW_EXEC_MODE=mock keeps a mock for tests.
@@ -71,7 +71,7 @@
 ## 1.49 Hot-reload channel/plugin restart coverage
 - real: scripts/e2e-hot-reload-channels.sh (part of smoke) proves a reload restarts only adapters whose channels.<id> subtree changed, restarts nothing on unrelated edits, adapters keep serving afterwards, and a plugins.* change restarts the JS host with the **new** plugin config (bug fixed: the host previously restarted with the stale config) and re-registers plugin channels/providers.
 - fix: `tools.invoke` RPC accepts plain-text tool results (JS plugin tools) instead of failing JSON parse.
-- real-sim: built-in adapters mostly read credentials from env, so a restart re-reads env-backed settings only.
+- real-sim (superseded by 1.54): adapters SetConfig + ChannelCred; Start exports config tokens into env for Socket/Gateway children.
 - note (superseded by 1.52): the “config reload swaps `deps.config` without a reader lock” gap is closed in **1.52** (exclusive `deps_mu_` + bounded HTTP workers + e2e).
 
 ## 1.50 Webhook authenticity + form bodies
