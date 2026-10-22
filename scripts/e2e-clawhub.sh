@@ -34,7 +34,7 @@ echo "local edit" >> "$T/wd/skills/demo/SKILL.md"
 # plugins
 "$BIN" plugins install clawhub:@acme/hubplug | grep -q '"source": "clawhub"' || fail "plugin clawhub install"
 [[ -f "$OPENCLAW_EXTENSIONS_DIR/hubplug/index.mjs" ]] || fail "plugin files missing"
-python3 -c "import json;r=json.load(open('$OPENCLAW_CONFIG_PATH'))['plugins']['installs']['hubplug'];assert r['clawhub']['artifact']['verified'] and r['version']=='2.1.0',r" || fail "install record"
+"$BIN" plugins installs | python3 -c "import json,sys;r=json.load(sys.stdin)['installs']['hubplug'];assert r['clawhub']['artifact']['verified'] and r['version']=='2.1.0',r" || fail "install record"
 { "$BIN" plugins install clawhub:@acme/bad 2>&1 || true; } | grep -q 'blocked' || fail "blocked release not refused"
 { "$BIN" plugins install clawhub:@acme/tampered 2>&1 || true; } | grep -q 'sha256 mismatch' || fail "tampered artifact not refused"
 "$BIN" plugins update hubplug --force | grep -q '"ok": true' || fail "plugin update via clawhub spec"

@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.158.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.159.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.159.0-dev 新增
+
+插件安装记录移出 openclaw.json，改存于已安装插件索引（<state>/plugins/installs.json，启用状态库时存 SQLite），旧配置中的 plugins.installs 自动迁移一次（e2e：scripts/e2e-plugin-install-index.sh）。
 
 ## 1.158.0-dev 新增
 

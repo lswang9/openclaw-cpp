@@ -1,3 +1,4 @@
+#include "openclaw/persist/state_db.hpp"
 #include "openclaw/plugins/install.hpp"
 #include "openclaw/clawhub/client.hpp"
 
@@ -54,18 +55,65 @@ fs::path FindRoot(const fs::path& dir) {
     return {};
 }
 
+// 1.159: install records live in the installed-plugin index (`<state>/plugins/installs.json`, a state-store document,
+// i.e. SQLite when the state store is enabled) like upstream's installed-plugin-index store, not in openclaw.json.
+// Legacy `plugins.installs` config entries are migrated into the index once and removed from the config.
+fs::path IndexPath() {
+    const char* sd = std::getenv("OPENCLAW_STATE_DIR");
+    const char* h = std::getenv("HOME");
+    fs::path st = sd && *sd ? fs::path(sd) : fs::path(h && *h ? h : "/tmp") / ".openclaw";
+    return st / "plugins" / "installs.json";
+}
+nlohmann::json ReadIndexRaw() {
+    auto t = persist::StateRead(IndexPath());
+    auto j = t ? nlohmann::json::parse(*t, nullptr, false) : nlohmann::json::object();
+    if (!j.is_object()) j = nlohmann::json::object();
+    if (!j.contains("installRecords") || !j["installRecords"].is_object()) j["installRecords"] = nlohmann::json::object();
+    return j;
+}
+void WriteIndex(nlohmann::json j) {
+    std::error_code ec; fs::create_directories(IndexPath().parent_path(), ec);
+    j["version"] = 1;
+    persist::StateWrite(IndexPath(), j.dump(2));
+}
+void SaveConfigRaw(const config::LoadResult& lr, const nlohmann::json& raw) {
+    const auto path = config::DefaultPath();
+    auto wr = config::SavePreserving(path, raw);
+    if (!wr.value("ok", false)) config::SaveRaw(path, config::ToFileDoc(lr.snap, raw));
+}
+nlohmann::json LoadIndex() {
+    auto j = ReadIndexRaw();
+    const auto path = config::DefaultPath();
+    auto lr = config::Load(path);
+    if (lr.error.empty() && lr.snap.raw.is_object()) {
+        auto legacy = config::GetPath(lr.snap.raw, "plugins.installs");
+        if (legacy && legacy->is_object()) {
+            for (auto& [k, v] : legacy->items()) if (!j["installRecords"].contains(k)) j["installRecords"][k] = v;
+            j["migratedFromConfig"] = true;
+            WriteIndex(j);
+            auto raw = lr.snap.raw;
+            config::UnsetPath(raw, "plugins.installs");
+            SaveConfigRaw(lr, raw);
+        }
+    }
+    return j;
+}
+nlohmann::json GetRecord(const std::string& id) {
+    auto j = LoadIndex();
+    return j["installRecords"].contains(id) ? j["installRecords"][id] : nlohmann::json();
+}
 void SaveInstallRecord(const std::string& id, const nlohmann::json& rec) {
+    auto j = LoadIndex();
+    if (rec.is_null()) j["installRecords"].erase(id); else j["installRecords"][id] = rec;
+    WriteIndex(j);
     const auto path = config::DefaultPath();
     auto lr = config::Load(path);
     auto raw = lr.error.empty() && lr.snap.raw.is_object() ? lr.snap.raw : nlohmann::json::object();
-    if (rec.is_null()) config::UnsetPath(raw, "plugins.installs." + id);
-    else config::SetPath(raw, "plugins.installs." + id, rec);
     // enable on install (upstream: plugins.entries.<id>.enabled)
-    if (!rec.is_null() && !config::GetPath(raw, "plugins.entries." + id + ".enabled"))
-        config::SetPath(raw, "plugins.entries." + id + ".enabled", true);
-    if (rec.is_null()) config::UnsetPath(raw, "plugins.entries." + id);
-    auto wr = config::SavePreserving(path, raw);
-    if (!wr.value("ok", false)) config::SaveRaw(path, config::ToFileDoc(lr.snap, raw));
+    bool changed = false;
+    if (!rec.is_null() && !config::GetPath(raw, "plugins.entries." + id + ".enabled")) { config::SetPath(raw, "plugins.entries." + id + ".enabled", true); changed = true; }
+    if (rec.is_null() && config::GetPath(raw, "plugins.entries." + id)) { config::UnsetPath(raw, "plugins.entries." + id); changed = true; }
+    if (changed) SaveConfigRaw(lr, raw);
 }
 }  // namespace
 
@@ -169,9 +217,9 @@ nlohmann::json Install(const std::string& spec, const InstallOptions& opts) {
 }
 
 nlohmann::json Uninstall(const std::string& id) {
-    auto raw = config::LoadOrDefault(config::DefaultPath()).raw;
-    auto rec = config::GetPath(raw, "plugins.installs." + id);
-    fs::path dest = rec && rec->is_object() && rec->contains("installPath") ? fs::path((*rec)["installPath"].get<std::string>())
+    auto recj = GetRecord(id);
+    const nlohmann::json* rec = recj.is_object() ? &recj : nullptr;
+    fs::path dest = rec && rec->contains("installPath") ? fs::path((*rec)["installPath"].get<std::string>())
                                                                             : ExtensionsDir() / DirName(id);
     if (dest.parent_path() != ExtensionsDir()) return Fail("refusing to remove path outside extensions dir: " + dest.string());
     std::error_code ec;
@@ -183,9 +231,9 @@ nlohmann::json Uninstall(const std::string& id) {
 }
 
 nlohmann::json Update(const std::string& id) {
-    auto raw = config::LoadOrDefault(config::DefaultPath()).raw;
-    auto rec = config::GetPath(raw, "plugins.installs." + id);
-    if (!rec || !rec->is_object()) return Fail("no install record for " + id);
+    auto recj = GetRecord(id);
+    const nlohmann::json* rec = recj.is_object() ? &recj : nullptr;
+    if (!rec) return Fail("no install record for " + id);
     InstallOptions o; o.force = true; o.link = rec->value("link", false);
     auto r = Install(rec->value("spec", ""), o);
     if (r.value("ok", false)) r["previousVersion"] = rec->value("version", "");
@@ -193,9 +241,8 @@ nlohmann::json Update(const std::string& id) {
 }
 
 nlohmann::json ListInstalls() {
-    auto raw = config::LoadOrDefault(config::DefaultPath()).raw;
-    auto v = config::GetPath(raw, "plugins.installs");
-    return {{"ok", true}, {"dir", ExtensionsDir().string()}, {"installs", v && v->is_object() ? *v : nlohmann::json::object()}};
+    auto j = LoadIndex();
+    return {{"ok", true}, {"dir", ExtensionsDir().string()}, {"index", IndexPath().string()}, {"installs", j["installRecords"]}};
 }
 
 }  // namespace openclaw::plugins
