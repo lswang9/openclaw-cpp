@@ -9,6 +9,7 @@
 #include "openclaw/channels/waweb/pairing.hpp"
 #include "openclaw/channels/waweb/session.hpp"
 #include "openclaw/channels/waweb/sender_keys.hpp"
+#include "openclaw/channels/waweb/app_state.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/auth/mfa.hpp"
@@ -118,7 +119,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.164.0-dev";
+constexpr const char* kVersion = "1.165.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2583,6 +2584,42 @@ int CmdSelfTest() {
     }
     {
         namespace ww = openclaw::channels::waweb;
+        // LTHash commutativity: add a,b then sub a == add b; order of independent adds
+        ww::Bytes z(128, 0);
+        auto a = ww::RandomBytes(32), b = ww::RandomBytes(32), c = ww::RandomBytes(32);
+        auto h1 = ww::LtHashSubtractThenAdd(z, {}, {a, b});
+        auto h2 = ww::LtHashSubtractThenAdd(z, {}, {b, a});
+        auto h3 = ww::LtHashSubtractThenAdd(h1, {a}, {});
+        auto h4 = ww::LtHashSubtractThenAdd(z, {}, {b});
+        bool ok = h1 == h2 && h3 == h4 && h1 != z;
+        auto key_data = ww::RandomBytes(32);
+        auto mk = ww::ExpandMutationKeys(key_data);
+        ok = ok && mk.index_key.size() == 32 && mk.patch_mac.size() == 32;
+        ww::Bytes key_id = ww::FromString("kid-1");
+        ww::SyncMutation mute{{}, {"mute", "1555@s.whatsapp.net"}, "mute", true, 1700000000000};
+        mute.op = ww::SyncOp::Set;
+        auto enc = ww::EncodeMutation(mute, mk, key_id);
+        std::string e;
+        auto dec = ww::DecodeMutation(enc, mk, key_id, ww::SyncOp::Set, &e);
+        ok = ok && dec && dec->action_type == "mute" && dec->bool_value && dec->index.size() == 2 && dec->mute_end_ms == 1700000000000;
+        ww::LtHashState st; st.hash.assign(128, 0);
+        ok = ok && ww::ApplyMutation(st, enc, ww::SyncOp::Set) && st.version == 1 && !st.index_value_map.empty();
+        auto snap = ww::SnapshotMac(st, "regular_high", mk);
+        ok = ok && snap.size() == 32;
+        // remove
+        ok = ok && ww::ApplyMutation(st, enc, ww::SyncOp::Remove) && st.version == 2 && st.index_value_map.empty();
+        auto dir = std::filesystem::temp_directory_path() / ("oc-as-" + std::to_string(getpid()));
+        std::filesystem::create_directories(dir);
+        ww::AppStateSyncKey ask{ww::Base64(key_id), key_data, 42};
+        ok = ok && ww::SaveAppStateKey(dir, ask) && ww::SaveAppStateVersion(dir, "regular_high", st);
+        auto lk = ww::LoadAppStateKey(dir, ask.id_b64); auto lv = ww::LoadAppStateVersion(dir, "regular_high");
+        ok = ok && lk && lk->key_data == key_data && lv && lv->version == 2 && lv->hash == st.hash;
+        std::filesystem::remove_all(dir);
+        if (!ok) { std::cerr << "FAIL waweb app-state\n"; ++failures; }
+        else std::cerr << "PASS waweb app-state (LTHash, mutation keys, mute encode/decode, persist)\n";
+    }
+    {
+        namespace ww = openclaw::channels::waweb;
         auto alice = ww::CreateSenderKey(7);
         auto skdm = ww::EncodeSkdm(alice);
         auto bob = ww::ProcessSkdm(skdm);
@@ -4336,6 +4373,20 @@ int main(int argc, char** argv) {
                 auto r = ww::ConfigureSuccessfulPairing(iq, *c);
                 out["ok"] = r.ok; out["error"] = r.error; out["me"] = c->me_jid; out["platform"] = c->platform;
                 if (r.ok) { out["reply"] = hex(ww::EncodeBinaryNode(r.reply)); ww::SaveAuthCreds(dir, *c); }
+            } else if (sub == "app-state") {
+                auto key_data = ww::RandomBytes(32); auto mk = ww::ExpandMutationKeys(key_data);
+                ww::Bytes kid = ww::FromString("demo-key");
+                ww::SyncMutation mute; mute.op = ww::SyncOp::Set; mute.index = {"mute", "15550001111@s.whatsapp.net"};
+                mute.action_type = "mute"; mute.bool_value = true; mute.mute_end_ms = 1800000000000;
+                auto enc = ww::EncodeMutation(mute, mk, kid);
+                ww::LtHashState st; st.hash.assign(128, 0); ww::ApplyMutation(st, enc, ww::SyncOp::Set);
+                out["ok"] = true; out["version"] = st.version; out["hash"] = ww::Base64(st.hash);
+                out["snapshotMac"] = ww::Base64(ww::SnapshotMac(st, "regular_high", mk));
+                if (!dir.empty()) {
+                    ww::SaveAppStateKey(dir, {ww::Base64(kid), key_data, 1});
+                    ww::SaveAppStateVersion(dir, "regular_high", st);
+                    out["saved"] = true;
+                }
             } else if (sub == "sender-keys") {
                 // Offline demo: create → distribute → encrypt/decrypt round-trip; optional --dir to persist.
                 auto alice = ww::CreateSenderKey(1);

@@ -1,6 +1,6 @@
 # WhatsApp Web (Baileys-equivalent) — gap assessment (1.61)
 
-> Refreshed 1.156: rows below updated where later slices landed; WABinary v3 and cert-chain verify are done (self-test fixtures). 1.162 ClientPayload + ADV; **1.163** live Noise login against an offline fake (TCP-framed Noise = post-WS-upgrade bytes; client also speaks `ws://` via curl). **1.164** SenderKeys. Next: app-state sync, real wss://web.whatsapp.com.
+> Refreshed 1.156: rows below updated where later slices landed; WABinary v3 and cert-chain verify are done (self-test fixtures). 1.162 ClientPayload + ADV; **1.163** live Noise login against an offline fake (TCP-framed Noise = post-WS-upgrade bytes; client also speaks `ws://` via curl). **1.164** SenderKeys; **1.165** app-state primitives. Next: live app-state IQ sync against a fake, real wss://web.whatsapp.com.
 
 Upstream OpenClaw's `whatsapp` channel logs in as a **linked device** through Baileys (WhatsApp Web multi-device
 protocol): QR or pairing-code login, persistent auth state, DMs and groups, media, reactions, read receipts.
@@ -19,10 +19,10 @@ Meta Business number. That is a different product.
 | Pairing | `pair-device` refs → QR `ref,noisePub,identityPub,advSecret`; `pair-success` → verify ADV HMAC, sign the device identity, reply `pair-device-sign` | QR payload format **real**. **1.162**: ADV HMAC (E2EE + HOSTED), account XEdDSA verify, device XEdDSA sign, `pair-device-sign` reply; CLI `whatsapp-web pair` (offline self-pair). Live QR scan still missing. |
 | Signal protocol | X3DH session setup with pre-key bundles (`encrypt` iq), Double Ratchet (`pkmsg`/`msg`), group SenderKeys (`skmsg`), XEdDSA signatures | **offline-real (1.14x–1.164)**: X3DH + Double Ratchet + **SenderKeys** (`sender_keys.hpp`: SKDM, chain HMAC 0x01/0x02, HKDF WhisperGroup, AES-256-CBC, XEdDSA-signed SKM, out-of-order ≤2000, persist). Not byte-verified against libsignal. |
 | Pre-key management | Upload 30+ one-time pre-keys, rotate the signed pre-key, `count` iq | **1.156**: `BuildPreKeyUploadNode` (encrypt iq: registration/type/identity/list/skey with XEdDSA-signed SPK), `ParsePreKeyCount`, Baileys MIN 5 / INITIAL 30 policy; CLI `whatsapp-web prekeys`. Signed pre-key rotation and live upload missing. |
-| App state sync | `app-state-sync-key-share`, LTHash mutations (contacts, mute, pin, archive) | **missing**. Not required for messaging. |
+| App state sync | `app-state-sync-key-share`, LTHash mutations (contacts, mute, pin, archive) | **1.165**: LTHash (whatsmeow WAPatchIntegrity), mutation key HKDF, SET mute/pin/archive/star encode+MAC+AES (zero-IV offline), key + collection version persist. Live `w:sync:app:state` IQ and full SyncdPatch codec still missing. |
 | History sync | Compressed `HistorySyncNotification` blobs | **missing**. Optional. |
 | Media | HKDF("WhatsApp {Image,Video,Audio,Document} Keys") → AES-256-CBC + HMAC-SHA256/10; upload to `mmg.whatsapp.net` with `media_conn` auth | Crypto **real** (round trip, wrong-type MAC rejected). Upload/download hosts **missing**. |
-| Auth persistence | `creds.json` + keys store (sessions, pre-keys, sender keys, app-state keys) | **1.156/1.164**: creds + pre-keys + sessions + **sender keys** in the state store. App-state keys still missing. |
+| Auth persistence | `creds.json` + keys store (sessions, pre-keys, sender keys, app-state keys) | **1.156–1.165**: creds, pre-keys, sessions, sender keys, **app-state-sync-key + collection versions** in the state store. |
 
 ## Why we stop at primitives now
 

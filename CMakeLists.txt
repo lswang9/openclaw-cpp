@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.164.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.165.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -106,6 +106,7 @@ set(OPENCLAW_SOURCES
   src/channels/waweb/pairing.cpp
   src/channels/waweb/session.cpp
   src/channels/waweb/sender_keys.cpp
+  src/channels/waweb/app_state.cpp
   src/net/safe_fetch.cpp
   src/voice/stt.cpp
   src/voice/inbound_audio.cpp

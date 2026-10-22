@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.164.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.165.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.165.0-dev 新增
+
+WhatsApp Web：app-state 基础能力（LTHash、mutation key HKDF、mute/pin/archive/star 编码与 MAC、密钥与集合版本持久化）；CLI whatsapp-web app-state（e2e：scripts/e2e-waweb-app-state.sh）。
 
 ## 1.164.0-dev 新增
 
