@@ -3,6 +3,12 @@
 Audited 2026-10-22, at openclaw-cpp 1.125.0. Upstream was re-checked: `npm view openclaw version` still returns
 **2026.10.5**, so no retarget was needed. Upstream source is the v2026.10.5 tree.
 
+**Re-diff at 1.160 (2026-10-22):** `git ls-remote --tags` shows v2026.10.5 is still the newest stable tag (only
+v2026.10.10-beta.1…3 exist), so the target stays 2026.10.5. Results: RPC catalog — all 475 upstream core + channel
+gateway methods (from `CORE_GATEWAY_METHOD_SPECS` and channel `gatewayMethods`) are in the C++ catalog (0 missing);
+CLI tree — `climiss` still 0; channel extensions — unchanged (0 by name). The re-diff did surface a class the audit
+never tracked: ~45 bundled **non-channel, non-provider** extensions. They are now listed in §5b.
+
 This audit tries to be honest. "Answers" means the command or method responds without "not implemented". It does
 **not** mean the behaviour matches upstream end to end. Each section below separates four kinds of thing:
 - what is real;
@@ -162,6 +168,42 @@ Offline e2e: `scripts/e2e-misc-channels.sh` against `scripts/fake_misc_channels.
 - onepassword/vault secret backends
 - tokenjuice, lobster, workboard, etc.
 
+## 5b. Non-channel / non-provider bundled extensions (added in the 1.160 re-diff)
+
+Upstream ships these as bundled plugins built on `openclaw/plugin-sdk`. The C++ JS host runs `api.register*` plugins
+but does not provide the upstream plugin-sdk module tree, so the bundled packages cannot be loaded as-is. Status
+below is for native C++ equivalents.
+
+| Extension | Purpose | C++ status |
+|---|---|---|
+| memory-core | memory search | **native** (memory_search/get/set, embeddings, SQLite vectors) |
+| document-extract | local document extraction | **partial**: pdf tool / media understanding via `pdftotext` |
+| web-readability | local Readability extraction | **partial**: web_fetch has its own HTML→text, not Readability |
+| diagnostics-otel | OTLP metrics/traces/logs | **partial**: best-effort JSON log batch to `OTEL_EXPORTER_OTLP_ENDPOINT`; no protobuf, metrics or traces |
+| code-mode-quickjs | Code Mode executor | **missing** (no embedded JS engine; the JS host is an external Node process) |
+| duckduckgo, exa, firecrawl, searxng | web_search / fetch providers | **missing** (web_search has Brave + Tavily only) |
+| file-transfer | file_fetch / dir_list / dir_fetch / file_write between nodes | **missing** |
+| imap | inbound IMAP email trigger | **missing** |
+| llm-task | JSON-only LLM task tool | **missing** (decision_evaluate covers boolean/choice/score only) |
+| lobster | typed workflow pipelines with resumable approvals | **missing** |
+| logbook, team-reports, workboard | work journal / team reports / dashboard workboard | **missing** (dashboard tool + board RPCs exist, not the workboard plugin) |
+| memory-lancedb, memory-wiki, active-memory | alternative memory backends / auto-recall | **missing** |
+| onepassword, vault | SecretRef resolvers | **missing** (env/file/exec SecretRefs only) |
+| diagnostics-prometheus | `/metrics` exporter | **missing** |
+| bonjour | mDNS gateway discovery | **missing** |
+| geolocation | IP → coarse city | **missing** |
+| session-share | read-only sessions on paired gateways | **missing** |
+| admin-http-rpc | admin HTTP RPC endpoint | **partial**: `/v1/rpc` HTTP JSON-RPC exists; no separate admin surface |
+| tokenjuice | exec output compaction | **missing** |
+| oc-path | `oc://` workspace paths | **missing** |
+| diffs (+language pack) | read-only diff viewer | **missing** |
+| migrate-claude, migrate-hermes | import from other agents | **missing** |
+| voice-call, facetime, talk-voice, tts-local-cli | phone / FaceTime / talk voice carriers, local TTS CLI | **missing** (talk.* RPCs + TTS providers exist; no telephony) |
+| google-meet, zoom-meetings, teams-meetings, slack-huddles | browser meeting participants | **missing** |
+| cua-computer, linux-node, mxc, openshell, crabbox | computer control, node capabilities, sandboxes, cloud workers | **missing** (computer/mobile_ui forward to a node; no Linux input injection) |
+| agentsapi, typesafe, visitor-access, device-pair, qa-channel/qa-lab | Agents API harness, typed decisions, CF Access grants, pairing UI, QA | **missing** / test-only upstream (device pairing itself is native) |
+
+
 ## 6. Plugin API
 
 The JS host (`plugins/js_bridge/host.mjs`) accepts all 60 upstream `api.register*` entry points (1.130; recount — the earlier audit said 59). A plugin that calls any of them keeps loading; before 1.130 an unimplemented call threw and the plugin failed.
@@ -228,6 +270,11 @@ offline fakes that copy the documented wire formats. The same applies to:
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
 5. ~~Plugin API inert registrations~~ (1.139: invoke + decision/web_fetch/media/reload/lifecycle hooks). 1.142/1.155: context engine (incl. bootstrap/compact/maintain), memory supplements, harness, speech, embedding provider, trusted-tool policy, realtime catalog (partials in §6).
 6. ~~SQLite session/transcript storage~~ (1.131, opt-in); ~~gateway state documents~~ (1.144/1.145, opt-in, document table covering cron/canvas/auth/WebAuthn/MFA/profiles); ~~plugin installs in config~~ (1.159 installed-plugin index); config itself is still a JSON file.
+
+7. **1.160 re-diff:** the bundled non-channel extensions in §5b. Most valuable next: web_search providers
+   (DuckDuckGo/SearXNG/Exa/Firecrawl), IMAP trigger, file-transfer, llm-task, SecretRef resolvers (1Password/Vault),
+   Prometheus `/metrics`. WhatsApp Web next gaps are in `docs/whatsapp-web-gap.md` (ClientPayload + ADV pair-success,
+   live Noise WS login, SenderKeys, app-state).
 
 ## 10. Test-suite notes
 
