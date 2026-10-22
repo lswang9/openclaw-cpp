@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.163.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.164.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.164.0-dev 新增
+
+WhatsApp Web：群 Sender Keys（SKDM 分发、链密钥 HMAC、WhisperGroup HKDF、AES-CBC、XEdDSA 签名 SKM、乱序≤2000、状态持久化）；CLI whatsapp-web sender-keys（e2e：scripts/e2e-waweb-sender-keys.sh）。
 
 ## 1.163.0-dev 新增
 

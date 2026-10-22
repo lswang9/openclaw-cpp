@@ -8,6 +8,7 @@
 #include "openclaw/channels/waweb/auth_store.hpp"
 #include "openclaw/channels/waweb/pairing.hpp"
 #include "openclaw/channels/waweb/session.hpp"
+#include "openclaw/channels/waweb/sender_keys.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/auth/mfa.hpp"
@@ -117,7 +118,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.163.0-dev";
+constexpr const char* kVersion = "1.164.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2582,6 +2583,35 @@ int CmdSelfTest() {
     }
     {
         namespace ww = openclaw::channels::waweb;
+        auto alice = ww::CreateSenderKey(7);
+        auto skdm = ww::EncodeSkdm(alice);
+        auto bob = ww::ProcessSkdm(skdm);
+        bool ok = bob.key_id == 7 && bob.signing.pub == alice.signing.pub && bob.signing.priv.empty();
+        auto m1 = ww::SenderKeyEncrypt(alice, ww::FromString("hi group"));
+        auto m2 = ww::SenderKeyEncrypt(alice, ww::FromString("again"));
+        auto m3 = ww::SenderKeyEncrypt(alice, ww::FromString("third"));
+        std::string e;
+        // out of order: deliver m3, m1, m2
+        auto p3 = ww::SenderKeyDecrypt(bob, m3.body, &e);
+        auto p1 = ww::SenderKeyDecrypt(bob, m1.body, &e);
+        auto p2 = ww::SenderKeyDecrypt(bob, m2.body, &e);
+        ok = ok && p3 && *p3 == ww::FromString("third") && p1 && *p1 == ww::FromString("hi group") && p2 && *p2 == ww::FromString("again");
+        ok = ok && !ww::SenderKeyDecrypt(bob, m1.body, &e);  // duplicate
+        auto bad = m3.body; bad.back() ^= 1;
+        ok = ok && !ww::SenderKeyDecrypt(bob, bad, &e);
+        auto dir = std::filesystem::temp_directory_path() / ("oc-sk-" + std::to_string(getpid()));
+        std::filesystem::create_directories(dir);
+        ww::SenderKeyRecord rec{{"g@g.us"}, {"1555:0"}, {alice}};
+        ok = ok && ww::SaveSenderKey(dir, rec);
+        auto loaded = ww::LoadSenderKey(dir, "g@g.us", "1555:0");
+        ok = ok && loaded && loaded->states.size() == 1 && loaded->states[0].chain_key == alice.chain_key &&
+             loaded->states[0].signing.priv == alice.signing.priv;
+        std::filesystem::remove_all(dir);
+        if (!ok) { std::cerr << "FAIL waweb sender keys\n"; ++failures; }
+        else std::cerr << "PASS waweb sender keys (SKDM, encrypt/decrypt, out-of-order, persist)\n";
+    }
+    {
+        namespace ww = openclaw::channels::waweb;
         auto companion = ww::InitAuthCreds();
         auto account = ww::GenerateKeyPair();
         auto login = ww::EncodeClientPayloadLogin(15551234567ULL, 15);
@@ -4306,6 +4336,21 @@ int main(int argc, char** argv) {
                 auto r = ww::ConfigureSuccessfulPairing(iq, *c);
                 out["ok"] = r.ok; out["error"] = r.error; out["me"] = c->me_jid; out["platform"] = c->platform;
                 if (r.ok) { out["reply"] = hex(ww::EncodeBinaryNode(r.reply)); ww::SaveAuthCreds(dir, *c); }
+            } else if (sub == "sender-keys") {
+                // Offline demo: create → distribute → encrypt/decrypt round-trip; optional --dir to persist.
+                auto alice = ww::CreateSenderKey(1);
+                auto skdm = ww::EncodeSkdm(alice);
+                auto bob = ww::ProcessSkdm(skdm);
+                auto env = ww::SenderKeyEncrypt(alice, ww::FromString("group hello"));
+                std::string e; auto pt = ww::SenderKeyDecrypt(bob, env.body, &e);
+                out["ok"] = pt && *pt == ww::FromString("group hello");
+                out["keyId"] = alice.key_id; out["iteration"] = env.iteration;
+                out["skdmBytes"] = skdm.size(); out["skmBytes"] = env.body.size();
+                if (!dir.empty()) {
+                    ww::SenderKeyRecord rec{{"demo@g.us"}, {"me:0"}, {alice}};
+                    ww::SaveSenderKey(dir, rec);
+                    out["saved"] = true;
+                }
             } else if (sub == "fake-server") {
                 std::string host = "127.0.0.1"; int port = 0; std::filesystem::path log;
                 std::string jid = "15550001234:1@s.whatsapp.net";
