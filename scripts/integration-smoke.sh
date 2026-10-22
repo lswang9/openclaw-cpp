@@ -71,7 +71,7 @@ echo "[smoke] POST /v1/rpc tools.list"
 RPC_TOOLS=$(curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools.list","params":{}}')
-echo "$RPC_TOOLS" | grep -q 'tools'
+grep -q tools <<<"$RPC_TOOLS"
 
 rpc() { curl -sf -X POST "http://${HOST}:${PORT}/v1/rpc" -H 'Content-Type: application/json' -d "$1"; }
 echo "[smoke] upstream gateway-backed CLI (health, devices list, gateway.restart.preflight via daemon)"
@@ -84,7 +84,7 @@ RL=$(rpc '{"jsonrpc":"2.0","id":9,"method":"config.reload","params":{}}')
 echo "$RL" | grep -Eq '"reloaded": ?true' && echo "$RL" | grep -Eq '"systemPromptChanged": ?true' || { echo "[smoke] hot reload failed: $RL" >&2; exit 1; }
 sleep 1; echo "{ gateway: { port: 'nope' } }" > "$OPENCLAW_CONFIG_PATH"
 rpc '{"jsonrpc":"2.0","id":10,"method":"config.reload","params":{}}' | grep -q 'expected integer' || { echo "[smoke] invalid reload not rejected" >&2; exit 1; }
-rpc '{"jsonrpc":"2.0","id":11,"method":"tools.list","params":{}}' | grep -q tools
+rpc '{"jsonrpc":"2.0","id":11,"method":"tools.list","params":{}}' | grep tools >/dev/null
 echo "[smoke] config hot reload + invalid config rejected (gateway keeps running)"
 rm -f "$OPENCLAW_CONFIG_PATH"
 
@@ -352,6 +352,7 @@ OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-node-worker.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-rpc-real.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-agent-tools.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-ext-channels.sh"
+OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-plugin-registrations.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-rpc-groups.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-rpc-local.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-config-schema.sh"

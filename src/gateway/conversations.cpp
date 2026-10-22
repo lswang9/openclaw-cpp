@@ -228,6 +228,7 @@ std::string CfgStr(const json& cfg, std::initializer_list<const char*> path) {
 }
 std::string Env(const char* k) { const char* v = std::getenv(k); return v ? v : ""; }
 
+std::function<json(const std::string&, const json&)> g_plugin_search;
 std::string WebSearch(const json& a, const json& cfg) {
     const auto query = a.value("query", std::string());
     if (query.empty()) return json{{"ok", false}, {"error", "query is required"}}.dump();
@@ -236,6 +237,13 @@ std::string WebSearch(const json& a, const json& cfg) {
     const std::string cfg_key = CfgStr(cfg, {"tools", "web", "search", "apiKey"});
     std::string brave = Env("BRAVE_API_KEY"), tav = Env("TAVILY_API_KEY");
     if (provider.empty()) provider = !brave.empty() ? "brave" : !tav.empty() ? "tavily" : !cfg_key.empty() ? "brave" : "";
+    const bool builtin = provider == "brave" || provider == "tavily";
+    if (g_plugin_search && (!builtin || (provider == "brave" && brave.empty() && cfg_key.empty()) || (provider == "tavily" && tav.empty() && cfg_key.empty()))) {
+        json args = a; args.erase("provider");
+        auto r = g_plugin_search(builtin ? std::string() : provider, args);
+        if (r.value("ok", false)) return json{{"provider", r.value("provider", provider)}, {"plugin", r.value("plugin", "")}, {"query", query}, {"result", r["result"]}, {"externalContent", true}}.dump();
+        if (!provider.empty() && !builtin) return json{{"ok", false}, {"error", r.value("error", std::string("plugin web search failed"))}}.dump();
+    }
     if (provider == "brave" && brave.empty()) brave = cfg_key;
     if (provider == "tavily" && tav.empty()) tav = cfg_key;
     if (provider.empty() || (provider == "brave" && brave.empty()) || (provider == "tavily" && tav.empty()))
@@ -385,6 +393,8 @@ std::string AskUser(const json& a, const std::string& agent, const std::string& 
     return json{{"status", "answered"}, {"questionId", id}, {"answers", lines}, {"mirroredToChannel", mirrored}}.dump();
 }
 }  // namespace
+
+void SetPluginWebSearch(std::function<json(const std::string&, const json&)> fn) { g_plugin_search = std::move(fn); }
 
 std::vector<std::string> ExtraGatewayToolNames() {
     return {"web_search", "ask_user", "view_image", "agents_wait", "conversations_list", "conversations_send", "conversations_turn"};

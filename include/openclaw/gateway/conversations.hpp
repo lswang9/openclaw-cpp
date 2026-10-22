@@ -21,4 +21,6 @@ nlohmann::json ConvRpc(const std::string& method, const nlohmann::json& params);
 bool ExtraGatewayTool(const std::string& name, const nlohmann::json& args, const std::string& agent, const std::string& session_key,
                       const nlohmann::json& cfg, const std::string& tool_root, std::string* out);
 std::vector<std::string> ExtraGatewayToolNames();
+// Plugin web search providers (api.registerWebSearchProvider): (provider id or "", tool args) → {ok, provider, result}|{ok:false,error}.
+void SetPluginWebSearch(std::function<nlohmann::json(const std::string& provider, const nlohmann::json& args)> fn);
 }  // namespace openclaw::gateway

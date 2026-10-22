@@ -60,7 +60,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.129.0-dev";
+constexpr const char* kVersion = "1.130.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -269,6 +269,17 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
                 if (!e.empty()) ev["error"] = e;
                 js->EmitHook("after_tool_call", ev);
             };
+        if (js->HasRegistration("registerAgentToolResultMiddleware"))
+            o.tool_result_middleware = [js](const std::string& t, const nlohmann::json& a, const std::string& r, bool is_err) {
+                auto ctx = tools::exec::CurrentContext();
+                auto res = js->Rpc("tool_result_middleware", {{"toolName", t}, {"args", a}, {"result", r}, {"isError", is_err}, {"agentId", ctx.agent_id}, {"sessionKey", ctx.session_key}});
+                return res.value("changed", false) && res.contains("result") && res["result"].is_string() ? res["result"].get<std::string>() : r;
+            };
+        if (js->HasRegistration("registerTextTransforms"))
+            o.text_transform = [js](const std::string& dir, const std::string& text) {
+                auto res = js->Rpc("text_transform", {{"direction", dir}, {"text", text}});
+                return res.contains("text") && res["text"].is_string() ? res["text"].get<std::string>() : text;
+            };
     }
     if (o.max_turns == 0) o.max_turns = 1;
     return o;
@@ -279,6 +290,11 @@ Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), de
     SetSubsystemContext(&deps_, SubsystemDataRoot(deps_));
     SetGatewayEmitter([this](const std::string& e, const nlohmann::json& p) { Emit(e, p); });
     ConvSetRoot(SubsystemDataRoot(deps_).string());
+    SetPluginWebSearch([this](const std::string& provider, const nlohmann::json& args) -> nlohmann::json {
+        auto* js = deps_.js_host;
+        if (!js || !js->HasRegistration("registerWebSearchProvider")) return {{"ok", false}, {"error", "no plugin web search provider"}};
+        return js->Rpc("web_search", {{"provider", provider}, {"args", args}});
+    });
     ConvSetSender([this](const std::string& ch, const std::string& to, const std::string& text, const nlohmann::json& extra) -> nlohmann::json {
         auto* out = dynamic_cast<channels::OutboundRecordAdapter*>(deps_.adapters.Get(ch));
         if (!out) return {{"ok", false}, {"error", "channel does not support outbound: " + ch}};

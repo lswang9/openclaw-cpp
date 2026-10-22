@@ -25,7 +25,7 @@ Reproduce the numbers with:
 | Config root keys | 46 | 46 accepted | ~20 deeply validated | 26 shallow (key accepted, sub-shape not validated) | 0 |
 | Channel extensions | 27 messaging | 11 working | telegram (1.126), discord, slack, feishu, whatsapp (Cloud API), imessage (bridge inbound); signal, matrix, msteams, googlechat, mattermost (1.129, text) | whatsapp-web (partial Noise/Baileys); 1.129 channels lack live listeners/inbound signature checks | 16 (§5) |
 | Model-provider extensions | ~85 | 28 built-in ids + any `models.providers.*` | 4 wire formats (chat completions, Responses, Anthropic Messages, Gemini) offline-tested | token streaming over SSE for all four formats (1.127); no OAuth/Bedrock/Vertex signing | Bedrock, Vertex, Copilot, Codex OAuth, … |
-| Plugin API (`api.register*`) | 59 | 10 (JS host) + C ABI | registerTool/Provider/GatewayMethod/HttpRoute/Hook/Command/Cli/Service/Channel/HttpHandler | Channel/Service are thin | 49 (§6) |
+| Plugin API (`api.register*`) | 60 | 60 accepted (JS host) + C ABI | 12 consumed: Tool/Provider/GatewayMethod/HttpRoute/Hook/Command/Cli/Service/Channel + WebSearchProvider/TextTransforms/AgentToolResultMiddleware (1.130) | Channel/Service thin; 48 captured but not consumed | 0 rejected; 48 unconsumed (§6) |
 
 ## 1. CLI tree
 
@@ -152,16 +152,21 @@ provider factory. Some raw-config consumers still read raw values.
 
 ## 6. Plugin API
 
-The JS host (`plugins/js_bridge/host.mjs`) implements 10 of 59 `api.register*` entry points:
+The JS host (`plugins/js_bridge/host.mjs`) accepts all 60 upstream `api.register*` entry points (1.130; recount — the earlier audit said 59). A plugin that calls any of them keeps loading; before 1.130 an unimplemented call threw and the plugin failed.
+
+**Consumed by the C++ runtime (12 upstream + the non-upstream registerHttpHandler):**
 - registerTool, registerProvider, registerGatewayMethod, registerHttpRoute, registerHttpHandler
 - registerHook, registerCommand, registerCli, registerService, registerChannel (thin)
+- 1.130: registerWebSearchProvider (feeds `web_search` when no built-in Brave/Tavily key, or by provider id), registerTextTransforms (input rewrites on the newest user message before the provider call; output rewrites on the final assistant text — already-streamed deltas are not rewritten), registerAgentToolResultMiddleware (string/array/RegExp/function matcher; rewrites tool results before the model sees them)
 
-Not implemented:
-- the agent harness/executor/middleware APIs
+**Captured only (48):** recorded and counted in the host's `initialize`/`list_registrations` answer, but nothing in the C++ runtime calls them yet:
+- the agent harness/executor/event-subscription APIs
 - the context engine, compaction, embedding, memory capability/corpus/prompt APIs
-- the speech/realtime/transcription/image/video/music generation providers
-- web search, storage, session catalog/extension/action, config migration, Control UI descriptors
-- security audit collectors, trusted tool policy, node host commands, worker providers, etc.
+- the speech/realtime/transcription/media-understanding/image/video/music generation providers
+- web fetch, storage, session catalog/extension/action/scheduler, config migration, Control UI descriptors, widget presenters
+- security audit collectors, trusted tool policy, node host commands/invoke policy, worker providers, gateway access policy/discovery, etc.
+
+Offline e2e: `scripts/e2e-plugin-registrations.sh`.
 
 The native C ABI (`docs/PLUGIN-SDK.md`) is a Linux-only subset with no upstream equivalent.
 
@@ -207,7 +212,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 2. ~~Signal, Matrix, MS Teams, Google Chat, Mattermost~~ (text transports in 1.129; live listeners/verification listed in §5).
 3. ~~Native streaming~~ (done in 1.127); Bedrock/Vertex auth remain.
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
-5. Plugin API breadth: provider families, context engine, memory capability.
+5. Plugin API: all register* accepted (1.130); still unconsumed: context engine, memory capability, media/speech providers, harness APIs.
 6. SQLite-backed session and transcript storage, for on-disk parity.
 
 ## 10. Test-suite notes
@@ -218,3 +223,5 @@ runs in the same minute (and `connect`, which polled `pairing.link.claim` every 
 budget, so the device-token claim was rate-limited and the token came back empty. Fixed in 1.126: the smoke gateway uses
 its own data dir, polls with the correct secret on a still-pending link no longer consume the budget (bad secrets
 still do), and `connect` polls once a second.
+
+- 1.130: the smoke `tools.list` checks piped large RPC output into `grep -q` under `pipefail`; once the tool list grew, the writer occasionally got SIGPIPE (rc 141). They now use a here-string / `grep >/dev/null`.

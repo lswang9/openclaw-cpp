@@ -48,6 +48,8 @@ public:
     bool HasCommand(const std::string& name) const;
     bool HasHook(const std::string& event) const;
     bool HasGatewayMethod(const std::string& method) const;
+    // 1.130: count of captured api.register<Kind> registrations (e.g. "registerTextTransforms").
+    bool HasRegistration(const std::string& kind) const;
     // {text, raw} or {error}
     nlohmann::json RunCommand(const std::string& name, const std::string& args, const nlohmann::json& ctx);
     // {handlers, results, merged} — merged = payload with handler results shallow-merged in order

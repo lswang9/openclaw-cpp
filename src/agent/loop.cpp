@@ -51,6 +51,9 @@ LoopResult RunAgentLoop(provider::Provider& provider,
                               ? std::chrono::steady_clock::now() + opts.timeout
                               : std::chrono::steady_clock::time_point::max();
 
+    if (opts.text_transform)
+        for (auto it = out.messages.rbegin(); it != out.messages.rend(); ++it)
+            if (it->role == "user") { it->content = opts.text_transform("input", it->content); break; }
     for (std::size_t turn = 0; turn < opts.max_turns; ++turn) {
         ++out.turns;
         if (opts.verbose) {
@@ -89,8 +92,9 @@ LoopResult RunAgentLoop(provider::Provider& provider,
         out.messages.push_back(completion.message);
 
         if (completion.tool_calls.empty() || completion.finish_reason == "stop") {
+            if (opts.text_transform) out.messages.back().content = opts.text_transform("output", out.messages.back().content);
             out.ok = true;
-            out.final_text = completion.message.content;
+            out.final_text = out.messages.back().content;
             return out;
         }
 
@@ -149,6 +153,7 @@ LoopResult RunAgentLoop(provider::Provider& provider,
                 if (opts.after_tool_call)
                     opts.after_tool_call(tc.name, args, result,
                                          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(), err);
+                if (opts.tool_result_middleware) result = opts.tool_result_middleware(tc.name, args, result, !err.empty());
             }
             Message tool_msg;
             tool_msg.role = "tool";

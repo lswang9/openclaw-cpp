@@ -32,6 +32,10 @@ struct LoopOptions {
                        long long duration_ms, const std::string& error)> after_tool_call;
     // Token-level streaming of assistant content (all turns). Set → provider.CompleteStreaming is used.
     std::function<void(std::string_view delta)> on_delta;
+    // Plugin api.registerAgentToolResultMiddleware: may rewrite a tool result before the model sees it.
+    std::function<std::string(const std::string& tool, const nlohmann::json& args, const std::string& result, bool is_error)> tool_result_middleware;
+    // Plugin api.registerTextTransforms: direction "input" (newest user message) / "output" (final assistant text).
+    std::function<std::string(const std::string& direction, const std::string& text)> text_transform;
 };
 
 class RateBucket {

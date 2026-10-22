@@ -34,6 +34,31 @@ const services = [];            // {plugin, svc}
 const channels = new Map();     // id -> {plugin, ch}
 const providers = new Map();    // id -> {plugin, p}
 const httpRoutes = [];          // {plugin, path, match, auth, handler}
+const registrations = new Map(); // register* kind -> [{plugin, value, opts}] (1.130: every upstream api.register* is accepted)
+const CAPTURED_KINDS = ['registerAgentEventSubscription', 'registerAgentExecutorController', 'registerAgentHarness', 'registerAgentToolResultMiddleware',
+  'registerAutoEnableProbe', 'registerBoardWidgetContentKind', 'registerCliBackend', 'registerCodexAppServerExtensionFactory', 'registerCompactionProvider',
+  'registerConfigMigration', 'registerContextEngine', 'registerControlUiDescriptor', 'registerDecisionProvider', 'registerEmbeddingProvider',
+  'registerGatewayAccessPolicy', 'registerGatewayDiscoveryService', 'registerHostedMediaResolver', 'registerImageGenerationProvider',
+  'registerInteractiveHandler', 'registerMcpServerConnectionResolver', 'registerMediaUnderstandingProvider', 'registerMemoryCapability',
+  'registerMemoryCorpusSupplement', 'registerMemoryPromptPreparation', 'registerMemoryPromptSupplement', 'registerMigrationProvider',
+  'registerModelCatalogProvider', 'registerMusicGenerationProvider', 'registerNodeCliFeature', 'registerNodeHostCommand', 'registerNodeInvokePolicy',
+  'registerRealtimeTranscriptionProvider', 'registerRealtimeVoiceProvider', 'registerReload', 'registerRuntimeLifecycle', 'registerSecurityAuditCollector',
+  'registerSessionAction', 'registerSessionCatalog', 'registerSessionExtension', 'registerSessionSchedulerJob', 'registerSpeechProvider',
+  'registerStorageProvider', 'registerTextTransforms', 'registerToolMetadata', 'registerTranscriptSourceProvider', 'registerTrustedToolPolicy',
+  'registerVideoGenerationProvider', 'registerWebFetchProvider', 'registerWebSearchProvider', 'registerWidgetPresenter', 'registerWorkerProvider'];
+function regs(kind) { return registrations.get(kind) || []; }
+function toolResultText(r) {
+  if (typeof r === 'string') return r;
+  if (r && Array.isArray(r.content)) return r.content.filter((c) => c && c.type === 'text').map((c) => c.text).join('\n');
+  return JSON.stringify(r);
+}
+function applyReplacements(list, text) {
+  for (const { from, to } of list) {
+    if (from instanceof RegExp) text = text.replace(from.global ? from : new RegExp(from.source, from.flags + 'g'), to);
+    else if (typeof from === 'string' && from) text = text.split(from).join(to);
+  }
+  return text;
+}
 const cliCommands = new Map();  // top-level name -> {plugin, cmd}
 let hostConfig = {};
 const events = [];            // queued host-side effects drained by the gateway (drain_events)
@@ -284,6 +309,11 @@ function makeApi(rec) {
       httpRoutes.push({ plugin: rec.id, path: r.path, match: r.match || 'exact', auth: r.auth || 'gateway', handler: r.handler });
     },
     registerHttpHandler(fn) { if (typeof fn === 'function') httpRoutes.push({ plugin: rec.id, path: '/', match: 'any', auth: 'gateway', handler: fn }); },
+    ...Object.fromEntries(CAPTURED_KINDS.map((kind) => [kind, (value, opts) => {
+      if (value === undefined || value === null) return api.logger.warn(`${kind}: missing registration`);
+      if (!registrations.has(kind)) registrations.set(kind, []);
+      registrations.get(kind).push({ plugin: rec.id, value, opts });
+    }])),
     registerCli(fn, opts) {
       if (typeof fn !== 'function') return;
       const program = makeProgram(rec.id);
@@ -326,7 +356,7 @@ async function loadPluginDir(dir) {
 
 async function scan(roots) {
   plugins.clear(); tools.clear(); commands.clear(); hooks.clear(); gwMethods.clear(); services.length = 0;
-  channels.clear(); providers.clear(); httpRoutes.length = 0; cliCommands.clear();
+  channels.clear(); providers.clear(); httpRoutes.length = 0; cliCommands.clear(); registrations.clear();
   for (const root of roots) {
     if (!root || !fs.existsSync(root)) continue;
     if (pluginEntries(root)) { await loadPluginDir(root); continue; }
@@ -371,6 +401,7 @@ async function handle(req) {
           hooks: [...hooks.keys()], gatewayMethods: [...gwMethods.keys()], services: services.map((s) => `${s.plugin}/${s.svc.id}`),
           channels: [...channels.keys()], providers: [...providers.keys()], cli: [...cliCommands.keys()],
           httpRoutes: httpRoutes.map((r) => ({ path: r.path, match: r.match, auth: r.auth, plugin: r.plugin })),
+          registrations: Object.fromEntries([...registrations].map(([k, v]) => [k, v.length])),
         });
       }
       case 'list_plugins':
@@ -587,6 +618,43 @@ async function handle(req) {
         if (typeof fn !== 'function') return respond(id, null, { code: -32601, message: 'provider has no OAuth refresh' });
         const cred = await fn(params.credential || {}, { config: hostConfig });
         return respond(id, { credential: cred });
+      }
+      case 'list_registrations':
+        return respond(id, { registrations: Object.fromEntries([...registrations].map(([k, v]) => [k, v.map((r) => ({
+          plugin: r.plugin, id: r.value && (r.value.id || r.value.name || r.value.kind) || null, label: r.value && r.value.label || null,
+          type: typeof r.value }))])) });
+      case 'web_search': {
+        const want = params.provider;
+        const entry = regs('registerWebSearchProvider').find((r) => !want || r.value.id === want);
+        if (!entry) return respond(id, { ok: false, error: want ? `no plugin web search provider ${want}` : 'no plugin web search provider' });
+        try {
+          const tool = typeof entry.value.createTool === 'function' ? entry.value.createTool({ config: hostConfig }) : null;
+          if (!tool || typeof tool.execute !== 'function') return respond(id, { ok: false, error: `provider ${entry.value.id} has no tool` });
+          const result = await tool.execute(params.args || {}, {});
+          return respond(id, { ok: true, provider: entry.value.id, plugin: entry.plugin, result });
+        } catch (e) { return respond(id, { ok: false, provider: entry.value.id, error: String(e && e.message || e) }); }
+      }
+      case 'text_transform': {
+        const dir = params.direction === 'input' ? 'input' : 'output';
+        let text = String(params.text ?? '');
+        for (const r of regs('registerTextTransforms')) if (Array.isArray(r.value[dir])) text = applyReplacements(r.value[dir], text);
+        return respond(id, { text });
+      }
+      case 'tool_result_middleware': {
+        let result = { content: [{ type: 'text', text: String(params.result ?? '') }] };
+        const event = { toolCallId: params.toolCallId || '', toolName: params.toolName, args: params.args || {}, isError: !!params.isError, result };
+        const ctx = { runtime: 'openclaw', agentId: params.agentId, sessionKey: params.sessionKey };
+        let changed = false;
+        for (const r of regs('registerAgentToolResultMiddleware')) {
+          const m = r.opts && r.opts.matcher;
+          if (m && ((typeof m === 'string' && m !== params.toolName) || (Array.isArray(m) && !m.includes(params.toolName)) ||
+                    (m instanceof RegExp && !m.test(params.toolName)) || (typeof m === 'function' && !m(params.toolName)))) continue;
+          try {
+            const out = await r.value({ ...event, result }, ctx);
+            if (out && out.result) { result = out.result; changed = true; }
+          } catch (e) { process.stderr.write(`[plugin:${r.plugin}] tool result middleware failed: ${e}\n`); }
+        }
+        return respond(id, { changed, result: toolResultText(result) });
       }
       case 'shutdown': {
         for (const run of channelRuns.values()) { try { run.abort.abort(); } catch {} }

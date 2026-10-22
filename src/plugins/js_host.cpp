@@ -313,6 +313,10 @@ bool JsHost::HasCommand(const std::string& n) const {
     std::lock_guard l(state_mu_); return InitListHas(last_init_, "commands", low);
 }
 bool JsHost::HasHook(const std::string& e) const { std::lock_guard l(state_mu_); return InitListHas(last_init_, "hooks", e); }
+bool JsHost::HasRegistration(const std::string& k) const {
+    std::lock_guard l(state_mu_);
+    return last_init_.contains("registrations") && last_init_["registrations"].is_object() && last_init_["registrations"].value(k, 0) > 0;
+}
 bool JsHost::HasGatewayMethod(const std::string& m) const { std::lock_guard l(state_mu_); return InitListHas(last_init_, "gatewayMethods", m); }
 
 nlohmann::json JsHost::RunCommand(const std::string& name, const std::string& args, const nlohmann::json& ctx) {
