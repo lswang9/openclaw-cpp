@@ -2,6 +2,9 @@
 # Offline: Gemini batchEmbedContents + Voyage /embeddings clients against local fake servers (task types,
 # auth headers, outputDimensionality), auto-selection by env key, both models side by side in the SQLite store.
 set -euo pipefail
+# Offline guard: never leak host LLM keys when this script is run alone (1.136).
+export OPENCLAW_DEFAULT_PROVIDER="${OPENCLAW_DEFAULT_PROVIDER:-mock}"
+unset DEEPSEEK_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY XAI_API_KEY MISTRAL_API_KEY GROQ_API_KEY 2>/dev/null || true
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT="${OPENCLAW_E2E_GV_PORT:-$((20400 + RANDOM % 300))}"

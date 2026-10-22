@@ -2,6 +2,9 @@
 # Discord voice offline: fake voice gateway (WS v8) + UDP; client does Identify/Ready/IP discovery/Select Protocol/
 # Session Description/Speaking, sends Ogg-demuxed Opus as AES-GCM rtpsize RTP paced 20 ms, then 5 silence frames.
 set -euo pipefail
+# Offline guard: never leak host LLM keys when this script is run alone (1.136).
+export OPENCLAW_DEFAULT_PROVIDER="${OPENCLAW_DEFAULT_PROVIDER:-mock}"
+unset DEEPSEEK_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY XAI_API_KEY MISTRAL_API_KEY GROQ_API_KEY 2>/dev/null || true
 # reap background gateways/fakes on any exit, including timeout/^C
 _reap(){ kill $(jobs -p) 2>/dev/null || true; }
 trap '_reap; exit 143' INT TERM HUP

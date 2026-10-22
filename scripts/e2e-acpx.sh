@@ -4,6 +4,9 @@
 # /etc/passwd refused), fs/write_text_file (only with --fs-write), audio passthrough vs local STT fallback;
 # (2) real interop with openclaw-cpp's own `acp-stdio` agent, incl. an audio block transcribed agent-side.
 set -euo pipefail
+# Offline guard: never leak host LLM keys when this script is run alone (1.136).
+export OPENCLAW_DEFAULT_PROVIDER="${OPENCLAW_DEFAULT_PROVIDER:-mock}"
+unset DEEPSEEK_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY XAI_API_KEY MISTRAL_API_KEY GROQ_API_KEY 2>/dev/null || true
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d)

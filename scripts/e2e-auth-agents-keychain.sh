@@ -2,6 +2,9 @@
 # Per-agent auth profiles (agent "work" uses its own store; others fall back to main) + libsecret keychain
 # round trip when a Secret Service can be started (gnome-keyring under dbus-run-session); otherwise SKIP that half.
 set -euo pipefail
+# Offline guard: never leak host LLM keys when this script is run alone (1.136).
+export OPENCLAW_DEFAULT_PROVIDER="${OPENCLAW_DEFAULT_PROVIDER:-mock}"
+unset DEEPSEEK_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY XAI_API_KEY MISTRAL_API_KEY GROQ_API_KEY 2>/dev/null || true
 # reap background gateways/fakes on any exit, including timeout/^C
 _reap(){ kill $(jobs -p) 2>/dev/null || true; }
 trap '_reap; exit 143' INT TERM HUP

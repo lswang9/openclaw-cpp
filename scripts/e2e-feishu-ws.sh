@@ -3,6 +3,9 @@
 # pong ClientConfig applied (PingInterval), multi-part event reassembly (out-of-order parts), ack frame (code 200,
 # biz_rt), gzip card.action.trigger answered with base64 card JSON, server drop → reconnect per ClientConfig, and the agent reply posted via im/v1/messages with the tenant token. Fake server only.
 set -euo pipefail
+# Offline guard: never leak host LLM keys when this script is run alone (1.136).
+export OPENCLAW_DEFAULT_PROVIDER="${OPENCLAW_DEFAULT_PROVIDER:-mock}"
+unset DEEPSEEK_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY XAI_API_KEY MISTRAL_API_KEY GROQ_API_KEY 2>/dev/null || true
 # reap background gateways/fakes on any exit, including timeout/^C
 _reap(){ kill $(jobs -p) 2>/dev/null || true; }
 trap '_reap; exit 143' INT TERM HUP

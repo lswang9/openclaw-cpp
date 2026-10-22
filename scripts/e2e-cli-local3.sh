@@ -2,6 +2,9 @@
 # 1.122: local CLI batch 3 — directory (fake Discord/Slack/Telegram), proxy (debug proxy capture/run/query/validate),
 # database (SQLite preflight via the built-in reader, ownership), update (wizard/cleanup/recover/migration-plan/admit/adopt-immutable).
 set -eu
+# Offline guard: never leak host LLM keys when this script is run alone (1.136).
+export OPENCLAW_DEFAULT_PROVIDER="${OPENCLAW_DEFAULT_PROVIDER:-mock}"
+unset DEEPSEEK_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY XAI_API_KEY MISTRAL_API_KEY GROQ_API_KEY 2>/dev/null || true
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); FK=""; UP=""; PX=""

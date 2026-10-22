@@ -2,6 +2,9 @@
 # 1.133: view_image results reach the model as real image input (Anthropic image block, Gemini inlineData,
 # Responses input_image, chat-completions image_url) and the base64 is stripped from the tool-result text.
 set -eu
+# Offline guard: never leak host LLM keys when this script is run alone (1.136).
+export OPENCLAW_DEFAULT_PROVIDER="${OPENCLAW_DEFAULT_PROVIDER:-mock}"
+unset DEEPSEEK_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY XAI_API_KEY MISTRAL_API_KEY GROQ_API_KEY 2>/dev/null || true
 # reap background gateways/fakes on any exit, including timeout/^C
 _reap(){ kill $(jobs -p) 2>/dev/null || true; }
 trap '_reap; exit 143' INT TERM HUP
