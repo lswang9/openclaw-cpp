@@ -110,7 +110,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.130.0-dev";
+constexpr const char* kVersion = "1.131.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3917,6 +3917,11 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) { PrintUsage(); return 1; }
         std::string cmd = argv[1];
+        try {  // 1.131: session.store = "sqlite" selects the upstream agent-DB layout (OPENCLAW_SESSION_STORE overrides)
+            auto lr0 = openclaw::config::Load(openclaw::config::DefaultPath());
+            auto st = lr0.exists ? openclaw::config::GetPath(lr0.snap.raw, "session.store") : std::nullopt;
+            if (st && st->is_string()) openclaw::session::SetSessionBackend(st->get<std::string>());
+        } catch (...) {}
         if (cmd == "self-test") return CmdSelfTest();
         if (cmd == "status") return CmdStatus();
         if (cmd == "tools") {

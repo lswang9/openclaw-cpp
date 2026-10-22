@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openclaw/agent/types.hpp"
+#include "openclaw/session/sqlite_backend.hpp"
 
 #include <nlohmann/json.hpp>
 #include <cstdint>
@@ -49,6 +50,9 @@ public:
     explicit Store(std::filesystem::path root);
 
     std::filesystem::path Root() const { return root_; }
+    // 1.131: "sqlite" when backed by <root>/openclaw-agent.sqlite (upstream agent DB layout), else "json".
+    std::string Backend() const { return db_ ? "sqlite" : "json"; }
+    nlohmann::json StorageInfo() const;
     std::vector<std::string> List() const;
     bool Exists(const std::string& id) const;
     std::vector<agent::Message> Load(const std::string& id) const;
@@ -105,6 +109,8 @@ private:
     mutable std::recursive_mutex index_mu_;
     std::shared_ptr<std::recursive_mutex> MutexFor(const std::string& id) const;
     std::filesystem::path root_;
+    std::shared_ptr<SqliteBackend> db_;
+    nlohmann::json migration_;
     mutable std::recursive_mutex map_mu_;
     mutable std::unordered_map<std::string, std::shared_ptr<std::recursive_mutex>> locks_;
 };

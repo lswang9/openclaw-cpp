@@ -185,8 +185,7 @@ The native C ABI (`docs/PLUGIN-SDK.md`) is a Linux-only subset with no upstream 
   templates, the `gmail` preset with forEach, token header rules, body limit, session-key prefix policy
 
 **Partial:**
-- **State is JSON files**, where upstream uses SQLite for sessions, transcripts and most stores. Behaviour matches,
-  but the on-disk format and `database`/`storage` semantics differ.
+- **Session storage (1.131):** `session.store: "sqlite"` (or `OPENCLAW_SESSION_STORE=sqlite`) stores sessions in `<sessions dir>/openclaw-agent.sqlite`, created from the verbatim upstream v2026.10.5 schema (all 57 tables, `user_version` 25, `schema_meta` primary row with role `agent`). The index entry goes in `session_nodes.entry_json`, each sessionId gets a `session_windows` row (`initial`/`reset`), and transcript lines go in `transcript_events.event_json` (same JSONL line shape as the file store). On first open, existing JSON/JSONL sessions are imported once; the files are left in place and a `sessions.migrated-to-sqlite.json` receipt is written. `sessions.reset` now starts a new window and archives the old transcript, as upstream does (it used to truncate). Default is still JSON. Partial: only the session/transcript tables are written; the other upstream tables (conversations, memory index, standing intents, pending inputs, …) exist but the C++ stores for those features remain JSON files. Events are stored as plain `event_json` (no zstd tier, no `navigation_json`), and upstream's own legacy-schema upgrade path (v<25 → 25) is not replicated — older upstream databases are refused rather than migrated. E2e: `scripts/e2e-sqlite-sessions.sh`.
 - **Streaming** (1.127): token-level SSE for chat completions, Anthropic Messages (text + tool_use input_json deltas), Gemini `streamGenerateContent?alt=sse` and Responses (`output_text.delta`, `output_item.done`), offline-tested. Reasoning/thinking blocks are dropped, not surfaced.
 - **Hooks:** there is no idempotency replay cache across restarts, no per-mapping `transform` modules, and
   `next-heartbeat` wakes queue to a file that heartbeat consumes.
@@ -213,7 +212,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 3. ~~Native streaming~~ (done in 1.127); Bedrock/Vertex auth remain.
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
 5. Plugin API: all register* accepted (1.130); still unconsumed: context engine, memory capability, media/speech providers, harness APIs.
-6. SQLite-backed session and transcript storage, for on-disk parity.
+6. ~~SQLite session/transcript storage~~ (1.131, opt-in); other stores still JSON.
 
 ## 10. Test-suite notes
 

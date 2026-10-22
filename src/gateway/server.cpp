@@ -60,7 +60,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.130.0-dev";
+constexpr const char* kVersion = "1.131.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2464,7 +2464,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
                    {"tools", deps_.tools.Names()}, {"sessions", deps_.sessions.List()},
                    {"providers", deps_.router ? nlohmann::json(deps_.router->Names()) : nlohmann::json::array()},
                    {"skills", deps_.skills.StatusJson()}, {"adapters", deps_.adapters.StatusJson()},
-                   {"auth", deps_.auth.require_auth}});
+                   {"auth", deps_.auth.require_auth}, {"sessionStore", deps_.sessions.StorageInfo()}});
     }
     if (method == "connect") {
         if (params.is_object() && params.value("role", "") == "node") {
@@ -2600,8 +2600,9 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
             deps_.logs.Append("info", "compacted session " + key);
             return ok({{"key", key}, {"compacted", true}, {"before", msgs.size()}, {"messages", kept.size()}});
         }
-        deps_.sessions.Save(key, {});
-        return ok({{"key", key}, {"reset", true}});
+        // Upstream: a reset starts a new session window (fresh sessionId); the old transcript is archived, not erased.
+        auto entry = deps_.sessions.Reset(key, params.value("reason", std::string("reset")));
+        return ok({{"key", key}, {"reset", true}, {"entry", entry}, {"sessionId", entry.value("sessionId", "")}});
     }
     if (method == "sessions.patch") {
         const std::string key = params.value("key", params.value("id", ""));

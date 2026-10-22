@@ -15,9 +15,61 @@
 namespace openclaw::session {
 namespace fs = std::filesystem;
 std::string NewSessionIdPublic();
+std::vector<nlohmann::json> BuildTranscriptLines(const std::string& sid, const std::string& key, const std::vector<agent::Message>& messages);
 
 Store::Store(fs::path root) : root_(std::move(root)) {
     fs::create_directories(root_);
+    if (SessionBackend() != "sqlite") return;
+    auto db = std::make_shared<SqliteBackend>(root_, root_.filename().string());
+    if (db->Empty()) {
+        // One-time, non-destructive import of the JSON/JSONL store (files are left in place).
+        std::size_t n = 0, msgs = 0;
+        for (const auto& key : List()) {
+            auto m = Load(key);
+            auto e = IndexEntry(key);
+            if (!e.is_object()) e = nlohmann::json::object();
+            if (!e.contains("sessionId")) e["sessionId"] = NewSessionIdPublic();
+            const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            if (!e.contains("createdAt")) e["createdAt"] = now;
+            if (!e.contains("updatedAt")) e["updatedAt"] = now;
+            e["messages"] = m.size();
+            db->Replace(key, e, BuildTranscriptLines(e["sessionId"].get<std::string>(), key, m));
+            ++n; msgs += m.size();
+        }
+        if (n) {
+            migration_ = {{"importedSessions", n}, {"importedMessages", msgs}, {"from", "json"}, {"at", std::time(nullptr)}};
+            std::ofstream(root_ / "sessions.migrated-to-sqlite.json") << migration_.dump(2);
+        }
+    }
+    db_ = std::move(db);
+}
+
+nlohmann::json Store::StorageInfo() const {
+    nlohmann::json j{{"backend", Backend()}, {"root", root_.string()}};
+    if (db_) j["sqlite"] = db_->Stats();
+    if (!migration_.is_null()) j["migration"] = migration_;
+    return j;
+}
+
+std::vector<nlohmann::json> BuildTranscriptLines(const std::string& sid, const std::string& key, const std::vector<agent::Message>& messages) {
+    auto t = std::chrono::system_clock::now();
+    std::time_t tt = std::chrono::system_clock::to_time_t(t);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count() % 1000;
+    std::tm u{}; gmtime_r(&tt, &u);
+    char buf[40]; std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%S", &u);
+    char out[48]; std::snprintf(out, sizeof out, "%s.%03dZ", buf, static_cast<int>(ms));
+    const std::string ts = out;
+    std::vector<nlohmann::json> lines;
+    lines.push_back({{"type", "session"}, {"version", 3}, {"id", sid}, {"key", key}, {"timestamp", ts}});
+    std::string parent;
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        std::ostringstream mid; mid << std::hex << std::setw(8) << std::setfill('0') << (i + 1);
+        nlohmann::json line{{"type", "message"}, {"id", mid.str()}, {"timestamp", ts}, {"message", messages[i].ToJson()}};
+        line["parentId"] = parent.empty() ? nlohmann::json(nullptr) : nlohmann::json(parent);
+        lines.push_back(line);
+        parent = mid.str();
+    }
+    return lines;
 }
 
 std::shared_ptr<std::recursive_mutex> Store::MutexFor(const std::string& id) const {
@@ -74,6 +126,7 @@ fs::path Store::LegacyPathFor(const std::string& id) const {
 }
 
 std::vector<std::string> Store::List() const {
+    if (db_) return db_->Keys();
     std::vector<std::string> ids;
     if (!fs::exists(root_)) return ids;
     for (const auto& e : fs::directory_iterator(root_)) {
@@ -93,6 +146,7 @@ std::vector<std::string> Store::List() const {
 
 bool Store::Exists(const std::string& id) const {
     auto g = Lock(id);
+    if (db_) return db_->Exists(id);
     return fs::exists(PathFor(id));
 }
 
@@ -119,6 +173,11 @@ std::vector<agent::Message> ParseTranscript(const fs::path& path) {
 
 std::vector<agent::Message> Store::Load(const std::string& id) const {
     auto g = Lock(id);
+    if (db_) {
+        std::vector<agent::Message> msgs;
+        for (auto& j : db_->Lines(id)) if (j.value("type", "") == "message" && j.contains("message")) msgs.push_back(agent::Message::FromJson(j["message"]));
+        return msgs;
+    }
     const auto path = PathFor(id);
     if (!fs::exists(path)) return {};
     return ParseTranscript(path);
@@ -126,6 +185,14 @@ std::vector<agent::Message> Store::Load(const std::string& id) const {
 
 void Store::Save(const std::string& id, const std::vector<agent::Message>& messages) const {
     auto g = Lock(id);
+    if (db_) {
+        auto e = db_->Entry(id);
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        if (!e.is_object()) e = {{"sessionId", NewSessionIdPublic()}, {"createdAt", now}};
+        e["updatedAt"] = now; e["messages"] = messages.size();
+        db_->Replace(id, e, BuildTranscriptLines(e["sessionId"].get<std::string>(), id, messages));
+        return;
+    }
     const auto src = PathFor(id);
     const auto dst = WritePathFor(id);
     if (!IndexEntry(id).is_object()) Touch(id, 0);
@@ -172,6 +239,7 @@ void Store::Append(const std::string& id, const agent::Message& message) const {
 
 bool Store::Remove(const std::string& id) const {
     auto g = Lock(id);
+    if (db_) return db_->Remove(id);
     const auto path = PathFor(id);
     {
         std::lock_guard<std::recursive_mutex> ig(index_mu_);
@@ -215,6 +283,11 @@ void Store::WriteIndex(const nlohmann::json& j) const {
 
 void Store::Touch(const std::string& key, std::size_t messages) const {
     std::lock_guard<std::recursive_mutex> ig(index_mu_);
+    if (db_) {
+        auto e = db_->Entry(key); auto now = NowMs();
+        if (!e.is_object()) e = {{"sessionId", NewSessionId()}, {"createdAt", now}};
+        e["updatedAt"] = now; e["messages"] = messages; db_->PutEntry(key, e); return;
+    }
     auto ix = ReadIndex();
     auto& e = ix[key];
     auto now = NowMs();
@@ -228,18 +301,30 @@ void Store::Touch(const std::string& key, std::size_t messages) const {
 
 nlohmann::json Store::IndexEntry(const std::string& key) const {
     std::lock_guard<std::recursive_mutex> ig(index_mu_);
+    if (db_) return db_->Entry(key);
     auto ix = ReadIndex();
     return ix.contains(key) ? ix[key] : nlohmann::json();
 }
 
 nlohmann::json Store::IndexJson() const {
     std::lock_guard<std::recursive_mutex> ig(index_mu_);
+    if (db_) return db_->AllEntries();
     return ReadIndex();
 }
 
 nlohmann::json Store::Reset(const std::string& key, const std::string& reason) const {
     auto g = Lock(key);
     std::lock_guard<std::recursive_mutex> ig(index_mu_);
+    if (db_) {
+        auto old = db_->Entry(key); if (!old.is_object()) old = nlohmann::json::object();
+        auto now = NowMs();
+        nlohmann::json e{{"sessionId", NewSessionId()}, {"createdAt", now}, {"updatedAt", now}, {"messages", 0},
+                         {"resets", old.value("resets", 0) + 1}, {"lastResetReason", reason}};
+        if (old.contains("sessionId")) e["previousSessionId"] = old["sessionId"];
+        // The previous window and its transcript_events stay in the database as history.
+        db_->NewWindow(key, e, old.value("sessionId", std::string()), reason == "compaction" ? "compaction" : "reset");
+        return e;
+    }
     auto ix = ReadIndex();
     auto old = ix.contains(key) ? ix[key] : nlohmann::json::object();
     auto path = PathFor(key);
