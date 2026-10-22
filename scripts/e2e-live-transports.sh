@@ -21,7 +21,7 @@ cat > "$T/cfg.json" <<J
 {"channels": {
   "mattermost": {"baseUrl": "$B", "botToken": "mm-tok", "dmPolicy": "open", "groupPolicy": "open"},
   "signal": {"httpUrl": "$B", "number": "+15550001", "dmPolicy": "open"},
-  "irc": {"server": "127.0.0.1:$IP", "tls": false, "nick": "clawbot", "channels": ["#lobby"], "dmPolicy": "open", "groupPolicy": "open"},
+  "irc": {"server": "127.0.0.1:$IP", "tls": false, "nick": "clawbot", "sasl": {"username": "clawacct", "password": "sasl-pw"}, "channels": ["#lobby"], "dmPolicy": "open", "groupPolicy": "open"},
   "twitch": {"mode": "irc", "ircServer": "127.0.0.1:$IP", "tls": false, "accessToken": "tw-tok", "username": "clawtv", "channel": "streamer", "groupPolicy": "open"}}}
 J
 PORT=$(freeport)
@@ -47,6 +47,8 @@ push __signal_push '{"envelope":{"sourceNumber":"+15559999","dataMessage":{"mess
 waitlog 'e.get("path")=="/api/v1/rpc" and e["body"]["method"]=="send" and e["body"]["params"]["recipient"]==["+15559999"] and e["body"]["params"]["account"]=="+15550001"'
 # native IRC: registration, JOIN, PONG, channel PRIVMSG → reply in channel; DM → reply to nick
 waitlog 'e.get("irc")=="NICK clawbot"'
+waitlog 'e.get("sasl")==["clawacct","clawacct","sasl-pw"] and e["ok"]'
+waitlog 'e.get("irc")=="CAP END"'
 waitlog 'e.get("irc")=="JOIN #lobby"'
 waitlog 'e.get("irc")=="PONG :fake.irc"'
 push __irc_push '{"line":":alice!a@h PRIVMSG #lobby :hello irc"}'

@@ -3,6 +3,7 @@
 #include "openclaw/config/config.hpp"
 
 #include <netdb.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -85,7 +86,7 @@ bool IrcNativeSend(const std::string& id, const std::string& target, const std::
 }
 
 void RunIrcClient(const std::string& id, const json& cfg, const std::atomic<bool>& stop, Adapter* ad, const DeliverFn& deliver) {
-    std::string host, port, nick, pass; bool tls; json chans = json::array();
+    std::string host, port, nick, pass, sasl_user, sasl_pass; bool tls; json chans = json::array();
     if (id == "twitch") {
         if (S(cfg, "twitch", "mode", "TWITCH_MODE") != "irc") return;
         const auto tok = S(cfg, "twitch", "accessToken", "TWITCH_ACCESS_TOKEN");
@@ -105,8 +106,15 @@ void RunIrcClient(const std::string& id, const json& cfg, const std::atomic<bool
         port = server.find(':') == std::string::npos ? S(cfg, "irc", "port", "", "6697") : server.substr(server.rfind(':') + 1);
         tls = B(cfg, "irc", "tls", port == "6697");
         pass = S(cfg, "irc", "password", "IRC_PASSWORD");
+        sasl_user = S(cfg, "irc", "saslUsername", "IRC_SASL_USERNAME");
+        sasl_pass = S(cfg, "irc", "saslPassword", "IRC_SASL_PASSWORD");
+        if (auto v = config::GetPath(cfg, "channels.irc.sasl"); v && v->is_object()) {
+            sasl_user = v->value("username", sasl_user); sasl_pass = v->value("password", sasl_pass);
+        }
+        if (!sasl_pass.empty() && sasl_user.empty()) sasl_user = nick;
         if (auto v = config::GetPath(cfg, "channels.irc.channels"); v && v->is_array()) chans = *v;
     }
+    const bool use_sasl = !sasl_pass.empty();
     std::cerr << "[gateway] " << id << ": native IRC " << host << ":" << port << (tls ? " (tls)" : "") << " as " << nick << "\n";
     int backoff = 1000;
     while (!stop.load()) {
@@ -114,6 +122,7 @@ void RunIrcClient(const std::string& id, const json& cfg, const std::atomic<bool
         auto c = Dial(host, port, tls, &why);
         if (!c) { std::cerr << "[gateway] " << id << " irc: " << why << "\n"; Nap(stop, backoff); backoff = std::min(backoff * 2, 60000); continue; }
         if (id == "twitch") c->Write("CAP REQ :twitch.tv/tags twitch.tv/commands");
+        if (use_sasl) c->Write("CAP REQ :sasl");  // 1.150: SASL PLAIN
         if (!pass.empty()) c->Write("PASS " + pass);
         c->Write("NICK " + nick);
         if (id != "twitch") c->Write("USER " + nick + " 0 * :OpenClaw");
@@ -136,6 +145,17 @@ void RunIrcClient(const std::string& id, const json& cfg, const std::atomic<bool
                 if (line.rfind("PING", 0) == 0) { c->Write("PONG" + line.substr(4)); continue; }
                 std::string prefix; if (!line.empty() && line[0] == ':') { auto sp = line.find(' '); prefix = line.substr(1, sp - 1); line = sp == std::string::npos ? "" : line.substr(sp + 1); }
                 auto sp = line.find(' '); const std::string cmd = line.substr(0, sp); const std::string rest = sp == std::string::npos ? "" : line.substr(sp + 1);
+                if (use_sasl && cmd == "CAP" && rest.find("ACK") != std::string::npos && rest.find("sasl") != std::string::npos) { c->Write("AUTHENTICATE PLAIN"); continue; }
+                if (use_sasl && cmd == "CAP" && rest.find("NAK") != std::string::npos) { std::cerr << "[gateway] irc: server refused SASL\n"; c->Write("CAP END"); continue; }
+                if (use_sasl && cmd == "AUTHENTICATE" && rest.rfind("+", 0) == 0) {
+                    const std::string raw = sasl_user + std::string(1, '\0') + sasl_user + std::string(1, '\0') + sasl_pass;
+                    std::string enc(4 * ((raw.size() + 2) / 3) + 1, '\0');
+                    const int n = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(enc.data()), reinterpret_cast<const unsigned char*>(raw.data()), (int)raw.size());
+                    enc.resize(n > 0 ? (std::size_t)n : 0);
+                    c->Write("AUTHENTICATE " + enc); continue;
+                }
+                if (use_sasl && (cmd == "903" || cmd == "907")) { c->Write("CAP END"); continue; }
+                if (use_sasl && (cmd == "904" || cmd == "905" || cmd == "906")) { std::cerr << "[gateway] irc: SASL failed (" << cmd << ")\n"; c->Write("CAP END"); continue; }
                 if (cmd == "001" && !welcomed) {
                     welcomed = true; backoff = 1000;
                     { std::lock_guard<std::mutex> l(g_mu); g_conns[id] = c; }

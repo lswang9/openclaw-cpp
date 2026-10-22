@@ -88,7 +88,7 @@ class H(BaseHTTPRequestHandler):
         self.send(404, {})
 class Irc(socketserver.BaseRequestHandler):
     def handle(self):
-        s = self.request; IRC_CLIENTS.append(s); buf = b""
+        s = self.request; IRC_CLIENTS.append(s); buf = b""; st = {}
         try:
             while True:
                 d = s.recv(4096)
@@ -97,7 +97,19 @@ class Irc(socketserver.BaseRequestHandler):
                 while b"\r\n" in buf:
                     line, buf = buf.split(b"\r\n", 1); line = line.decode(errors="replace")
                     log({"irc": line})
-                    if line.startswith("NICK "): s.sendall(f":fake.irc 001 {line[5:]} :Welcome\r\n".encode()); s.sendall(b"PING :fake.irc\r\n")
+                    if line == "CAP REQ :sasl": st["sasl"] = True; s.sendall(b":fake.irc CAP * ACK :sasl\r\n")
+                    elif line == "AUTHENTICATE PLAIN": s.sendall(b"AUTHENTICATE +\r\n")
+                    elif line.startswith("AUTHENTICATE "):
+                        import base64 as _b
+                        parts = _b.b64decode(line[13:]).split(b"\0")
+                        ok = len(parts) == 3 and parts[2] == b"sasl-pw"
+                        log({"sasl": [p.decode() for p in parts], "ok": ok})
+                        s.sendall(b":fake.irc 903 * :SASL ok\r\n" if ok else b":fake.irc 904 * :SASL failed\r\n")
+                    elif line == "CAP END" and st.get("nick"):
+                        s.sendall(f":fake.irc 001 {st['nick']} :Welcome\r\n".encode()); s.sendall(b"PING :fake.irc\r\n")
+                    if line.startswith("NICK "):
+                        st["nick"] = line[5:]
+                        if not st.get("sasl"): s.sendall(f":fake.irc 001 {line[5:]} :Welcome\r\n".encode()); s.sendall(b"PING :fake.irc\r\n")
         finally:
             if s in IRC_CLIENTS: IRC_CLIENTS.remove(s)
 class TS(socketserver.ThreadingTCPServer): allow_reuse_address = True; daemon_threads = True

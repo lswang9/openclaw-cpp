@@ -152,7 +152,7 @@ provider factory. Some raw-config consumers still read raw values.
 Webhook inbound on `/api/channels/<id>/inbound` + HTTP outbound when credentials are set:
 LINE reply/push, Zalo sendMessage, Twilio SMS, Twitch Helix chat, X DM API, Synology incoming webhook, Nextcloud Talk OCS chat, and HTTP bridges for IRC/Nostr/a2a/buzz/clickclack/raft/reef/tlon/zalouser (`apiBase` + optional bearer).
 Offline e2e: `scripts/e2e-misc-channels.sh` against `scripts/fake_misc_channels.py`.
-1.143: native IRC client (plain/TLS, PASS/NICK/USER, JOIN, PING/PONG, 433 nick retry, IRCv3 tags stripped) for `irc` and Twitch chat (`mode: "irc"`, PASS oauth:); e2e `scripts/e2e-live-transports.sh`. Not yet: SASL, Nostr NIP-04 crypto in-process, X Account Activity CRC, LINE rich menus/flex, Zalo OA stickers.
+1.143: native IRC client (plain/TLS, PASS/NICK/USER, JOIN, PING/PONG, 433 nick retry, IRCv3 tags stripped) for `irc` and Twitch chat (`mode: "irc"`, PASS oauth:); e2e `scripts/e2e-live-transports.sh`. 1.150: IRC SASL PLAIN (`channels.irc.sasl {username,password}` or IRC_SASL_USERNAME/PASSWORD; CAP REQ → AUTHENTICATE → 903 → CAP END; 904/905 logged and registration continues), e2e checked in the same script. Not yet: Nostr NIP-04 crypto in-process, X Account Activity CRC, LINE rich menus/flex, Zalo OA stickers.
 
 **Other extension families with no or only partial C++ counterpart:**
 - memory-lancedb, memory-wiki
