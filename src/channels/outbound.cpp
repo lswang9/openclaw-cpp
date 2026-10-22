@@ -1,3 +1,4 @@
+#include <map>
 #include "openclaw/voice/tts.hpp"
 #include "openclaw/config/config.hpp"
 #include <curl/curl.h>
@@ -121,6 +122,10 @@ nlohmann::json OutboundRecordAdapter::HttpJson(const std::string& method, const 
     return out;
 }
 
+// 1.157: business connections (chat id → business_connection_id) so replies go out through the connection.
+static std::mutex g_biz_mu;
+static std::map<std::string, std::string>& BizConn() { static std::map<std::string, std::string> m; return m; }
+static std::string BizFor(const std::string& chat) { std::lock_guard<std::mutex> l(g_biz_mu); auto it = BizConn().find(chat); return it == BizConn().end() ? "" : it->second; }
 nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const std::string& text,
                                                const nlohmann::json& extra) {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -163,6 +168,8 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
                 nlohmann::json b = {{"chat_id", chat_id}, {"text", chunks[i]}};
                 if (i + 1 == chunks.size() && keyboard.is_object()) b["reply_markup"] = keyboard;
                 if (extra.is_object() && extra.contains("message_thread_id")) b["message_thread_id"] = extra["message_thread_id"];
+                if (extra.is_object() && extra.contains("business_connection_id")) b["business_connection_id"] = extra["business_connection_id"];
+                else if (auto bz = BizFor(chat_id); !bz.empty()) b["business_connection_id"] = bz;
                 if (i == 0 && extra.is_object() && extra.contains("reply_to_message_id")) b["reply_parameters"] = {{"message_id", extra["reply_to_message_id"]}, {"allow_sending_without_reply", true}};
                 auto r = HttpPostJson(url, b, {});
                 all_ok = all_ok && r.value("http", 0) >= 200 && r.value("http", 0) < 300; parts.push_back(r);
@@ -593,6 +600,10 @@ void OutboundRecordAdapter::TelegramRememberPoll(const nlohmann::json& entry) {
     PollRegistry()[entry.value("pollId", "")] = entry;
     PersistPollRegistry();
 }
+static void TelegramRetirePoll(const std::string& poll_id) {
+    std::lock_guard<std::mutex> l(g_poll_mu);
+    if (PollRegistry().erase(poll_id)) PersistPollRegistry();
+}
 nlohmann::json OutboundRecordAdapter::TelegramLookupPoll(const std::string& poll_id) {
     std::lock_guard<std::mutex> l(g_poll_mu);
     auto& reg = PollRegistry();
@@ -643,9 +654,10 @@ nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, 
             auto result = resp.value("result", nlohmann::json::object());
             std::string poll_id;
             if (result.is_object() && result.contains("poll") && result["poll"].is_object()) poll_id = result["poll"].value("id", std::string());
-            if (!poll_id.empty() && !body.value("is_anonymous", true)) {
+            if (!poll_id.empty()) {  // 1.157: anonymous polls too (results arrive as `poll` updates, not poll_answer)
                 nlohmann::json entry{{"pollId", poll_id}, {"chat", {{"id", body["chat_id"]}, {"type", p.value("chatType", "private")}}},
-                                    {"messageId", result.value("message_id", 0)}, {"question", q}, {"options", opt_strs}};
+                                    {"messageId", result.value("message_id", 0)}, {"question", q}, {"options", opt_strs},
+                                    {"anonymous", body.value("is_anonymous", true)}};
                 if (body.contains("message_thread_id")) entry["threadId"] = body["message_thread_id"];
                 TelegramRememberPoll(entry);
                 out["pollId"] = poll_id;
@@ -653,7 +665,16 @@ nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, 
         }
         return out;
     }
-    if (action == "create_topic" || action == "createForumTopic") {
+    if (action == "invoice" || action == "sendInvoice") {  // 1.157
+        method = "sendInvoice";
+        for (const char* k : {"title", "description", "payload", "currency"})
+            if (!p.contains(k)) return {{"ok", false}, {"error", std::string(k) + " is required"}};
+        body["title"] = p["title"]; body["description"] = p["description"]; body["payload"] = p["payload"]; body["currency"] = p["currency"];
+        body["prices"] = p.contains("prices") ? p["prices"] : nlohmann::json::array({{{"label", p.value("label", std::string("Total"))}, {"amount", p.value("amount", 0)}}});
+        if (p.contains("provider_token")) body["provider_token"] = p["provider_token"];
+        else if (p["currency"] != "XTR") { auto pt = config::GetPath(Config(), "channels.telegram.payments.providerToken"); if (pt && pt->is_string()) body["provider_token"] = *pt; }
+        body.erase("message_id");
+    } else if (action == "create_topic" || action == "createForumTopic") {
         method = "createForumTopic";
         const std::string name = p.value("name", p.value("topic", p.value("title", std::string())));
         if (name.empty()) return {{"ok", false}, {"error", "name is required"}};
@@ -755,12 +776,64 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
         if (cbq.contains("from")) synth["from"] = cbq["from"];
         synth["__callback"] = true;
     }
+    // 1.157: `poll` state updates. A closed poll we sent retires its registry entry and its final tallies are noted in
+    // the chat's session (the only result signal anonymous polls ever produce); open-poll tallies are ignored.
+    if (body.contains("poll") && body["poll"].is_object() && !body.contains("message")) {
+        const auto& pl = body["poll"];
+        const std::string poll_id = pl.value("id", std::string());
+        auto entry = TelegramLookupPoll(poll_id);
+        if (!entry.is_object() || entry.empty()) return {{"ok", true}, {"ignored", true}, {"note", "unknown poll_id"}};
+        if (!pl.value("is_closed", false)) return {{"ok", true}, {"ignored", true}, {"note", "poll still open"}};
+        std::string tallies; long total = pl.value("total_voter_count", 0L);
+        for (auto& o : pl.value("options", nlohmann::json::array()))
+            tallies += (tallies.empty() ? "" : ", ") + o.value("text", std::string("?")) + ": " + std::to_string(o.value("voter_count", 0));
+        TelegramRetirePoll(poll_id);
+        InboundMessage m; m.channel = "telegram";
+        const auto& chat = entry["chat"];
+        const std::string cid = chat["id"].is_string() ? chat["id"].get<std::string>() : chat["id"].dump();
+        m.sender = cid; m.peer_id = cid;
+        m.chat_type = chat.value("type", std::string("private")) == "private" ? "direct" : "group";
+        if (m.chat_type == "group") m.conversation_id = cid;
+        m.session_key = "telegram-" + cid;
+        if (entry.contains("threadId")) { m.thread_id = entry["threadId"].dump(); m.session_key += ":topic:" + m.thread_id; if (m.chat_type == "group") m.conversation_id = cid + ":topic:" + m.thread_id; }
+        m.text = std::string("[poll closed") + (entry.value("anonymous", false) ? ", anonymous" : "") + "] " + entry.value("question", std::string("?")) +
+                 " → " + tallies + " (" + std::to_string(total) + " voters)";
+        m.inject_only = true;
+        if (deliver) deliver(m);
+        return {{"ok", true}, {"channel", "telegram"}, {"pollId", poll_id}, {"closed", true}, {"results", tallies}};
+    }
+    // 1.157: payments. pre_checkout_query must be answered within 10 s; approved only when channels.telegram.payments.enabled.
+    if (body.contains("pre_checkout_query") && body["pre_checkout_query"].is_object()) {
+        const auto& q = body["pre_checkout_query"];
+        auto en = config::GetPath(Config(), "channels.telegram.payments.enabled");
+        const bool enabled = en && en->is_boolean() && en->get<bool>();
+        const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
+        nlohmann::json ans{{"pre_checkout_query_id", q.value("id", std::string())}, {"ok", enabled}};
+        if (!enabled) ans["error_message"] = "Payments are not enabled for this bot.";
+        if (!token.empty()) HttpPostJson(TelegramBase(Config()) + "/bot" + token + "/answerPreCheckoutQuery", ans, {});
+        return {{"ok", true}, {"channel", "telegram"}, {"preCheckout", enabled ? "approved" : "declined"}};
+    }
+    if (body.contains("message") && body["message"].is_object() && body["message"].contains("successful_payment")) {
+        const auto& msg = body["message"]; const auto& sp = msg["successful_payment"];
+        InboundMessage m; m.channel = "telegram";
+        const auto& chat = msg["chat"]; const std::string cid = chat["id"].is_string() ? chat["id"].get<std::string>() : chat["id"].dump();
+        m.sender = msg.contains("from") ? msg["from"]["id"].dump() : cid; m.peer_id = m.sender;
+        m.chat_type = chat.value("type", std::string("private")) == "private" ? "direct" : "group";
+        if (m.chat_type == "group") m.conversation_id = cid;
+        m.session_key = "telegram-" + cid;
+        char amt[64]; std::snprintf(amt, sizeof amt, "%.2f", sp.value("total_amount", 0L) / 100.0);
+        m.text = "[payment received] " + std::string(amt) + " " + sp.value("currency", std::string()) + " payload=" + sp.value("invoice_payload", std::string()) +
+                 " charge=" + sp.value("telegram_payment_charge_id", std::string());
+        m.inject_only = true;
+        if (deliver) deliver(m);
+        return {{"ok", true}, {"channel", "telegram"}, {"payment", sp}};
+    }
     // 1.146: poll_answer updates (public polls only) rejoin via the sendPoll registry.
     if (body.contains("poll_answer") && body["poll_answer"].is_object()) {
         const auto& pa = body["poll_answer"];
         const std::string poll_id = pa.value("poll_id", std::string());
         auto entry = TelegramLookupPoll(poll_id);
-        if (!entry.is_object() || entry.empty()) return {{"ok", true}, {"ignored", true}, {"note", "unknown poll_id"}};
+        if (!entry.is_object() || entry.empty() || entry.value("anonymous", false)) return {{"ok", true}, {"ignored", true}, {"note", "unknown poll_id"}};
         if (pa.contains("user") && pa["user"].value("is_bot", false)) return {{"ok", true}, {"ignored", true}};
         std::string chosen;
         auto opts = entry.value("options", nlohmann::json::array());
@@ -799,8 +872,15 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
         if (deliver) deliver(m);
         return {{"ok", true}, {"channel", "telegram"}, {"reaction", added}};
     }
-    const bool edited = !synth.is_object() && !body.contains("message") && body.contains("edited_message");
-    const auto& tm = synth.is_object() ? synth : body.contains("message") ? body["message"] : (body.contains("edited_message") ? body["edited_message"] : nlohmann::json());
+    if (body.contains("business_connection") || body.contains("deleted_business_messages")) return {{"ok", true}, {"ignored", true}, {"note", "business bookkeeping"}};
+    const bool edited = !synth.is_object() && !body.contains("message") && (body.contains("edited_message") || body.contains("edited_business_message"));
+    const auto& tm = synth.is_object() ? synth : body.contains("message") ? body["message"] : body.contains("business_message") ? body["business_message"]
+                   : body.contains("edited_message") ? body["edited_message"] : body.contains("edited_business_message") ? body["edited_business_message"] : nlohmann::json();
+    if (tm.is_object() && tm.contains("business_connection_id") && tm.contains("chat")) {
+        const auto& bc = tm["chat"]["id"];
+        std::lock_guard<std::mutex> l(g_biz_mu);
+        BizConn()[bc.is_string() ? bc.get<std::string>() : bc.dump()] = tm["business_connection_id"].get<std::string>();
+    }
     if (!tm.is_object() || !tm.contains("chat")) return {{"ok", true}, {"ignored", true}, {"note", "no message"}};
     InboundMessage m;
     m.channel = "telegram";

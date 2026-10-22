@@ -92,4 +92,25 @@ waitlog 'm=="editForumTopic" and a["message_thread_id"]==42 and a["name"]=="Idea
 tl '{"action":"close_topic","channel":"telegram","to":"-1001","threadId":42}' >/dev/null
 waitlog 'm=="closeForumTopic" and a["message_thread_id"]==42'
 waitlog 'm=="getUpdates" and "poll_answer" in a.get("allowed_updates","")'
+# 1.157: anonymous poll results (closed `poll` update), public poll close retires the route, payments, business messages
+tl '{"action":"poll","channel":"telegram","to":"777","question":"Lunch?","options":["Pizza","Sushi","Salad"],"anonymous":true}' | grep -q '"ok": true' || fail "anon poll rpc"
+waitlog 'm=="sendPoll" and a["question"]=="Lunch?" and a.get("is_anonymous") is True'
+push '{"poll":{"id":"poll-777-3","question":"Lunch?","is_closed":false,"total_voter_count":1,"options":[{"text":"Pizza","voter_count":1},{"text":"Sushi","voter_count":0},{"text":"Salad","voter_count":0}]}}'
+push '{"poll":{"id":"poll-777-3","question":"Lunch?","is_closed":true,"total_voter_count":3,"options":[{"text":"Pizza","voter_count":2},{"text":"Sushi","voter_count":1},{"text":"Salad","voter_count":0}]}}'
+intr '[poll closed, anonymous] Lunch? → Pizza: 2, Sushi: 1, Salad: 0 (3 voters)'
+push '{"poll":{"id":"poll-777-2","question":"Coffee?","is_closed":true,"total_voter_count":1,"options":[{"text":"Yes","voter_count":1},{"text":"No","voter_count":0}]}}'
+intr '[poll closed] Coffee? → Yes: 1, No: 0 (1 voters)'
+N=$(grep -c '"sendMessage"' "$T/tg.log")
+push '{"poll_answer":{"poll_id":"poll-777-2","user":{"id":777},"option_ids":[1]}}'
+sleep 0.6; grep -rqF 'Coffee? → No' "$T/s" && fail "retired poll still routed"
+tl '{"action":"invoice","channel":"telegram","to":"777","title":"Pro","description":"Pro plan","payload":"pro-1","currency":"XTR","amount":50}' | grep -q '"ok": true' || fail "invoice rpc"
+waitlog 'm=="sendInvoice" and a["payload"]=="pro-1" and a["prices"]==[{"label":"Total","amount":50}] and "provider_token" not in a'
+push '{"pre_checkout_query":{"id":"pcq1","from":{"id":777},"currency":"XTR","total_amount":50,"invoice_payload":"pro-1"}}'
+waitlog 'm=="answerPreCheckoutQuery" and a["pre_checkout_query_id"]=="pcq1" and a["ok"] is False'
+push '{"message":{"message_id":60,"chat":{"id":777,"type":"private"},"from":{"id":777},"successful_payment":{"currency":"XTR","total_amount":5000,"invoice_payload":"pro-1","telegram_payment_charge_id":"ch_1"}}}'
+intr '[payment received] 50.00 XTR payload=pro-1 charge=ch_1'
+sleep 0.4; [[ $(grep -c '"sendMessage"' "$T/tg.log") == "$N" ]] || fail "payment/poll note triggered a reply"
+push '{"business_message":{"message_id":70,"business_connection_id":"bc-1","chat":{"id":555,"type":"private"},"from":{"id":555},"text":"biz hi"}}'
+waitlog 'm=="sendMessage" and str(a.get("chat_id"))=="555" and a.get("business_connection_id")=="bc-1"'
+waitlog 'm=="getUpdates" and "business_message" in a.get("allowed_updates","") and "pre_checkout_query" in a.get("allowed_updates","")'
 echo "[e2e-telegram-actions] OK"

@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.156.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.157.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.157.0-dev 新增
+
+Telegram：已关闭投票结果（含匿名投票）记入会话并注销路由；business_message 入站与带 business_connection_id 的回复；支付（sendInvoice、pre_checkout_query 应答、successful_payment 记录）。
 
 ## 1.156.0-dev 新增
 

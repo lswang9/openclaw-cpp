@@ -1420,7 +1420,7 @@ bool ChannelCredPresent(const json& cfg) { return !channels::ChannelCred(cfg, "t
 ExtraResult MessageAction(const fs::path& root, const json& p) {
     const auto channel = p.value("channel", std::string()), action = p.value("action", std::string());
     if (channel.empty() || action.empty()) return Fail("channel and action are required");
-    static const std::set<std::string> known{"send", "react", "edit", "delete", "unsend", "pin", "unpin", "reply", "thread-reply", "read", "typing", "poll", "create_topic", "createForumTopic", "edit_topic", "editForumTopic", "rename_topic", "close_topic", "closeForumTopic", "reopen_topic", "reopenForumTopic"};
+    static const std::set<std::string> known{"send", "react", "edit", "delete", "unsend", "pin", "unpin", "reply", "thread-reply", "read", "typing", "poll", "invoice", "sendInvoice", "create_topic", "createForumTopic", "edit_topic", "editForumTopic", "rename_topic", "close_topic", "closeForumTopic", "reopen_topic", "reopenForumTopic"};
     if (!known.count(action)) return Fail("unsupported message action: " + action);
     if (action == "send") { auto r = GatewayRpc("send", {{"channel", channel}, {"to", p.value("to", p.value("target", std::string()))}, {"message", p.value("message", p.value("params", json::object()).value("message", std::string()))}});
         return r.value("ok", false) ? Ok(r["payload"]) : Fail(r.value("error", json()).is_object() ? r["error"].value("message", "send failed") : "send failed"); }
@@ -1436,7 +1436,7 @@ ExtraResult MessageAction(const fs::path& root, const json& p) {
     if (channel == "telegram" && g_tool_deps) {
         if (auto* oa = dynamic_cast<channels::OutboundRecordAdapter*>(g_tool_deps->adapters.Get("telegram"))) {
             json pp = p.value("params", json::object());
-            for (auto k : {"to", "target", "messageId", "message_id", "emoji", "message", "buttons", "remove", "question", "options", "choices", "anonymous", "is_anonymous", "pollAnonymous", "pollPublic", "multiple", "allows_multiple_answers", "name", "topic", "title", "threadId", "message_thread_id", "icon_color", "iconCustomEmojiId", "icon_custom_emoji_id", "chatType"}) if (p.contains(k) && !pp.contains(k)) pp[k] = p[k];
+            for (auto k : {"to", "target", "messageId", "message_id", "emoji", "message", "buttons", "remove", "question", "options", "choices", "anonymous", "is_anonymous", "pollAnonymous", "pollPublic", "multiple", "allows_multiple_answers", "name", "topic", "title", "threadId", "message_thread_id", "icon_color", "iconCustomEmojiId", "icon_custom_emoji_id", "chatType", "description", "payload", "currency", "prices", "amount", "label", "provider_token"}) if (p.contains(k) && !pp.contains(k)) pp[k] = p[k];
             oa->SetConfig(g_tool_deps->config.raw);
             if (!ChannelCredPresent(g_tool_deps->config.raw)) {} else {
                 auto r = oa->TelegramAction(action, pp);
