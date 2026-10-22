@@ -1531,12 +1531,12 @@ int CmdConnect(int argc, char** argv) {
         json raw = json::object(); raw["gateway"]["port"] = 0; setenv("OPENCLAW_GATEWAY_URL", url.c_str(), 1);
         const int timeout = std::max(1, std::atoi(a->get("--timeout", "300").c_str()));
         std::cerr << "Waiting for the operator to approve this node (link " << id << ")…\n";
-        for (int t = 0; t < timeout * 2; ++t) {
+        for (int t = 0; t < timeout; ++t) {
             std::string err; auto r = GwRpc(raw, "pairing.link.claim", {{"id", id}, {"poll_secret", secret}}, &err);
             if (!err.empty()) { std::cerr << "claim failed: " << err << "\n"; return 1; }
             if (r.value("ok", false) && r.contains("token")) { token = r["token"]; break; }
             if (!r.value("pending", false)) { std::cerr << "claim rejected: " << r.value("error", r.dump()) << "\n"; return 1; }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
         if (token.empty()) { std::cerr << "Timed out waiting for approval.\n"; return 1; }
     } else token = boot;  // a pre-minted device token

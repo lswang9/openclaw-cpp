@@ -29,7 +29,7 @@ Registry MakeDefaultChannels() {
     r.Register({"http", "Gateway HTTP /v1/chat/completions + /tools/invoke", true});
     r.Register({"webhook", "HTTP inbound POST /api/channels/webhook/inbound", true});
     r.Register({"websocket", "Gateway WebSocket control plane (partial RPC)", true});
-    r.Register({"telegram", "Telegram Bot API (TODO)", false});
+    r.Register({"telegram", "Telegram Bot API: long polling (getUpdates) or webhook inbound, chunked sendMessage", true});
     r.Register({"discord", "Discord webhook + Gateway WS inbound+outbound", true});
     r.Register({"slack", "Slack Events API + Socket Mode inbound", true});
     r.Register({"whatsapp", "WhatsApp Cloud API inbound+outbound (not Baileys)", true});

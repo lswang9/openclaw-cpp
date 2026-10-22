@@ -31,6 +31,9 @@
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/whatsapp.hpp"
 #include <thread>
+#include <curl/curl.h>
+#include <filesystem>
+#include <fstream>
 
 #include <optional>
 #include <nlohmann/json.hpp>
@@ -56,7 +59,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.125.0-dev";
+constexpr const char* kVersion = "1.126.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -575,6 +578,66 @@ void Server::PluginEventPump() {
     }
 }
 
+// ---------------------------------------------------------------- 1.126: Telegram Bot API long polling (getUpdates)
+// Active when a bot token is configured and channels.telegram.mode != "webhook" (and no webhookUrl). Mirrors upstream
+// grammY runner semantics: deleteWebhook once, getUpdates with offset persisted under the state dir, each update goes
+// through the same HandleHttpInbound path as webhook delivery (dmPolicy/allowFrom/mention gating, chunked replies).
+namespace {
+size_t TgSink(char* p, size_t s, size_t n, void* u) { static_cast<std::string*>(u)->append(p, s * n); return s * n; }
+long TgGet(const std::string& url, long timeout_s, std::string* body) {
+    CURL* c = curl_easy_init(); if (!c) return 0;
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str()); curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, TgSink); curl_easy_setopt(c, CURLOPT_WRITEDATA, body);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, timeout_s + 10); curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    long st = 0; if (curl_easy_perform(c) == CURLE_OK) curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st);
+    curl_easy_cleanup(c); return st;
+}
+}  // namespace
+
+void Server::TelegramPollLoop() {
+    auto cfg_s = [&](const std::string& p, const char* env) {
+        if (const char* e = std::getenv(env); e && *e) return std::string(e);
+        std::lock_guard<std::mutex> lk(deps_mu_);
+        auto v = config::GetPath(deps_.config.raw, p); return v && v->is_string() ? v->get<std::string>() : std::string();
+    };
+    const std::string token = cfg_s("channels.telegram.botToken", "TELEGRAM_BOT_TOKEN");
+    if (token.empty()) return;
+    const std::string mode = cfg_s("channels.telegram.mode", "TELEGRAM_MODE");
+    if (mode == "webhook" || mode == "off" || !cfg_s("channels.telegram.webhookUrl", "TELEGRAM_WEBHOOK_URL").empty() ||
+        (mode != "polling" && !cfg_s("channels.telegram.webhookSecret", "TELEGRAM_WEBHOOK_SECRET").empty())) return;
+    std::string base = cfg_s("channels.telegram.apiBase", "TELEGRAM_API_BASE"); if (base.empty()) base = "https://api.telegram.org";
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    long timeout = 25; if (const char* e = std::getenv("OPENCLAW_TELEGRAM_POLL_TIMEOUT")) timeout = std::max(0, std::atoi(e));
+    const std::string api = base + "/bot" + token + "/";
+    const auto state = (deps_.persist ? deps_.persist->Root() : std::filesystem::path(EnvOr("OPENCLAW_DATA_DIR", "/tmp/openclaw-cpp-data"))) / "telegram" / "update-offset.json";
+    long long offset = 0;
+    { std::ifstream f(state); if (f) { try { offset = nlohmann::json::parse(f).value("offset", 0LL); } catch (...) {} } }
+    { std::string b; TgGet(api + "deleteWebhook?drop_pending_updates=false", 10, &b); }
+    std::cerr << "[gateway] telegram: long polling getUpdates (offset " << offset << ")\n";
+    int backoff_ms = 500;
+    while (!pump_stop_.load()) {
+        std::string body;
+        const long st = TgGet(api + "getUpdates?timeout=" + std::to_string(timeout) + "&offset=" + std::to_string(offset) + "&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%5D", timeout, &body);
+        nlohmann::json j; try { j = nlohmann::json::parse(body); } catch (...) {}
+        if (st == 409) { std::cerr << "[gateway] telegram: getUpdates conflict (another poller or webhook active)\n"; }
+        if (st != 200 || !j.value("ok", false)) {
+            for (int i = 0; i < backoff_ms / 50 && !pump_stop_.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            backoff_ms = std::min(backoff_ms * 2, 30000); continue;
+        }
+        backoff_ms = 500;
+        for (auto& u : j.value("result", nlohmann::json::array())) {
+            offset = std::max(offset, u.value("update_id", 0LL) + 1);
+            { std::error_code ec; std::filesystem::create_directories(state.parent_path(), ec); std::ofstream(state) << nlohmann::json{{"offset", offset}}.dump(); }
+            auto* adapter = deps_.adapters.Get("telegram");
+            if (!adapter) continue;
+            try {
+                auto deliver = [this](const channels::InboundMessage& m) { return DeliverInbound(m); };
+                adapter->HandleHttpInbound(u, deliver);
+            } catch (const std::exception& e) { std::cerr << "[gateway] telegram update " << u.value("update_id", 0LL) << ": " << e.what() << "\n"; }
+        }
+        if (timeout == 0) for (int i = 0; i < 4 && !pump_stop_.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
 void Server::Run() {
     for (auto* a : deps_.adapters.List()) a->SetConfig(deps_.config.raw);
     if (deps_.js_host)  // before channel gateways start: their startAccount may call api.runtime host calls
@@ -590,6 +653,7 @@ void Server::Run() {
     if (deps_.js_host) {
         plugin_pump_ = std::thread([this] { PluginEventPump(); });
     }
+    telegram_poll_ = std::thread([this] { TelegramPollLoop(); });
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
     int yes = 1;
@@ -628,6 +692,7 @@ void Server::Run() {
     StopWorkers();
     pump_stop_ = true;
     if (plugin_pump_.joinable()) plugin_pump_.join();
+    if (telegram_poll_.joinable()) telegram_poll_.join();
     {
         std::vector<std::thread> ts;
         { std::lock_guard l(host_threads_mu_); ts.swap(host_threads_); }

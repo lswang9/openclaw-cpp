@@ -93,7 +93,7 @@ AdapterHub AdapterHub::MakeDefault() {
     hub.Add(std::make_unique<WebhookAdapter>("webhook"));
     hub.Add(std::make_unique<OutboundRecordAdapter>(
         "telegram",
-        "TODO: live Telegram Bot API; outbound payloads recorded locally",
+        "Telegram Bot API: getUpdates long polling or webhook inbound; chunked sendMessage (records when no token)",
         "/bot<token>/sendMessage"));
     hub.Add(std::make_unique<DiscordAdapter>());
     hub.Add(std::make_unique<SlackAdapter>());

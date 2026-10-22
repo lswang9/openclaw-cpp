@@ -153,6 +153,8 @@ private:
     std::vector<std::string> plugin_channels_;
     std::set<std::string> plugin_providers_;
     std::thread plugin_pump_;
+    std::thread telegram_poll_;
+    void TelegramPollLoop();
     std::atomic<bool> pump_stop_{false};
     void PluginEventPump();
     nlohmann::json PluginHostCall(long long id, const std::string& method, const nlohmann::json& params);

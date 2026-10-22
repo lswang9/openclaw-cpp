@@ -189,7 +189,7 @@ rpc "{\"method\":\"pairing.token.verify\",\"params\":{\"token\":\"$TOK\"}}" | gr
 echo "[smoke] gateway auth: OPENCLAW_GATEWAY_TOKEN + ocd_ device token (HTTP + WS) + revoke"
 PORT2=$((PORT + 1))
 SESS2=$(mktemp -d)
-OPENCLAW_GATEWAY_TOKEN=smoke-gw-token OPENCLAW_SESSION_DIR="$SESS2" OPENCLAW_PIDFILE="$SESS2/pid" \
+OPENCLAW_GATEWAY_TOKEN=smoke-gw-token OPENCLAW_SESSION_DIR="$SESS2" OPENCLAW_DATA_DIR="$SESS2/data" OPENCLAW_PIDFILE="$SESS2/pid" \
   "$BIN" gateway --port "$PORT2" --host "$HOST" >/tmp/oc-smoke2-$$.log 2>&1 &
 GW2=$!
 for i in $(seq 1 50); do curl -sf "http://${HOST}:${PORT2}/health" >/dev/null && break; sleep 0.1; done
@@ -370,6 +370,7 @@ OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-cli-local4.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-cli-local5.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-providers.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-hooks.sh"
+OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-telegram.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-tui-fullscreen.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-voice-providers.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-auth-agents-keychain.sh"

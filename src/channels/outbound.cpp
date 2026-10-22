@@ -119,9 +119,27 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
         const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
         if (!token.empty() && !chat_id.empty()) {
             const std::string url = TelegramBase(Config()) + "/bot" + token + "/sendMessage";
-            http_result = HttpPostJson(url, {{"chat_id", chat_id}, {"text", text}}, {});
+            // Bot API caps text at 4096 chars: split on paragraph/line/space boundaries (upstream chunker semantics).
+            std::vector<std::string> chunks; std::string rest = text; const std::size_t lim = 4096;
+            while (rest.size() > lim) {
+                std::size_t cut = rest.rfind("\n\n", lim); if (cut == std::string::npos || cut < lim / 2) cut = rest.rfind('\n', lim);
+                if (cut == std::string::npos || cut < lim / 2) cut = rest.rfind(' ', lim);
+                if (cut == std::string::npos || cut == 0) { cut = lim; while (cut > 0 && (static_cast<unsigned char>(rest[cut]) & 0xC0) == 0x80) --cut; }
+                chunks.push_back(rest.substr(0, cut)); rest = rest.substr(cut); while (!rest.empty() && (rest[0] == '\n' || rest[0] == ' ')) rest.erase(0, 1);
+            }
+            if (!rest.empty() || chunks.empty()) chunks.push_back(rest);
+            bool all_ok = true; nlohmann::json parts = nlohmann::json::array();
+            for (std::size_t i = 0; i < chunks.size(); ++i) {
+                nlohmann::json b = {{"chat_id", chat_id}, {"text", chunks[i]}};
+                if (extra.is_object() && extra.contains("message_thread_id")) b["message_thread_id"] = extra["message_thread_id"];
+                if (i == 0 && extra.is_object() && extra.contains("reply_to_message_id")) b["reply_parameters"] = {{"message_id", extra["reply_to_message_id"]}, {"allow_sending_without_reply", true}};
+                auto r = HttpPostJson(url, b, {});
+                all_ok = all_ok && r.value("http", 0) >= 200 && r.value("http", 0) < 300; parts.push_back(r);
+            }
+            http_result = parts.size() == 1 ? parts[0] : nlohmann::json{{"http", all_ok ? 200 : 502}, {"chunks", parts}};
             entry["mode"] = "live_http";
-            entry["delivered"] = http_result.value("http", 0) >= 200 && http_result.value("http", 0) < 300;
+            entry["chunks"] = chunks.size();
+            entry["delivered"] = all_ok;
             entry["http"] = http_result;
         }
     } else if (id_ == "discord") {
@@ -453,7 +471,12 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
     if (tm.value("is_topic_message", false) && tm.contains("message_thread_id")) m.thread_id = tm["message_thread_id"].dump();
     auto reply = deliver ? deliver(m) : std::string();
     nlohmann::json sent;
-    if (!reply.empty()) sent = SendText(cid, reply);
+    if (!reply.empty()) {
+        nlohmann::json ex = nlohmann::json::object();
+        if (!m.thread_id.empty()) ex["message_thread_id"] = tm["message_thread_id"];
+        if (m.chat_type == "group" && tm.contains("message_id")) ex["reply_to_message_id"] = tm["message_id"];
+        sent = SendText(cid, reply, ex);
+    }
     nlohmann::json voice_sent = MaybeAutoVoice(cid, reply, !m.media.empty());
     return {{"ok", true}, {"channel", "telegram"}, {"reply", reply}, {"sent", sent}, {"voice", voice_sent}, {"impl", "real"}};
 }

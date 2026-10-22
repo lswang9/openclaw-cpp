@@ -508,7 +508,15 @@ nlohmann::json DeviceLinkStore::Claim(const std::string& id, const std::string& 
         return {{"ok", false}, {"error", "invalid link or poll_secret"}, {"failed_claims", fails}};
     }
     auto st = S(*l, "state");
-    if (st == "pending") return {{"ok", false}, {"pending", true}, {"state", st}};
+    if (st == "pending") {
+        // A well-formed poll (correct secret) on a pending link is not a guessing attempt: refund its rate-limit slot so
+        // `connect` can keep polling while the operator approves (the budget still caps bad-secret attempts).
+        const std::string ip = g_client_ip.empty() ? std::string("local") : g_client_ip;
+        if (data_.contains("claim_rate") && data_["claim_rate"].contains(ip) && data_["claim_rate"][ip].is_array() && !data_["claim_rate"][ip].empty())
+            data_["claim_rate"][ip].erase(data_["claim_rate"][ip].size() - 1);
+        Save();
+        return {{"ok", false}, {"pending", true}, {"state", st}};
+    }
     if (st != "approved") return {{"ok", false}, {"error", "link " + st}, {"state", st}};
     auto token = "ocd_" + RandHex(24);
     nlohmann::json t{{"id", "tok-" + RandHex(6)}, {"link_id", S(*l, "id")}, {"device_name", (*l)["device_name"]},

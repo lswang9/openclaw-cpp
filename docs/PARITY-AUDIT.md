@@ -23,7 +23,7 @@ Reproduce the numbers with:
 | Gateway RPC methods (catalog) | 493 | 493 (0 unimplemented) | 267 ok on `{}` + 185 param-validating handlers | 1 real-sim (`computer.invoke`), 31 precondition-only (need node/creds/session) | 0 |
 | Agent tools (core) | ~57 | 46 native (+JS/MCP bridged) | 46 | browser/desktop are local-runtime variants | ~19 (§3) |
 | Config root keys | 46 | 46 accepted | ~20 deeply validated | 26 shallow (key accepted, sub-shape not validated) | 0 |
-| Channel extensions | 27 messaging | 5 working + 1 stub | discord, slack, feishu, whatsapp (Cloud API), imessage (bridge inbound) | telegram (outbound recorded, no live API), whatsapp-web (partial Noise/Baileys) | 21 (§5) |
+| Channel extensions | 27 messaging | 6 working | telegram (1.126), discord, slack, feishu, whatsapp (Cloud API), imessage (bridge inbound) | whatsapp-web (partial Noise/Baileys) | 21 (§5) |
 | Model-provider extensions | ~85 | 28 built-in ids + any `models.providers.*` | 4 wire formats (chat completions, Responses, Anthropic Messages, Gemini) offline-tested | no streaming for Anthropic/Gemini/Responses (single delta); no OAuth/Bedrock/Vertex signing | Bedrock, Vertex, Copilot, Codex OAuth, … |
 | Plugin API (`api.register*`) | 59 | 10 (JS host) + C ABI | registerTool/Provider/GatewayMethod/HttpRoute/Hook/Command/Cli/Service/Channel/HttpHandler | Channel/Service are thin | 49 (§6) |
 
@@ -127,7 +127,7 @@ provider factory. Some raw-config consumers still read raw values.
 - **iMessage:** bridge inbound.
 - **Generic:** webhook, HTTP, WS, CLI.
 
-**Stub:** Telegram. It is registered and outbound payloads are recorded, but there is no live Bot API polling or send.
+**Telegram (1.126, real):** getUpdates long polling (deleteWebhook first, offset persisted across restarts, backoff, 409 conflict logged) or webhook inbound with secret header; replies chunked at 4096 chars, group replies use `reply_parameters`, forum topics keep `message_thread_id`. Offline e2e: `scripts/e2e-telegram.sh`. Not yet: media send (except voice), inline keyboards/callback actions, reactions, native commands menu.
 
 **Missing channel extensions (21):**
 - a2a, buzz, clickclack, googlechat, irc, line, matrix, mattermost, msteams, nextcloud-talk, nostr
@@ -194,9 +194,18 @@ offline fakes that copy the documented wire formats. The same applies to:
 
 ## 9. Largest remaining gaps (priority order)
 
-1. Telegram channel (live Bot API: getUpdates/webhook + sendMessage/media). This is the most-used upstream channel.
+1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards remain).
 2. Signal, Matrix, MS Teams, Google Chat, Mattermost channel extensions.
 3. Native streaming for Anthropic/Gemini/Responses, plus Bedrock/Vertex auth.
 4. Missing core tools: web_search, ask_user, view_image, agents_wait, conversations_*.
 5. Plugin API breadth: provider families, context engine, memory capability.
 6. SQLite-backed session and transcript storage, for on-disk parity.
+
+## 10. Test-suite notes
+
+The smoke step "device tools.list allowed" failed intermittently. Root cause: the smoke's second gateway shared the
+default data dir (`~/.openclaw-cpp/data`), whose device-link store persists a per-IP claim rate limit (30/min). Earlier
+runs in the same minute (and `connect`, which polled `pairing.link.claim` every 500 ms while pending) used up the
+budget, so the device-token claim was rate-limited and the token came back empty. Fixed in 1.126: the smoke gateway uses
+its own data dir, polls with the correct secret on a still-pending link no longer consume the budget (bad secrets
+still do), and `connect` polls once a second.
