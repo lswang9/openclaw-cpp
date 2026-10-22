@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.138.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.139.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -107,6 +107,7 @@ set(OPENCLAW_SOURCES
   src/auth/mfa.cpp
   src/auth/oidc.cpp
   src/plugins/js_host.cpp
+  src/plugins/caps.cpp
   src/plugins/js_extensions.cpp
   src/mcp/client.cpp
   src/mcp/bridge.cpp

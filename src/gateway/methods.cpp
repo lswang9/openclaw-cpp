@@ -448,6 +448,8 @@ std::vector<std::string> DispatchableMethods() {
         "plugins.credentials.inspect",
         "plugins.install.progress",
         "plugins.reload",
+        "plugins.listCapabilities",
+        "plugins.invokeRegistration",
         "plugins.sessionAction",
         "plugins.skills.read",
         "plugins.uiDescriptors",

@@ -1,3 +1,4 @@
+#include "openclaw/plugins/caps.hpp"
 #include <openssl/crypto.h>
 #include <regex>
 #include "openclaw/auth/webauthn.hpp"
@@ -64,7 +65,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.138.0-dev";
+constexpr const char* kVersion = "1.139.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1038,6 +1039,7 @@ nlohmann::json Server::ReloadConfigNow() {
                            {"systemPromptChanged", prompt_changed}, {"channelsRestarted", restarted},
                            {"pluginsRestarted", plugins_restarted}});
     deps_.logs.Append("info", std::string("config hot-reloaded") + (restart ? " (gateway bind change needs restart)" : ""));
+    plugins::NotifyReload(deps_.js_host, {{"reason", "config-hot-reload"}});
     return {{"reloaded", true}, {"restartRequired", restart}, {"warnings", warnings},
             {"systemPromptChanged", prompt_changed}, {"channelsRestarted", restarted},
             {"pluginsRestarted", plugins_restarted}, {"systemPromptChars", prompt_chars}};

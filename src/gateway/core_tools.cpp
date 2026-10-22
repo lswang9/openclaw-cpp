@@ -396,6 +396,18 @@ std::string DecisionModel(const json& cfg, const std::string& agent) {
     return {};
 }
 std::string DecisionTool(const json& a, const std::string& agent, const json& cfg) {
+    // 1.139: prefer a plugin registerDecisionProvider when one is loaded.
+    {
+        auto plug = GatewayRpc("plugins.invokeRegistration", {{"kind", "registerDecisionProvider"}, {"method", "evaluate"}, {"args", a}, {"agentId", agent}});
+        if (plug.value("ok", false)) {
+            auto payload = plug.contains("payload") ? plug["payload"] : plug;
+            if (payload.value("ok", false) && payload.contains("result")) {
+                json ans = payload["result"];
+                if (ans.is_object() && ans.contains("result")) ans = ans["result"];
+                return json{{"status", "ok"}, {"result", ans}, {"provenance", {{"provider", "plugin"}, {"plugin", payload.value("plugin", "")}}}}.dump();
+            }
+        }
+    }
     const auto model = DecisionModel(cfg, agent);
     if (model.empty()) return json{{"status", "unavailable"}, {"reason", "no-decision-model"}, {"guidance", "Set agents.defaults.decisionModel to enable decision_evaluate."}}.dump();
     auto bad = [] { return Err("Invalid decision_evaluate input: provide state and a nonempty questions map with boolean, choice, or score questions; no evidence was sent."); };

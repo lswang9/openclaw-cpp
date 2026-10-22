@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.138.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.139.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.139.0-dev 新增
+
+1.139：原 48 个仅捕获的 api.register* 可通过 plugins.invokeRegistration 调用；decision_evaluate / web_fetch / image|video|music_generate 优先插件；reload/lifecycle 通知；离线 e2e-plugin-caps
 
 ## 1.138.0-dev 新增
 

@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <poll.h>
 #include <thread>
+#include "openclaw/plugins/caps.hpp"
 #include "openclaw/plugins/registry.hpp"
 #include <optional>
 #include "openclaw/mcp/client.hpp"
@@ -2192,7 +2193,25 @@ ExtraResult Plugins(ServerDeps& d, const fs::path& root, const std::string& m, c
         for (auto& c : cat) if (c.value("id", "") == id) return Ok({{"plugin", decorate(c)}});
         return Fail("plugin not in catalog: " + id);
     }
-    if (m == "plugins.reload") { int n = rescan(); return Ok({{"plugins", d.plugins.ListJson()}, {"nativesLoaded", n}}); }
+    if (m == "plugins.reload") {
+        int n = rescan();
+        plugins::NotifyReload(d.js_host, {{"reason", "plugins.reload"}});
+        return Ok({{"plugins", d.plugins.ListJson()}, {"nativesLoaded", n}});
+    }
+    if (m == "plugins.listCapabilities") {
+        if (!d.js_host || !d.js_host->Running()) return Fail("js plugin host not running");
+        auto r = d.js_host->Rpc("list_capability_providers", json::object());
+        auto regs = d.js_host->Rpc("list_registrations", json::object());
+        return Ok({{"providers", r.value("providers", json::object())}, {"registrations", regs.value("registrations", json::object())}});
+    }
+    if (m == "plugins.invokeRegistration") {
+        if (!d.js_host || !d.js_host->Running()) return Fail("js plugin host not running");
+        const auto kind = str("kind");
+        if (kind.empty()) return Fail("kind required (e.g. registerEmbeddingProvider)");
+        auto r = plugins::InvokeRegistration(d.js_host, kind, p.value("args", json::object()), p.value("method", "execute"), str("id"));
+        if (!r) return Fail("no registration for " + kind);
+        return Ok(*r);
+    }
     if (m == "plugins.install") {
         std::string src = str("source").empty() ? str("spec") : str("source");
         if (src.empty()) for (auto& c : cat) if (c.value("id", "") == id) src = c.value("source", "");
@@ -3652,7 +3671,7 @@ ExtraResult TrySubsystemDispatch(ServerDeps& deps, const fs::path& root, const s
         { auto r = LocalGroups(deps, root, method, params); if (r.handled) return r; }
         { auto r = Batch3(deps, root, method, params); if (r.handled) return r; }
         { static const std::set<std::string> pm{"plugins.catalog.browse", "plugins.catalog.categories", "plugins.catalog.get", "plugins.controlUi.list", "plugins.controlUi.report",
-              "plugins.controlUi.status", "plugins.credentials.inspect", "plugins.inspect", "plugins.install", "plugins.reload", "plugins.skills.read", "plugins.uninstall"};
+              "plugins.controlUi.status", "plugins.credentials.inspect", "plugins.inspect", "plugins.install", "plugins.invokeRegistration", "plugins.listCapabilities", "plugins.reload", "plugins.skills.read", "plugins.uninstall"};
           if (pm.count(method)) { auto r = Plugins(deps, root, method, params); if (r.handled) return r; } }
         { static const std::set<std::string> sm{"sessions.activitySummary.ensure", "sessions.catalog.archive", "sessions.catalog.continue", "sessions.catalog.import",
               "sessions.catalog.startTerminal", "sessions.files.reveal", "sessions.github.options", "sessions.github.status", "sessions.pluginPatch",
@@ -4089,6 +4108,21 @@ nlohmann::json GenerateMedia(const std::string& kind, const nlohmann::json& a) {
     using nlohmann::json;
     const auto prompt = a.value("prompt", std::string());
     if (prompt.empty()) return {{"ok", false}, {"error", "prompt is required"}};
+    // 1.139: prefer plugin image/video/music generation providers when registered.
+    {
+        const std::string kind_reg = kind == "image" ? "registerImageGenerationProvider"
+                                    : kind == "video" ? "registerVideoGenerationProvider"
+                                    : kind == "music" ? "registerMusicGenerationProvider" : "";
+        if (!kind_reg.empty() && g_tool_deps && g_tool_deps->js_host) {
+            auto r = plugins::InvokeRegistration(g_tool_deps->js_host, kind_reg, a, "generate");
+            if (r && r->value("ok", false) && r->contains("result")) {
+                json out = r->value("result", json::object());
+                if (!out.is_object()) out = {{"data", out}};
+                out["ok"] = true; out["provider"] = "plugin"; out["plugin"] = r->value("plugin", ""); out["kind"] = kind;
+                return out;
+            }
+        }
+    }
     const char* prov = std::getenv("OPENCLAW_MEDIA_PROVIDER");
     const char* def = std::getenv("OPENCLAW_DEFAULT_PROVIDER");
     const std::string provider = prov ? prov : (def && std::string(def) == "mock" ? "mock" : "");

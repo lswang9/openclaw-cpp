@@ -369,6 +369,10 @@ async function scan(roots) {
     try { if (typeof svc.start === 'function') await svc.start({ config: hostConfig }); }
     catch (e) { process.stderr.write(`js_bridge: service ${plugin}/${svc.id} start failed: ${e}\n`); }
   }
+  for (const r of regs('registerRuntimeLifecycle')) {
+    try { if (r.value && typeof r.value.start === 'function') await r.value.start({ config: hostConfig }); }
+    catch (e) { process.stderr.write(`js_bridge: runtime lifecycle ${r.plugin} start failed: ${e}\n`); }
+  }
 }
 
 function toText(r) {
@@ -656,9 +660,47 @@ async function handle(req) {
         }
         return respond(id, { changed, result: toolResultText(result) });
       }
+      case 'invoke_registration': {
+        // 1.139: generic consumer for any captured api.register* (kind + optional id + method + args).
+        const kind = params.kind, want = params.id, method = params.method || 'execute';
+        const list = regs(kind);
+        if (!list.length) return respond(id, { ok: false, error: `no registrations for ${kind}` });
+        const entry = want ? list.find((r) => (r.value && (r.value.id || r.value.name)) === want) : list[0];
+        if (!entry) return respond(id, { ok: false, error: `no registration ${kind}/${want}` });
+        const v = entry.value;
+        const ctx = { config: hostConfig, plugin: entry.plugin, opts: entry.opts || {}, runtime: makeRuntime({ id: entry.plugin }) };
+        try {
+          let result;
+          if (typeof v === 'function') result = await v(params.args || {}, ctx);
+          else if (v && typeof v[method] === 'function') result = await v[method](params.args || {}, ctx);
+          else if (v && typeof v.execute === 'function') result = await v.execute(params.args || {}, ctx);
+          else if (v && typeof v.handle === 'function') result = await v.handle(params.args || {}, ctx);
+          else if (v && typeof v.run === 'function') result = await v.run(params.args || {}, ctx);
+          else if (v && typeof v.collect === 'function') result = await v.collect(params.args || {}, ctx);
+          else if (v && typeof v.create === 'function') {
+            const created = await v.create(params.args || {}, ctx);
+            result = created && typeof created.execute === 'function' ? await created.execute(params.args || {}, ctx) : created;
+          } else result = { registration: { id: v && (v.id || v.name) || null, label: v && v.label || null, keys: v && typeof v === 'object' ? Object.keys(v) : [] } };
+          return respond(id, { ok: true, kind, plugin: entry.plugin, id: v && (v.id || v.name) || null, result });
+        } catch (e) { return respond(id, { ok: false, kind, plugin: entry.plugin, error: String(e && e.message || e) }); }
+      }
+      case 'list_capability_providers': {
+        // Summaries for provider-like registrations the C++ runtime prefers over built-ins when present.
+        const kinds = [].concat(params.kinds || CAPTURED_KINDS);
+        const out = {};
+        for (const kind of kinds) out[kind] = regs(kind).map((r) => ({
+          plugin: r.plugin, id: r.value && (r.value.id || r.value.name) || null, label: r.value && r.value.label || null,
+          methods: r.value && typeof r.value === 'object' ? Object.keys(r.value).filter((k) => typeof r.value[k] === 'function') : [],
+        }));
+        return respond(id, { providers: out });
+      }
       case 'shutdown': {
         for (const run of channelRuns.values()) { try { run.abort.abort(); } catch {} }
         for (const { svc } of services) { try { if (typeof svc.stop === 'function') await svc.stop(); } catch {} }
+        // 1.139: notify lifecycle registrations on shutdown
+        for (const r of regs('registerRuntimeLifecycle')) {
+          try { if (r.value && typeof r.value.stop === 'function') await r.value.stop({ config: hostConfig }); } catch {}
+        }
         respond(id, { ok: true });
         process.exit(0);
       }

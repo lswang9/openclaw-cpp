@@ -33,6 +33,7 @@
 #include "openclaw/memory/store.hpp"
 #include "openclaw/plugins/registry.hpp"
 #include "openclaw/plugins/js_host.hpp"
+#include "openclaw/plugins/caps.hpp"
 #include "openclaw/plugins/js_extensions.hpp"
 #include "openclaw/plugins/install.hpp"
 #include "openclaw/agent/routing.hpp"
@@ -111,7 +112,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.138.0-dev";
+constexpr const char* kVersion = "1.139.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3522,9 +3523,18 @@ int CmdGateway(int argc, char** argv, int argi) {
         }
         for (auto& [name, desc, schema] : gw_tools)
             tools.Register({name, desc, schema, [name](const J& a) { const auto& ctx = tools::exec::CurrentContext(); return gateway::GatewayTool(name, a, ctx.agent_id, ctx.session_key); }});
-        tools.Register({"web_fetch", "Fetch a URL (http/https) and return its text (maxChars, default 20000). SSRF-guarded like http_get.",
+        tools.Register({"web_fetch", "Fetch a URL (http/https) and return its text (maxChars, default 20000). SSRF-guarded like http_get. Uses a plugin registerWebFetchProvider when one is loaded.",
                         obj({{"url", {{"type", "string"}}}, {"maxChars", {{"type", "integer"}}}}),
-                        [&tools](const J& a) {
+                        [&tools, &js_host](const J& a) {
+                            // Call JS host directly — GatewayRpc would deadlock under tools.invoke's deps_lock.
+                            if (auto plug = plugins::InvokeRegistration(&js_host, "registerWebFetchProvider", a, "fetch")) {
+                                if (plug->value("ok", false) && plug->contains("result")) {
+                                    auto r = (*plug)["result"];
+                                    if (r.is_string()) return r.get<std::string>();
+                                    if (r.is_object() && r.contains("text")) return r.value("text", r.dump());
+                                    return r.dump();
+                                }
+                            }
                             auto r = tools.Invoke("http_get", {{"url", a.value("url", std::string())}, {"max_bytes", std::clamp(a.value("maxChars", 20000), 256, 2000000)}});
                             return r;
                         }});

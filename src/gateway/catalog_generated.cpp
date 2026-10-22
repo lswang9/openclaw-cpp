@@ -456,6 +456,8 @@ const std::vector<std::string>& UpstreamMethods() {
     "sessions.storage.status",
     "sessions.storage.run",
     "plugins.reload",
+    "plugins.listCapabilities",
+    "plugins.invokeRegistration",
     "claws.packages.remove",
     "canvas.document.preview",
     "computer.status",
