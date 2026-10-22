@@ -47,6 +47,29 @@ const CAPTURED_KINDS = ['registerAgentEventSubscription', 'registerAgentExecutor
   'registerStorageProvider', 'registerTextTransforms', 'registerToolMetadata', 'registerTranscriptSourceProvider', 'registerTrustedToolPolicy',
   'registerVideoGenerationProvider', 'registerWebFetchProvider', 'registerWebSearchProvider', 'registerWidgetPresenter', 'registerWorkerProvider'];
 function regs(kind) { return registrations.get(kind) || []; }
+// 1.142: domain consumers for context engine / memory prompt supplements / agent harness / speech providers.
+const engineCache = new Map();
+async function contextEngine(id) {
+  const list = regs('registerContextEngine');
+  const entry = id ? list.find((r) => r.value && r.value.id === id) : null;
+  if (!entry) return null;
+  if (engineCache.has(id)) return engineCache.get(id);
+  const v = entry.value;
+  let eng = null;
+  if (typeof v.factory === 'function') eng = await v.factory({ config: hostConfig, runtime: makeRuntime({ id: entry.plugin }) });
+  else if (v && typeof v.assemble === 'function') eng = v;
+  engineCache.set(id, eng);
+  return eng;
+}
+function assistantText(r) {
+  if (r == null) return null;
+  if (typeof r === 'string') return r;
+  if (Array.isArray(r.assistantTexts)) return r.assistantTexts.join('\n');
+  for (const k of ['finalText', 'text', 'output', 'reply']) if (typeof r[k] === 'string') return r[k];
+  if (r.result !== undefined) return assistantText(r.result);
+  return null;
+}
+
 function toolResultText(r) {
   if (typeof r === 'string') return r;
   if (r && Array.isArray(r.content)) return r.content.filter((c) => c && c.type === 'text').map((c) => c.text).join('\n');
@@ -312,6 +335,8 @@ function makeApi(rec) {
     ...Object.fromEntries(CAPTURED_KINDS.map((kind) => [kind, (value, opts) => {
       if (value === undefined || value === null) return api.logger.warn(`${kind}: missing registration`);
       if (!registrations.has(kind)) registrations.set(kind, []);
+      // registerContextEngine(id, factory): keep both so the engine can be instantiated on demand (1.142).
+      if (kind === 'registerContextEngine' && typeof value === 'string') { value = { id: value, factory: opts }; opts = undefined; }
       registrations.get(kind).push({ plugin: rec.id, value, opts });
     }])),
     registerCli(fn, opts) {
@@ -660,6 +685,64 @@ async function handle(req) {
         }
         return respond(id, { changed, result: toolResultText(result) });
       }
+      case 'context_engine_assemble': {
+        const eng = await contextEngine(params.engineId);
+        if (!eng || typeof eng.assemble !== 'function') return respond(id, { ok: false, error: `no context engine ${params.engineId}` });
+        try {
+          const r = await eng.assemble({ sessionId: params.sessionKey || 'main', sessionKey: params.sessionKey, messages: params.messages || [], tokenBudget: params.tokenBudget });
+          return respond(id, { ok: true, messages: Array.isArray(r && r.messages) ? r.messages : null, systemPromptAddition: r && r.systemPromptAddition || null, estimatedTokens: r && r.estimatedTokens || null });
+        } catch (e) { return respond(id, { ok: false, error: String(e && e.message || e) }); }
+      }
+      case 'context_engine_after_turn': {
+        const eng = await contextEngine(params.engineId);
+        try {
+          if (eng && typeof eng.afterTurn === 'function') await eng.afterTurn({ sessionId: params.sessionKey || 'main', sessionKey: params.sessionKey, messages: params.messages || [], prePromptMessageCount: params.prePromptMessageCount || 0 });
+          else if (eng && typeof eng.ingest === 'function') for (const m of (params.messages || []).slice(params.prePromptMessageCount || 0)) await eng.ingest({ sessionId: params.sessionKey || 'main', sessionKey: params.sessionKey, message: m });
+          return respond(id, { ok: true });
+        } catch (e) { return respond(id, { ok: false, error: String(e && e.message || e) }); }
+      }
+      case 'memory_prompt_supplements': {
+        const out = [];
+        for (const r of regs('registerMemoryPromptSupplement')) {
+          const v = r.value; const fn = typeof v === 'function' ? v : v && (v.build || v.execute || v.supplement);
+          try {
+            const res = typeof fn === 'function' ? await fn.call(v, { agentId: params.agentId, sessionKey: params.sessionKey, config: hostConfig }) : null;
+            const lines = Array.isArray(res) ? res : typeof res === 'string' ? [res] : res && typeof res.text === 'string' ? [res.text] : res && Array.isArray(res.lines) ? res.lines : [];
+            for (const l of lines) if (typeof l === 'string' && l.trim()) out.push(l);
+          } catch (e) { process.stderr.write(`js_bridge: memory prompt supplement ${r.plugin} failed: ${e}\n`); }
+        }
+        return respond(id, { ok: true, text: out.join('\n') });
+      }
+      case 'harness_run': {
+        const entry = regs('registerAgentHarness').find((r) => r.value && r.value.id === params.harnessId);
+        if (!entry) return respond(id, { ok: false, error: `no agent harness ${params.harnessId}` });
+        const h = entry.value;
+        try {
+          const ctx = { provider: params.provider, modelId: params.model, agentId: params.agentId };
+          if (typeof h.supports === 'function') {
+            const sup = await h.supports(ctx);
+            if (sup === false || (sup && sup.supported === false)) return respond(id, { ok: false, unsupported: true, reason: sup && sup.reason || 'unsupported' });
+          }
+          const run = h.runAttempt || h.run || h.execute;
+          if (typeof run !== 'function') return respond(id, { ok: false, error: 'harness has no runAttempt' });
+          const r = await run.call(h, { prompt: params.prompt, messages: params.messages || [], provider: params.provider, modelId: params.model, agentId: params.agentId, sessionKey: params.sessionKey, config: hostConfig });
+          const text = assistantText(r);
+          return respond(id, { ok: text !== null, text, error: text === null ? 'harness returned no assistant text' : undefined });
+        } catch (e) { return respond(id, { ok: false, error: String(e && e.message || e) }); }
+      }
+      case 'speech_synthesize': {
+        const list = regs('registerSpeechProvider');
+        const entry = params.providerId ? list.find((r) => r.value && r.value.id === params.providerId) : list[0];
+        if (!entry) return respond(id, { ok: false, error: 'no speech provider' });
+        const v = entry.value; const fn = v.synthesize || v.execute;
+        try {
+          const r = await fn.call(v, { text: params.text, voice: params.voice, cfg: hostConfig, config: hostConfig });
+          const buf = r && (r.audioBuffer || r.audio || r.buffer);
+          const b64 = buf == null ? null : (typeof buf === 'string' ? buf : Buffer.from(buf).toString('base64'));
+          if (!b64) return respond(id, { ok: false, error: 'speech provider returned no audio' });
+          return respond(id, { ok: true, provider: v.id || null, plugin: entry.plugin, audioBase64: b64, format: r.outputFormat || r.format || 'mp3', fileExtension: r.fileExtension || ('.' + (r.outputFormat || 'mp3')) });
+        } catch (e) { return respond(id, { ok: false, error: String(e && e.message || e) }); }
+      }
       case 'invoke_registration': {
         // 1.139: generic consumer for any captured api.register* (kind + optional id + method + args).
         const kind = params.kind, want = params.id, method = params.method || 'execute';
@@ -667,7 +750,8 @@ async function handle(req) {
         if (!list.length) return respond(id, { ok: false, error: `no registrations for ${kind}` });
         const entry = want ? list.find((r) => (r.value && (r.value.id || r.value.name)) === want) : list[0];
         if (!entry) return respond(id, { ok: false, error: `no registration ${kind}/${want}` });
-        const v = entry.value;
+        let v = entry.value;
+        if (kind === 'registerContextEngine' && v && typeof v.factory === 'function') v = await contextEngine(v.id) || v;
         const ctx = { config: hostConfig, plugin: entry.plugin, opts: entry.opts || {}, runtime: makeRuntime({ id: entry.plugin }) };
         try {
           let result;

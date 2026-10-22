@@ -1,6 +1,7 @@
 #include "openclaw/provider/mock.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 namespace openclaw::provider {
@@ -57,6 +58,11 @@ agent::CompletionResult MockProvider::Complete(const std::vector<agent::Message>
             r.message.content = "mock-saw-image:" + std::to_string(images) +
                                 (files ? (" file:" + std::to_string(files)) : "");
             if (!last_text.empty()) r.message.content += " text:" + last_text;
+        } else if (const char* e = std::getenv("OPENCLAW_MOCK_ECHO"); e && *e == '1') {
+            // 1.142 test aid: reveal what the model was actually sent (count, system prompt, last message).
+            std::string sys; for (const auto& m : messages) if (m.role == "system") { sys = m.content; break; }
+            if (sys.size() > 400) sys = sys.substr(sys.size() - 400);
+            r.message.content = "mock-echo n=" + std::to_string(messages.size()) + " sys=[" + sys + "] last=[" + last_text + "]";
         } else {
             r.message.content = "mock-default";
         }

@@ -175,7 +175,8 @@ The JS host (`plugins/js_bridge/host.mjs`) accepts all 60 upstream `api.register
 - Host: `invoke_registration` + `list_capability_providers`; C++ `plugins::InvokeRegistration` / `HasCapability` / `NotifyReload` / `NotifyLifecycle`.
 - RPCs: `plugins.listCapabilities`, `plugins.invokeRegistration` (any captured `register*` kind + method + args).
 - Prefer-plugin hooks: `decision_evaluate` → `registerDecisionProvider`; `web_fetch` → `registerWebFetchProvider` (direct JsHost call, not nested GatewayRpc); `image_generate` / `video_generate` / `music_generate` → matching generation providers; config hot-reload → `registerReload`; host start/stop → `registerRuntimeLifecycle`.
-- Remaining kinds (context engine, memory, speech, embedding, policies, harness, …) stay generic-invoke only until a domain path wires them.
+- **1.142 domain wiring:** `registerContextEngine(id, factory)` selected by `plugins.slots.contextEngine` — `assemble` shapes the messages sent to the model on every loop turn (transcript unchanged; `systemPromptAddition` appended to the system prompt) and `afterTurn` (or `ingest`) runs after each finished loop; `registerMemoryPromptSupplement` lines are appended to the system prompt; `registerAgentHarness` selected by `agents.list[].agentRuntime.id` / `agents.defaults.agentRuntime.id` — `supports` + `runAttempt` replace the built-in loop (falls back to it on error/unsupported); `registerSpeechProvider` — `tts.convert` / `tts.speak` use `synthesize` when `messages.tts.provider` names it or no HTTP TTS is configured, audio saved under `media/tts/`. Partial vs upstream: engine `bootstrap`/`maintain`/`compact` and token budgets are not driven; harness gets prompt + messages only (no tool bridge, side questions or delivery defaults); speech has no streaming/personas. Offline e2e: `scripts/e2e-plugin-domains.sh`.
+- Still generic-invoke only: embedding, memory capability/corpus, realtime voice/transcription, media understanding, policies (trusted tool / gateway access / node invoke), session catalog/actions/scheduler, storage, worker, migrations, widget/Control UI descriptors.
 
 Offline e2e: `scripts/e2e-plugin-registrations.sh`, `scripts/e2e-plugin-caps.sh`.
 
@@ -224,7 +225,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 2. ~~Signal, Matrix, MS Teams, Google Chat, Mattermost~~ (text transports in 1.129; live listeners/verification listed in §5). ~~16 misc channels~~ (1.138 text transports).
 3. ~~Native streaming~~ (done in 1.127); ~~Bedrock/Vertex auth~~ (1.137: AWS SigV4 + `AWS_BEARER_TOKEN_BEDROCK`, Google ADC authorized_user/service_account → Vertex Anthropic rawPredict + Gemini generateContent; offline `scripts/e2e-bedrock-vertex.sh`).
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
-5. ~~Plugin API inert registrations~~ (1.139: invoke + decision/web_fetch/media/reload/lifecycle hooks). Still thin: context engine, memory, speech, harness need domain wiring beyond generic invoke.
+5. ~~Plugin API inert registrations~~ (1.139: invoke + decision/web_fetch/media/reload/lifecycle hooks). 1.142: context engine, memory prompt supplements, agent harness and speech providers wired into their domains (partials in §6); embedding/realtime/policies still generic.
 6. ~~SQLite session/transcript storage~~ (1.131, opt-in); other stores still JSON.
 
 ## 10. Test-suite notes

@@ -38,10 +38,19 @@ std::size_t RateBucket::RecentCount() const {
 }
 
 
+static LoopResult RunAgentLoopImpl(provider::Provider& provider, tools::Registry& registry, std::vector<Message> messages, LoopOptions& opts);
+
 LoopResult RunAgentLoop(provider::Provider& provider,
                         tools::Registry& registry,
                         std::vector<Message> messages,
                         LoopOptions opts) {
+    const std::size_t pre = messages.size();
+    auto r = RunAgentLoopImpl(provider, registry, std::move(messages), opts);
+    if (r.ok && opts.after_turn) { try { opts.after_turn(r.messages, pre); } catch (...) {} }
+    return r;
+}
+
+static LoopResult RunAgentLoopImpl(provider::Provider& provider, tools::Registry& registry, std::vector<Message> messages, LoopOptions& opts) {
     LoopResult out;
     out.messages = std::move(messages);
     // Provider-facing tool names must match ^[a-zA-Z0-9_-]{1,64}$ (OpenAI/DeepSeek/Anthropic reject e.g. "mcp.echo");
@@ -72,6 +81,14 @@ LoopResult RunAgentLoop(provider::Provider& provider,
     if (opts.text_transform)
         for (auto it = out.messages.rbegin(); it != out.messages.rend(); ++it)
             if (it->role == "user") { it->content = opts.text_transform("input", it->content); break; }
+    if (opts.harness) {
+        if (auto txt = opts.harness(out.messages)) {
+            Message m; m.role = "assistant"; m.content = opts.text_transform ? opts.text_transform("output", *txt) : *txt;
+            out.messages.push_back(m); out.ok = true; out.final_text = m.content; out.turns = 1;
+            return out;
+        }
+    }
+
     for (std::size_t turn = 0; turn < opts.max_turns; ++turn) {
         ++out.turns;
         if (opts.verbose) {
@@ -99,8 +116,11 @@ LoopResult RunAgentLoop(provider::Provider& provider,
             return out;
         }
 
-        auto completion = opts.on_delta ? provider.CompleteStreaming(out.messages, tools, opts.on_delta)
-                                        : provider.Complete(out.messages, tools);
+        std::vector<Message> assembled;
+        if (opts.context_assemble) { try { assembled = opts.context_assemble(out.messages); } catch (...) { assembled.clear(); } }
+        const auto& to_send = assembled.empty() ? out.messages : assembled;
+        auto completion = opts.on_delta ? provider.CompleteStreaming(to_send, tools, opts.on_delta)
+                                        : provider.Complete(to_send, tools);
         if (!completion.ok) {
             out.ok = false;
             out.error = completion.error.empty() ? "provider failed" : completion.error;

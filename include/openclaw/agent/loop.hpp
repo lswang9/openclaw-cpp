@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <optional>
 
 #include "openclaw/agent/types.hpp"
 #include "openclaw/provider/provider.hpp"
@@ -39,6 +40,13 @@ struct LoopOptions {
     bool inline_tool_images = true;
     // Plugin api.registerTextTransforms: direction "input" (newest user message) / "output" (final assistant text).
     std::function<std::string(const std::string& direction, const std::string& text)> text_transform;
+    // 1.142 plugin domain hooks.
+    // Context engine (plugins.slots.contextEngine): messages actually sent to the model each turn; transcript is unchanged.
+    std::function<std::vector<Message>(const std::vector<Message>&)> context_assemble;
+    // Called once after a finished loop with the full transcript and the pre-prompt message count.
+    std::function<void(const std::vector<Message>&, std::size_t)> after_turn;
+    // Agent harness (agentRuntime.id = plugin harness id): replaces the provider loop when it returns text.
+    std::function<std::optional<std::string>(const std::vector<Message>&)> harness;
 };
 
 class RateBucket {

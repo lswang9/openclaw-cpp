@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.141.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.142.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.142.0-dev 新增
+
+1.142：插件注册接入领域——上下文引擎（plugins.slots.contextEngine）、记忆提示补充、Agent Harness（agentRuntime.id）、语音合成提供方；离线 e2e-plugin-domains
 
 ## 1.141.0-dev 新增
 

@@ -1,3 +1,4 @@
+#include <openssl/evp.h>
 #include "openclaw/acp/acpx.hpp"
 #include "openclaw/channels/waweb/noise.hpp"
 #include <chrono>
@@ -1452,6 +1453,35 @@ ExtraResult TryExtraDispatchImpl(ServerDeps& deps, const std::string& method,
         }
         if (method == "tts.speak" || method == "tts.convert" || method == "talk.voice.complete") {
             auto text = params.value("text", params.value("input", ""));
+            // 1.142: plugin api.registerSpeechProvider — used when messages.tts.provider / the TTS provider names it,
+            // or when no HTTP TTS endpoint is configured.
+            if (deps.js_host && deps.js_host->Running() && deps.js_host->HasRegistration("registerSpeechProvider") && !text.empty()) {
+                std::string want;
+                if (auto pv = config::GetPath(deps.config.raw, "messages.tts.provider"); pv && pv->is_string()) want = pv->get<std::string>();
+                if (want.empty()) want = tts.Provider();
+                auto caps = deps.js_host->Rpc("list_capability_providers", {{"kinds", {"registerSpeechProvider"}}});
+                std::string pick;
+                for (auto& e : caps["providers"].value("registerSpeechProvider", nlohmann::json::array())) if (e.value("id", nlohmann::json()).is_string() && e["id"] == want) pick = want;
+                const char* url = std::getenv("OPENCLAW_TTS_URL");
+                if (!pick.empty() || !(url && *url)) {
+                    auto sr = deps.js_host->Rpc("speech_synthesize", {{"providerId", pick}, {"text", text}, {"voice", params.value("voice", "")}});
+                    if (sr.value("ok", false)) {
+                        std::string b64 = sr.value("audioBase64", std::string()), bytes((b64.size() / 4 + 1) * 3, '\0');
+                        int n = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(bytes.data()), reinterpret_cast<const unsigned char*>(b64.data()), (int)b64.size());
+                        if (n >= 0) {
+                            std::size_t pad = 0; for (auto it = b64.rbegin(); it != b64.rend() && *it == '='; ++it) ++pad;
+                            bytes.resize((std::size_t)n - std::min<std::size_t>(pad, (std::size_t)n));
+                            std::string ext = sr.value("fileExtension", std::string(".mp3")); if (ext.empty() || ext[0] != '.') ext = "." + ext;
+                            const auto dir = DataRoot(deps) / "media" / "tts"; std::error_code ec; std::filesystem::create_directories(dir, ec);
+                            const auto f = dir / ("tts-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ext);
+                            std::ofstream(f, std::ios::binary).write(bytes.data(), (std::streamsize)bytes.size());
+                            r.payload = Real({{"ok", true}, {"mode", "plugin"}, {"delivered", true}, {"provider", sr.value("provider", nlohmann::json())}, {"plugin", sr.value("plugin", "")},
+                                              {"path", f.string()}, {"bytes", bytes.size()}, {"format", sr.value("format", "")}});
+                            return r;
+                        }
+                    }
+                }
+            }
             r.payload = Real(tts.Speak(text, params.value("voice", "")));
             return r;
         }

@@ -65,7 +65,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.141.0-dev";
+constexpr const char* kVersion = "1.142.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -279,6 +279,63 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
                 auto ctx = tools::exec::CurrentContext();
                 auto res = js->Rpc("tool_result_middleware", {{"toolName", t}, {"args", a}, {"result", r}, {"isError", is_err}, {"agentId", ctx.agent_id}, {"sessionKey", ctx.session_key}});
                 return res.value("changed", false) && res.contains("result") && res["result"].is_string() ? res["result"].get<std::string>() : r;
+            };
+        // 1.142: context engine slot, memory prompt supplements, agent harness (agentRuntime.id).
+        std::string engine_id;
+        if (auto e = config::GetPath(raw, "plugins.slots.contextEngine"); e && e->is_string() && *e != "none" && *e != "legacy" && *e != "") engine_id = e->get<std::string>();
+        const bool has_engine = !engine_id.empty() && js->HasRegistration("registerContextEngine");
+        const bool has_supp = js->HasRegistration("registerMemoryPromptSupplement");
+        if (has_engine || has_supp)
+            o.context_assemble = [js, engine_id, has_engine, has_supp](const std::vector<agent::Message>& msgs) {
+                auto ctx = tools::exec::CurrentContext();
+                std::vector<agent::Message> out = msgs;
+                std::string addition;
+                if (has_engine) {
+                    nlohmann::json arr = nlohmann::json::array(); for (auto& m : msgs) arr.push_back(m.ToJson());
+                    auto r = js->Rpc("context_engine_assemble", {{"engineId", engine_id}, {"messages", arr}, {"sessionKey", ctx.session_key}, {"agentId", ctx.agent_id}});
+                    if (r.value("ok", false)) {
+                        if (r.contains("messages") && r["messages"].is_array()) { out.clear(); for (auto& j : r["messages"]) out.push_back(agent::Message::FromJson(j)); }
+                        if (r.contains("systemPromptAddition") && r["systemPromptAddition"].is_string()) addition = r["systemPromptAddition"].get<std::string>();
+                    }
+                }
+                if (has_supp) {
+                    auto r = js->Rpc("memory_prompt_supplements", {{"agentId", ctx.agent_id}, {"sessionKey", ctx.session_key}});
+                    if (auto t = r.value("text", std::string()); !t.empty()) addition += (addition.empty() ? "" : "\n") + t;
+                }
+                if (!addition.empty()) {
+                    if (!out.empty() && out.front().role == "system") out.front().content += "\n\n" + addition;
+                    else { agent::Message sm; sm.role = "system"; sm.content = addition; out.insert(out.begin(), sm); }
+                }
+                return out;
+            };
+        if (has_engine)
+            o.after_turn = [js, engine_id](const std::vector<agent::Message>& msgs, std::size_t pre) {
+                auto ctx = tools::exec::CurrentContext();
+                nlohmann::json arr = nlohmann::json::array(); for (auto& m : msgs) arr.push_back(m.ToJson());
+                js->Rpc("context_engine_after_turn", {{"engineId", engine_id}, {"messages", arr}, {"prePromptMessageCount", pre}, {"sessionKey", ctx.session_key}});
+            };
+        if (js->HasRegistration("registerAgentHarness"))
+            o.harness = [js, raw](const std::vector<agent::Message>& msgs) -> std::optional<std::string> {
+                auto ctx = tools::exec::CurrentContext();
+                const std::string agent = ctx.agent_id.empty() ? "main" : ctx.agent_id;
+                std::string hid, model;
+                if (auto list = config::GetPath(raw, "agents.list"); list && list->is_array())
+                    for (auto& e : *list) if (e.is_object() && e.value("id", "") == agent) {
+                        if (e.contains("agentRuntime") && e["agentRuntime"].is_object()) hid = e["agentRuntime"].value("id", std::string());
+                        if (e.contains("model") && e["model"].is_string()) model = e["model"].get<std::string>();
+                    }
+                if (hid.empty()) if (auto d = config::GetPath(raw, "agents.defaults.agentRuntime.id"); d && d->is_string()) hid = d->get<std::string>();
+                if (hid.empty() || hid == "openclaw" || hid == "pi" || hid == "auto" || hid == "default") return std::nullopt;
+                std::string prompt; for (auto it = msgs.rbegin(); it != msgs.rend(); ++it) if (it->role == "user") { prompt = it->content; break; }
+                nlohmann::json arr = nlohmann::json::array(); for (auto& m : msgs) arr.push_back(m.ToJson());
+                const auto slash = model.find('/');
+                auto r = js->Rpc("harness_run", {{"harnessId", hid}, {"prompt", prompt}, {"messages", arr}, {"agentId", agent}, {"sessionKey", ctx.session_key},
+                                                 {"provider", slash == std::string::npos ? std::string() : model.substr(0, slash)}, {"model", slash == std::string::npos ? model : model.substr(slash + 1)}});
+                if (!r.value("ok", false) || !r.contains("text") || !r["text"].is_string()) {
+                    if (!r.value("unsupported", false)) std::cerr << "[gateway] agent harness " << hid << ": " << r.value("error", std::string("failed")) << " (falling back to the built-in loop)\n";
+                    return std::nullopt;
+                }
+                return r["text"].get<std::string>();
             };
         if (js->HasRegistration("registerTextTransforms"))
             o.text_transform = [js](const std::string& dir, const std::string& text) {
