@@ -2,7 +2,7 @@
 // 1.138: text transports for the 16 previously missing channel extensions
 // (a2a, buzz, clickclack, irc, line, nextcloud-talk, nostr, raft, reef, sms,
 //  synology-chat, tlon, twitch, x, zalo, zalouser). Webhook inbound + HTTP outbound;
-// crypto-heavy features (Nostr NIP-04, IRC native sockets) stay behind a bridge URL.
+// IRC native sockets and Nostr NIP-04 (when privateKey set) run in-process; relay I/O still uses the bridge URL.
 #include <functional>
 #include <utility>
 #include <vector>

@@ -1,5 +1,6 @@
 #include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/channels/irc_native.hpp"
+#include "openclaw/channels/nostr_nip04.hpp"
 
 #include <curl/curl.h>
 
@@ -52,7 +53,7 @@ const std::vector<std::pair<const char*, const char*>> kCatalog = {
     {"irc", "IRC via HTTP bridge (inbound PRIVMSG webhook; outbound POST {apiBase}/privmsg)"},
     {"line", "LINE Messaging API (webhook events; reply/push)"},
     {"nextcloud-talk", "Nextcloud Talk (webhook inbound; outbound chat message OCS)"},
-    {"nostr", "Nostr DMs via HTTP bridge (NIP-04 handled by the bridge; POST {apiBase}/dm)"},
+    {"nostr", "Nostr DMs via HTTP bridge (in-process NIP-04 when privateKey set; POST {apiBase}/dm)"},
     {"raft", "Raft channel (webhook inbound; outbound POST {apiBase}/send)"},
     {"reef", "Reef channel (webhook inbound; outbound POST {apiBase}/send)"},
     {"sms", "Twilio SMS/MMS (inbound webhook; outbound Messages.json)"},
@@ -162,7 +163,20 @@ json MiscChannelSend(const std::string& id, const json& cfg, const std::string& 
         std::string path = id == "irc" ? "/privmsg" : id == "nostr" ? "/dm" : id == "buzz" ? "/v1/messages" : id == "a2a" ? "/message" : id == "tlon" ? "/dm" : "/send";
         json b{{"to", to}, {"text", text}, {"message", text}};
         if (id == "irc") b = {{"target", to}, {"message", text}};
-        if (id == "nostr") b = {{"pubkey", to}, {"content", text}};
+        if (id == "nostr") {
+            b = {{"pubkey", to}, {"content", text}};
+            const auto sk = Cred(cfg, "nostr", "privateKey", "NOSTR_PRIVATE_KEY");
+            if (!sk.empty()) {
+                const auto skn = nostr::NormalizeKey(sk);
+                const auto peer = nostr::NormalizeKey(to);
+                const auto enc = nostr::Encrypt(skn.empty() ? sk : skn, peer.empty() ? to : peer, text);
+                if (enc.empty()) return json{{"ok", false}, {"error", "nostr NIP-04 encrypt failed"}};
+                b["content"] = enc;
+                b["kind"] = 4;
+                const auto pk = nostr::PubkeyHex(skn.empty() ? sk : skn);
+                if (!pk.empty()) b["from"] = pk;
+            }
+        }
         std::vector<std::string> h;
         if (!tok.empty()) h.push_back("Authorization: Bearer " + tok);
         return PostJson(base + path, b, h);
@@ -241,6 +255,16 @@ json MiscChannelInbound(const std::string& id, const json& cfg, const json& body
         m.text = FirstS(body, {"content", "text", "message"});
         m.sender = FirstS(body, {"pubkey", "from", "sender"});
         to = m.sender;
+        const auto sk = Cred(cfg, "nostr", "privateKey", "NOSTR_PRIVATE_KEY");
+        if (!sk.empty() && m.text.find("?iv=") != std::string::npos && !m.sender.empty()) {
+            const auto skn = nostr::NormalizeKey(sk);
+            const auto peer = nostr::NormalizeKey(m.sender);
+            if (auto pt = nostr::Decrypt(skn.empty() ? sk : skn, peer.empty() ? m.sender : peer, m.text)) {
+                m.text = *pt;
+            } else {
+                return {{"ok", false}, {"error", "nostr NIP-04 decrypt failed"}, {"status", 400}};
+            }
+        }
     } else {
         // Generic: a2a, buzz, clickclack, raft, reef, tlon, zalouser
         m.text = FirstS(body, {"text", "message", "content", "body"});

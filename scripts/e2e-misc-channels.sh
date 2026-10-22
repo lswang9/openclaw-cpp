@@ -36,7 +36,7 @@ cfg={"channels":{
  "synology-chat":{"incomingUrl":F+"/incoming","dmPolicy":"open"},
  "nextcloud-talk":{"baseUrl":F,"user":"u","appPassword":"p","dmPolicy":"open","groupPolicy":"open"},
  "irc":{"apiBase":F,"token":"bridge-tok","dmPolicy":"open","groupPolicy":"open"},
- "nostr":{"apiBase":F,"token":"bridge-tok","dmPolicy":"open"},
+ "nostr":{"apiBase":F,"token":"bridge-tok","dmPolicy":"open","privateKey":"0000000000000000000000000000000000000000000000000000000000000001"},
  "a2a":{"apiBase":F,"token":"bridge-tok","dmPolicy":"open"},
  "buzz":{"apiBase":F,"token":"bridge-tok","dmPolicy":"open"},
  "clickclack":{"apiBase":F,"token":"bridge-tok","dmPolicy":"open"},
@@ -96,9 +96,62 @@ has '"/ocs/v2.php/apps/spreed/api/v1/chat/ROOM1" in e["path"] and e["body"]["mes
 inb irc '{"nick":"alice","target":"#lobby","message":"hi"}' >/dev/null
 has 'e["path"].endswith("/privmsg") and e["body"]["target"]=="#lobby" and e["body"]["message"]=="irc-ok"'
 
-# Nostr bridge
-inb nostr '{"pubkey":"npub1abc","content":"hi"}' >/dev/null
-has 'e["path"].endswith("/dm") and e["body"]["pubkey"]=="npub1abc" and e["body"]["content"]=="nostr-ok"'
+# Nostr NIP-04 (1.151): privateKey set → decrypt inbound, encrypt outbound
+python3 - "$T/nip04_in.json" <<'NP'
+import json,sys,base64
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
+peer_priv=bytes.fromhex("00"*31+"02")
+our_priv=bytes.fromhex("00"*31+"01")
+kb=ec.derive_private_key(int.from_bytes(peer_priv,"big"), ec.SECP256K1(), default_backend())
+ka=ec.derive_private_key(int.from_bytes(our_priv,"big"), ec.SECP256K1(), default_backend())
+shared=kb.exchange(ec.ECDH(), ka.public_key())
+iv=bytes([7]*16)
+padder=padding.PKCS7(128).padder(); pt=padder.update(b"hi")+padder.finalize()
+enc=Cipher(algorithms.AES(shared), modes.CBC(iv), backend=default_backend()).encryptor()
+ct=enc.update(pt)+enc.finalize()
+content=base64.b64encode(ct).decode()+"?iv="+base64.b64encode(iv).decode()
+peer_pub=kb.public_key().public_numbers().x.to_bytes(32,"big").hex()
+json.dump({"pubkey":peer_pub,"content":content}, open(sys.argv[1],"w"))
+NP
+inb nostr "$(cat "$T/nip04_in.json")" >/dev/null
+python3 - "$T/fk.log" <<'NP' || fail "nostr NIP-04 round-trip"
+import json,sys,base64
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.backends import default_backend
+peer_priv=bytes.fromhex("00"*31+"02")
+our_pub=bytes.fromhex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+kb=ec.derive_private_key(int.from_bytes(peer_priv,"big"), ec.SECP256K1(), default_backend())
+def pub_from_x(x):
+    for prefix in (b"\x02", b"\x03"):
+        try: return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), prefix+x)
+        except Exception: continue
+    raise SystemExit("bad pub")
+shared=kb.exchange(ec.ECDH(), pub_from_x(our_pub))
+peer_pub=kb.public_key().public_numbers().x.to_bytes(32,"big").hex()
+found=False
+for l in open(sys.argv[1]):
+    e=json.loads(l)
+    if not str(e.get("path","")).endswith("/dm"): continue
+    b=e.get("body") or {}
+    if b.get("pubkey")!=peer_pub: continue
+    c=b.get("content","")
+    if "?iv=" not in c: continue
+    ct_b64, iv_b64=c.split("?iv=",1)
+    ct=base64.b64decode(ct_b64); iv=base64.b64decode(iv_b64)
+    dec=Cipher(algorithms.AES(shared), modes.CBC(iv), backend=default_backend()).decryptor()
+    raw=dec.update(ct)+dec.finalize()
+    unpadder=padding.PKCS7(128).unpadder()
+    pt=unpadder.update(raw)+unpadder.finalize()
+    assert pt==b"nostr-ok", pt
+    assert b.get("kind")==4 and b.get("from")==our_pub.hex()
+    found=True; break
+assert found, "encrypted nostr outbound missing"
+NP
 
 # Generic bridges
 for ch in a2a buzz clickclack raft reef tlon zalouser; do
