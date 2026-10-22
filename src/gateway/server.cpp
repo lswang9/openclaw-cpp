@@ -66,7 +66,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.166.0-dev";
+constexpr const char* kVersion = "1.167.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2452,9 +2452,10 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         }
     }
 
-    // POST /api/channels/<id>/inbound (and /command|/slash for Mattermost slash callbacks — 1.149)
+    // POST /api/channels/<id>/inbound (and /command|/slash for Mattermost slash; /interactions for buttons — 1.167)
     if (method == "POST" && path.rfind("/api/channels/", 0) == 0 && path.size() > 14 &&
-        (path.find("/inbound") != std::string::npos || path.find("/command") != std::string::npos || path.find("/slash") != std::string::npos)) {
+        (path.find("/inbound") != std::string::npos || path.find("/command") != std::string::npos || path.find("/slash") != std::string::npos ||
+         path.find("/interactions") != std::string::npos)) {
         // Keep shared for adapter/config lookup; drop before DeliverInbound (nested MaybeReload/unique).
         try {
             auto rest = path.substr(std::string("/api/channels/").size());
@@ -2531,12 +2532,12 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                 send(HttpResponse(200, "OK", nlohmann::json{{"type", 1}}.dump()));
                 return;
             }
-            if (result.value("status", 0) == 401) { send(HttpResponse(401, "Unauthorized", result.dump())); return; }
+            if (int st = result.value("status", 0); st == 401 || st == 403) { send(HttpResponse(st, st == 403 ? "Forbidden" : "Unauthorized", result.dump())); return; }
             if (chan_id == "googlechat") {  // Google Chat reads the HTTP response body as the reply Message
                 send(HttpResponse(200, "OK", result.contains("syncResponse") ? result["syncResponse"].dump() : std::string("{}")));
                 return;
             }
-            if (chan_id == "mattermost" && result.contains("syncResponse")) {  // slash commands expect a Mattermost CommandResponse
+            if (chan_id == "mattermost" && result.contains("syncResponse")) {  // slash CommandResponse or interactive empty ack
                 send(HttpResponse(200, "OK", result["syncResponse"].dump()));
                 return;
             }

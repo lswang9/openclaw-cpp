@@ -8,6 +8,8 @@ LOG = sys.argv[2]
 Q = {"matrix": [], "matrix_invite": [], "signal": [], "mattermost": []}
 LOCK = threading.Lock()
 BATCH = [0]
+POSTS = {}
+POST_N = [0]
 def pop(kind, wait_s=0.0):
     end = time.time() + wait_s
     while True:
@@ -39,7 +41,30 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/v4/commands":
             return self.send(201, {"id": "cmd-1", "trigger": (body.get("trigger") if isinstance(body, dict) else ""), "url": body.get("url") if isinstance(body, dict) else ""})
         if p == "/api/v4/posts":
-            return self.send(201 if self.headers.get("Authorization") == "Bearer mm-tok" else 401, {"id": "p1"})
+            if self.headers.get("Authorization") != "Bearer mm-tok":
+                return self.send(401, {"error": "unauthorized"})
+            POST_N[0] += 1
+            pid = body.get("id") or ("p%d" % POST_N[0])
+            post = dict(body) if isinstance(body, dict) else {}
+            post["id"] = pid
+            post.setdefault("channel_id", post.get("channel_id", ""))
+            post.setdefault("message", post.get("message", ""))
+            post.setdefault("user_id", "botid")
+            with LOCK: POSTS[pid] = post
+            return self.send(201, post)
+        if p.startswith("/api/v4/posts/") and method in ("GET", "PUT"):
+            pid = p.split("/api/v4/posts/", 1)[1].split("?", 1)[0]
+            if self.headers.get("Authorization") != "Bearer mm-tok":
+                return self.send(401, {"error": "unauthorized"})
+            with LOCK:
+                if method == "GET":
+                    return self.send(200 if pid in POSTS else 404, POSTS.get(pid, {"id": pid, "message": "", "props": {}}))
+                post = dict(POSTS.get(pid, {"id": pid}))
+                if isinstance(body, dict):
+                    post.update(body)
+                    post["id"] = pid
+                POSTS[pid] = post
+                return self.send(200, post)
         self.send(200, {"ok": True})
     def send(self, code, obj):
         b = json.dumps(obj).encode(); self.send_response(code); self.send_header("Content-Type", "application/json")
@@ -64,6 +89,8 @@ class H(BaseHTTPRequestHandler):
             posts = {}
             for i, it in enumerate(pop("mattermost")): it.setdefault("create_at", now + i); posts[it["id"]] = it
             return self.send(200, {"order": list(posts), "posts": posts})
+        if p.startswith("/api/v4/posts/") and "/posts/" in p:
+            return self.handle_any("GET")
         if p.startswith("/api/v4/channels/"): return self.send(200, {"id": p.rsplit("/", 1)[1], "type": "O"})
         self.handle_any("GET")
     def do_POST(self): self.handle_any("POST")

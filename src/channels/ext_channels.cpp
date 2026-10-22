@@ -1,7 +1,10 @@
 #include "openclaw/channels/ext_channels.hpp"
 
 #include <curl/curl.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <filesystem>
@@ -58,6 +61,85 @@ std::string TeamsToken(const json& cfg) {
     return g_teams_token;
 }
 }  // namespace
+
+
+// 1.167: Mattermost interactive message buttons (upstream interactions.ts).
+std::string HexLower(const unsigned char* d, size_t n) {
+    static const char* x = "0123456789abcdef";
+    std::string o; o.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) { o += x[d[i] >> 4]; o += x[d[i] & 15]; }
+    return o;
+}
+std::string HmacSha256Hex(const std::string& key, const std::string& data) {
+    unsigned char md[EVP_MAX_MD_SIZE]; unsigned int len = 0;
+    if (!HMAC(EVP_sha256(), key.data(), (int)key.size(),
+              reinterpret_cast<const unsigned char*>(data.data()), data.size(), md, &len))
+        return {};
+    return HexLower(md, len);
+}
+std::string MmInteractionSecret(const std::string& bot_token) {
+    return HmacSha256Hex("openclaw-mattermost-interactions", bot_token);
+}
+std::string SanitizeActionId(std::string id) {
+    id.erase(std::remove_if(id.begin(), id.end(), [](char c) { return c == '-' || c == '_'; }), id.end());
+    return id;
+}
+bool CtEq(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned d = 0;
+    for (size_t i = 0; i < a.size(); ++i) d |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    return d == 0;
+}
+json BuildMmButtonProps(const std::string& callback_url, const std::string& bot_token,
+                        const std::string& channel_id, const json& buttons_in, const std::string& att_text) {
+    json flat = json::array();
+    auto push_btn = [&](const json& b) {
+        if (b.is_string()) {
+            std::string t = b.get<std::string>();
+            if (!t.empty()) flat.push_back({{"id", t}, {"name", t}, {"style", "default"}});
+            return;
+        }
+        if (!b.is_object()) return;
+        std::string id = S(b, "id"); if (id.empty()) id = S(b, "callback_data");
+        std::string name = S(b, "text"); if (name.empty()) name = S(b, "name"); if (name.empty()) name = S(b, "label");
+        if (id.empty() || name.empty()) return;
+        json ctx = b.contains("context") && b["context"].is_object() ? b["context"] : json::object();
+        flat.push_back({{"id", id}, {"name", name}, {"style", b.value("style", std::string("default"))}, {"context", ctx}});
+    };
+    if (!buttons_in.is_array()) return nullptr;
+    for (auto& r : buttons_in) {
+        if (r.is_array()) for (auto& b : r) push_btn(b);
+        else push_btn(r);
+    }
+    if (flat.empty()) return nullptr;
+    const std::string secret = MmInteractionSecret(bot_token);
+    json actions = json::array();
+    for (auto& btn : flat) {
+        std::string safe = SanitizeActionId(btn["id"].get<std::string>());
+        json ctx = btn.value("context", json::object());
+        ctx["action_id"] = safe;
+        ctx["__openclaw_channel_id"] = channel_id;
+        // nlohmann dump sorts object keys → matches upstream canonicalizeInteractionContext.
+        const std::string token = HmacSha256Hex(secret, ctx.dump());
+        ctx["_token"] = token;
+        json act{{"id", safe}, {"type", "button"}, {"name", btn["name"]},
+                 {"integration", {{"url", callback_url}, {"context", ctx}}}};
+        if (btn.contains("style") && btn["style"].is_string() && btn["style"] != "default") act["style"] = btn["style"];
+        actions.push_back(act);
+    }
+    return json{{"attachments", json::array({{{"text", att_text}, {"actions", actions}}})}};
+}
+std::string MmCallbackUrl(const json& cfg) {
+    std::string base;
+    if (auto v = config::GetPath(cfg, "channels.mattermost.interactions.callbackBaseUrl"); v && v->is_string()) base = v->get<std::string>();
+    if (base.empty()) base = Cred(cfg, "mattermost", "callbackBaseUrl", "MATTERMOST_CALLBACK_BASE");
+    if (auto v = config::GetPath(cfg, "channels.mattermost.interactions.callbackUrl"); v && v->is_string() && !v->get<std::string>().empty())
+        return v->get<std::string>();
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    if (!base.empty()) return base + "/api/channels/mattermost/interactions";
+    const char* port = std::getenv("OPENCLAW_GATEWAY_PORT");
+    return std::string("http://127.0.0.1:") + (port && *port ? port : "18789") + "/api/channels/mattermost/interactions";
+}
 
 bool IsExtChannel(const std::string& id) { return id == "signal" || id == "matrix" || id == "msteams" || id == "googlechat" || id == "mattermost"; }
 
@@ -153,6 +235,12 @@ json ExtChannelSend(const std::string& id, const json& cfg, const std::string& t
         if (base.empty() || tok.empty()) return nullptr;
         json b{{"channel_id", to}, {"message", text}};
         if (!S(ex, "rootId").empty()) b["root_id"] = ex["rootId"];
+        // 1.167: interactive buttons → props.attachments[].actions with HMAC-signed context.
+        json buttons = ex.contains("buttons") ? ex["buttons"] : (ex.contains("extra") && ex["extra"].is_object() && ex["extra"].contains("buttons") ? ex["extra"]["buttons"] : json());
+        if (buttons.is_array() && !buttons.empty()) {
+            auto props = BuildMmButtonProps(MmCallbackUrl(cfg), tok, to, buttons, S(ex, "attachmentText"));
+            if (!props.is_null()) b["props"] = props;
+        }
         return PostJson(base + "/api/v4/posts", b, {"Authorization: Bearer " + tok});
     }
     return nullptr;
@@ -308,6 +396,55 @@ json ExtChannelInbound(const std::string& id, const json& cfg, const json& body,
         if (m.chat_type == "group") m.conversation_id = to;
         if (msg.contains("thread") && !S(msg["thread"], "name").empty()) { ex["threadName"] = msg["thread"]["name"]; if (m.chat_type == "group" && !S(space, "threaded").empty()) m.thread_id = S(msg["thread"], "name"); }
     } else if (id == "mattermost") {
+        // 1.167: interactive button callback (Mattermost posts action integration.url).
+        if (body.contains("context") && body["context"].is_object() && body["context"].contains("_token")) {
+            const auto base = Trim(Cred(cfg, "mattermost", "baseUrl", "MATTERMOST_URL"));
+            const auto tok = Cred(cfg, "mattermost", "botToken", "MATTERMOST_BOT_TOKEN");
+            json ctx = body["context"];
+            const std::string got_tok = S(ctx, "_token");
+            ctx.erase("_token");
+            const std::string expect = HmacSha256Hex(MmInteractionSecret(tok), ctx.dump());
+            if (tok.empty() || !CtEq(got_tok, expect))
+                return {{"ok", false}, {"error", "mattermost interaction token mismatch"}, {"status", 403}};
+            const std::string action_id = S(ctx, "action_id");
+            if (action_id.empty()) return {{"ok", false}, {"error", "Missing action_id in context"}, {"status", 400}};
+            const std::string channel_id = S(body, "channel_id"), post_id = S(body, "post_id");
+            const std::string signed_ch = S(ctx, "__openclaw_channel_id");
+            if (!signed_ch.empty() && !channel_id.empty() && signed_ch != channel_id)
+                return {{"ok", false}, {"error", "Channel mismatch"}, {"status", 403}};
+            std::string user_name = S(body, "user_name"); if (user_name.empty()) user_name = S(body, "user_id");
+            std::string action_name = action_id, original_message;
+            if (!base.empty() && !tok.empty() && !post_id.empty()) {
+                auto pr = Http("GET", base + "/api/v4/posts/" + Esc(post_id), "", {"Authorization: Bearer " + tok});
+                if (pr.contains("json") && pr["json"].is_object()) {
+                    original_message = S(pr["json"], "message");
+                    if (pr["json"].contains("props") && pr["json"]["props"].contains("attachments")) {
+                        for (auto& att : pr["json"]["props"]["attachments"]) {
+                            if (!att.contains("actions")) continue;
+                            for (auto& a : att["actions"]) if (S(a, "id") == action_id && !S(a, "name").empty()) { action_name = S(a, "name"); break; }
+                        }
+                    }
+                }
+                // Retire buttons: show which one was selected (upstream updateMattermostPost).
+                json upd{{"id", post_id}, {"message", original_message},
+                         {"props", {{"attachments", json::array({{{"text", "✓ **" + action_name + "** selected by @" + user_name}}})}}}};
+                Http("PUT", base + "/api/v4/posts/" + Esc(post_id), upd.dump(),
+                     {"Authorization: Bearer " + tok, "Content-Type: application/json"});
+            }
+            m.text = "[Button click: user @" + user_name + " selected \"" + action_name + "\"]";
+            m.sender = S(body, "user_id").empty() ? user_name : S(body, "user_id");
+            to = channel_id;
+            m.chat_type = "group"; m.conversation_id = to;
+            if (!S(body, "root_id").empty()) ex["rootId"] = body["root_id"];
+            else if (!post_id.empty()) ex["rootId"] = post_id;
+            if (m.sender == Cred(cfg, "mattermost", "botUserId", "MATTERMOST_BOT_USER_ID")) return ignored("own message");
+            if (m.chat_type == "direct") m.peer_id = m.sender;
+            m.session_key = id + "-" + to;
+            auto reply = deliver ? deliver(m) : std::string();
+            if (!reply.empty() && send) send(to, reply, ex);
+            return json{{"ok", true}, {"channel", id}, {"reply", reply}, {"interaction", true}, {"actionId", action_id},
+                        {"syncResponse", json::object()}, {"impl", "real"}};
+        }
         // Outgoing webhook OR slash command (form/JSON): token, channel_id, user_id, text; slash also has `command`.
         const bool is_slash = !S(body, "command").empty();
         const auto want = Cred(cfg, "mattermost", "webhookToken", "MATTERMOST_WEBHOOK_TOKEN");
