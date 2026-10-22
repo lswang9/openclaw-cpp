@@ -95,6 +95,13 @@ AdapterHub AdapterHub::MakeDefault() {
         "telegram",
         "Telegram Bot API: getUpdates long polling or webhook inbound; chunked sendMessage (records when no token)",
         "/bot<token>/sendMessage"));
+    for (auto [cid, note] : std::initializer_list<std::pair<const char*, const char*>>{
+             {"signal", "Signal via signal-cli REST API: POST /v2/send; inbound receive envelopes on /api/channels/signal/inbound"},
+             {"matrix", "Matrix client-server API: PUT rooms/{room}/send/m.room.message; inbound app-service transactions/events"},
+             {"msteams", "Microsoft Teams Bot Framework: client-credentials token + POST {serviceUrl}/v3/conversations/{id}/activities"},
+             {"googlechat", "Google Chat HTTP app: synchronous reply in the event response, or spaces.messages.create with accessToken"},
+             {"mattermost", "Mattermost REST POST /api/v4/posts; inbound outgoing-webhook (token-verified)"}})
+        hub.Add(std::make_unique<OutboundRecordAdapter>(cid, note, std::string("/api/channels/") + cid + "/inbound"));
     hub.Add(std::make_unique<DiscordAdapter>());
     hub.Add(std::make_unique<SlackAdapter>());
     hub.Add(std::make_unique<FeishuAdapter>());

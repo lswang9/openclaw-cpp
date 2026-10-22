@@ -60,7 +60,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.128.0-dev";
+constexpr const char* kVersion = "1.129.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -974,7 +974,8 @@ nlohmann::json Server::ReloadConfigNow() {
             prompt_chars = deps_.system_prompt.size();
             for (auto* a : deps_.adapters.List()) {
                 const auto id = a->Id();
-                if (!a->Enabled() || sub(old_raw, "channels." + id) == sub(deps_.config.raw, "channels." + id)) continue;
+                if (sub(old_raw, "channels." + id) == sub(deps_.config.raw, "channels." + id)) continue;
+                if (!a->Enabled()) { a->SetConfig(deps_.config.raw); continue; }  // idle adapters just take the new snapshot
                 channel_ids_to_restart.push_back(id);
             }
             plugins_changed = sub(old_raw, "plugins") != sub(deps_.config.raw, "plugins");
@@ -2327,6 +2328,11 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             // Discord Interactions PING
             if (result.value("mode", "") == "discord_ping") {
                 send(HttpResponse(200, "OK", nlohmann::json{{"type", 1}}.dump()));
+                return;
+            }
+            if (result.value("status", 0) == 401) { send(HttpResponse(401, "Unauthorized", result.dump())); return; }
+            if (chan_id == "googlechat") {  // Google Chat reads the HTTP response body as the reply Message
+                send(HttpResponse(200, "OK", result.contains("syncResponse") ? result["syncResponse"].dump() : std::string("{}")));
                 return;
             }
             send(HttpResponse(200, "OK", result.dump(2)));

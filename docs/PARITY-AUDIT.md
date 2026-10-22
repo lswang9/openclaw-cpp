@@ -21,9 +21,9 @@ Reproduce the numbers with:
 |---|---|---|---|---|---|
 | CLI command groups / subcommands (upstream tree) | 45 / 131 | 45 / 131 | most; e2e for every 1.12x addition | see §1 | 0 |
 | Gateway RPC methods (catalog) | 493 | 493 (0 unimplemented) | 267 ok on `{}` + 185 param-validating handlers | 1 real-sim (`computer.invoke`), 31 precondition-only (need node/creds/session) | 0 |
-| Agent tools (core) | ~57 | 46 native (+JS/MCP bridged) | 46 | browser/desktop are local-runtime variants | ~19 (§3) |
+| Agent tools (core) | ~57 | 53 native (+JS/MCP bridged) | 53 (7 added in 1.128) | browser/desktop are local-runtime variants; view_image/web_search partial | ~12 (§3) |
 | Config root keys | 46 | 46 accepted | ~20 deeply validated | 26 shallow (key accepted, sub-shape not validated) | 0 |
-| Channel extensions | 27 messaging | 6 working | telegram (1.126), discord, slack, feishu, whatsapp (Cloud API), imessage (bridge inbound) | whatsapp-web (partial Noise/Baileys) | 21 (§5) |
+| Channel extensions | 27 messaging | 11 working | telegram (1.126), discord, slack, feishu, whatsapp (Cloud API), imessage (bridge inbound); signal, matrix, msteams, googlechat, mattermost (1.129, text) | whatsapp-web (partial Noise/Baileys); 1.129 channels lack live listeners/inbound signature checks | 16 (§5) |
 | Model-provider extensions | ~85 | 28 built-in ids + any `models.providers.*` | 4 wire formats (chat completions, Responses, Anthropic Messages, Gemini) offline-tested | token streaming over SSE for all four formats (1.127); no OAuth/Bedrock/Vertex signing | Bedrock, Vertex, Copilot, Codex OAuth, … |
 | Plugin API (`api.register*`) | 59 | 10 (JS host) + C ABI | registerTool/Provider/GatewayMethod/HttpRoute/Hook/Command/Cli/Service/Channel/HttpHandler | Channel/Service are thin | 49 (§6) |
 
@@ -130,9 +130,17 @@ provider factory. Some raw-config consumers still read raw values.
 
 **Telegram (1.126, real):** getUpdates long polling (deleteWebhook first, offset persisted across restarts, backoff, 409 conflict logged) or webhook inbound with secret header; replies chunked at 4096 chars, group replies use `reply_parameters`, forum topics keep `message_thread_id`. Offline e2e: `scripts/e2e-telegram.sh`. Not yet: media send (except voice), inline keyboards/callback actions, reactions, native commands menu.
 
-**Missing channel extensions (21):**
-- a2a, buzz, clickclack, googlechat, irc, line, matrix, mattermost, msteams, nextcloud-talk, nostr
-- raft, reef, signal, sms, synology-chat, tlon, twitch, x, zalo, zalouser
+**Signal, Matrix, MS Teams, Google Chat, Mattermost (1.129, text-only transports):** offline e2e `scripts/e2e-ext-channels.sh` against `scripts/fake_chatops.py`.
+- Signal: signal-cli REST `POST /v2/send` (DM + `group.<id>`); inbound receive envelopes are pushed to `/api/channels/signal/inbound`. Not yet: polling `/v1/receive` or the JSON-RPC/SSE daemon, attachments, reactions.
+- Matrix: `PUT rooms/{room}/send/m.room.message/{txn}` with thread (`m.thread`) replies; inbound app-service transactions or single events; `dmRooms` marks 1:1 rooms. Not yet: `/sync` long polling, E2EE, invites/auto-join.
+- MS Teams: Bot Framework client-credentials token (cached) and `POST {serviceUrl}/v3/conversations/{id}/activities[/replyToId]`; `<at>` mentions stripped. Not yet: inbound JWT validation, Adaptive Cards, files, proactive install flows.
+- Google Chat: synchronous reply in the event response, or `spaces.messages.create` (thread reply) when `accessToken` is configured. Not yet: service-account JWT minting, inbound bearer verification, cards.
+- Mattermost: `POST /api/v4/posts` (thread `root_id`); inbound outgoing webhooks verified by `webhookToken`. Not yet: WebSocket events, DMs via WebSocket, slash commands.
+- All five record a conversationRef, so conversations_* and ask_user work over them. Idle adapters now pick up hot-reloaded config.
+
+**Missing channel extensions (16):**
+- a2a, buzz, clickclack, irc, line, nextcloud-talk, nostr
+- raft, reef, sms, synology-chat, tlon, twitch, x, zalo, zalouser
 
 **Other extension families with no or only partial C++ counterpart:**
 - memory-lancedb, memory-wiki
@@ -196,7 +204,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 ## 9. Largest remaining gaps (priority order)
 
 1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards remain).
-2. Signal, Matrix, MS Teams, Google Chat, Mattermost channel extensions.
+2. ~~Signal, Matrix, MS Teams, Google Chat, Mattermost~~ (text transports in 1.129; live listeners/verification listed in §5).
 3. ~~Native streaming~~ (done in 1.127); Bedrock/Vertex auth remain.
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
 5. Plugin API breadth: provider families, context engine, memory capability.

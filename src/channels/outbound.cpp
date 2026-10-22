@@ -3,6 +3,7 @@
 #include <curl/curl.h>
 #include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/outbound.hpp"
+#include "openclaw/channels/ext_channels.hpp"
 
 #include <curl/curl.h>
 
@@ -196,6 +197,13 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
             entry["mode"] = "live_http";
             entry["delivered"] =
                 http_result.value("http", 0) >= 200 && http_result.value("http", 0) < 300;
+            entry["http"] = http_result;
+        }
+    } else if (IsExtChannel(id_)) {
+        http_result = ExtChannelSend(id_, Config(), chat_id, text, extra);
+        if (!http_result.is_null()) {
+            entry["mode"] = "live_http";
+            entry["delivered"] = http_result.value("http", 0) >= 200 && http_result.value("http", 0) < 300;
             entry["http"] = http_result;
         }
     }
@@ -451,6 +459,8 @@ nlohmann::json OutboundRecordAdapter::OutboundLog() const { return sent_; }
 void OutboundRecordAdapter::ClearLog() { sent_.clear(); }
 
 nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) {
+    if (IsExtChannel(id_))
+        return ExtChannelInbound(id_, Config(), body, deliver, [this](const std::string& to, const std::string& t, const nlohmann::json& ex) { return SendText(to, t, ex); });
     if (id_ != "telegram") return {{"ok", false}, {"error", "unsupported"}};
     // Secret is verified by the gateway HTTP layer from X-Telegram-Bot-Api-Secret-Token (1.79).
     const auto& tm = body.contains("message") ? body["message"] : (body.contains("edited_message") ? body["edited_message"] : nlohmann::json());
