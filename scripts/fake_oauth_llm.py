@@ -20,8 +20,17 @@ class H(BaseHTTPRequestHandler):
         for ev, data in events: self.wfile.write(((f"event: {ev}\n" if ev else "") + "data: " + json.dumps(data) + "\n\n").encode()); self.wfile.flush()
     def rec(self, body):
         with open(LOG, "a") as f: f.write(json.dumps({"m": self.command, "path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body}) + "\n")
+    def do_HEAD(self):
+        self.do_GET()
     def do_GET(self):
         self.rec(None)
+        if self.path.startswith("/oauth/authorize"):
+            from urllib.parse import urlparse, parse_qs, urlencode
+            q=parse_qs(urlparse(self.path).query)
+            redir=q.get("redirect_uri",[""])[0]; st=q.get("state",[""])[0]
+            if not redir: return self.send(400, {"error": "redirect_uri"})
+            loc=redir + (("&" if ("?" in redir) else "?") + urlencode({"code": "pkce-ac-1", "state": st}))
+            self.send_response(302); self.send_header("Location", loc); self.send_header("Content-Length", "0"); self.end_headers(); return
         if self.path == "/copilot_internal/user":
             if self.headers.get("Authorization") != "Bearer gho_test": return self.send(401, {"message": "Bad credentials"})
             return self.send(200, {"login": "octo", "endpoints": {"api": B + "/capi"}})
@@ -55,6 +64,8 @@ class H(BaseHTTPRequestHandler):
             g = body.get("grant_type")
             if g == "authorization_code" and body.get("code") == "ac-1" and body.get("code_verifier") == "cv-1" and body.get("redirect_uri", "").endswith("/deviceauth/callback"):
                 return self.send(200, {"access_token": ACCESS1, "refresh_token": "rt-1", "id_token": ACCESS1, "expires_in": 1})
+            if g == "authorization_code" and body.get("code") == "pkce-ac-1" and body.get("code_verifier") and "/auth/callback" in body.get("redirect_uri", ""):
+                return self.send(200, {"access_token": ACCESS1, "refresh_token": "rt-pkce", "id_token": ACCESS1, "expires_in": 3600})
             if g == "refresh_token" and body.get("refresh_token") == "rt-1":
                 return self.send(200, {"access_token": ACCESS2, "refresh_token": "rt-2", "expires_in": 3600})
             return self.send(400, {"error": "invalid_grant"})

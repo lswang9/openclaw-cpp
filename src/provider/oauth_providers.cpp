@@ -7,9 +7,18 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <random>
+#include <atomic>
+#include <openssl/sha.h>
 
 namespace openclaw::provider::oauth {
 using json = nlohmann::json;
@@ -222,6 +231,135 @@ json CodexDeviceLogin(const std::function<void(const std::string&, const std::st
         return cred;
     }
     return {{"error", "OpenAI device code expired"}};
+}
+
+
+std::string B64Url(const unsigned char* data, size_t n) {
+    static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o; o.reserve((n + 2) / 3 * 4);
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = data[i] << 16; if (i + 1 < n) v |= data[i + 1] << 8; if (i + 2 < n) v |= data[i + 2];
+        o += t[(v >> 18) & 63]; o += t[(v >> 12) & 63]; o += (i + 1 < n) ? t[(v >> 6) & 63] : '='; o += (i + 2 < n) ? t[v & 63] : '=';
+    }
+    while (!o.empty() && o.back() == '=') o.pop_back();
+    for (char& c : o) { if (c == '+') c = '-'; else if (c == '/') c = '_'; }
+    return o;
+}
+std::string RandomUrlSafe(size_t n) {
+    static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<int> d(0, 63);
+    std::string o; o.resize(n); for (size_t i = 0; i < n; ++i) o[i] = alphabet[d(gen)]; return o;
+}
+std::string PkceChallenge(const std::string& verifier) {
+    unsigned char h[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(verifier.data()), verifier.size(), h);
+    return B64Url(h, SHA256_DIGEST_LENGTH);
+}
+
+// Tiny loopback HTTP server: waits for GET /auth/callback?code=&state= (or any path with those query params).
+struct LoopbackWait {
+    int port = 0; int fd = -1; std::string code, state, err;
+    bool Start(int prefer) {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0); if (fd < 0) { err = "socket"; return false; }
+        int yes = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port = htons(static_cast<uint16_t>(prefer > 0 ? prefer : 0));
+        if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) { err = "bind"; ::close(fd); fd = -1; return false; }
+        socklen_t al = sizeof a; getsockname(fd, reinterpret_cast<sockaddr*>(&a), &al); port = ntohs(a.sin_port);
+        if (listen(fd, 1) != 0) { err = "listen"; ::close(fd); fd = -1; return false; }
+        return true;
+    }
+    bool AcceptOnce(int timeout_ms) {
+        if (fd < 0) return false;
+        fd_set rf; FD_ZERO(&rf); FD_SET(fd, &rf);
+        timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        if (select(fd + 1, &rf, nullptr, nullptr, &tv) <= 0) { err = "timeout waiting for OAuth callback"; return false; }
+        int c = ::accept(fd, nullptr, nullptr); if (c < 0) { err = "accept"; return false; }
+        char buf[4096]; ssize_t n = ::recv(c, buf, sizeof buf - 1, 0); if (n <= 0) { ::close(c); err = "empty request"; return false; }
+        buf[n] = 0; std::string req(buf);
+        auto qpos = req.find('?'); auto sp = req.find(' ', qpos == std::string::npos ? 0 : qpos);
+        std::string query = (qpos != std::string::npos && sp != std::string::npos) ? req.substr(qpos + 1, sp - qpos - 1) : std::string();
+        auto get = [&](const char* k) {
+            auto p = query.find(std::string(k) + "="); if (p == std::string::npos) return std::string();
+            p += std::strlen(k) + 1; auto e = query.find('&', p); auto v = query.substr(p, e == std::string::npos ? std::string::npos : e - p);
+            // minimal URL decode for %XX
+            std::string o; for (size_t i = 0; i < v.size(); ++i) {
+                if (v[i] == '%' && i + 2 < v.size()) { int x = 0; std::sscanf(v.c_str() + i + 1, "%2x", &x); o += (char)x; i += 2; }
+                else if (v[i] == '+') o += ' '; else o += v[i];
+            }
+            return o;
+        };
+        code = get("code"); state = get("state");
+        const char* html = code.empty()
+            ? "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body>Missing code.</body></html>"
+            : "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body>Authorization received. You can return to OpenClaw.</body></html>";
+        ::send(c, html, std::strlen(html), 0); ::close(c);
+        if (code.empty()) { err = "callback missing code"; return false; }
+        return true;
+    }
+    ~LoopbackWait() { if (fd >= 0) ::close(fd); }
+};
+
+json CodexBrowserPkceLogin(const std::function<void(const std::string&, const std::string&)>& show) {
+    const std::string verifier = RandomUrlSafe(64);
+    const std::string challenge = PkceChallenge(verifier);
+    const std::string state = RandomUrlSafe(32);
+    int prefer = 1455; if (const char* e = std::getenv("OPENCLAW_OAUTH_CALLBACK_PORT"); e && *e) prefer = std::atoi(e);
+    LoopbackWait lb;
+    if (!lb.Start(prefer > 0 ? prefer : 0)) return {{"error", "cannot bind OAuth callback: " + lb.err}};
+    const std::string redirect = "http://127.0.0.1:" + std::to_string(lb.port) + "/auth/callback";
+    std::string url = OpenAiAuthBase() + "/oauth/authorize?response_type=code&client_id=" + Enc(kCodexClientId)
+        + "&redirect_uri=" + Enc(redirect) + "&scope=" + Enc("openid profile email offline_access")
+        + "&code_challenge=" + Enc(challenge) + "&code_challenge_method=S256&state=" + Enc(state)
+        + "&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=openclaw";
+    show(url, "");
+    std::string code, got_state;
+    auto parse_qs = [](const std::string& q, const char* k) {
+        auto p = q.find(std::string(k) + "="); if (p == std::string::npos) return std::string();
+        p += std::strlen(k) + 1; auto e = q.find('&', p); return q.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    };
+    if (const char* ec = std::getenv("OPENCLAW_OAUTH_CODE"); ec && *ec) {
+        code = ec; got_state = Env("OPENCLAW_OAUTH_STATE", state.c_str());
+    } else if (Env("OPENCLAW_OAUTH_FAKE_BROWSER") == "1") {
+        // Offline fakes: GET authorize (no follow), read Location ?code=&state=, skip the loopback race.
+        CURL* c = curl_easy_init(); if (!c) return {{"error", "curl init"}};
+        std::string loc, discard;
+        curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, Sink); curl_easy_setopt(c, CURLOPT_WRITEDATA, &discard);
+        curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, +[](char* p, size_t sz, size_t n, void* u) -> size_t {
+            std::string line(p, sz * n); auto* out = static_cast<std::string*>(u);
+            if (line.size() > 9 && (line.rfind("Location:", 0) == 0 || line.rfind("location:", 0) == 0)) {
+                auto v = line.substr(line.find(':') + 1);
+                while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+                while (!v.empty() && (v.back() == '\r' || v.back() == '\n')) v.pop_back();
+                *out = v;
+            }
+            return sz * n;
+        });
+        curl_easy_setopt(c, CURLOPT_HEADERDATA, &loc);
+        curl_easy_perform(c); curl_easy_cleanup(c);
+        if (loc.empty()) return {{"error", "fake browser: authorize returned no Location"}};
+        auto qpos = loc.find('?'); std::string q = qpos == std::string::npos ? std::string() : loc.substr(qpos + 1);
+        code = parse_qs(q, "code"); got_state = parse_qs(q, "state");
+    } else {
+        if (!lb.AcceptOnce(5 * 60 * 1000)) return {{"error", lb.err.empty() ? "OAuth callback failed" : lb.err}};
+        code = lb.code; got_state = lb.state;
+    }
+    if (got_state != state) return {{"error", "OAuth state mismatch"}};
+    if (code.empty()) return {{"error", "OAuth callback missing code"}};
+    auto x = Http("POST", OpenAiAuthBase() + "/oauth/token", {"Content-Type: application/x-www-form-urlencoded", "Accept: application/json"},
+                  Form({{"grant_type", "authorization_code"}, {"code", code}, {"code_verifier", verifier}, {"client_id", kCodexClientId},
+                        {"redirect_uri", redirect}}));
+    if (x.status != 200 || !x.j.is_object() || !x.j.contains("access_token"))
+        return {{"error", "OpenAI PKCE token exchange failed (HTTP " + std::to_string(x.status) + ")"}};
+    json cred{{"type", "oauth"}, {"provider", "openai-codex"}, {"access", x.j["access_token"]}, {"refresh", x.j.value("refresh_token", std::string())},
+              {"expires", NowMs() + x.j.value("expires_in", 3600) * 1000LL}, {"authFlow", "oauth-pkce"}};
+    if (auto acc = CodexAccountIdFromJwt(x.j.value("id_token", x.j["access_token"].get<std::string>())); !acc.empty()) cred["accountId"] = acc;
+    return cred;
 }
 
 void ResetCachesForTest() { std::lock_guard<std::mutex> l(g_mu); g_copilot.clear(); }

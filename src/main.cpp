@@ -113,7 +113,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.146.0-dev";
+constexpr const char* kVersion = "1.147.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2824,23 +2824,33 @@ int CmdModels(int argc, char** argv) {
     if (act == "login") {
         const std::string provider = flag("--provider");
         if (provider.empty()) { std::cerr << "usage: models auth login --provider <id> [--method <authId>]\n"; return 2; }
-        if ((provider == "github-copilot" || provider == "openai-codex") && flag("--method").empty()) {
-            // 1.141: native device-code logins (GitHub device flow / OpenAI Codex device auth).
+        {
+            const std::string method = flag("--method");
+            const bool native_copilot = provider == "github-copilot" && (method.empty() || method == "device" || method == "device-code");
+            const bool native_codex_device = provider == "openai-codex" && (method.empty() || method == "device" || method == "device-code");
+            const bool native_codex_pkce = provider == "openai-codex" && (method == "browser" || method == "pkce" || method == "oauth-pkce");
+            if (native_copilot || native_codex_device || native_codex_pkce) {
+            // 1.141: device-code; 1.147: Codex browser PKCE (--method browser|pkce).
             const char* pm = std::getenv("OPENCLAW_OAUTH_POLL_MS");
             auto show = [&](const std::string& url, const std::string& code) {
-                std::cerr << "Open " << url << " and enter code: " << code << "\n" << std::flush; };
-            auto cred = provider == "github-copilot" ? provider::oauth::CopilotDeviceLogin(show, pm ? std::atoi(pm) : -1)
-                                                     : provider::oauth::CodexDeviceLogin(show, pm ? std::atoi(pm) : -1);
+                if (code.empty()) std::cerr << "Open this URL to continue: " << url << "\n" << std::flush;
+                else std::cerr << "Open " << url << " and enter code: " << code << "\n" << std::flush; };
+            nlohmann::json cred;
+            if (native_copilot) cred = provider::oauth::CopilotDeviceLogin(show, pm ? std::atoi(pm) : -1);
+            else if (native_codex_pkce) cred = provider::oauth::CodexBrowserPkceLogin(show);
+            else cred = provider::oauth::CodexDeviceLogin(show, pm ? std::atoi(pm) : -1);
             if (cred.contains("error")) { std::cerr << "error: " << cred["error"].get<std::string>() << "\n"; return 1; }
             std::string pid = flag("--profile-id"); if (pid.empty()) pid = provider + ":default";
             store.Upsert(pid, cred);
             record_in_config(pid, provider, cred.value("type", std::string("oauth")), nullptr);
             nlohmann::json outj{{"ok", true}, {"profileId", pid}, {"type", cred["type"]}, {"path", store.path().string()}};
             if (cred.contains("accountId")) outj["accountId"] = cred["accountId"];
+            if (cred.contains("authFlow")) outj["authFlow"] = cred["authFlow"];
             std::cout << outj.dump(2) << "\n";
             return 0;
+            }
         }
-        auto& host = StartCliJsHost();
+                auto& host = StartCliJsHost();
         host.host_call = [](long long, const std::string& method, const nlohmann::json& p) -> nlohmann::json {
             auto ask = [](const std::string& msg) { std::cerr << msg << " "; std::string l; std::getline(std::cin, l);
                                                     while (!l.empty() && (l.back() == '\r')) l.pop_back(); return l; };

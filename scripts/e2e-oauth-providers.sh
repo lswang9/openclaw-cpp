@@ -59,4 +59,13 @@ assert r["headers"]["chatgpt-account-id"]=="acct-1" and r["headers"]["originator
 prof=json.load(open(sys.argv[2]))["profiles"]["openai-codex:default"]
 assert prof["refresh"]=="rt-2" and prof["expires"]>0, prof
 PY
+# 1.147: Codex browser PKCE (fake authorize → loopback callback → token exchange)
+rm -f "$T/st/agents/main/agent/auth-profiles.json"
+OPENCLAW_OAUTH_FAKE_BROWSER=1 OPENCLAW_OAUTH_CALLBACK_PORT=0 \
+  "$BIN" models auth login --provider openai-codex --method browser --profile-id openai-codex:pkce \
+  </dev/null >"$T/l3.json" 2>"$T/l3.err" || fail "codex pkce login: $(cat $T/l3.err)"
+grep -q 'Open this URL to continue:' "$T/l3.err" || fail "pkce authorize url shown"
+python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); assert j["ok"] and j.get("authFlow")=="oauth-pkce" and j["accountId"]=="acct-1", j' "$T/l3.json" || fail "pkce login result"
+grep -q 'pkce-ac-1' "$T/f.log" || fail "pkce code not exchanged"
+grep -q 'rt-pkce' "$T/st/agents/main/agent/auth-profiles.json" || fail "pkce refresh stored"
 echo "[e2e-oauth-providers] OK"
