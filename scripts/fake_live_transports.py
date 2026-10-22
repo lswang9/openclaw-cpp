@@ -77,7 +77,14 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"ok": True, "clients": len(IRC_CLIENTS)})
         log({"m": "POST", "path": p, "auth": self.headers.get("Authorization", ""), "body": body})
         if p == "/api/v4/posts": return self.send(201, {"id": "p-out", **body})
-        if p == "/api/v1/rpc": return self.send(200, {"jsonrpc": "2.0", "id": body.get("id"), "result": {"timestamp": 1}})
+        if p == "/api/v1/rpc":
+            method=body.get("method"); params=body.get("params") or {}
+            if method=="getAttachment":
+                import base64
+                return self.send(200, {"jsonrpc":"2.0","id":body.get("id"),"result":{"data": base64.b64encode(b"PNGDATA").decode()}})
+            if method=="sendReaction":
+                return self.send(200, {"jsonrpc":"2.0","id":body.get("id"),"result":{"timestamp": params.get("targetTimestamp", 1)}})
+            return self.send(200, {"jsonrpc": "2.0", "id": body.get("id"), "result": {"timestamp": 1}})
         self.send(404, {})
 class Irc(socketserver.BaseRequestHandler):
     def handle(self):

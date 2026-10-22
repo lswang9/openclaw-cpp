@@ -1,4 +1,5 @@
 #include "openclaw/channels/outbound.hpp"
+#include "openclaw/channels/ext_channels.hpp"
 #include "openclaw/channels/waweb/noise.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/clawhub/client.hpp"
@@ -1423,6 +1424,14 @@ ExtraResult MessageAction(const fs::path& root, const json& p) {
     if (!known.count(action)) return Fail("unsupported message action: " + action);
     if (action == "send") { auto r = GatewayRpc("send", {{"channel", channel}, {"to", p.value("to", p.value("target", std::string()))}, {"message", p.value("message", p.value("params", json::object()).value("message", std::string()))}});
         return r.value("ok", false) ? Ok(r["payload"]) : Fail(r.value("error", json()).is_object() ? r["error"].value("message", "send failed") : "send failed"); }
+    // 1.148: Signal reactions via signal-cli JSON-RPC sendReaction (or REST /v1/reactions).
+    if (channel == "signal" && action == "react" && g_tool_deps) {
+        json pp = p.value("params", json::object());
+        for (auto k : {"to", "target", "emoji", "reaction", "remove", "messageId", "targetTimestamp", "targetAuthor", "targetAuthorUuid"})
+            if (p.contains(k) && !pp.contains(k)) pp[k] = p[k];
+        auto r = channels::ExtChannelReact("signal", g_tool_deps->config.raw, pp);
+        return r.value("ok", false) ? Ok(r) : Fail(r.value("error", std::string("signal react failed")));
+    }
     // 1.140: Telegram actions go to the Bot API when a bot token is configured.
     if (channel == "telegram" && g_tool_deps) {
         if (auto* oa = dynamic_cast<channels::OutboundRecordAdapter*>(g_tool_deps->adapters.Get("telegram"))) {
