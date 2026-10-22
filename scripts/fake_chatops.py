@@ -36,6 +36,8 @@ class H(BaseHTTPRequestHandler):
         if "/v3/conversations/" in p:
             return self.send(200 if self.headers.get("Authorization") == "Bearer teams-tok" else 401, {"id": "a1"})
         if p.startswith("/v1/spaces/"): return self.send(200, {"name": "spaces/x/messages/1"})
+        if p == "/api/v4/commands":
+            return self.send(201, {"id": "cmd-1", "trigger": (body.get("trigger") if isinstance(body, dict) else ""), "url": body.get("url") if isinstance(body, dict) else ""})
         if p == "/api/v4/posts":
             return self.send(201 if self.headers.get("Authorization") == "Bearer mm-tok" else 401, {"id": "p1"})
         self.send(200, {"ok": True})

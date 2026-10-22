@@ -312,6 +312,32 @@ void SignalLoop(const json& cfg, const std::atomic<bool>& stop, Adapter* ad, con
     }
 }
 
+
+void MattermostSyncCommands(const json& cfg, const std::string& base, const std::string& tok) {
+    auto enabled = config::GetPath(cfg, "channels.mattermost.commands.enabled");
+    if (enabled && enabled->is_boolean() && !enabled->get<bool>()) return;
+    auto list = config::GetPath(cfg, "channels.mattermost.commands.list");
+    if (!list || !list->is_array() || list->empty()) return;
+    std::string team = Cfg(cfg, "mattermost", "teamId", "MATTERMOST_TEAM_ID");
+    if (team.empty()) { auto v = config::GetPath(cfg, "channels.mattermost.commands.teamId"); if (v && v->is_string()) team = v->get<std::string>(); }
+    if (team.empty()) { std::cerr << "[gateway] mattermost: slash commands configured but teamId missing\n"; return; }
+    std::string callback = Cfg(cfg, "mattermost", "callbackBaseUrl", "MATTERMOST_CALLBACK_BASE");
+    if (callback.empty()) { auto v = config::GetPath(cfg, "channels.mattermost.commands.callbackUrl"); if (v && v->is_string()) callback = v->get<std::string>(); }
+    if (callback.empty()) callback = "http://127.0.0.1:" + std::to_string(EnvInt("OPENCLAW_GATEWAY_PORT", 18789)) + "/api/channels/mattermost/command";
+    for (auto& c : *list) {
+        std::string trigger = c.is_string() ? c.get<std::string>() : c.value("trigger", c.value("command", std::string()));
+        while (!trigger.empty() && trigger[0] == '/') trigger.erase(0, 1);
+        if (trigger.empty()) continue;
+        json body{{"team_id", team}, {"method", "P"}, {"trigger", trigger}, {"url", callback},
+                  {"display_name", c.is_object() ? c.value("display_name", trigger) : trigger},
+                  {"description", c.is_object() ? c.value("description", trigger) : trigger},
+                  {"auto_complete", true}};
+        std::string payload = body.dump(), resp;
+        auto st = HttpGet(Trim(base) + "/api/v4/commands", {"Authorization: Bearer " + tok, "Content-Type: application/json"}, &resp, 15, &payload);
+        std::cerr << "[gateway] mattermost: register /" << trigger << " → " << st << "\n";
+    }
+}
+
 void MattermostLoop(const json& cfg, const std::atomic<bool>& stop, Adapter* ad, const DeliverFn& deliver) {
     const auto base = Trim(Cfg(cfg, "mattermost", "baseUrl", "MATTERMOST_URL")), tok = Cfg(cfg, "mattermost", "botToken", "MATTERMOST_BOT_TOKEN");
     auto chans = config::GetPath(cfg, "channels.mattermost.channels");
@@ -321,6 +347,7 @@ void MattermostLoop(const json& cfg, const std::atomic<bool>& stop, Adapter* ad,
     std::string me = Cfg(cfg, "mattermost", "botUserId", "MATTERMOST_BOT_USER_ID");
     if (me.empty()) { std::string b; if (HttpGet(base + "/api/v4/users/me", auth, &b) == 200) { auto j = json::parse(b, nullptr, false); if (j.is_object()) me = j.value("id", ""); } }
     // 1.143: WebSocket by default (mode "websocket", or no channel list); "poll" keeps the 1.132 per-channel polling.
+    MattermostSyncCommands(cfg, base, tok);
     if (mmode == "websocket" || (mmode != "poll" && (!chans || !chans->is_array() || chans->empty())))
         return MattermostWsLoop(base, tok, me, Cfg(cfg, "mattermost", "webhookToken", "MATTERMOST_WEBHOOK_TOKEN"), stop, ad, deliver);
     if (!chans || !chans->is_array() || chans->empty()) return;

@@ -308,17 +308,44 @@ json ExtChannelInbound(const std::string& id, const json& cfg, const json& body,
         if (m.chat_type == "group") m.conversation_id = to;
         if (msg.contains("thread") && !S(msg["thread"], "name").empty()) { ex["threadName"] = msg["thread"]["name"]; if (m.chat_type == "group" && !S(space, "threaded").empty()) m.thread_id = S(msg["thread"], "name"); }
     } else if (id == "mattermost") {
-        // Outgoing webhook (form or JSON): token, channel_id, user_id, user_name, text, post_id, trigger_word
+        // Outgoing webhook OR slash command (form/JSON): token, channel_id, user_id, text; slash also has `command`.
+        const bool is_slash = !S(body, "command").empty();
         const auto want = Cred(cfg, "mattermost", "webhookToken", "MATTERMOST_WEBHOOK_TOKEN");
-        if (!want.empty() && S(body, "token") != want) return {{"ok", false}, {"error", "mattermost webhook token mismatch"}, {"status", 401}};
+        std::string cmd_tok;
+        if (auto v = config::GetPath(cfg, "channels.mattermost.commands.token"); v && v->is_string()) cmd_tok = v->get<std::string>();
+        if (const char* e = std::getenv("MATTERMOST_COMMAND_TOKEN"); e && *e) cmd_tok = e;
+        const std::string got = S(body, "token");
+        if (is_slash) {
+            if (!cmd_tok.empty() && got != cmd_tok && (want.empty() || got != want))
+                return {{"ok", false}, {"error", "mattermost slash token mismatch"}, {"status", 401}};
+        } else if (!want.empty() && got != want) {
+            return {{"ok", false}, {"error", "mattermost webhook token mismatch"}, {"status", 401}};
+        }
         m.text = S(body, "text"); m.sender = S(body, "user_id").empty() ? S(body, "user_name") : S(body, "user_id");
-        if (!S(body, "trigger_word").empty() && m.text.rfind(S(body, "trigger_word"), 0) == 0) m.text = m.text.substr(S(body, "trigger_word").size());
-        while (!m.text.empty() && m.text[0] == ' ') m.text.erase(0, 1);
+        if (is_slash) {
+            std::string cmd = S(body, "command");
+            if (!cmd.empty() && cmd[0] != '/') cmd = "/" + cmd;
+            while (!m.text.empty() && m.text[0] == ' ') m.text.erase(0, 1);
+            m.text = m.text.empty() ? cmd : (cmd + " " + m.text);
+            ex["slash"] = true; ex["command"] = cmd;
+        } else if (!S(body, "trigger_word").empty() && m.text.rfind(S(body, "trigger_word"), 0) == 0) {
+            m.text = m.text.substr(S(body, "trigger_word").size());
+            while (!m.text.empty() && m.text[0] == ' ') m.text.erase(0, 1);
+        }
         to = S(body, "channel_id");
         m.chat_type = S(body, "channel_type") == "D" ? "direct" : "group";
         if (m.chat_type == "group") m.conversation_id = to;
         if (!S(body, "post_id").empty()) ex["rootId"] = S(body, "root_id").empty() ? body["post_id"] : body["root_id"];
         if (m.sender == Cred(cfg, "mattermost", "botUserId", "MATTERMOST_BOT_USER_ID")) return ignored("own message");
+        // Slash replies prefer a synchronous CommandResponse so Mattermost shows them without a second post.
+        if (is_slash) {
+            if (m.chat_type == "direct") m.peer_id = m.sender;
+            m.session_key = id + "-" + to;
+            auto reply = deliver ? deliver(m) : std::string();
+            json sync{{"response_type", body.value("response_type", std::string("ephemeral"))}, {"text", reply.empty() ? std::string("(no reply)") : reply}};
+            if (!reply.empty() && send) send(to, reply, ex);  // also post into the channel when we have a bot token
+            return json{{"ok", true}, {"channel", id}, {"reply", reply}, {"slash", true}, {"syncResponse", sync}, {"impl", "real"}};
+        }
     }
     if (m.text.empty() && m.media.empty()) return ignored("no text");
     if (m.chat_type == "direct") m.peer_id = m.sender;

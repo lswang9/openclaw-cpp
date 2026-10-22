@@ -65,7 +65,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.148.0-dev";
+constexpr const char* kVersion = "1.149.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2373,9 +2373,9 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
         }
     }
 
-    // POST /api/channels/<id>/inbound
+    // POST /api/channels/<id>/inbound (and /command|/slash for Mattermost slash callbacks — 1.149)
     if (method == "POST" && path.rfind("/api/channels/", 0) == 0 && path.size() > 14 &&
-        path.find("/inbound") != std::string::npos) {
+        (path.find("/inbound") != std::string::npos || path.find("/command") != std::string::npos || path.find("/slash") != std::string::npos)) {
         // Keep shared for adapter/config lookup; drop before DeliverInbound (nested MaybeReload/unique).
         try {
             auto rest = path.substr(std::string("/api/channels/").size());
@@ -2455,6 +2455,10 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
             if (result.value("status", 0) == 401) { send(HttpResponse(401, "Unauthorized", result.dump())); return; }
             if (chan_id == "googlechat") {  // Google Chat reads the HTTP response body as the reply Message
                 send(HttpResponse(200, "OK", result.contains("syncResponse") ? result["syncResponse"].dump() : std::string("{}")));
+                return;
+            }
+            if (chan_id == "mattermost" && result.contains("syncResponse")) {  // slash commands expect a Mattermost CommandResponse
+                send(HttpResponse(200, "OK", result["syncResponse"].dump()));
                 return;
             }
             send(HttpResponse(200, "OK", result.dump(2)));
