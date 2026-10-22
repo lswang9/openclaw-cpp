@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.140.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.141.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.141.0-dev 新增
+
+1.141：GitHub Copilot（设备码登录、copilot_internal/user、CAPI 头）与 OpenAI Codex（设备码登录、令牌刷新、chatgpt-account-id）；离线 e2e-oauth-providers
 
 ## 1.140.0-dev 新增
 

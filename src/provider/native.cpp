@@ -1,5 +1,6 @@
 #include "openclaw/provider/native.hpp"
 #include "openclaw/provider/cloud.hpp"
+#include "openclaw/provider/oauth_providers.hpp"
 
 #include "openclaw/config/config.hpp"
 
@@ -428,7 +429,9 @@ const std::map<std::string, Builtin>& Builtins() {
         {"litellm", {"openai-completions", "http://127.0.0.1:4000/v1", "LITELLM_API_KEY"}},
         {"amazon-bedrock", {"bedrock-converse", "https://bedrock-runtime.us-east-1.amazonaws.com", ""}},
         {"anthropic-vertex", {"anthropic-vertex", "https://us-east1-aiplatform.googleapis.com", ""}},
-        {"google-vertex", {"google-vertex", "https://us-east1-aiplatform.googleapis.com", ""}}};
+        {"google-vertex", {"google-vertex", "https://us-east1-aiplatform.googleapis.com", ""}},
+        {"github-copilot", {"openai-completions", "https://api.individual.githubcopilot.com", ""}},
+        {"openai-codex", {"openai-responses", "https://chatgpt.com/backend-api/codex", ""}}};
     return m;
 }
 
@@ -478,8 +481,10 @@ bool ResolveProviderSpec(const json& cfg_raw, const std::string& route, Provider
     if (s.auth.empty()) {
         if (s.api == "bedrock-converse") s.auth = "aws-sdk";
         else if (s.api == "anthropic-vertex" || s.api == "google-vertex") s.auth = "google-adc";
+        else if (s.id == "github-copilot") s.auth = "github-copilot";
+        else if (s.id == "openai-codex") s.auth = "openai-codex";
     }
-    const bool cloud_auth = s.auth == "aws-sdk" || s.auth == "google-adc";
+    const bool cloud_auth = s.auth == "aws-sdk" || s.auth == "google-adc" || s.auth == "github-copilot" || s.auth == "openai-codex";
     const bool local = base.find("127.0.0.1") != std::string::npos || base.find("localhost") != std::string::npos;
     if (s.api_key.empty() && !local && builtin && !envs.empty() && !cloud_auth) { if (why) *why = "no API key for provider \"" + s.id + "\" (set models.providers." + s.id + ".apiKey or " + envs + ")"; return false; }
     if (pc.contains("headers") && pc["headers"].is_object()) s.headers = pc["headers"];
@@ -487,6 +492,10 @@ bool ResolveProviderSpec(const json& cfg_raw, const std::string& route, Provider
     static const char* kOk[] = {"openai-completions","openai-responses","anthropic-messages","google-generative-ai","bedrock-converse","anthropic-vertex","google-vertex"};
     bool ok_api = false; for (auto* x : kOk) if (s.api == x) { ok_api = true; break; }
     if (!ok_api) { if (why) *why = "unsupported provider api \"" + s.api + "\""; return false; }
+    if (s.auth == "github-copilot" || s.auth == "openai-codex") {
+        if (pc.contains("headers") && pc["headers"].is_object()) s.headers = pc["headers"];
+        if (!oauth::ApplyRuntimeAuth(cfg_raw, &s, why)) return false;
+    }
     *out = s; return true;
 }
 

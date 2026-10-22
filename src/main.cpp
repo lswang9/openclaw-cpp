@@ -74,6 +74,7 @@
 #include "openclaw/provider/openai_compat.hpp"
 #include "openclaw/provider/router.hpp"
 #include "openclaw/provider/native.hpp"
+#include "openclaw/provider/oauth_providers.hpp"
 #include "openclaw/agent/files.hpp"
 #include "openclaw/logging/tail.hpp"
 #include "openclaw/context/assemble.hpp"
@@ -112,7 +113,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.140.0-dev";
+constexpr const char* kVersion = "1.141.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2823,6 +2824,22 @@ int CmdModels(int argc, char** argv) {
     if (act == "login") {
         const std::string provider = flag("--provider");
         if (provider.empty()) { std::cerr << "usage: models auth login --provider <id> [--method <authId>]\n"; return 2; }
+        if ((provider == "github-copilot" || provider == "openai-codex") && flag("--method").empty()) {
+            // 1.141: native device-code logins (GitHub device flow / OpenAI Codex device auth).
+            const char* pm = std::getenv("OPENCLAW_OAUTH_POLL_MS");
+            auto show = [&](const std::string& url, const std::string& code) {
+                std::cerr << "Open " << url << " and enter code: " << code << "\n" << std::flush; };
+            auto cred = provider == "github-copilot" ? provider::oauth::CopilotDeviceLogin(show, pm ? std::atoi(pm) : -1)
+                                                     : provider::oauth::CodexDeviceLogin(show, pm ? std::atoi(pm) : -1);
+            if (cred.contains("error")) { std::cerr << "error: " << cred["error"].get<std::string>() << "\n"; return 1; }
+            std::string pid = flag("--profile-id"); if (pid.empty()) pid = provider + ":default";
+            store.Upsert(pid, cred);
+            record_in_config(pid, provider, cred.value("type", std::string("oauth")), nullptr);
+            nlohmann::json outj{{"ok", true}, {"profileId", pid}, {"type", cred["type"]}, {"path", store.path().string()}};
+            if (cred.contains("accountId")) outj["accountId"] = cred["accountId"];
+            std::cout << outj.dump(2) << "\n";
+            return 0;
+        }
         auto& host = StartCliJsHost();
         host.host_call = [](long long, const std::string& method, const nlohmann::json& p) -> nlohmann::json {
             auto ask = [](const std::string& msg) { std::cerr << msg << " "; std::string l; std::getline(std::cin, l);

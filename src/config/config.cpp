@@ -498,7 +498,7 @@ SchemaReport ValidateSchema(const nlohmann::json& raw) {
             expect(b + ".baseUrl", isstr, "string");
             expect(b + ".apiKey", isstr, "string");
             expect(b + ".api", oneof({"openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai", "bedrock-converse", "bedrock-converse-stream", "anthropic-vertex", "google-vertex"}), "openai-completions|openai-responses|anthropic-messages|google-generative-ai|bedrock-converse|anthropic-vertex|google-vertex");
-            expect(b + ".auth", oneof({"api-key", "aws-sdk", "google-adc"}), "api-key|aws-sdk|google-adc");
+            expect(b + ".auth", oneof({"api-key", "aws-sdk", "google-adc", "github-copilot", "openai-codex", "token", "oauth"}), "api-key|aws-sdk|google-adc|github-copilot|openai-codex|token|oauth");
             expect(b + ".region", isstr, "string");
             expect(b + ".project", isstr, "string");
             expect(b + ".location", isstr, "string");
