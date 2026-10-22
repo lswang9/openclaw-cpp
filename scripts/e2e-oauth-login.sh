@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # 1.121: mcp.authLogin / models.authLogin OAuth 2.1 (discovery, dynamic registration, PKCE S256, /oauth/callback, paste-back) against a fake auth server.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; FO=""
-trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FO" ]] && kill $FO 2>/dev/null; wait 2>/dev/null; rm -rf "$T" 2>/dev/null || true' EXIT
+trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FO" ]] && kill $FO 2>/dev/null; wait 2>/dev/null; rm -rf "$T" 2>/dev/null || true; _reap' EXIT
 fail() { echo "[e2e-oauth-login] FAIL: $*"; tail -8 "$T/gw.log"; exit 1; }
 python3 -u "$ROOT/scripts/fake-oauth.py" >"$T/fo.port" 2>"$T/fo.log" & FO=$!
 for i in $(seq 1 50); do [[ -s "$T/fo.port" ]] && break; sleep 0.1; done

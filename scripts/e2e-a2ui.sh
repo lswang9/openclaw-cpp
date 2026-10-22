@@ -2,6 +2,10 @@
 # A2UI v0.8 host: validate (v0.9 rejected), push JSONL, server render (text, data binding, template list, escaping),
 # Button → userAction with resolved context recorded as canvas event, deleteSurface, auth required.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
+trap _reap EXIT
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); PORT=$((20000 + RANDOM % 10000))

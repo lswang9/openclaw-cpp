@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # tools.exec.mode=auto: allowlist miss → provider reviewer (mock) decides allow / deny without a human.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT="${OPENCLAW_E2E_PORT8:-$((19800 + RANDOM % 150))}"
@@ -24,7 +27,7 @@ export OPENCLAW_CONFIG_PATH="$T/data/openclaw.json" OPENCLAW_PIDFILE="$T/pid" OP
 unset OPENCLAW_EXEC_APPROVALS_PATH OPENCLAW_EXEC_MODE
 "$BIN" gateway >"$T/gw.log" 2>&1 &
 GW=$!
-trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 for _ in $(seq 1 80); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done
 post() { curl -sf -m 30 -X POST "http://127.0.0.1:$PORT/api/channels/slack/inbound" -H 'Content-Type: application/json' \
   -d "{\"type\":\"event_callback\",\"event\":{\"type\":\"message\",\"text\":\"$1\",\"user\":\"U1\",\"channel\":\"C9\",\"channel_type\":\"channel\"}}"; }

@@ -2,6 +2,9 @@
 # OIDC auth-code + PKCE login against a fake IdP: allowed user gets an operator session; disallowed user and
 # bad signature are rejected; state cookie binding enforced.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 python3 -c 'import cryptography' 2>/dev/null || { echo "[e2e-oidc] SKIP (python cryptography missing)"; exit 0; }
@@ -12,7 +15,7 @@ export OPENCLAW_GATEWAY_TOKEN="gw-$RANDOM" OPENCLAW_OIDC_ISSUER="http://127.0.0.
 export OPENCLAW_OIDC_ALLOWED_EMAILS="alice@example.com"
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done; }
-trap cleanup EXIT
+trap 'cleanup; _reap' EXIT
 fail() { echo "[e2e-oidc] FAIL: $*"; tail -20 "$T/gw.log" 2>/dev/null; exit 1; }
 idp() { IDP_PORT=$IP IDP_EMAIL="$1" IDP_BAD_SIG="${2:-0}" IDP_ALG="${3:-RS256}" IDP_GROUPS="${4:-}" IDP_REFRESH_DENY_FILE="$T/deny" python3 "$ROOT/scripts/fake-oidc-idp.py" >"$T/idp.log" 2>&1 & IDPPID=$!; PIDS+=($IDPPID)
   for _ in $(seq 50); do curl -s "http://127.0.0.1:$IP/jwks" >/dev/null 2>&1 && break; sleep 0.1; done; }

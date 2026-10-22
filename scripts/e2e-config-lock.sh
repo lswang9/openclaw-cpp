@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Prove config.reload (deps lock) does not race concurrent HTTP inbound; bounded workers avoid OOM.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT="${OPENCLAW_E2E_PORT4:-$((19000 + RANDOM % 500))}"
@@ -24,7 +27,7 @@ unset OPENCLAW_WORKSPACE OPENCLAW_STATE_DIR OPENCLAW_PLUGIN_PATH || true
 
 "$BIN" gateway >"$T/gw.log" 2>&1 &
 GW=$!
-trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 ok_health=0
 for _ in $(seq 1 80); do
   if grep -q "http+ws://127.0.0.1:$PORT" "$T/gw.log" 2>/dev/null && curl -sf "http://127.0.0.1:$PORT/health" >/dev/null; then

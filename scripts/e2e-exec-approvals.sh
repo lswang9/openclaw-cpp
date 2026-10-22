@@ -2,6 +2,9 @@
 # Offline e2e: real exec tool under tools.exec.mode=ask; the run waits for an approval that arrives as a
 # chat `/approve <id>` on the same channel while the first request is still in flight.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT="${OPENCLAW_E2E_PORT2:-18798}"
@@ -24,7 +27,7 @@ export OPENCLAW_CONFIG_PATH="$T/data/openclaw.json" OPENCLAW_PIDFILE="$T/pid" OP
 export OPENCLAW_EXEC_APPROVALS_PATH="$T/data/exec-approvals.json"
 "$BIN" gateway >"$T/gw.log" 2>&1 &
 GW=$!
-trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 for _ in $(seq 1 50); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done
 post() { curl -sf -m 30 -X POST "http://127.0.0.1:$PORT/api/channels/slack/inbound" -H 'Content-Type: application/json' \
   -d "{\"type\":\"event_callback\",\"event\":{\"type\":\"message\",\"text\":\"$1\",\"user\":\"U1\",\"channel\":\"C4\",\"channel_type\":\"channel\"}}"; }

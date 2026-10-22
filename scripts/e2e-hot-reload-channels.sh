@@ -3,6 +3,9 @@
 # restarts the JS plugin host when plugins.* changes (plugin channels/routes re-registered), and leaves
 # everything else running.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT="${OPENCLAW_E2E_PORT3:-18799}"
@@ -14,7 +17,7 @@ export OPENCLAW_GATEWAY_HOST=127.0.0.1 OPENCLAW_SESSION_DIR="$T/sessions" OPENCL
 export OPENCLAW_CONFIG_PATH="$T/data/openclaw.json" OPENCLAW_PIDFILE="$T/pid" OPENCLAW_TOKENIZER_PATH="$T/none"
 "$BIN" gateway >"$T/gw.log" 2>&1 &
 GW=$!
-trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 for _ in $(seq 1 50); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done
 rpc() { curl -sf -X POST "http://127.0.0.1:$PORT/v1/rpc" -H 'Content-Type: application/json' -d "$1"; }
 reload() { sleep 0.05; rpc '{"jsonrpc":"2.0","id":1,"method":"config.reload","params":{}}'; }

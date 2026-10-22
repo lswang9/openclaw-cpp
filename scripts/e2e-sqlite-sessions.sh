@@ -2,10 +2,13 @@
 # 1.131: session storage in the upstream agent database (openclaw-agent.sqlite, schema v25): one-time import from
 # the JSON/JSONL store, transcript persistence across restarts, reset windows kept as history, JSON files untouched.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""
-trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; wait 2>/dev/null; rm -rf "$T"' EXIT
+trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; wait 2>/dev/null; rm -rf "$T"; _reap' EXIT
 fail() { echo "[e2e-sqlite] FAIL: $*"; tail -8 "$T/gw.log"; exit 1; }
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN OPENCLAW_SESSION_STORE

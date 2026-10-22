@@ -2,10 +2,13 @@
 # 1.132: live listeners (Matrix /sync, Signal /v1/receive, Mattermost channel polling) and inbound auth
 # (Bot Framework + Google Chat RS256 JWTs via JWKS, Matrix hs_token, Signal webhook secret), all offline.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; FK=""
-trap 'for p in $GW $FK; do kill $p 2>/dev/null; done; wait 2>/dev/null; rm -rf "$T"' EXIT
+trap 'for p in $GW $FK; do kill $p 2>/dev/null; done; wait 2>/dev/null; rm -rf "$T"; _reap' EXIT
 fail() { echo "[e2e-ext-live] FAIL: $*"; grep -i -E "mattermost|error" "$T/gw.log" | tail -8; [[ -f "$T/fk.log" ]] && tail -4 "$T/fk.log"; exit 1; }
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN

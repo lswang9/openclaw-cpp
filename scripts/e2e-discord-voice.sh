@@ -2,12 +2,15 @@
 # Discord voice offline: fake voice gateway (WS v8) + UDP; client does Identify/Ready/IP discovery/Select Protocol/
 # Session Description/Speaking, sends Ogg-demuxed Opus as AES-GCM rtpsize RTP paced 20 ms, then 5 silence frames.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 python3 -c 'import cryptography' 2>/dev/null || { echo "[e2e-discord-voice] SKIP (python cryptography missing)"; exit 0; }
 T=$(mktemp -d)
 python3 "$ROOT/scripts/fake-discord-voice.py" "$T/report.json" > "$T/port" 2>"$T/fake.log" & FP=$!
-trap 'kill $FP 2>/dev/null || true' EXIT
+trap 'kill $FP 2>/dev/null || true; _reap' EXIT
 for _ in $(seq 50); do [[ -s "$T/port" ]] && break; sleep 0.1; done
 fail() { echo "[e2e-discord-voice] FAIL: $*"; cat "$T/fake.log"; exit 1; }
 R=$("$BIN" discord voice play --endpoint "ws://127.0.0.1:$(cat "$T/port")/?v=8" --server G1 --user U1 --session S1 --token VT --ogg "$ROOT/scripts/fixtures/sine-0.5s.ogg") || fail "play: $R"
@@ -40,7 +43,7 @@ printf '%s' "$RD" | grep -q '"dave_required": *true' && printf '%s' "$RD" | grep
 # Opus-encoded with libopus; the fake's second speaker (U2, RTP with header extension) is received + decoded.
 T2=$(mktemp -d)
 python3 "$ROOT/scripts/fake-discord-voice.py" "$T2/report.json" "$ROOT/scripts/fixtures/sine-0.5s.ogg" > "$T2/port" 2>"$T2/fake.log" & FP2=$!
-trap 'kill $FP $FP2 ${GW:-} 2>/dev/null || true' EXIT
+trap 'kill $FP $FP2 ${GW:-} 2>/dev/null || true; _reap' EXIT
 for _ in $(seq 50); do [[ -s "$T2/port" ]] && break; sleep 0.1; done
 VP=$(cat "$T2/port")
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')

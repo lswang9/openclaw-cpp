@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # TOTP MFA on gateway /login: enroll, require otp, accept code, reject replay, accept recovery code once.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
+trap _reap EXIT
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); PORT=$((20000 + RANDOM % 10000))

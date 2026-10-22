@@ -3,6 +3,9 @@
 # login → session cookie with the registering role; replay, wrong origin, bad signature and non-increasing
 # signCount are rejected; removing the passkey ends its sessions. No browser needed.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 python3 -c 'import cryptography' 2>/dev/null || { echo "[e2e-webauthn] SKIP (python cryptography missing)"; exit 0; }
@@ -11,7 +14,7 @@ PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print
 export OPENCLAW_SESSION_DIR="$T/s" OPENCLAW_CONFIG_PATH="$T/cfg.json" OPENCLAW_PIDFILE="$T/pid"
 echo '{}' > "$OPENCLAW_CONFIG_PATH"
 OPENCLAW_GATEWAY_TOKEN=gwtok "$BIN" gateway --port "$PORT" --host 127.0.0.1 >"$T/gw.log" 2>&1 & GW=$!
-trap 'kill $GW 2>/dev/null || true' EXIT
+trap 'kill $GW 2>/dev/null || true; _reap' EXIT
 U="http://127.0.0.1:$PORT"; ORIGIN="$U"; RP=127.0.0.1
 for _ in $(seq 80); do curl -s "$U/health" >/dev/null 2>&1 && break; sleep 0.1; done
 fail() { echo "[e2e-webauthn] FAIL: $*"; tail -5 "$T/gw.log"; exit 1; }

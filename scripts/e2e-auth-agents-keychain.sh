@@ -2,6 +2,9 @@
 # Per-agent auth profiles (agent "work" uses its own store; others fall back to main) + libsecret keychain
 # round trip when a Secret Service can be started (gnome-keyring under dbus-run-session); otherwise SKIP that half.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT=$((22500 + RANDOM % 200)); FPORT=$((PORT + 60)); T="${TMPDIR:-/tmp}/oc-e2e-aak-$$"
@@ -22,7 +25,7 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1",int(sys.argv[1])),H).serve_forever()
 P
 python3 "$T/fake.py" "$FPORT" & SRV=$!; GW=
-trap 'kill $SRV $GW 2>/dev/null||true; rm -rf "$T"' EXIT
+trap 'kill $SRV $GW 2>/dev/null||true; rm -rf "$T"; _reap' EXIT
 fail() { echo "[e2e-aak] $*" >&2; cat "$T/gw.log" 2>/dev/null | tail -20 >&2; exit 1; }
 timeout 20 "$BIN" models auth paste-token --provider openai --profile-id openai:default <<<"main-key" >/dev/null
 timeout 20 "$BIN" models auth paste-token --provider openai --profile-id openai:default --agent work <<<"work-key" >/dev/null

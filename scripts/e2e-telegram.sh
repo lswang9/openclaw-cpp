@@ -2,10 +2,13 @@
 # 1.126: Telegram live Bot API against an offline fake — deleteWebhook + getUpdates long polling, offset persistence,
 # DM reply, group reply_parameters, forum topic message_thread_id, 4096-char chunking.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; FT=""
-trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FT" ]] && kill $FT 2>/dev/null; wait 2>/dev/null; rm -rf "$T"' EXIT
+trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FT" ]] && kill $FT 2>/dev/null; wait 2>/dev/null; rm -rf "$T"; _reap' EXIT
 fail() { echo "[e2e-telegram] FAIL: $*"; [[ -f "$T/gw.log" ]] && tail -8 "$T/gw.log"; exit 1; }
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_API_BASE TELEGRAM_MODE TELEGRAM_WEBHOOK_URL

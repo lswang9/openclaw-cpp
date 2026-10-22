@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SQLite approvals store (migrate from JSON), binary-changed denial after approve, background+process poll.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT="${OPENCLAW_E2E_PORT5:-$((19000 + RANDOM % 500))}"
@@ -29,7 +32,7 @@ J
 export OPENCLAW_MOCK_SCRIPT="$T/script-migrate.json"
 "$BIN" gateway >"$T/gw.log" 2>&1 &
 GW=$!
-trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill $GW 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 for _ in $(seq 1 80); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.1; done
 
 # Trigger an allowlist allow-always path via RPC tools — use chat completions with exec after seed

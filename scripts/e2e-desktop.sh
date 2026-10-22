@@ -2,6 +2,9 @@
 # Real desktop control under Xvfb + private D-Bus/AT-SPI: launch policy, windows, a11y tree, a11y click/set_text, release.
 # SKIPs honestly when Xvfb/xdotool/python3-gi Atspi/dbus-run-session are missing.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 for b in Xvfb xdotool dbus-run-session python3; do command -v $b >/dev/null || { echo "[e2e-desktop] SKIP ($b missing)"; exit 0; }; done
@@ -15,7 +18,7 @@ export DISPLAY=":$DN" NO_AT_BRIDGE=0 GTK_A11Y=atspi
 APP="$T/oc-a11y-app"; cp "$ROOT/scripts/fixtures/a11y-test-app.py" "$APP"; sed -i '1i #!/usr/bin/env python3' "$APP"; chmod +x "$APP"
 GW=
 cleanup() { [[ -n "$GW" ]] && kill $GW 2>/dev/null; kill $XV 2>/dev/null; true; }
-trap cleanup EXIT
+trap 'cleanup; _reap' EXIT
 fail() { echo "[e2e-desktop] FAIL: $*"; tail -20 "$T/gw.log" 2>/dev/null; exit 1; }
 for _ in $(seq 30); do xdotool getmouselocation >/dev/null 2>&1 && break; sleep 0.1; done
 start_gw() { "$BIN" gateway --port "$PORT" --host 127.0.0.1 >"$T/gw.log" 2>&1 & GW=$!

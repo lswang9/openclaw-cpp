@@ -2,6 +2,9 @@
 # Inbound voice notes are auto-transcribed (Telegram voice, WhatsApp Cloud audio, Discord audio attachment) before
 # the agent sees them; streaming TTS delivers ElevenLabs /stream chunks (CLI + tts.stream RPC). Fake servers only.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); PORT=$((20000 + RANDOM % 10000))
@@ -16,7 +19,7 @@ export TELEGRAM_WEBHOOK_SECRET=S3cret OPENCLAW_TTS_AUTO=inbound
 export OPENCLAW_TTS_PROVIDER=elevenlabs OPENCLAW_TTS_URL="$B" OPENCLAW_TTS_API_KEY=k
 GW=
 cleanup() { [[ -n "$GW" ]] && kill $GW 2>/dev/null; kill $FPID 2>/dev/null; true; }
-trap cleanup EXIT
+trap 'cleanup; _reap' EXIT
 fail() { echo "[e2e-voice-inbound] FAIL: $*"; tail -20 "$T/gw.log" 2>/dev/null; exit 1; }
 # streaming TTS via CLI
 R=$("$BIN" voice tts --stream --out "$T/s.mp3" hello stream) || fail "cli stream: $R"

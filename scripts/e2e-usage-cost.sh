@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # 1.115: usage/cost from transcripts with the cl100k tokenizer and configured model pricing.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
+trap _reap EXIT
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 TOK="${OPENCLAW_TOKENIZER_PATH:-$HOME/.openclaw/tokenizers/cl100k_base.tiktoken}"

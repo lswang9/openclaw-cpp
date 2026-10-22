@@ -3,12 +3,15 @@
 # pong ClientConfig applied (PingInterval), multi-part event reassembly (out-of-order parts), ack frame (code 200,
 # biz_rt), gzip card.action.trigger answered with base64 card JSON, server drop → reconnect per ClientConfig, and the agent reply posted via im/v1/messages with the tenant token. Fake server only.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d)
 python3 "$ROOT/scripts/fake-feishu-ws.py" "$T/report.json" > "$T/fp" 2>"$T/fake.log" & FP=$!
 GW=
-trap 'kill $FP ${GW:-} 2>/dev/null || true' EXIT
+trap 'kill $FP ${GW:-} 2>/dev/null || true; _reap' EXIT
 for _ in $(seq 50); do [[ -s "$T/fp" ]] && break; sleep 0.1; done
 fail() { echo "[e2e-feishu-ws] FAIL: $*"; cat "$T/fake.log"; tail -5 "$T/gw.log"; [[ -f "$T/report.json" ]] && cat "$T/report.json"; exit 1; }
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')

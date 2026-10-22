@@ -2,6 +2,9 @@
 # Offline: token-level SSE streaming (content + split tool_call deltas) from an OpenAI-compatible fake,
 # plugin onPartialReply/onTyping, and Discord typing keep-alive (POST /channels/{id}/typing) during a slow turn.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 command -v node >/dev/null || { echo "[e2e-st] SKIP (no node)"; exit 0; }
@@ -38,7 +41,7 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
 P
 python3 "$T/fake.py" "$FP" "$T/log" & SRV=$!; GW=
-trap 'kill $SRV $GW 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill $SRV $GW 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 cat > "$T/src/stplug/openclaw.plugin.json" <<'J'
 { "id": "stplug" }
 J

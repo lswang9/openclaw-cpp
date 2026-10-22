@@ -2,10 +2,13 @@
 # 1.123: top-level guard (upstream names never reach the chat model), mcp list/show/add/set/unset/tools/status/probe/doctor/login/logout,
 # reset, uninstall, docs search, clawbot/acp/resume aliases.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; FO=""; DS=""
-trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FO" ]] && kill $FO 2>/dev/null; [[ -n "$DS" ]] && kill $DS 2>/dev/null; wait 2>/dev/null; rm -rf "$T" 2>/dev/null || true' EXIT
+trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FO" ]] && kill $FO 2>/dev/null; [[ -n "$DS" ]] && kill $DS 2>/dev/null; wait 2>/dev/null; rm -rf "$T" 2>/dev/null || true; _reap' EXIT
 fail() { echo "[e2e-cli-local4] FAIL: $*"; [[ -f "$T/gw.log" ]] && tail -8 "$T/gw.log"; exit 1; }
 mkdir -p "$T/home"; unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN OPENCLAW_DOCS_URL
 export OPENCLAW_DEFAULT_PROVIDER=mock OPENCLAW_SESSION_DIR="$T/sess" OPENCLAW_DATA_DIR="$T/data" OPENCLAW_CONFIG_PATH="$T/cfg.json" HOME="$T/home" OPENCLAW_GATEWAY_PORT=1

@@ -2,10 +2,13 @@
 # 1.125: config-driven model providers routed per "provider/model": Anthropic Messages, Gemini generateContent,
 # OpenAI Responses and chat completions (against an offline fake), incl. a tool-call round trip and SecretRef keys.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; FL=""
-trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FL" ]] && kill $FL 2>/dev/null; wait 2>/dev/null; [[ -z "${KEEP:-}" ]] && rm -rf "$T"' EXIT
+trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FL" ]] && kill $FL 2>/dev/null; wait 2>/dev/null; [[ -z "${KEEP:-}" ]] && rm -rf "$T"; _reap' EXIT
 fail() { echo "[e2e-providers] FAIL: $*"; echo "T=$T"; [[ -f "$T/gw.log" ]] && tail -8 "$T/gw.log"; exit 1; }
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN OPENCLAW_DEFAULT_PROVIDER ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY

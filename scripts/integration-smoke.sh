@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Boots gateway with mock provider (no live LLM) and hits HTTP surface.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 export OPENCLAW_KEYCHAIN="${OPENCLAW_KEYCHAIN:-off}"  # deterministic: no host Secret Service in smoke
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
@@ -34,7 +37,7 @@ cleanup() {
   fi
   rm -rf "$OPENCLAW_SESSION_DIR" "$OPENCLAW_DATA_DIR"
 }
-trap cleanup EXIT
+trap 'cleanup; _reap' EXIT
 
 echo "[smoke] starting gateway mock on ${HOST}:${PORT}"
 # Use a private pidfile for the shell job; gateway also writes OPENCLAW_PIDFILE — keep them same

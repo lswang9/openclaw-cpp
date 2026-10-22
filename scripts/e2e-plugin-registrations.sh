@@ -3,11 +3,14 @@
 # web_search tool, registerTextTransforms rewrites user input / final assistant text, registerAgentToolResultMiddleware
 # rewrites tool results before the model sees them.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 command -v node >/dev/null || { echo "[e2e-plugin-reg] SKIP (no node)"; exit 0; }
 T=$(mktemp -d); GW=""; FL=""
-trap 'for p in $GW $FL; do kill $p 2>/dev/null; done; wait 2>/dev/null; rm -rf "$T"' EXIT
+trap 'for p in $GW $FL; do kill $p 2>/dev/null; done; wait 2>/dev/null; rm -rf "$T"; _reap' EXIT
 fail() { echo "[e2e-plugin-reg] FAIL: $*"; tail -15 "$T/gw.log"; exit 1; }
 freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 unset OPENCLAW_GATEWAY_URL OPENCLAW_GATEWAY_TOKEN BRAVE_API_KEY TAVILY_API_KEY

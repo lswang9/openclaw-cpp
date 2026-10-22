@@ -2,6 +2,10 @@
 # 1.101: full-screen tui under a pseudo-terminal: alternate screen, header, wrapped transcript, line editing,
 # history recall, background send + reply, slash commands, PgUp scroll, resize, clean terminal restore.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
+trap _reap EXIT
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; rm -rf "$T"' EXIT

@@ -3,6 +3,9 @@
 # media.fetchRemoteMedia (SSRF guard + allowPrivateNetwork) / saveMediaBuffer, tts.textToSpeech, stt.transcribeAudioFile,
 # config.writeConfigFile (validated + hot reload), streaming reply.block events, command-initiated agent reply (no deadlock), writeConfigFile preserves comments/$include.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 command -v node >/dev/null || { echo "[e2e-prt] SKIP (no node)"; exit 0; }
@@ -92,7 +95,7 @@ export OPENCLAW_SESSION_DIR="$T/sessions" OPENCLAW_DATA_DIR="$T/data" OPENCLAW_P
 export OPENCLAW_TTS_URL="$FAKE/tts" OPENCLAW_STT_URL="$FAKE/stt"
 "$BIN" gateway >"$T/gw.log" 2>&1 &
 GW=$!
-trap 'kill $GW $SRV 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill $GW $SRV 2>/dev/null || true; wait $GW 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 for _ in $(seq 1 150); do grep -q '"step":"done"' "$RESULTS" 2>/dev/null && break; sleep 0.1; done
 fail() { echo "[e2e-prt] $*" >&2; cat "$RESULTS" >&2 2>/dev/null || true; tail -20 "$T/gw.log" >&2; exit 1; }
 grep -q '"step":"done"' "$RESULTS" || fail "plugin steps did not finish"

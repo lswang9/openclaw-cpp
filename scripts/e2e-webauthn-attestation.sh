@@ -2,13 +2,16 @@
 # WebAuthn attestation verification (1.92, 1.99): none, packed self/x5c, fido-u2f, android-key, apple, tpm, android-safetynet;
 # anchors) / fido-u2f / none, under OPENCLAW_WEBAUTHN_ATTESTATION=none (default) and =trusted. Software authenticator.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 python3 -c 'import cryptography' 2>/dev/null || { echo "[e2e-webauthn-att] SKIP (python cryptography missing)"; exit 0; }
 T=$(mktemp -d); mkdir -p "$T/ca"
 FA="$ROOT/scripts/fake-webauthn.py"
 GW=
-trap 'kill ${GW:-} 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill ${GW:-} 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 fail() { echo "[e2e-webauthn-att] FAIL: $*"; tail -5 "$T/gw.log"; exit 1; }
 # pre-create the CAs so the anchor file exists before the gateway starts
 echo '{"challenge":"x"}' | python3 "$FA" create "$T/tmpk" es256 http://x x --att packed-x5c --ca-dir "$T/ca" >/dev/null

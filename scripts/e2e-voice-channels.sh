@@ -3,13 +3,16 @@
 # Discord voice message (flags 8192 + duration + waveform), Slack files.getUploadURLExternal/upload/complete,
 # Feishu im/v1/files (opus) + msg_type=audio, WhatsApp Cloud /media + type=audio voice. Fake servers only.
 set -euo pipefail
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 command -v ffmpeg >/dev/null || { echo "[e2e-voice-channels] SKIP: ffmpeg not installed (needed for Ogg/Opus voice notes)"; exit 0; }
 T=$(mktemp -d)
 python3 "$ROOT/scripts/fake-voice-channels.py" "$T/rep.json" > "$T/fp" 2>"$T/fake.log" & FP=$!
 GW=
-trap 'kill $FP ${GW:-} 2>/dev/null || true; rm -rf "$T"' EXIT
+trap 'kill $FP ${GW:-} 2>/dev/null || true; rm -rf "$T"; _reap' EXIT
 for _ in $(seq 50); do [[ -s "$T/fp" ]] && break; sleep 0.1; done
 B="http://127.0.0.1:$(cat "$T/fp")"
 fail() { echo "[e2e-voice-channels] FAIL: $*"; cat "$T/fake.log"; tail -5 "$T/gw.log"; [[ -f "$T/rep.json" ]] && cat "$T/rep.json"; exit 1; }

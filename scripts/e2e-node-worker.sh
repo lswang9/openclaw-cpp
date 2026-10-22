@@ -3,6 +3,10 @@
 # node.invoke round-trips; a session dispatched to that device runs its turns on the node (worker.launch.v1 →
 # worker.status.v1 receipts) while the transcript stays on the gateway; node exit fails the placement.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
+trap _reap EXIT
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; ND=""; trap '[[ -n "$ND" ]] && kill $ND 2>/dev/null; [[ -n "$GW" ]] && kill $GW 2>/dev/null; wait 2>/dev/null; rm -rf "$T" 2>/dev/null || true' EXIT

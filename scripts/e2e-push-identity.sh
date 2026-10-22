@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # 1.119: Web Push (VAPID + RFC 8291 aes128gcm, decrypted by a fake push service), users.authConnect, tools.github identity (managed PAT, inherit, device flow).
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
+trap _reap EXIT
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; FK=""; PS=""; trap '[[ -n "$GW" ]] && kill $GW 2>/dev/null; [[ -n "$FK" ]] && kill $FK 2>/dev/null; [[ -n "$PS" ]] && kill $PS 2>/dev/null; wait 2>/dev/null; rm -rf "$T" 2>/dev/null || true' EXIT

@@ -2,6 +2,10 @@
 # 1.107: re-diff closures (agent, sessions.describe, projects.*, node.event/pair.remove) and the honest
 # not-implemented contract; probe-unimplemented --check keeps the generated list current.
 set -eu
+# reap background gateways/fakes on any exit, including timeout/^C
+_reap(){ kill $(jobs -p) 2>/dev/null || true; }
+trap '_reap; exit 143' INT TERM HUP
+trap _reap EXIT
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 T=$(mktemp -d); GW=""; ND=""; trap '[[ -n "$ND" ]] && kill $ND 2>/dev/null; [[ -n "$GW" ]] && kill $GW 2>/dev/null; wait 2>/dev/null; rm -rf "$T" 2>/dev/null || true' EXIT
