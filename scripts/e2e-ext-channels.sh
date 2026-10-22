@@ -16,7 +16,7 @@ cat > "$T/cfg.json" <<JSON
 {"channels":{
  "signal":{"apiBase":"$F","number":"+15550000","dmPolicy":"open","groupPolicy":"open"},
  "matrix":{"homeserver":"$F","accessToken":"mx-tok","userId":"@bot:x","dmPolicy":"open","groupPolicy":"open"},
- "msteams":{"appId":"app-1","appPassword":"pw-1","tokenUrl":"$F/botframework.com/oauth2/v2.0/token","dmPolicy":"open","groupPolicy":"open"},
+ "msteams":{"appId":"app-1","appPassword":"pw-1","verifyJwt":false,"tokenUrl":"$F/botframework.com/oauth2/v2.0/token","dmPolicy":"open","groupPolicy":"open"},
  "googlechat":{"dmPolicy":"open","groupPolicy":"open"},
  "mattermost":{"baseUrl":"$F","botToken":"mm-tok","webhookToken":"hook-1","dmPolicy":"open","groupPolicy":"open"}}}
 JSON

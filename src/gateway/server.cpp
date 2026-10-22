@@ -8,6 +8,8 @@
 #include "openclaw/config/schema.hpp"
 #include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/gateway/conversations.hpp"
+#include "openclaw/channels/ext_auth.hpp"
+#include "openclaw/channels/ext_channels.hpp"
 #include "openclaw/gateway/node_hub.hpp"
 #include "openclaw/util.hpp"
 #include "openclaw/net/safe_fetch.hpp"
@@ -60,7 +62,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.131.0-dev";
+constexpr const char* kVersion = "1.132.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -680,6 +682,11 @@ void Server::Run() {
         plugin_pump_ = std::thread([this] { PluginEventPump(); });
     }
     telegram_poll_ = std::thread([this] { TelegramPollLoop(); });
+    ext_listen_ = std::thread([this, cfg = deps_.config.raw] {
+        const auto state = deps_.persist ? deps_.persist->Root() : std::filesystem::path(EnvOr("OPENCLAW_DATA_DIR", "/tmp/openclaw-cpp-data"));
+        channels::RunExtListeners(cfg, state, pump_stop_, [this](const std::string& id) { return deps_.adapters.Get(id); },
+                                  [this](const channels::InboundMessage& m) { return DeliverInbound(m); });
+    });
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
     int yes = 1;
@@ -719,6 +726,7 @@ void Server::Run() {
     pump_stop_ = true;
     if (plugin_pump_.joinable()) plugin_pump_.join();
     if (telegram_poll_.joinable()) telegram_poll_.join();
+    if (ext_listen_.joinable()) ext_listen_.join();
     {
         std::vector<std::thread> ts;
         { std::lock_guard l(host_threads_mu_); ts.swap(host_threads_); }
@@ -2320,6 +2328,13 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                         send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", "telegram secret token mismatch"}}.dump()));
                         return;
                     }
+                }
+            } else if (channels::IsExtChannel(chan_id)) {
+                const auto q = path_raw.find('?');
+                if (!channels::VerifyExtInbound(chan_id, deps_.config.raw, [&](const std::string& h) { return HeaderValue(req, h); },
+                                                q == std::string::npos ? std::string() : path_raw.substr(q + 1), &why)) {
+                    send(HttpResponse(401, "Unauthorized", nlohmann::json{{"error", why}}.dump()));
+                    return;
                 }
             } else if (chan_id == "discord") {
                 if (auto pk = cfg_str("channels.discord.publicKey", "DISCORD_PUBLIC_KEY"); !pk.empty()) {

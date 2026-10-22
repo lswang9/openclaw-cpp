@@ -154,6 +154,7 @@ private:
     std::set<std::string> plugin_providers_;
     std::thread plugin_pump_;
     std::thread telegram_poll_;
+    std::thread ext_listen_;
     void TelegramPollLoop();
     std::atomic<bool> pump_stop_{false};
     void PluginEventPump();
