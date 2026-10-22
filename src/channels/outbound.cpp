@@ -595,6 +595,32 @@ void PersistPollRegistry() {
     persist::StateWrite(path, PollRegistry().dump(2));
 }
 }  // namespace
+
+// 1.166: forum topic icon cache (chatId:threadId → {name, icon_color, icon_custom_emoji_id}).
+static std::mutex g_topic_mu;
+nlohmann::json& TopicIconCache() {
+    static nlohmann::json cache = nlohmann::json::object();
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        const char* d = std::getenv("OPENCLAW_DATA_DIR");
+        std::filesystem::path path = (d && *d) ? std::filesystem::path(d) / "telegram" / "topic-icons.json"
+                                              : std::filesystem::path("/tmp/openclaw-cpp-data/telegram/topic-icons.json");
+        if (auto t = persist::StateRead(path)) try { auto j = nlohmann::json::parse(*t); if (j.is_object()) cache = j; } catch (...) {}
+    }
+    return cache;
+}
+void PersistTopicIcons() {
+    const char* d = std::getenv("OPENCLAW_DATA_DIR");
+    std::filesystem::path path = (d && *d) ? std::filesystem::path(d) / "telegram" / "topic-icons.json"
+                                          : std::filesystem::path("/tmp/openclaw-cpp-data/telegram/topic-icons.json");
+    persist::StateWrite(path, TopicIconCache().dump(2));
+}
+void RememberTopicIcon(const std::string& chat, const std::string& thread, const nlohmann::json& info) {
+    std::lock_guard<std::mutex> l(g_topic_mu);
+    TopicIconCache()[chat + ":" + thread] = info;
+    PersistTopicIcons();
+}
 void OutboundRecordAdapter::TelegramRememberPoll(const nlohmann::json& entry) {
     std::lock_guard<std::mutex> l(g_poll_mu);
     PollRegistry()[entry.value("pollId", "")] = entry;
@@ -623,6 +649,14 @@ nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, 
     if (chat.is_null() || chat == "") return {{"ok", false}, {"error", "to (chat id) is required"}};
     nlohmann::json body{{"chat_id", chat.is_string() ? chat : nlohmann::json(chat.dump())}};
     if (!thread.is_null() && thread != "") body["message_thread_id"] = idv(thread);
+    // 1.166: business callback edits/deletes carry business_connection_id (upstream createTelegramCallbackMessageActions).
+    std::string biz;
+    if (p.contains("business_connection_id")) biz = p["business_connection_id"].get<std::string>();
+    else {
+        std::string cid = body["chat_id"].is_string() ? body["chat_id"].get<std::string>() : body["chat_id"].dump();
+        biz = BizFor(cid);
+    }
+    if (!biz.empty()) body["business_connection_id"] = biz;
     std::string method;
     // 1.146: sendPoll (public polls register a route for later poll_answer updates) and forum topic CRUD.
     if (action == "poll") {
@@ -664,6 +698,18 @@ nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, 
             }
         }
         return out;
+    }
+    if (action == "topic_icon" || action == "get_topic_icon") {  // 1.166
+        std::string cid = body["chat_id"].is_string() ? body["chat_id"].get<std::string>() : body["chat_id"].dump();
+        std::string tid;
+        if (!thread.is_null() && thread != "") tid = thread.is_string() ? thread.get<std::string>() : thread.dump();
+        else if (!mid.is_null() && mid != "") tid = mid.is_string() ? mid.get<std::string>() : mid.dump();
+        if (tid.empty()) return {{"ok", false}, {"error", "threadId (topic id) is required"}};
+        std::lock_guard<std::mutex> l(g_topic_mu);
+        auto& cache = TopicIconCache();
+        auto key = cid + ":" + tid;
+        if (!cache.contains(key)) return {{"ok", false}, {"error", "no cached icon for topic"}, {"key", key}};
+        return {{"ok", true}, {"topicIcon", cache[key]}, {"chatId", cid}, {"threadId", tid}};
     }
     if (action == "invoice" || action == "sendInvoice") {  // 1.157
         method = "sendInvoice";
@@ -717,7 +763,19 @@ nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, 
             if (p.contains("buttons")) body["reply_markup"] = TelegramInlineKeyboard(p["buttons"]);
             if (text.empty()) { if (!p.contains("buttons")) return {{"ok", false}, {"error", "message (new text) or buttons required"}}; method = "editMessageReplyMarkup"; }
             else { method = "editMessageText"; body["text"] = text; }
-        } else if (action == "delete" || action == "unsend") method = "deleteMessage";
+        } else if (action == "delete" || action == "unsend") {
+        if (!biz.empty()) {
+            // Bot API deleteBusinessMessages(business_connection_id, message_ids)
+            method = "deleteBusinessMessages";
+            body.erase("chat_id"); body.erase("message_thread_id");
+            body["business_connection_id"] = biz;
+            nlohmann::json ids = nlohmann::json::array();
+            if (!mid.is_null() && mid != "") ids.push_back(idv(mid));
+            else if (p.contains("message_ids")) ids = p["message_ids"];
+            if (ids.empty()) return {{"ok", false}, {"error", "messageId is required"}};
+            body["message_ids"] = ids;
+        } else method = "deleteMessage";
+        }
         else if (action == "pin") { method = "pinChatMessage"; if (p.value("silent", false)) body["disable_notification"] = true; }
         else if (action == "unpin") method = "unpinChatMessage";
         else if (action == "typing") { method = "sendChatAction"; body["action"] = "typing"; }
@@ -727,7 +785,21 @@ nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, 
     nlohmann::json rec{{"channel", "telegram"}, {"action", action}, {"method", method}, {"body", body}, {"http", r.value("http", 0)}};
     sent_.push_back(rec);
     const bool ok = r.value("http", 0) == 200;
-    return {{"ok", ok}, {"method", method}, {"http", r.value("http", 0)}, {"response", r.value("body", nlohmann::json())}};
+    nlohmann::json out{{"ok", ok}, {"method", method}, {"http", r.value("http", 0)}, {"response", r.contains("json") ? r["json"] : r.value("body", nlohmann::json())}};
+    if (ok && (method == "createForumTopic" || method == "editForumTopic")) {
+        auto result = r.contains("json") ? r["json"].value("result", nlohmann::json::object()) : nlohmann::json::object();
+        std::string cid = body["chat_id"].is_string() ? body["chat_id"].get<std::string>() : body["chat_id"].dump();
+        std::string tid = result.contains("message_thread_id") ? result["message_thread_id"].dump()
+                        : (body.contains("message_thread_id") ? body["message_thread_id"].dump() : "");
+        if (!tid.empty()) {
+            nlohmann::json info{{"name", result.value("name", body.value("name", ""))},
+                                {"icon_color", result.contains("icon_color") ? result["icon_color"] : body.value("icon_color", nlohmann::json())},
+                                {"icon_custom_emoji_id", result.value("icon_custom_emoji_id", body.value("icon_custom_emoji_id", ""))}};
+            RememberTopicIcon(cid, tid, info);
+            out["topicIcon"] = info; out["threadId"] = result.value("message_thread_id", nlohmann::json());
+        }
+    }
+    return out;
 }
 
 nlohmann::json OutboundRecordAdapter::TelegramSyncCommands() {
@@ -775,6 +847,11 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
         synth.erase("caption"); synth.erase("photo"); synth.erase("document");
         if (cbq.contains("from")) synth["from"] = cbq["from"];
         synth["__callback"] = true;
+        if (synth.contains("business_connection_id") && synth.contains("chat")) {
+            const auto& bc = synth["chat"]["id"];
+            std::lock_guard<std::mutex> l(g_biz_mu);
+            BizConn()[bc.is_string() ? bc.get<std::string>() : bc.dump()] = synth["business_connection_id"].get<std::string>();
+        }
     }
     // 1.157: `poll` state updates. A closed poll we sent retires its registry entry and its final tallies are noted in
     // the chat's session (the only result signal anonymous polls ever produce); open-poll tallies are ignored.
@@ -902,6 +979,27 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
     if (tm.contains("video")) add_ref("video", tm["video"], "video/mp4", "video.mp4");
     if (tm.contains("animation")) add_ref("video", tm["animation"], "video/mp4", "animation.mp4");
     if (tm.contains("sticker") && !tm["sticker"].value("is_animated", false) && !tm["sticker"].value("is_video", false)) add_ref("image", tm["sticker"], "image/webp", "sticker.webp");
+    // 1.166: cache forum topic icons from service messages / topic headers.
+    if (tm.contains("forum_topic_created") && tm["forum_topic_created"].is_object()) {
+        const auto& ft = tm["forum_topic_created"];
+        std::string cid = tm["chat"]["id"].is_string() ? tm["chat"]["id"].get<std::string>() : tm["chat"]["id"].dump();
+        std::string tid = tm.contains("message_thread_id") ? tm["message_thread_id"].dump() : "";
+        if (!tid.empty()) RememberTopicIcon(cid, tid, {{"name", ft.value("name", "")}, {"icon_color", ft.value("icon_color", nlohmann::json())},
+                                                       {"icon_custom_emoji_id", ft.value("icon_custom_emoji_id", "")}});
+    }
+    if (tm.contains("forum_topic_edited") && tm["forum_topic_edited"].is_object()) {
+        const auto& ft = tm["forum_topic_edited"];
+        std::string cid = tm["chat"]["id"].is_string() ? tm["chat"]["id"].get<std::string>() : tm["chat"]["id"].dump();
+        std::string tid = tm.contains("message_thread_id") ? tm["message_thread_id"].dump() : "";
+        if (!tid.empty()) {
+            nlohmann::json info = nlohmann::json::object();
+            { std::lock_guard<std::mutex> l(g_topic_mu); auto& c = TopicIconCache(); auto k = cid + ":" + tid; if (c.contains(k)) info = c[k]; }
+            if (ft.contains("name")) info["name"] = ft["name"];
+            if (ft.contains("icon_color")) info["icon_color"] = ft["icon_color"];
+            if (ft.contains("icon_custom_emoji_id")) info["icon_custom_emoji_id"] = ft["icon_custom_emoji_id"];
+            RememberTopicIcon(cid, tid, info);
+        }
+    }
     if (m.text.empty() && m.media.empty()) return {{"ok", true}, {"ignored", true}, {"note", "no text or media"}};
     const auto& chat = tm["chat"];
     const std::string cid = chat["id"].is_string() ? chat["id"].get<std::string>() : chat["id"].dump();

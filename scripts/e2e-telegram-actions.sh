@@ -113,4 +113,18 @@ sleep 0.4; [[ $(grep -c '"sendMessage"' "$T/tg.log") == "$N" ]] || fail "payment
 push '{"business_message":{"message_id":70,"business_connection_id":"bc-1","chat":{"id":555,"type":"private"},"from":{"id":555},"text":"biz hi"}}'
 waitlog 'm=="sendMessage" and str(a.get("chat_id"))=="555" and a.get("business_connection_id")=="bc-1"'
 waitlog 'm=="getUpdates" and "business_message" in a.get("allowed_updates","") and "pre_checkout_query" in a.get("allowed_updates","")'
+# 1.166: business callback edit/delete + topic icon cache
+push '{"callback_query":{"id":"cb-biz","from":{"id":555},"data":"ok","message":{"message_id":80,"business_connection_id":"bc-2","chat":{"id":555,"type":"private"},"text":"btn"}}}'
+waitlog 'm=="answerCallbackQuery" and a["callback_query_id"]=="cb-biz"'
+tl '{"action":"edit","channel":"telegram","to":"555","messageId":80,"message":"edited biz"}' >/dev/null
+waitlog 'm=="editMessageText" and a.get("business_connection_id")=="bc-2" and a["text"]=="edited biz"'
+tl '{"action":"delete","channel":"telegram","to":"555","messageId":80}' >/dev/null
+waitlog 'm=="deleteBusinessMessages" and a.get("business_connection_id")=="bc-2" and a["message_ids"]==[80]'
+tl '{"action":"create_topic","channel":"telegram","to":"-1001","name":"Design","icon_color":7322096,"iconCustomEmojiId":"emoji-1"}' | grep -q '"ok": true' || fail "create_topic icon"
+waitlog 'm=="createForumTopic" and a["name"]=="Design" and a.get("icon_custom_emoji_id")=="emoji-1"'
+tl '{"action":"topic_icon","channel":"telegram","to":"-1001","threadId":42}' | python3 -c "import json,sys;r=json.load(sys.stdin);assert r.get('ok') or (r.get('result') or r).get('ok') or 'topicIcon' in json.dumps(r),r" || fail "topic_icon lookup"
+# inbound forum_topic_created caches too
+push '{"message":{"message_id":90,"message_thread_id":99,"chat":{"id":-1001,"type":"supergroup","is_forum":true},"forum_topic_created":{"name":"Ops","icon_color":16766590,"icon_custom_emoji_id":"emoji-2"}}}'
+sleep 0.4
+tl '{"action":"topic_icon","channel":"telegram","to":"-1001","threadId":99}' | grep -q 'Ops' || fail "inbound topic icon not cached"
 echo "[e2e-telegram-actions] OK"

@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.165.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.166.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.166.0-dev 新增
+
+Telegram：business 回调 edit/delete 带 business_connection_id（deleteBusinessMessages）；topic_icon 缓存（create/edit 与 inbound forum_topic_*）
 
 ## 1.165.0-dev 新增
 

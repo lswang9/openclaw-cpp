@@ -40,7 +40,11 @@ class H(BaseHTTPRequestHandler):
             pid = "poll-" + str(args.get("chat_id")) + "-" + str(len(args.get("options", [])))
             return self.send({"ok": True, "result": {"message_id": 200, "chat": {"id": args.get("chat_id")}, "poll": {"id": pid, "question": args.get("question"), "options": [{"text": o, "voter_count": 0} for o in args.get("options", [])], "is_anonymous": args.get("is_anonymous", True)}}})
         if m in ("createForumTopic", "editForumTopic", "closeForumTopic", "reopenForumTopic"):
-            return self.send({"ok": True, "result": {"message_thread_id": args.get("message_thread_id", 42), "name": args.get("name", "topic"), "icon_color": args.get("icon_color", 0x6FB9F0)}})
+            r={"message_thread_id": args.get("message_thread_id", 42), "name": args.get("name", "topic"), "icon_color": args.get("icon_color", 0x6FB9F0)}
+            if "icon_custom_emoji_id" in args: r["icon_custom_emoji_id"]=args["icon_custom_emoji_id"]
+            return self.send({"ok": True, "result": r})
+        if m == "deleteBusinessMessages":
+            return self.send({"ok": True, "result": True})
         if m == "getFile":
             fid = args.get("file_id", "")
             if fid not in FILES: return self.send({"ok": False, "error_code": 400, "description": "file not found"}, 400)
