@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.162.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.163.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.163.0-dev 新增
+
+WhatsApp Web：对离线假服务器完成 Noise 登录（注册 ClientPayload → pair-success → pair-device-sign → success，以及再次登录）；CLI whatsapp-web login|fake-server（e2e：scripts/e2e-waweb-noise-login.sh）。
 
 ## 1.162.0-dev 新增
 

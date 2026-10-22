@@ -7,6 +7,7 @@
 #include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/channels/waweb/auth_store.hpp"
 #include "openclaw/channels/waweb/pairing.hpp"
+#include "openclaw/channels/waweb/session.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/auth/mfa.hpp"
@@ -116,7 +117,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.162.0-dev";
+constexpr const char* kVersion = "1.163.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -4305,7 +4306,30 @@ int main(int argc, char** argv) {
                 auto r = ww::ConfigureSuccessfulPairing(iq, *c);
                 out["ok"] = r.ok; out["error"] = r.error; out["me"] = c->me_jid; out["platform"] = c->platform;
                 if (r.ok) { out["reply"] = hex(ww::EncodeBinaryNode(r.reply)); ww::SaveAuthCreds(dir, *c); }
-            } else if (sub != "show" && sub != "init") { std::cerr << "usage: whatsapp-web init|show|prekeys|payload|pair [--server-count N] [--dir D]\n"; return 2; }
+            } else if (sub == "fake-server") {
+                std::string host = "127.0.0.1"; int port = 0; std::filesystem::path log;
+                std::string jid = "15550001234:1@s.whatsapp.net";
+                for (int i = 3; i + 1 < argc; ++i) {
+                    std::string a = argv[i];
+                    if (a == "--port") port = std::atoi(argv[++i]);
+                    else if (a == "--host") host = argv[++i];
+                    else if (a == "--log") log = argv[++i];
+                    else if (a == "--jid") jid = argv[++i];
+                }
+                if (port <= 0) { std::cerr << "usage: whatsapp-web fake-server --port N [--host H] [--log F] [--jid J]\n"; return 2; }
+                return ww::RunFakeNoiseServer(host, port, log, jid);
+            } else if (sub == "login") {
+                std::string url;
+                for (int i = 3; i + 1 < argc; ++i) { if (std::string(argv[i]) == "--url") url = argv[++i]; else if (std::string(argv[i]) == "--dir") dir = argv[++i]; }
+                if (url.empty()) { std::cerr << "usage: whatsapp-web login --url tcp://host:port|ws://host:port [--dir D]\n"; return 2; }
+                std::filesystem::create_directories(dir);
+                if (!c) { c = ww::InitAuthCreds(); ww::SaveAuthCreds(dir, *c); }
+                auto r = ww::RunNoiseLogin(*c, dir, url);
+                out["ok"] = r.ok; out["error"] = r.error; out["stage"] = r.stage; out["registered"] = r.registered;
+                out["me"] = r.me_jid; out["platform"] = r.platform; out["framesOut"] = r.frames_out; out["framesIn"] = r.frames_in;
+                std::cout << out.dump(2) << "\n";
+                return r.ok ? 0 : 1;
+            } else if (sub != "show" && sub != "init") { std::cerr << "usage: whatsapp-web init|show|prekeys|payload|pair|login|fake-server [--dir D]\n"; return 2; }
             std::cout << out.dump(2) << "\n";
             return 0;
         }

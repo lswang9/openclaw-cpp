@@ -1,6 +1,6 @@
 # WhatsApp Web (Baileys-equivalent) — gap assessment (1.61)
 
-> Refreshed 1.156: rows below updated where later slices landed; WABinary v3 and cert-chain verify are done (self-test fixtures). 1.162 landed ClientPayload + ADV pair-success (offline). Next gaps: live Noise WS login, SenderKeys, app-state.
+> Refreshed 1.156: rows below updated where later slices landed; WABinary v3 and cert-chain verify are done (self-test fixtures). 1.162 ClientPayload + ADV; **1.163** live Noise login against an offline fake (TCP-framed Noise = post-WS-upgrade bytes; client also speaks `ws://` via curl). Next: SenderKeys, app-state, real wss://web.whatsapp.com.
 
 Upstream OpenClaw's `whatsapp` channel logs in as a **linked device** through Baileys (WhatsApp Web multi-device
 protocol): QR or pairing-code login, persistent auth state, DMs and groups, media, reactions, read receipts.
@@ -11,8 +11,8 @@ Meta Business number. That is a different product.
 
 | Layer | What Baileys does | openclaw-cpp status |
 |---|---|---|
-| Transport | `wss://web.whatsapp.com/ws/chat`, binary frames: `WA 6 3` intro, then 3-byte BE length | **real** framing (`NoiseState::EncodeFrame/DecodeFrames`). The WebSocket client exists elsewhere (Slack/Discord) but is not wired here yet. |
-| Noise handshake | `Noise_XX_25519_AESGCM_SHA256`; HandshakeMessage protobuf (clientHello/serverHello/clientFinish) | **real**: both roles, tested in-process; tampering is rejected. Not yet tested against the real WA server. |
+| Transport | `wss://web.whatsapp.com/ws/chat`, binary frames: `WA 6 3` intro, then 3-byte BE length | **1.163**: framing + `whatsapp-web login --url tcp://|ws://` (curl WS) and `fake-server` (TCP Noise offline). Real `wss://web.whatsapp.com` not contacted in tests. |
+| Noise handshake | `Noise_XX_25519_AESGCM_SHA256`; HandshakeMessage protobuf (clientHello/serverHello/clientFinish) | **real**: both roles in-process + **1.163** end-to-end over a socket with registration ClientPayload → pair-success → pair-device-sign → success (and a second login). Not against the real WA server. |
 | Server cert check | Verify the serverHello payload `CertChain` (WA root key, intermediate) | **real (later 1.14x)**: `VerifyCertChain` with XEdDSA against WA root + intermediate, leaf key / validity checks. |
 | ClientPayload | Protobuf: `UserAgent`, `WebInfo`, `DevicePairingRegistrationData` (reg id, signed pre-key, identity) for the first login, `username`/`device` afterwards | **1.162**: hand-written encode/decode (`pairing.hpp`); registration + login shapes; CLI `whatsapp-web payload`. |
 | WABinary nodes | XMPP-like `<iq>`/`<message>`/`<receipt>` trees, token dictionary v3 (single- and double-byte), JID encodings, nibble/hex packing | **real (later 1.14x)**: dictionary v3, Baileys fixtures byte-identical in self-test. |

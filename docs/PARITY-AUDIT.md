@@ -139,7 +139,7 @@ provider factory. Some raw-config consumers still read raw values.
 - **Discord:** webhook, Gateway WS, slash commands, voice/DAVE.
 - **Slack:** Events API, Socket Mode, interactive.
 - **Feishu:** webhook and long-connection WS.
-- **WhatsApp:** Cloud API in/out. WhatsApp-Web (Baileys-equivalent) is partial; see `docs/whatsapp-web-gap.md`. 1.156 adds auth-state persistence (creds + pre-keys + sessions in the state store), XEdDSA signing, and the pre-key upload IQ/count policy. **1.162:** ClientPayload encode/decode (registration + login) and ADV pair-success (HMAC + account verify + device sign → `pair-device-sign`); offline `whatsapp-web payload|pair`. Still no live Noise WS login.
+- **WhatsApp:** Cloud API in/out. WhatsApp-Web (Baileys-equivalent) is partial; see `docs/whatsapp-web-gap.md`. 1.156 adds auth-state persistence (creds + pre-keys + sessions in the state store), XEdDSA signing, and the pre-key upload IQ/count policy. **1.162:** ClientPayload + ADV pair-success. **1.163:** live Noise login (`whatsapp-web login` / `fake-server`) over TCP-framed Noise (same bytes as post-WS-upgrade) with registration→pair→success and subsequent login; client also accepts `ws://` via curl. SenderKeys, app-state, and real wss://web.whatsapp.com still missing.
 - **iMessage:** bridge inbound.
 - **Generic:** webhook, HTTP, WS, CLI.
 
