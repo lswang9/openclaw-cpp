@@ -98,6 +98,7 @@ LoopResult RunAgentLoop(provider::Provider& provider,
             return out;
         }
 
+        nlohmann::json pending_images = nlohmann::json::array();
         for (const auto& tc : completion.tool_calls) {
             const std::string sig = tc.name + "|" + tc.arguments_json;
             if (sig == last_sig) {
@@ -155,12 +156,34 @@ LoopResult RunAgentLoop(provider::Provider& provider,
                                          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(), err);
                 if (opts.tool_result_middleware) result = opts.tool_result_middleware(tc.name, args, result, !err.empty());
             }
+            if (opts.inline_tool_images && result.find("\"dataUrl\"") != std::string::npos) {
+                nlohmann::json rj = nlohmann::json::parse(result, nullptr, false);
+                if (rj.is_object() && rj.contains("dataUrl") && rj["dataUrl"].is_string() &&
+                    rj["dataUrl"].get<std::string>().rfind("data:image/", 0) == 0) {
+                    const std::string url = rj["dataUrl"];
+                    rj.erase("dataUrl");
+                    rj["imageAttached"] = true;
+                    result = rj.dump();
+                    std::string label = "[image from " + tc.name + " call " + tc.id + "]";
+                    if (rj.contains("prompt") && rj["prompt"].is_string()) label += " " + rj["prompt"].get<std::string>();
+                    pending_images.push_back({{"type", "text"}, {"text", label}});
+                    pending_images.push_back({{"type", "image_url"}, {"image_url", {{"url", url}}}});
+                }
+            }
             Message tool_msg;
             tool_msg.role = "tool";
             tool_msg.tool_call_id = tc.id;
             tool_msg.name = tc.name;
             tool_msg.content = result;
             out.messages.push_back(std::move(tool_msg));
+        }
+        if (!pending_images.empty()) {
+            Message img;
+            img.role = "user";
+            img.content = "[tool images attached]";
+            img.multimodal_parts = std::move(pending_images);
+            pending_images = nlohmann::json::array();
+            out.messages.push_back(std::move(img));
         }
     }
 

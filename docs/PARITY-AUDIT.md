@@ -21,7 +21,7 @@ Reproduce the numbers with:
 |---|---|---|---|---|---|
 | CLI command groups / subcommands (upstream tree) | 45 / 131 | 45 / 131 | most; e2e for every 1.12x addition | see §1 | 0 |
 | Gateway RPC methods (catalog) | 493 | 493 (0 unimplemented) | 267 ok on `{}` + 185 param-validating handlers | 1 real-sim (`computer.invoke`), 31 precondition-only (need node/creds/session) | 0 |
-| Agent tools (core) | ~57 | 53 native (+JS/MCP bridged) | 53 (7 added in 1.128) | browser/desktop are local-runtime variants; view_image/web_search partial | ~12 (§3) |
+| Agent tools (core) | ~57 | 53 native (+JS/MCP bridged) | 53 (7 added in 1.128) | browser/desktop are local-runtime variants; web_search partial | ~12 (§3) |
 | Config root keys | 46 | 46 accepted | ~20 deeply validated | 26 shallow (key accepted, sub-shape not validated) | 0 |
 | Channel extensions | 27 messaging | 11 working | telegram (1.126), discord, slack, feishu, whatsapp (Cloud API), imessage (bridge inbound); signal, matrix, msteams, googlechat, mattermost (1.129, text) | whatsapp-web (partial Noise/Baileys); 1.129 channels: no Mattermost WebSocket, no Signal daemon transport | 16 (§5) |
 | Model-provider extensions | ~85 | 28 built-in ids + any `models.providers.*` | 4 wire formats (chat completions, Responses, Anthropic Messages, Gemini) offline-tested | token streaming over SSE for all four formats (1.127); no OAuth/Bedrock/Vertex signing | Bedrock, Vertex, Copilot, Codex OAuth, … |
@@ -101,7 +101,8 @@ There are also JS-plugin tools and MCP-bridged tools.
 - computer (only `desktop` exists)
 - dashboard, decision_evaluate, gateway, github_identity_status, mobile_ui
 - personal_instructions, plugins, portal, progress_card, screen, skill_workshop, terminal
-- Partial: view_image returns the image as a data URL in the tool result text; it is not attached as a native vision content block. web_search supports Brave and Tavily only (upstream also has Perplexity/Gemini/Grok/etc.). ask_user has no interactive buttons (options are a numbered list).
+- 1.133: view_image (and any tool result carrying a `data:image/*` `dataUrl`) is fed back as real image input: the base64 is stripped from the tool-result text (`imageAttached: true`) and a user message with the image follows the tool results, serialized as an Anthropic `image` block, Gemini `inlineData`, Responses `input_image` or chat-completions `image_url` (e2e `scripts/e2e-view-image.sh`). Not yet: per-model `input` capability gating / routing to `imageModel` when the primary lacks vision, remote URL fetch, and resizing large images.
+- Partial: web_search supports Brave and Tavily only (upstream also has Perplexity/Gemini/Grok/etc.). ask_user has no interactive buttons (options are a numbered list).
 
 ## 4. Config schema
 

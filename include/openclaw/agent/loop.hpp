@@ -34,6 +34,9 @@ struct LoopOptions {
     std::function<void(std::string_view delta)> on_delta;
     // Plugin api.registerAgentToolResultMiddleware: may rewrite a tool result before the model sees it.
     std::function<std::string(const std::string& tool, const nlohmann::json& args, const std::string& result, bool is_error)> tool_result_middleware;
+    // view_image / image tool results carrying a data: URL are fed back to the model as real image input
+    // (a user message with image_url parts after the tool results); false keeps them as text only.
+    bool inline_tool_images = true;
     // Plugin api.registerTextTransforms: direction "input" (newest user message) / "output" (final assistant text).
     std::function<std::string(const std::string& direction, const std::string& text)> text_transform;
 };
