@@ -1,6 +1,7 @@
 #include "openclaw/persist/store.hpp"
 
 #include <fstream>
+#include "openclaw/persist/state_db.hpp"
 
 namespace openclaw::persist {
 namespace fs = std::filesystem;
@@ -10,16 +11,14 @@ StateStore::StateStore(fs::path data_dir) : root_(std::move(data_dir)) {
 }
 
 void StateStore::WriteJson(const fs::path& path, const nlohmann::json& j) const {
-    std::ofstream out(path);
-    out << j.dump(2);
+    StateWrite(path, j.dump(2));
 }
 
 nlohmann::json StateStore::ReadJson(const fs::path& path) const {
-    if (!fs::exists(path)) return nlohmann::json::object();
-    std::ifstream in(path);
-    nlohmann::json j;
-    in >> j;
-    return j;
+    auto t = StateRead(path);
+    if (!t) return nlohmann::json::object();
+    auto j = nlohmann::json::parse(*t, nullptr, false);
+    return j.is_discarded() ? nlohmann::json::object() : j;
 }
 
 void StateStore::SaveCron(const cron::Scheduler& sch) const {

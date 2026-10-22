@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.143.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.144.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -122,6 +122,7 @@ set(OPENCLAW_SOURCES
   src/context/assemble.cpp
   src/logging/tail.cpp
   src/persist/store.cpp
+  src/persist/state_db.cpp
   src/diagnostics/doctor.cpp
 )
 

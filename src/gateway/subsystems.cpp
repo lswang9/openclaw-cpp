@@ -62,6 +62,7 @@
 #include "openclaw/nodes/registry.hpp"
 #include "openclaw/provider/provider.hpp"
 #include "openclaw/session/store.hpp"
+#include "openclaw/persist/state_db.hpp"
 
 namespace openclaw::gateway {
 namespace fs = std::filesystem;
@@ -87,14 +88,11 @@ std::string RandomHex(std::size_t bytes) {
     return s;
 }
 json ReadJsonFile(const fs::path& p, json def) {
-    std::ifstream f(p); if (!f) return def;
-    try { return json::parse(f); } catch (...) { return def; }
+    auto t = persist::StateRead(p); if (!t) return def;
+    auto j = json::parse(*t, nullptr, false); return j.is_discarded() ? def : j;
 }
 void WriteJsonFile(const fs::path& p, const json& j) {
-    std::error_code ec; fs::create_directories(p.parent_path(), ec);
-    const auto tmp = p.string() + ".tmp";
-    { std::ofstream f(tmp, std::ios::trunc); f << j.dump(2); }
-    fs::rename(tmp, p, ec);
+    persist::StateWrite(p, j.dump(2));
 }
 ExtraResult Ok(json payload) { ExtraResult r; r.handled = true; r.payload = std::move(payload); return r; }
 ExtraResult Fail(std::string e) { ExtraResult r; r.handled = true; r.ok = false; r.error = std::move(e); return r; }

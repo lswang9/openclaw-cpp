@@ -1,4 +1,5 @@
 #include "openclaw/board/store.hpp"
+#include "openclaw/persist/state_db.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -34,13 +35,13 @@ Store::Store(fs::path path) : path_(std::move(path)) {
 }
 
 void Store::Load() {
-    if (!fs::exists(path_)) {
+    auto text = persist::StateRead(path_);
+    if (!text) {
         data_ = DefaultBoard();
         return;
     }
     try {
-        std::ifstream in(path_);
-        in >> data_;
+        data_ = nlohmann::json::parse(*text);
         if (!data_.is_object()) data_ = DefaultBoard();
         if (!data_.contains("cards") || !data_["cards"].is_array()) data_["cards"] = nlohmann::json::array();
         if (!data_.contains("columns") || !data_["columns"].is_array()) {
@@ -63,9 +64,7 @@ void Store::Load() {
 }
 
 void Store::Save() const {
-    fs::create_directories(path_.parent_path());
-    std::ofstream out(path_);
-    out << data_.dump(2) << '\n';
+    persist::StateWrite(path_, data_.dump(2) + "\n");
 }
 
 std::string Store::NextId(const std::string& prefix) {

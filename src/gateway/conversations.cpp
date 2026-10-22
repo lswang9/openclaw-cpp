@@ -1,3 +1,4 @@
+#include "openclaw/persist/state_db.hpp"
 #include "openclaw/gateway/conversations.hpp"
 #include "openclaw/gateway/core_tools.hpp"
 
@@ -324,7 +325,7 @@ std::string AgentsWait(const json& a, const std::string& session_key, const std:
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<long long>(std::max(0.0, a.value("timeoutSeconds", 30.0)) * 1000));
     const bool await_results = a.value("awaitResults", true);
     for (;;) {
-        std::ifstream in(fs::path(root) / "subagents.json"); json reg = json::parse(in, nullptr, false); if (!reg.is_object()) reg = json::object();
+        auto regt = persist::StateRead(fs::path(root) / "subagents.json"); json reg = json::parse(regt.value_or("{}"), nullptr, false); if (!reg.is_object()) reg = json::object();
         json completed = json::array(), pending = json::array(), errors = json::array();
         for (auto& idj : ids) {
             const auto id = idj.is_string() ? idj.get<std::string>() : std::string();

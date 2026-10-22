@@ -2,6 +2,7 @@
 #include <regex>
 #include <unordered_map>
 #include "openclaw/auth/device_link.hpp"
+#include "openclaw/persist/state_db.hpp"
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <cctype>
@@ -68,10 +69,10 @@ DeviceLinkStore::DeviceLinkStore(std::filesystem::path path) : path_(std::move(p
 
 void DeviceLinkStore::Load() {
     data_ = {{"version", 1}, {"links", nlohmann::json::array()}, {"tokens", nlohmann::json::array()}};
-    std::ifstream in(path_);
-    if (!in) return;
+    auto text = persist::StateRead(path_);
+    if (!text) return;
     try {
-        nlohmann::json j; in >> j;
+        nlohmann::json j = nlohmann::json::parse(*text);
         if (j.is_object()) {
             if (j.contains("links") && j["links"].is_array()) data_["links"] = j["links"];
             if (j.contains("tokens") && j["tokens"].is_array()) data_["tokens"] = j["tokens"];
@@ -82,10 +83,8 @@ void DeviceLinkStore::Load() {
 }
 
 void DeviceLinkStore::Save() const {
-    auto tmp = path_; tmp += ".tmp";
-    { std::ofstream out(tmp); out << data_.dump(2); }
+    persist::StateWrite(path_, data_.dump(2));
     std::error_code ec;
-    std::filesystem::rename(tmp, path_, ec);
     std::filesystem::permissions(path_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
                                  std::filesystem::perm_options::replace, ec);
 }
