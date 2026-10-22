@@ -55,4 +55,22 @@ grep -q "default model route: cc/default-model" "$T/gw.log" || fail "default rou
 OPENCLAW_CONFIG_PATH="$T/cfg.json" OPENCLAW_SESSION_DIR="$T/cs" HOME="$T" "$BIN" chat "what time" 2>&1 | grep -q "chat-final:default-model" || fail "local chat via config model"
 OPENCLAW_CONFIG_PATH="$T/cfg.json" OPENCLAW_SESSION_DIR="$T/cs" HOME="$T" OPENCLAW_MODEL=anth/claude-t "$BIN" chat "what time" 2>&1 | grep -q "anthropic-final" || fail "local chat OPENCLAW_MODEL"
 OPENCLAW_CONFIG_PATH="$T/cfg.json" HOME="$T" OPENCLAW_MODEL=anthropic/claude-x "$BIN" chat "x" 2>&1 | grep -q "no API key for provider \"anthropic\"" || fail "missing key message"
+# ---- streaming (agents.defaults.streaming=true → CompleteStreaming): SSE for all four wire formats
+kill $GW; wait $GW 2>/dev/null || true; GW=""; : > "$T/llm.log"
+python3 - "$T/cfg.json" <<'PY'
+import json,sys;p=sys.argv[1];c=json.load(open(p));c["agents"]["defaults"]["streaming"]=True;json.dump(c,open(p,"w"))
+PY
+OPENCLAW_CONFIG_PATH="$T/cfg.json" OPENCLAW_SESSION_DIR="$T/s2" OPENCLAW_DATA_DIR="$T/d2" OPENCLAW_STATE_DIR="$T/st2" HOME="$T" OPENCLAW_GATEWAY_PORT=$PORT "$BIN" gateway >"$T/gw.log" 2>&1 & GW=$!
+for i in $(seq 1 50); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.2; done
+ask a1 anthropic-streamed
+ask a2 gemini-streamed
+ask a3 responses-streamed
+ask a4 "chat-streamed:my-model"
+python3 - "$T/llm.log" <<'PY' || fail "stream wire: $(head -c 300 $T/llm.log)"
+import json,sys
+L=[json.loads(l) for l in open(sys.argv[1])]
+assert all(x["body"].get("stream") for x in L if x["path"].endswith(("/v1/messages","/responses","/chat/completions"))), "stream flag"
+assert any(":streamGenerateContent?alt=sse" in x["path"] for x in L)
+assert any(x["headers"].get("accept")=="text/event-stream" for x in L if x["path"].endswith("/v1/messages"))
+PY
 echo "[e2e-providers] OK"

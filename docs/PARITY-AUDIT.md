@@ -24,7 +24,7 @@ Reproduce the numbers with:
 | Agent tools (core) | ~57 | 46 native (+JS/MCP bridged) | 46 | browser/desktop are local-runtime variants | ~19 (§3) |
 | Config root keys | 46 | 46 accepted | ~20 deeply validated | 26 shallow (key accepted, sub-shape not validated) | 0 |
 | Channel extensions | 27 messaging | 6 working | telegram (1.126), discord, slack, feishu, whatsapp (Cloud API), imessage (bridge inbound) | whatsapp-web (partial Noise/Baileys) | 21 (§5) |
-| Model-provider extensions | ~85 | 28 built-in ids + any `models.providers.*` | 4 wire formats (chat completions, Responses, Anthropic Messages, Gemini) offline-tested | no streaming for Anthropic/Gemini/Responses (single delta); no OAuth/Bedrock/Vertex signing | Bedrock, Vertex, Copilot, Codex OAuth, … |
+| Model-provider extensions | ~85 | 28 built-in ids + any `models.providers.*` | 4 wire formats (chat completions, Responses, Anthropic Messages, Gemini) offline-tested | token streaming over SSE for all four formats (1.127); no OAuth/Bedrock/Vertex signing | Bedrock, Vertex, Copilot, Codex OAuth, … |
 | Plugin API (`api.register*`) | 59 | 10 (JS host) + C ABI | registerTool/Provider/GatewayMethod/HttpRoute/Hook/Command/Cli/Service/Channel/HttpHandler | Channel/Service are thin | 49 (§6) |
 
 ## 1. CLI tree
@@ -173,7 +173,7 @@ The native C ABI (`docs/PLUGIN-SDK.md`) is a Linux-only subset with no upstream 
 **Partial:**
 - **State is JSON files**, where upstream uses SQLite for sessions, transcripts and most stores. Behaviour matches,
   but the on-disk format and `database`/`storage` semantics differ.
-- **Streaming** is token-level only for chat-completions providers. Anthropic/Gemini/Responses deliver one final delta.
+- **Streaming** (1.127): token-level SSE for chat completions, Anthropic Messages (text + tool_use input_json deltas), Gemini `streamGenerateContent?alt=sse` and Responses (`output_text.delta`, `output_item.done`), offline-tested. Reasoning/thinking blocks are dropped, not surfaced.
 - **Hooks:** there is no idempotency replay cache across restarts, no per-mapping `transform` modules, and
   `next-heartbeat` wakes queue to a file that heartbeat consumes.
 - **Control UI:** the bundled UI is served. Plugin UI descriptors are not.
@@ -196,7 +196,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 
 1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards remain).
 2. Signal, Matrix, MS Teams, Google Chat, Mattermost channel extensions.
-3. Native streaming for Anthropic/Gemini/Responses, plus Bedrock/Vertex auth.
+3. ~~Native streaming~~ (done in 1.127); Bedrock/Vertex auth remain.
 4. Missing core tools: web_search, ask_user, view_image, agents_wait, conversations_*.
 5. Plugin API breadth: provider families, context engine, memory capability.
 6. SQLite-backed session and transcript storage, for on-disk parity.

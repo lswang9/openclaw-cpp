@@ -5,6 +5,7 @@
 #include <curl/curl.h>
 
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <sstream>
 
@@ -26,6 +27,38 @@ HttpRes Post(const std::string& url, const std::vector<std::string>& headers, co
     auto rc = curl_easy_perform(c); if (rc != CURLE_OK) r.error = curl_easy_strerror(rc);
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status); curl_slist_free_all(h); curl_easy_cleanup(c);
     return r;
+}
+
+// Server-sent events POST: on_event(event_name, data) for each event; returns status/body-on-error.
+struct SseState { std::string buf, ev, data, raw; long status = 0; const std::function<void(const std::string&, const std::string&)>* cb; CURL* c; };
+size_t SseSink(char* p, size_t s, size_t n, void* u) {
+    auto* st = static_cast<SseState*>(u); const size_t len = s * n;
+    if (!st->status) curl_easy_getinfo(st->c, CURLINFO_RESPONSE_CODE, &st->status);
+    if (st->status && (st->status < 200 || st->status >= 300)) { st->raw.append(p, len); return len; }
+    st->buf.append(p, len);
+    std::size_t nl;
+    while ((nl = st->buf.find('\n')) != std::string::npos) {
+        std::string line = st->buf.substr(0, nl); st->buf.erase(0, nl + 1);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) { if (!st->data.empty()) (*st->cb)(st->ev, st->data); st->ev.clear(); st->data.clear(); continue; }
+        if (line.rfind("event:", 0) == 0) { st->ev = line.substr(6); while (!st->ev.empty() && st->ev[0] == ' ') st->ev.erase(0, 1); }
+        else if (line.rfind("data:", 0) == 0) { std::string d = line.substr(5); if (!d.empty() && d[0] == ' ') d.erase(0, 1); if (!st->data.empty()) st->data += "\n"; st->data += d; }
+    }
+    return len;
+}
+HttpRes PostSse(const std::string& url, std::vector<std::string> headers, const std::string& body, const std::function<void(const std::string&, const std::string&)>& cb) {
+    HttpRes r; CURL* c = curl_easy_init(); if (!c) { r.error = "curl init failed"; return r; }
+    headers.push_back("Accept: text/event-stream");
+    curl_slist* h = nullptr; for (auto& x : headers) h = curl_slist_append(h, x.c_str());
+    SseState st; st.cb = &cb; st.c = c;
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str()); curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, SseSink); curl_easy_setopt(c, CURLOPT_WRITEDATA, &st);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L); curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    auto rc = curl_easy_perform(c); if (rc != CURLE_OK) r.error = curl_easy_strerror(rc);
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
+    if (!st.data.empty()) cb(st.ev, st.data);
+    r.body = st.raw; curl_slist_free_all(h); curl_easy_cleanup(c); return r;
 }
 
 agent::CompletionResult Fail(const std::string& label, const HttpRes& h) {
@@ -109,7 +142,11 @@ private:
 class Responses : public Provider {
 public:
     explicit Responses(ProviderSpec s) : s_(std::move(s)) {}
-    agent::CompletionResult Complete(const std::vector<agent::Message>& messages, const json& tools) override {
+    agent::CompletionResult Complete(const std::vector<agent::Message>& messages, const json& tools) override { return Run(messages, tools, nullptr); }
+    agent::CompletionResult CompleteStreaming(const std::vector<agent::Message>& messages, const json& tools, DeltaFn on_delta) override {
+        return on_delta ? Run(messages, tools, &on_delta) : Run(messages, tools, nullptr);
+    }
+    agent::CompletionResult Run(const std::vector<agent::Message>& messages, const json& tools, const DeltaFn* on_delta) {
         json input = json::array(); std::string instructions;
         for (auto& m : messages) {
             if (m.role == "system") { instructions += (instructions.empty() ? "" : "\n\n") + m.content; continue; }
@@ -133,6 +170,24 @@ public:
         auto td = Tools(tools);
         if (!td.empty()) { b["tools"] = json::array(); for (auto& t : td) b["tools"].push_back({{"type", "function"}, {"name", t.name}, {"description", t.description}, {"parameters", t.params}}); }
         auto h = BaseHeaders(s_); if (!s_.api_key.empty()) h.push_back("Authorization: Bearer " + s_.api_key);
+        if (on_delta) {
+            b["stream"] = true;
+            agent::CompletionResult r; r.message.role = "assistant"; r.finish_reason = "stop"; std::string err;
+            auto res = PostSse(NoSlash(s_.base_url) + "/responses", h, b.dump(), [&](const std::string& ev, const std::string& data) {
+                json e; try { e = json::parse(data); } catch (...) { return; }
+                const std::string type = e.value("type", ev);
+                if (type == "response.output_text.delta") { const auto d = e.value("delta", std::string()); r.message.content += d; if (!d.empty()) (*on_delta)(d); }
+                else if (type == "response.output_item.done" && e.contains("item") && e["item"].value("type", "") == "function_call") {
+                    const auto& item = e["item"]; agent::ToolCall c; c.id = item.value("call_id", item.value("id", "")); c.name = item.value("name", ""); c.arguments_json = item.value("arguments", "{}");
+                    r.tool_calls.push_back(c); r.message.tool_calls.push_back({{"id", c.id}, {"type", "function"}, {"function", {{"name", c.name}, {"arguments", c.arguments_json}}}});
+                } else if (type == "response.incomplete") r.finish_reason = "length";
+                else if (type == "response.failed" || type == "error") err = e.contains("response") && e["response"].contains("error") ? e["response"]["error"].value("message", data) : e.value("message", data);
+            });
+            if (!res.error.empty() || res.status < 200 || res.status >= 300) return Fail(s_.id, res);
+            if (!err.empty()) { r.ok = false; r.finish_reason = "error"; r.error = s_.id + ": " + err; return r; }
+            r.http_status = static_cast<int>(res.status); if (!r.tool_calls.empty()) r.finish_reason = "tool_calls";
+            return r;
+        }
         auto res = Post(NoSlash(s_.base_url) + "/responses", h, b.dump());
         if (!res.error.empty() || res.status < 200 || res.status >= 300) return Fail(s_.id, res);
         agent::CompletionResult r; r.http_status = static_cast<int>(res.status); r.message.role = "assistant"; r.finish_reason = "stop";
@@ -159,7 +214,11 @@ private:
 class AnthropicMessages : public Provider {
 public:
     explicit AnthropicMessages(ProviderSpec s) : s_(std::move(s)) {}
-    agent::CompletionResult Complete(const std::vector<agent::Message>& messages, const json& tools) override {
+    agent::CompletionResult Complete(const std::vector<agent::Message>& messages, const json& tools) override { return Run(messages, tools, nullptr); }
+    agent::CompletionResult CompleteStreaming(const std::vector<agent::Message>& messages, const json& tools, DeltaFn on_delta) override {
+        return on_delta ? Run(messages, tools, &on_delta) : Run(messages, tools, nullptr);
+    }
+    agent::CompletionResult Run(const std::vector<agent::Message>& messages, const json& tools, const DeltaFn* on_delta) {
         std::string system; json msgs = json::array();
         auto push = [&](const std::string& role, const json& block) {
             if (!msgs.empty() && msgs.back()["role"] == role) msgs.back()["content"].push_back(block);
@@ -194,6 +253,27 @@ public:
         if (!td.empty()) { b["tools"] = json::array(); for (auto& t : td) b["tools"].push_back({{"name", t.name}, {"description", t.description}, {"input_schema", t.params}}); }
         auto h = BaseHeaders(s_); h.push_back("anthropic-version: 2023-06-01");
         if (!s_.api_key.empty()) { if (s_.api_key.rfind("sk-ant-oat", 0) == 0) { h.push_back("Authorization: Bearer " + s_.api_key); h.push_back("anthropic-beta: oauth-2025-04-20"); } else h.push_back("x-api-key: " + s_.api_key); }
+        if (on_delta) {
+            b["stream"] = true;
+            agent::CompletionResult r; r.message.role = "assistant"; r.finish_reason = "stop"; std::string err;
+            std::map<int, agent::ToolCall> calls; std::map<int, std::string> partial;
+            auto res = PostSse(NoSlash(s_.base_url) + "/v1/messages", h, b.dump(), [&](const std::string& ev, const std::string& data) {
+                json e; try { e = json::parse(data); } catch (...) { return; }
+                const std::string type = e.value("type", ev); const int idx = e.value("index", 0);
+                if (type == "content_block_start" && e.contains("content_block") && e["content_block"].value("type", "") == "tool_use") { calls[idx].id = e["content_block"].value("id", ""); calls[idx].name = e["content_block"].value("name", ""); }
+                else if (type == "content_block_delta" && e.contains("delta")) {
+                    const auto& d = e["delta"];
+                    if (d.value("type", "") == "text_delta") { const auto t = d.value("text", std::string()); r.message.content += t; if (!t.empty()) (*on_delta)(t); }
+                    else if (d.value("type", "") == "input_json_delta") partial[idx] += d.value("partial_json", std::string());
+                } else if (type == "message_delta" && e.contains("delta")) { const auto stop = e["delta"].value("stop_reason", std::string()); if (stop == "max_tokens") r.finish_reason = "length"; }
+                else if (type == "error") err = e.contains("error") ? e["error"].value("message", data) : data;
+            });
+            if (!res.error.empty() || res.status < 200 || res.status >= 300) return Fail(s_.id, res);
+            if (!err.empty()) { r.ok = false; r.finish_reason = "error"; r.error = s_.id + ": " + err; return r; }
+            for (auto& [i, c] : calls) { c.arguments_json = partial[i].empty() ? "{}" : partial[i]; r.tool_calls.push_back(c); r.message.tool_calls.push_back({{"id", c.id}, {"type", "function"}, {"function", {{"name", c.name}, {"arguments", c.arguments_json}}}}); }
+            r.http_status = static_cast<int>(res.status); if (!r.tool_calls.empty()) r.finish_reason = "tool_calls";
+            return r;
+        }
         auto res = Post(NoSlash(s_.base_url) + "/v1/messages", h, b.dump());
         if (!res.error.empty() || res.status < 200 || res.status >= 300) return Fail(s_.id, res);
         agent::CompletionResult r; r.http_status = static_cast<int>(res.status); r.message.role = "assistant";
@@ -229,7 +309,11 @@ json GeminiSchema(const json& s) {
 class Gemini : public Provider {
 public:
     explicit Gemini(ProviderSpec s) : s_(std::move(s)) {}
-    agent::CompletionResult Complete(const std::vector<agent::Message>& messages, const json& tools) override {
+    agent::CompletionResult Complete(const std::vector<agent::Message>& messages, const json& tools) override { return Run(messages, tools, nullptr); }
+    agent::CompletionResult CompleteStreaming(const std::vector<agent::Message>& messages, const json& tools, DeltaFn on_delta) override {
+        return on_delta ? Run(messages, tools, &on_delta) : Run(messages, tools, nullptr);
+    }
+    agent::CompletionResult Run(const std::vector<agent::Message>& messages, const json& tools, const DeltaFn* on_delta) {
         std::string system; json contents = json::array(); std::map<std::string, std::string> call_names;
         auto push = [&](const std::string& role, const json& part) {
             if (!contents.empty() && contents.back()["role"] == role) contents.back()["parts"].push_back(part);
@@ -267,6 +351,27 @@ public:
         auto td = Tools(tools);
         if (!td.empty()) { json decl = json::array(); for (auto& t : td) decl.push_back({{"name", t.name}, {"description", t.description}, {"parameters", GeminiSchema(t.params)}}); b["tools"] = json::array({{{"functionDeclarations", decl}}}); }
         auto h = BaseHeaders(s_); if (!s_.api_key.empty()) h.push_back("x-goog-api-key: " + s_.api_key);
+        if (on_delta) {
+            agent::CompletionResult r; r.message.role = "assistant"; r.finish_reason = "stop"; int n = 0; std::string err;
+            auto res = PostSse(NoSlash(s_.base_url) + "/models/" + s_.model + ":streamGenerateContent?alt=sse", h, b.dump(), [&](const std::string&, const std::string& data) {
+                json e; try { e = json::parse(data); } catch (...) { return; }
+                if (e.contains("error")) { err = e["error"].value("message", data); return; }
+                if (!e.contains("candidates") || e["candidates"].empty()) return;
+                const auto& cand = e["candidates"][0];
+                for (auto& p : cand.value("content", json::object()).value("parts", json::array())) {
+                    if (p.contains("text") && !p.value("thought", false)) { const auto t = p.value("text", std::string()); r.message.content += t; if (!t.empty()) (*on_delta)(t); }
+                    else if (p.contains("functionCall")) {
+                        agent::ToolCall tc; tc.id = "gemini_call_" + std::to_string(++n); tc.name = p["functionCall"].value("name", ""); tc.arguments_json = p["functionCall"].value("args", json::object()).dump();
+                        r.tool_calls.push_back(tc); r.message.tool_calls.push_back({{"id", tc.id}, {"type", "function"}, {"function", {{"name", tc.name}, {"arguments", tc.arguments_json}}}});
+                    }
+                }
+                if (cand.value("finishReason", "") == "MAX_TOKENS") r.finish_reason = "length";
+            });
+            if (!res.error.empty() || res.status < 200 || res.status >= 300) return Fail(s_.id, res);
+            if (!err.empty()) { r.ok = false; r.finish_reason = "error"; r.error = s_.id + ": " + err; return r; }
+            r.http_status = static_cast<int>(res.status); if (!r.tool_calls.empty()) r.finish_reason = "tool_calls";
+            return r;
+        }
         auto res = Post(NoSlash(s_.base_url) + "/models/" + s_.model + ":generateContent", h, b.dump());
         if (!res.error.empty() || res.status < 200 || res.status >= 300) return Fail(s_.id, res);
         agent::CompletionResult r; r.http_status = static_cast<int>(res.status); r.message.role = "assistant"; r.finish_reason = "stop";
