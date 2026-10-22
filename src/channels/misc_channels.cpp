@@ -1,4 +1,5 @@
 #include "openclaw/channels/misc_channels.hpp"
+#include "openclaw/channels/irc_native.hpp"
 
 #include <curl/curl.h>
 
@@ -122,6 +123,9 @@ json MiscChannelSend(const std::string& id, const json& cfg, const std::string& 
         if (url.empty()) return nullptr;
         return PostJson(url, {{"text", text}, {"user_ids", json::array({to})}}, {});
     }
+    // 1.143: a live native IRC connection (channels.irc.server, or Twitch mode "irc") carries replies directly.
+    if ((id == "irc" || id == "twitch") && IrcNativeSend(id, id == "twitch" && !to.empty() && to[0] != '#' ? "#" + to : to, text))
+        return json{{"http", 200}, {"ok", true}, {"via", "irc-native"}, {"target", to}};
     if (id == "twitch") {
         const auto tok = Cred(cfg, "twitch", "accessToken", "TWITCH_ACCESS_TOKEN");
         const auto cid = Cred(cfg, "twitch", "clientId", "TWITCH_CLIENT_ID");

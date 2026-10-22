@@ -64,6 +64,14 @@ json ExtChannelSend(const std::string& id, const json& cfg, const std::string& t
     if (to.empty()) return nullptr;
     if (id == "signal") {
         const auto base = Trim(Cred(cfg, "signal", "apiBase", "SIGNAL_API_BASE")), number = Cred(cfg, "signal", "number", "SIGNAL_NUMBER");
+        // 1.143: signal-cli JSON-RPC daemon (`signal-cli daemon --http`): POST {httpUrl}/api/v1/rpc method "send".
+        if (const auto rpc = Trim(Cred(cfg, "signal", "httpUrl", "SIGNAL_HTTP_URL")); !rpc.empty()) {
+            static std::atomic<long long> rid{0};
+            json params{{"message", text}};
+            if (!number.empty()) params["account"] = number;
+            if (to.rfind("group.", 0) == 0) params["groupId"] = to.substr(6); else params["recipient"] = json::array({to});
+            return PostJson(rpc + "/api/v1/rpc", {{"jsonrpc", "2.0"}, {"id", "oc-" + std::to_string(++rid)}, {"method", "send"}, {"params", params}}, {});
+        }
         if (base.empty() || number.empty()) return nullptr;
         return PostJson(base + "/v2/send", {{"message", text}, {"number", number}, {"recipients", json::array({to})}}, {});
     }
