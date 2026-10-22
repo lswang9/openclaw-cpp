@@ -67,6 +67,9 @@ PY
 # LINE
 inb line '{"events":[{"type":"message","replyToken":"rt1","source":{"type":"user","userId":"U1"},"message":{"type":"text","text":"hi"}}]}' >/dev/null
 has 'e["path"].endswith("/v2/bot/message/reply") and e["auth"]=="Bearer line-tok" and e["body"]["replyToken"]=="rt1" and e["body"]["messages"][0]["text"]=="line-ok"'
+# 1.153: LINE flex push via send RPC (extra.flex as bubble contents)
+curl -s "http://127.0.0.1:$PORT/v1/rpc" -H 'Content-Type: application/json'   -d '{"id":2,"method":"send","params":{"channel":"line","to":"U1","message":"card","altText":"Welcome","flex":{"type":"bubble","body":{"type":"box","layout":"vertical","contents":[{"type":"text","text":"Hello flex"}]}}}}' >/dev/null
+has 'e["path"].endswith("/v2/bot/message/push") and e["body"]["to"]=="U1" and e["body"]["messages"][0]["type"]=="flex" and e["body"]["messages"][0]["altText"]=="Welcome" and e["body"]["messages"][0]["contents"]["type"]=="bubble"'
 
 # Zalo
 inb zalo '{"message":{"chat":{"id":"c1"},"from":{"id":"u1"},"text":"yo"}}' >/dev/null

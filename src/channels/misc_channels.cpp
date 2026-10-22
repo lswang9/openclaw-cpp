@@ -54,7 +54,7 @@ const std::vector<std::pair<const char*, const char*>> kCatalog = {
     {"buzz", "Buzz workspace chat (webhook inbound; outbound POST {apiBase}/v1/messages)"},
     {"clickclack", "ClickClack channel (webhook inbound; outbound POST {apiBase}/send)"},
     {"irc", "IRC via HTTP bridge (inbound PRIVMSG webhook; outbound POST {apiBase}/privmsg)"},
-    {"line", "LINE Messaging API (webhook events; reply/push)"},
+    {"line", "LINE Messaging API (webhook events; reply/push; flex via extra.flex)"},
     {"nextcloud-talk", "Nextcloud Talk (webhook inbound; outbound chat message OCS)"},
     {"nostr", "Nostr DMs via HTTP bridge (in-process NIP-04 when privateKey set; POST {apiBase}/dm)"},
     {"raft", "Raft channel (webhook inbound; outbound POST {apiBase}/send)"},
@@ -86,7 +86,25 @@ json MiscChannelSend(const std::string& id, const json& cfg, const std::string& 
         std::string reply;
         { std::lock_guard<std::mutex> l(g_mu); auto it = g_line_reply.find(to); if (it != g_line_reply.end()) { reply = it->second; g_line_reply.erase(it); } }
         if (reply.empty()) reply = S(ex, "replyToken");
-        json msg = json::array({{{"type", "text"}, {"text", text}}});
+        // 1.153: flex / rich messages via extra.messages (passthrough) or extra.flex (+ altText).
+        json msg = json::array();
+        if (ex.contains("messages") && ex["messages"].is_array() && !ex["messages"].empty()) {
+            msg = ex["messages"];
+        } else if (ex.contains("flex") && ex["flex"].is_object()) {
+            json flex = ex["flex"];
+            std::string alt = S(ex, "altText");
+            if (alt.empty()) alt = S(flex, "altText");
+            if (alt.empty()) alt = text.empty() ? "message" : text;
+            if (S(flex, "type") == "flex" && flex.contains("contents")) {
+                if (!flex.contains("altText")) flex["altText"] = alt;
+                msg = json::array({flex});
+            } else {
+                // Treat extra.flex as FlexContainer (bubble/carousel) or a bare contents object.
+                msg = json::array({{{"type", "flex"}, {"altText", alt}, {"contents", flex}}});
+            }
+        } else {
+            msg = json::array({{{"type", "text"}, {"text", text}}});
+        }
         if (!reply.empty()) return PostJson(base + "/v2/bot/message/reply", {{"replyToken", reply}, {"messages", msg}}, {"Authorization: Bearer " + tok});
         return PostJson(base + "/v2/bot/message/push", {{"to", to}, {"messages", msg}}, {"Authorization: Bearer " + tok});
     }
