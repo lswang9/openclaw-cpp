@@ -68,4 +68,28 @@ sleep 0.5; [[ $(grep -c '"sendMessage"' "$T/tg.log") == "$N" ]] || fail "reactio
 push '{"edited_message":{"message_id":1,"chat":{"id":777,"type":"private"},"from":{"id":777},"text":"hi again"}}'
 intr '[edited message 1] hi again'
 waitlog 'm=="getUpdates" and "message_reaction" in a.get("allowed_updates","")'
+
+# 1.146: sendPoll + poll_answer rejoin; forum topic session + create/edit/close
+tl '{"action":"poll","channel":"telegram","to":"777","question":"Coffee?","options":["Yes","No"],"pollPublic":true}' | grep -q '"ok": true' || fail "poll rpc"
+waitlog 'm=="sendPoll" and a["question"]=="Coffee?" and a["options"]==["Yes","No"] and a.get("is_anonymous") is False'
+POLL=poll-777-2
+push "{\"poll_answer\":{\"poll_id\":\"$POLL\",\"user\":{\"id\":777},\"option_ids\":[0]}}"
+intr '[poll answer] Coffee? → Yes'
+push '{"message":{"message_id":50,"is_topic_message":true,"message_thread_id":42,"chat":{"id":-1001,"type":"supergroup","is_forum":true,"title":"Forum"},"from":{"id":9},"text":"topic hi"}}'
+waitlog 'm=="sendMessage" and str(a.get("chat_id")) in ("-1001","\"-1001\"") and a.get("message_thread_id") in (42,"42")'
+python3 - "$T/s" <<'PY' || fail "no topic session file"
+import os,sys
+root=sys.argv[1]; found=False
+for dp,_,fs in os.walk(root):
+    blob=(dp+" "+" ".join(fs)).lower()
+    if "topic" in blob: found=True
+raise SystemExit(0 if found else 1)
+PY
+tl '{"action":"create_topic","channel":"telegram","to":"-1001","name":"Ideas"}' | grep -q '"ok": true' || fail "create_topic"
+waitlog 'm=="createForumTopic" and a["name"]=="Ideas"'
+tl '{"action":"edit_topic","channel":"telegram","to":"-1001","threadId":42,"name":"Ideas v2"}' >/dev/null
+waitlog 'm=="editForumTopic" and a["message_thread_id"]==42 and a["name"]=="Ideas v2"'
+tl '{"action":"close_topic","channel":"telegram","to":"-1001","threadId":42}' >/dev/null
+waitlog 'm=="closeForumTopic" and a["message_thread_id"]==42'
+waitlog 'm=="getUpdates" and "poll_answer" in a.get("allowed_updates","")'
 echo "[e2e-telegram-actions] OK"

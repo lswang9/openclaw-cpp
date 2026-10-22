@@ -65,7 +65,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.145.0-dev";
+constexpr const char* kVersion = "1.146.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -708,7 +708,7 @@ void Server::TelegramPollLoop() {
     int backoff_ms = 500;
     while (!pump_stop_.load()) {
         std::string body;
-        const long st = TgGet(api + "getUpdates?timeout=" + std::to_string(timeout) + "&offset=" + std::to_string(offset) + "&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%2C%22message_reaction%22%5D", timeout, &body);
+        const long st = TgGet(api + "getUpdates?timeout=" + std::to_string(timeout) + "&offset=" + std::to_string(offset) + "&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%2C%22message_reaction%22%2C%22poll_answer%22%5D", timeout, &body);
         nlohmann::json j; try { j = nlohmann::json::parse(body); } catch (...) {}
         if (st == 409) { std::cerr << "[gateway] telegram: getUpdates conflict (another poller or webhook active)\n"; }
         if (st != 200 || !j.value("ok", false)) {

@@ -3,6 +3,8 @@
 #include <curl/curl.h>
 #include "openclaw/voice/inbound_audio.hpp"
 #include "openclaw/channels/outbound.hpp"
+#include "openclaw/persist/state_db.hpp"
+#include <mutex>
 #include "openclaw/channels/ext_channels.hpp"
 #include "openclaw/channels/misc_channels.hpp"
 
@@ -563,6 +565,40 @@ nlohmann::json OutboundRecordAdapter::MaybeAutoVoice(const std::string& chat_id,
     return nullptr;
 }
 
+
+// 1.146: public-poll routes so inbound poll_answer (which lacks chat/thread) can rejoin the right session.
+namespace {
+std::mutex g_poll_mu;
+nlohmann::json& PollRegistry() {
+    static nlohmann::json reg = nlohmann::json::object();
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        const char* d = std::getenv("OPENCLAW_DATA_DIR");
+        std::filesystem::path path = (d && *d) ? std::filesystem::path(d) / "telegram" / "poll-registry.json"
+                                              : std::filesystem::path("/tmp/openclaw-cpp-data/telegram/poll-registry.json");
+        if (auto t = persist::StateRead(path)) try { auto j = nlohmann::json::parse(*t); if (j.is_object()) reg = j; } catch (...) {}
+    }
+    return reg;
+}
+void PersistPollRegistry() {
+    const char* d = std::getenv("OPENCLAW_DATA_DIR");
+    std::filesystem::path path = (d && *d) ? std::filesystem::path(d) / "telegram" / "poll-registry.json"
+                                          : std::filesystem::path("/tmp/openclaw-cpp-data/telegram/poll-registry.json");
+    persist::StateWrite(path, PollRegistry().dump(2));
+}
+}  // namespace
+void OutboundRecordAdapter::TelegramRememberPoll(const nlohmann::json& entry) {
+    std::lock_guard<std::mutex> l(g_poll_mu);
+    PollRegistry()[entry.value("pollId", "")] = entry;
+    PersistPollRegistry();
+}
+nlohmann::json OutboundRecordAdapter::TelegramLookupPoll(const std::string& poll_id) {
+    std::lock_guard<std::mutex> l(g_poll_mu);
+    auto& reg = PollRegistry();
+    return reg.contains(poll_id) ? reg[poll_id] : nlohmann::json();
+}
+
 nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, const nlohmann::json& p) {
     const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
     if (token.empty()) return {{"ok", false}, {"error", "telegram botToken not configured"}};
@@ -572,27 +608,100 @@ nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, 
         return v; };
     nlohmann::json chat = p.contains("chat_id") ? p["chat_id"] : p.contains("to") ? p["to"] : p.value("target", nlohmann::json());
     nlohmann::json mid = p.contains("message_id") ? p["message_id"] : p.value("messageId", nlohmann::json());
+    nlohmann::json thread = p.contains("message_thread_id") ? p["message_thread_id"] : p.value("threadId", nlohmann::json());
     if (chat.is_null() || chat == "") return {{"ok", false}, {"error", "to (chat id) is required"}};
     nlohmann::json body{{"chat_id", chat.is_string() ? chat : nlohmann::json(chat.dump())}};
+    if (!thread.is_null() && thread != "") body["message_thread_id"] = idv(thread);
     std::string method;
-    const bool need_mid = action != "typing";
-    if (need_mid) { if (mid.is_null() || mid == "") return {{"ok", false}, {"error", "messageId is required"}}; body["message_id"] = idv(mid); }
-    if (action == "react") {
-        method = "setMessageReaction";
-        const std::string emoji = p.value("emoji", p.value("reaction", std::string()));
-        const bool remove = p.value("remove", false) || emoji.empty();
-        body["reaction"] = remove ? nlohmann::json::array() : nlohmann::json::array({{{"type", "emoji"}, {"emoji", emoji}}});
-        if (p.value("big", false)) body["is_big"] = true;
-    } else if (action == "edit") {
-        const std::string text = p.value("message", p.value("text", std::string()));
-        if (p.contains("buttons")) body["reply_markup"] = TelegramInlineKeyboard(p["buttons"]);
-        if (text.empty()) { if (!p.contains("buttons")) return {{"ok", false}, {"error", "message (new text) or buttons required"}}; method = "editMessageReplyMarkup"; }
-        else { method = "editMessageText"; body["text"] = text; }
-    } else if (action == "delete" || action == "unsend") method = "deleteMessage";
-    else if (action == "pin") { method = "pinChatMessage"; if (p.value("silent", false)) body["disable_notification"] = true; }
-    else if (action == "unpin") method = "unpinChatMessage";
-    else if (action == "typing") { method = "sendChatAction"; body["action"] = "typing"; }
-    else return {{"ok", false}, {"error", "unsupported telegram action: " + action}};
+    // 1.146: sendPoll (public polls register a route for later poll_answer updates) and forum topic CRUD.
+    if (action == "poll") {
+        method = "sendPoll";
+        const std::string q = p.value("question", p.value("message", p.value("text", std::string())));
+        nlohmann::json opts = p.contains("options") ? p["options"] : p.value("choices", nlohmann::json::array());
+        if (q.empty() || !opts.is_array() || opts.size() < 2) return {{"ok", false}, {"error", "poll requires question and ≥2 options"}};
+        nlohmann::json opt_strs = nlohmann::json::array();
+        for (auto& o : opts) opt_strs.push_back(o.is_string() ? o.get<std::string>() : o.value("text", o.dump()));
+        body["question"] = q; body["options"] = opt_strs;
+        if (p.contains("is_anonymous") || p.contains("anonymous") || p.contains("pollAnonymous") || p.contains("pollPublic")) {
+            bool anon = true;
+            if (p.contains("is_anonymous")) anon = p["is_anonymous"].get<bool>();
+            else if (p.contains("anonymous")) anon = p["anonymous"].get<bool>();
+            else if (p.value("pollAnonymous", false)) anon = true;
+            else if (p.value("pollPublic", false)) anon = false;
+            body["is_anonymous"] = anon;
+        } else body["is_anonymous"] = false;  // public by default so poll_answer updates arrive
+        if (p.value("allows_multiple_answers", p.value("multiple", false))) body["allows_multiple_answers"] = true;
+        if (p.contains("correct_option_id")) body["correct_option_id"] = p["correct_option_id"];
+        if (p.contains("explanation")) body["explanation"] = p["explanation"];
+        auto r = HttpPostJson(api + method, body, {});
+        nlohmann::json rec{{"channel", "telegram"}, {"action", action}, {"method", method}, {"body", body}, {"http", r.value("http", 0)}};
+        sent_.push_back(rec);
+        const bool ok = r.value("http", 0) == 200;
+        nlohmann::json resp = r.contains("json") ? r["json"] : nlohmann::json();
+        nlohmann::json out{{"ok", ok}, {"method", method}, {"http", r.value("http", 0)}, {"response", resp}};
+        if (ok) {
+            auto result = resp.value("result", nlohmann::json::object());
+            std::string poll_id;
+            if (result.is_object() && result.contains("poll") && result["poll"].is_object()) poll_id = result["poll"].value("id", std::string());
+            if (!poll_id.empty() && !body.value("is_anonymous", true)) {
+                nlohmann::json entry{{"pollId", poll_id}, {"chat", {{"id", body["chat_id"]}, {"type", p.value("chatType", "private")}}},
+                                    {"messageId", result.value("message_id", 0)}, {"question", q}, {"options", opt_strs}};
+                if (body.contains("message_thread_id")) entry["threadId"] = body["message_thread_id"];
+                TelegramRememberPoll(entry);
+                out["pollId"] = poll_id;
+            }
+        }
+        return out;
+    }
+    if (action == "create_topic" || action == "createForumTopic") {
+        method = "createForumTopic";
+        const std::string name = p.value("name", p.value("topic", p.value("title", std::string())));
+        if (name.empty()) return {{"ok", false}, {"error", "name is required"}};
+        body["name"] = name.substr(0, 128);
+        if (p.contains("icon_color")) body["icon_color"] = p["icon_color"];
+        if (p.contains("icon_custom_emoji_id") || p.contains("iconCustomEmojiId"))
+            body["icon_custom_emoji_id"] = p.contains("icon_custom_emoji_id") ? p["icon_custom_emoji_id"] : p["iconCustomEmojiId"];
+        body.erase("message_id");
+    } else if (action == "edit_topic" || action == "editForumTopic" || action == "rename_topic") {
+        method = "editForumTopic";
+        nlohmann::json tid = thread.is_null() || thread == "" ? mid : thread;
+        if (tid.is_null() || tid == "") return {{"ok", false}, {"error", "message_thread_id (topic id) is required"}};
+        body["message_thread_id"] = idv(tid);
+        if (p.contains("name") || p.contains("topic") || p.contains("title"))
+            body["name"] = p.value("name", p.value("topic", p.value("title", std::string()))).substr(0, 128);
+        if (p.contains("icon_custom_emoji_id") || p.contains("iconCustomEmojiId"))
+            body["icon_custom_emoji_id"] = p.contains("icon_custom_emoji_id") ? p["icon_custom_emoji_id"] : p["iconCustomEmojiId"];
+        if (!body.contains("name") && !body.contains("icon_custom_emoji_id")) return {{"ok", false}, {"error", "name or iconCustomEmojiId required"}};
+    } else if (action == "close_topic" || action == "closeForumTopic") {
+        method = "closeForumTopic";
+        nlohmann::json tid = thread.is_null() || thread == "" ? mid : thread;
+        if (tid.is_null() || tid == "") return {{"ok", false}, {"error", "message_thread_id (topic id) is required"}};
+        body["message_thread_id"] = idv(tid);
+    } else if (action == "reopen_topic" || action == "reopenForumTopic") {
+        method = "reopenForumTopic";
+        nlohmann::json tid = thread.is_null() || thread == "" ? mid : thread;
+        if (tid.is_null() || tid == "") return {{"ok", false}, {"error", "message_thread_id (topic id) is required"}};
+        body["message_thread_id"] = idv(tid);
+    } else {
+        const bool need_mid = action != "typing";
+        if (need_mid) { if (mid.is_null() || mid == "") return {{"ok", false}, {"error", "messageId is required"}}; body["message_id"] = idv(mid); }
+        if (action == "react") {
+            method = "setMessageReaction";
+            const std::string emoji = p.value("emoji", p.value("reaction", std::string()));
+            const bool remove = p.value("remove", false) || emoji.empty();
+            body["reaction"] = remove ? nlohmann::json::array() : nlohmann::json::array({{{"type", "emoji"}, {"emoji", emoji}}});
+            if (p.value("big", false)) body["is_big"] = true;
+        } else if (action == "edit") {
+            const std::string text = p.value("message", p.value("text", std::string()));
+            if (p.contains("buttons")) body["reply_markup"] = TelegramInlineKeyboard(p["buttons"]);
+            if (text.empty()) { if (!p.contains("buttons")) return {{"ok", false}, {"error", "message (new text) or buttons required"}}; method = "editMessageReplyMarkup"; }
+            else { method = "editMessageText"; body["text"] = text; }
+        } else if (action == "delete" || action == "unsend") method = "deleteMessage";
+        else if (action == "pin") { method = "pinChatMessage"; if (p.value("silent", false)) body["disable_notification"] = true; }
+        else if (action == "unpin") method = "unpinChatMessage";
+        else if (action == "typing") { method = "sendChatAction"; body["action"] = "typing"; }
+        else return {{"ok", false}, {"error", "unsupported telegram action: " + action}};
+    }
     auto r = HttpPostJson(api + method, body, {});
     nlohmann::json rec{{"channel", "telegram"}, {"action", action}, {"method", method}, {"body", body}, {"http", r.value("http", 0)}};
     sent_.push_back(rec);
@@ -646,6 +755,32 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
         if (cbq.contains("from")) synth["from"] = cbq["from"];
         synth["__callback"] = true;
     }
+    // 1.146: poll_answer updates (public polls only) rejoin via the sendPoll registry.
+    if (body.contains("poll_answer") && body["poll_answer"].is_object()) {
+        const auto& pa = body["poll_answer"];
+        const std::string poll_id = pa.value("poll_id", std::string());
+        auto entry = TelegramLookupPoll(poll_id);
+        if (!entry.is_object() || entry.empty()) return {{"ok", true}, {"ignored", true}, {"note", "unknown poll_id"}};
+        if (pa.contains("user") && pa["user"].value("is_bot", false)) return {{"ok", true}, {"ignored", true}};
+        std::string chosen;
+        auto opts = entry.value("options", nlohmann::json::array());
+        for (auto& oid : pa.value("option_ids", nlohmann::json::array())) {
+            int i = oid.is_number() ? oid.get<int>() : 0;
+            if (i >= 0 && i < (int)opts.size()) chosen += (chosen.empty() ? "" : ", ") + opts[i].get<std::string>();
+        }
+        InboundMessage m; m.channel = "telegram";
+        const auto& chat = entry["chat"];
+        const std::string cid = chat["id"].is_string() ? chat["id"].get<std::string>() : chat["id"].dump();
+        m.sender = pa.contains("user") ? pa["user"]["id"].dump() : cid; m.peer_id = m.sender;
+        const auto type = chat.value("type", std::string("private"));
+        m.chat_type = type == "private" ? "direct" : "group";
+        if (m.chat_type == "group") m.conversation_id = cid;
+        m.session_key = "telegram-" + cid;
+        if (entry.contains("threadId")) { m.thread_id = entry["threadId"].dump(); m.session_key += ":topic:" + m.thread_id; if (m.chat_type == "group") m.conversation_id = cid + ":topic:" + m.thread_id; }
+        m.text = "[poll answer] " + entry.value("question", std::string("?")) + " → " + (chosen.empty() ? "(none)" : chosen);
+        if (deliver) deliver(m);
+        return {{"ok", true}, {"channel", "telegram"}, {"pollId", poll_id}, {"options", chosen}};
+    }
     // 1.140: message_reaction updates become a short system-style user note in the chat's session.
     if (body.contains("message_reaction") && body["message_reaction"].is_object()) {
         const auto& mr = body["message_reaction"];
@@ -696,7 +831,12 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
     if (m.chat_type == "group") m.conversation_id = cid;
     m.peer_id = m.sender;
     m.session_key = "telegram-" + cid;
-    if (tm.value("is_topic_message", false) && tm.contains("message_thread_id")) m.thread_id = tm["message_thread_id"].dump();
+    // 1.146: forum topics get their own session (`telegram-<chat>:topic:<threadId>`) so threads do not share history.
+    if ((tm.value("is_topic_message", false) || (chat.value("is_forum", false) && tm.contains("message_thread_id"))) && tm.contains("message_thread_id")) {
+        m.thread_id = tm["message_thread_id"].dump();
+        m.session_key += ":topic:" + m.thread_id;
+        if (m.chat_type == "group") m.conversation_id = cid + ":topic:" + m.thread_id;
+    }
     auto reply = deliver ? deliver(m) : std::string();
     nlohmann::json sent;
     if (!reply.empty()) {

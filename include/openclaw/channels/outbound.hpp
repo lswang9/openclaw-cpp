@@ -66,6 +66,8 @@ public:
     // 1.140 Telegram: message actions (react → setMessageReaction, edit → editMessageText / editMessageReplyMarkup,
     // delete|unsend → deleteMessage, pin/unpin → (un)pinChatMessage, typing → sendChatAction).
     nlohmann::json TelegramAction(const std::string& action, const nlohmann::json& params);
+    static void TelegramRememberPoll(const nlohmann::json& entry);
+    static nlohmann::json TelegramLookupPoll(const std::string& poll_id);
     // 1.140 Telegram: publish the slash-command menu (setMyCommands) from channels.telegram.commands or defaults.
     nlohmann::json TelegramSyncCommands();
 
