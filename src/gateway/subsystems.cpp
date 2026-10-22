@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <ctime>
 #include "openclaw/gateway/subsystems.hpp"
+#include "openclaw/gateway/conversations.hpp"
 #include "openclaw/gateway/node_hub.hpp"
 
 #include <curl/curl.h>
@@ -3781,6 +3782,7 @@ std::string GatewayTool(const std::string& name, const nlohmann::json& a, const 
     auto fail = [](const std::string& e) { return json{{"ok", false}, {"error", e}}.dump(); };
     if (!g_tool_deps) return fail("gateway not running");
     auto& d = *g_tool_deps;
+    { std::string extra_out; if (ExtraGatewayTool(name, a, agent.empty() ? std::string("main") : agent, session_key, d.config.raw, g_tool_root, &extra_out)) return extra_out; }
     session::Store& store = d.agent_pool ? d.agent_pool->Sessions(agent.empty() ? std::string("main") : agent) : d.sessions;
     // Accept the stored key, or the short form a caller used (k1 → agent:<agent>:k1 / any key ending in :k1).
     auto resolve = [&](const std::string& k) -> std::string {
@@ -4072,7 +4074,8 @@ nlohmann::json GatewayRpc(const std::string& m, const nlohmann::json& p) {
 std::vector<std::string> GatewayToolNames() {
     return {"sessions_list", "sessions_history", "session_status", "agents_list", "nodes", "sessions_send", "sessions_spawn", "sessions_yield",
             "sessions_search", "subagents", "message", "automations", "reminder", "image", "pdf", "tts", "image_generate", "video_generate",
-            "music_generate", "create_goal", "get_goal", "update_goal", "docs_search", "skills_search", "skills_read", "transcripts", "secrets", "presence"};
+            "music_generate", "create_goal", "get_goal", "update_goal", "docs_search", "skills_search", "skills_read", "transcripts", "secrets", "presence",
+            "web_search", "ask_user", "view_image", "agents_wait", "conversations_list", "conversations_send", "conversations_turn"};
 }
 
 nlohmann::json GenerateMedia(const std::string& kind, const nlohmann::json& a) {

@@ -87,20 +87,21 @@ sessions with no index entry) and `agents.files.get` (it read a directory).
 
 ## 3. Agent tools
 
-**Native (46):**
+**Native (53):**
 - agents_list, automations, acp_agent, browser(+evaluate/open_url/screenshot), canvas
 - create_goal/get_goal/update_goal, desktop, discord_voice, docs_search, echo, edit, exec, process, shell, read, write
 - github_publish, http_get, image, image_generate, music_generate, video_generate
 - memory_get/search/set, message, nodes, pdf, presence, reminder, secrets, session_status
 - sessions_history/list/search/send/spawn/yield, skills_read/search, subagents, time_now, transcripts, tts, web_fetch
+- 1.128: web_search (Brave/Tavily), ask_user (question.request/get/list/resolve/waitAnswer RPCs; prompt mirrored to the session's channel; next inbound message answers), view_image (png/jpeg/gif/webp metadata + data URL), agents_wait, conversations_list/send/turn (conversationRef = conv_<32 hex>, recorded from inbound channel messages; turn replies are consumed instead of starting an agent turn)
 
 There are also JS-plugin tools and MCP-bridged tools.
 
 **Missing compared with upstream core tools:**
-- agents_wait, ask_user, computer (only `desktop` exists), conversations_list/send/turn
+- computer (only `desktop` exists)
 - dashboard, decision_evaluate, gateway, github_identity_status, mobile_ui
-- personal_instructions, plugins, portal, progress_card, screen, skill_workshop, terminal, view_image
-- web_search (as a tool; webSearch RPC exists)
+- personal_instructions, plugins, portal, progress_card, screen, skill_workshop, terminal
+- Partial: view_image returns the image as a data URL in the tool result text; it is not attached as a native vision content block. web_search supports Brave and Tavily only (upstream also has Perplexity/Gemini/Grok/etc.). ask_user has no interactive buttons (options are a numbered list).
 
 ## 4. Config schema
 
@@ -197,7 +198,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards remain).
 2. Signal, Matrix, MS Teams, Google Chat, Mattermost channel extensions.
 3. ~~Native streaming~~ (done in 1.127); Bedrock/Vertex auth remain.
-4. Missing core tools: web_search, ask_user, view_image, agents_wait, conversations_*.
+4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
 5. Plugin API breadth: provider families, context engine, memory capability.
 6. SQLite-backed session and transcript storage, for on-disk parity.
 

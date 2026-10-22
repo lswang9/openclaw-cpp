@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.127.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.128.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.128.0-dev 新增
+
+核心工具：web_search、ask_user、view_image、agents_wait、conversations_*
 
 ## 1.127.0-dev 新增
 

@@ -7,6 +7,7 @@
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/config/schema.hpp"
 #include "openclaw/gateway/subsystems.hpp"
+#include "openclaw/gateway/conversations.hpp"
 #include "openclaw/gateway/node_hub.hpp"
 #include "openclaw/util.hpp"
 #include "openclaw/net/safe_fetch.hpp"
@@ -59,7 +60,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.127.0-dev";
+constexpr const char* kVersion = "1.128.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -277,6 +278,15 @@ Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), de
     deps_.emit = [this](const std::string& ev, const nlohmann::json& p) { Emit(ev, p); };
     SetSubsystemContext(&deps_, SubsystemDataRoot(deps_));
     SetGatewayEmitter([this](const std::string& e, const nlohmann::json& p) { Emit(e, p); });
+    ConvSetRoot(SubsystemDataRoot(deps_).string());
+    ConvSetSender([this](const std::string& ch, const std::string& to, const std::string& text, const nlohmann::json& extra) -> nlohmann::json {
+        auto* out = dynamic_cast<channels::OutboundRecordAdapter*>(deps_.adapters.Get(ch));
+        if (!out) return {{"ok", false}, {"error", "channel does not support outbound: " + ch}};
+        out->SetEnabled(true);
+        auto r = out->SendText(to, text, extra);
+        Emit("chat", {{"outbound", true}, {"channel", ch}, {"chat_id", to}, {"via", "conversations"}});
+        return r;
+    });
     SetGatewayRpc([this](const std::string& m, const nlohmann::json& p) { return DispatchRpc({{"type", "req"}, {"id", "tool"}, {"method", m}, {"params", p}}); });
     std::error_code ec;
     cfg_mtime_ = std::filesystem::last_write_time(config::DefaultPath(), ec);
@@ -1088,6 +1098,16 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         } else if (deps_.sessions.Exists(legacy_migrate_from)) {
             sessions.Save(msg.session_key, deps_.sessions.Load(legacy_migrate_from));
             Emit("session.migrated", {{"from", legacy_migrate_from}, {"to", msg.session_key}});
+        }
+    }
+    if (!msg.channel.empty() && msg.channel != "cli" && msg.channel != "http" && msg.channel != "webchat") {
+        const bool direct = msg.chat_type.empty() || msg.chat_type == "direct";
+        const std::string to = direct ? (msg.peer_id.empty() ? msg.sender : msg.peer_id) : msg.conversation_id;
+        ConvRecord({{"channel", msg.channel}, {"to", to}, {"accountId", msg.account_id}, {"threadId", msg.thread_id}, {"chatType", msg.chat_type},
+                    {"sessionKey", msg.session_key}, {"agentId", agent_id}});
+        if (ConvConsumeInbound(msg.channel, to, msg.session_key, msg.text)) {
+            Emit("conversation.reply", {{"channel", msg.channel}, {"to", to}, {"sessionKey", msg.session_key}});
+            return "";
         }
     }
     // Channel-bound ACP: slack/feishu/discord → session/prompt + outbound reply
@@ -2409,6 +2429,11 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
                          {"role", "operator"}, {"code", 403}};
         if (!id.is_null()) r["id"] = id;
         return r;
+    }
+    if (IsConvRpc(method, params)) {
+        auto r = ConvRpc(method, params);
+        if (r.value("ok", false)) return ok(r["payload"]);
+        return err(r.value("error", std::string("failed")));
     }
     if (method == "webauthn.list") return ok({{"credentials", WebAuthnStore().List()}});
     if (method == "webauthn.remove") return ok(WebAuthnStore().Remove(params.value("id", std::string())));
