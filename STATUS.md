@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.157.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.158.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.158.0-dev 新增
+
+Mattermost：WebSocket 重连退避与上游一致（初始 2 秒、失败翻倍至 60 秒、±20% 抖动、成功会话后重置），并加入 ping/pong 存活检测（e2e：scripts/e2e-mattermost-reconnect.sh）。
 
 ## 1.157.0-dev 新增
 

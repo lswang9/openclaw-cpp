@@ -1,3 +1,4 @@
+#include <cmath>
 #include "openclaw/channels/ext_auth.hpp"
 
 #include <curl/curl.h>
@@ -217,6 +218,22 @@ void SignalSseLoop(const std::string& rpc, const std::string& number, const std:
     }
 }
 
+// 1.158: reconnect delay policy (upstream mattermost/reconnect.ts runWithReconnect).
+class MmReconnect {
+  public:
+    MmReconnect(int initial, int max, double jitter) : init_(std::max(1, initial)), max_(std::max(initial, max)), jitter_(std::max(0.0, jitter)), retry_(init_) {}
+    // Returns the delay before the next attempt. failed=false: the previous session connected (delay resets).
+    int Next(bool failed) {
+        if (!failed) retry_ = init_;
+        int d = retry_;
+        if (jitter_ > 0) { double spread = d * jitter_; d = std::max(1, static_cast<int>(std::lround(d - spread + (std::rand() / (double)RAND_MAX) * spread * 2))); }
+        if (failed) retry_ = std::min(retry_ * 2, max_);
+        return d;
+    }
+  private:
+    int init_, max_; double jitter_; int retry_;
+};
+
 // 1.143: Mattermost WebSocket event stream (/api/v4/websocket): authentication_challenge, then "posted" events
 // (data.post is a JSON string) for every channel the bot can see — DMs included, no channel list needed.
 void MattermostWsLoop(const std::string& base, const std::string& tok, std::string me, const std::string& hook_token,
@@ -225,37 +242,55 @@ void MattermostWsLoop(const std::string& base, const std::string& tok, std::stri
     if (ws.rfind("https://", 0) == 0) ws = "wss://" + ws.substr(8); else if (ws.rfind("http://", 0) == 0) ws = "ws://" + ws.substr(7);
     ws += "/api/v4/websocket";
     std::cerr << "[gateway] mattermost: websocket " << ws << "\n";
-    int backoff = 500;
+    // 1.158: upstream runWithReconnect policy — initial 2 s, ×2 per failed attempt up to 60 s, ±20% jitter, reset after
+    // a session that connected and later closed; ping every 30 s, reconnect when no pong within 10 s.
+    MmReconnect rc(EnvInt("OPENCLAW_MATTERMOST_RECONNECT_INITIAL_MS", 2000), EnvInt("OPENCLAW_MATTERMOST_RECONNECT_MAX_MS", 60000),
+                   std::getenv("OPENCLAW_MATTERMOST_RECONNECT_JITTER") ? std::atof(std::getenv("OPENCLAW_MATTERMOST_RECONNECT_JITTER")) : 0.2);
+    const int ping_ms = EnvInt("OPENCLAW_MATTERMOST_PING_MS", 30000), pong_ms = EnvInt("OPENCLAW_MATTERMOST_PONG_TIMEOUT_MS", 10000);
     while (!stop.load()) {
         CURL* c = curl_easy_init(); if (!c) return;
         curl_slist* h = curl_slist_append(nullptr, ("Authorization: Bearer " + tok).c_str());
         curl_easy_setopt(c, CURLOPT_URL, ws.c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
         curl_easy_setopt(c, CURLOPT_CONNECT_ONLY, 2L); curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
-        if (curl_easy_perform(c) != CURLE_OK) { curl_slist_free_all(h); curl_easy_cleanup(c); Nap(stop, backoff); backoff = std::min(backoff * 2, 30000); continue; }
-        backoff = 500;
-        { const auto a = json{{"seq", 1}, {"action", "authentication_challenge"}, {"data", {{"token", tok}}}}.dump(); size_t sent = 0; curl_ws_send(c, a.data(), a.size(), &sent, 0, CURLWS_TEXT); }
-        std::string frame; char buf[65536];
-        while (!stop.load()) {
-            size_t n = 0; const curl_ws_frame* meta = nullptr;
-            const auto rc = curl_ws_recv(c, buf, sizeof buf, &n, &meta);
-            if (rc == CURLE_AGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
-            if (rc != CURLE_OK || (meta && (meta->flags & CURLWS_CLOSE))) break;
-            if (meta && (meta->flags & CURLWS_PING)) { size_t sent = 0; curl_ws_send(c, buf, n, &sent, 0, CURLWS_PONG); continue; }
-            frame.append(buf, n);
-            if (meta && meta->bytesleft > 0) continue;
-            auto ev = json::parse(frame, nullptr, false); frame.clear();
-            if (!ev.is_object()) continue;
-            if (ev.value("event", "") == "hello" && me.empty() && ev.contains("broadcast")) me = ev["broadcast"].value("user_id", std::string());
-            if (ev.value("event", "") != "posted" || !ev.contains("data")) continue;
-            const auto& d = ev["data"];
-            auto p = d.contains("post") && d["post"].is_string() ? json::parse(d["post"].get<std::string>(), nullptr, false) : d.value("post", json());
-            if (!p.is_object() || p.value("user_id", "") == me || !p.value("type", std::string()).empty()) continue;
-            json body{{"token", hook_token}, {"channel_id", p.value("channel_id", "")}, {"user_id", p.value("user_id", "")}, {"text", p.value("message", "")},
-                      {"post_id", p.value("id", "")}, {"root_id", p.value("root_id", "")}, {"channel_type", d.value("channel_type", std::string("O"))}};
-            try { ad->HandleHttpInbound(body, deliver); } catch (const std::exception& e) { std::cerr << "[gateway] mattermost ws post: " << e.what() << "\n"; }
-        }
+        bool connected = curl_easy_perform(c) == CURLE_OK;
+        if (connected) {
+            const auto a = json{{"seq", 1}, {"action", "authentication_challenge"}, {"data", {{"token", tok}}}}.dump(); size_t sent = 0; curl_ws_send(c, a.data(), a.size(), &sent, 0, CURLWS_TEXT);
+            std::string frame; char buf[65536];
+            auto last_ping = std::chrono::steady_clock::now(); bool awaiting_pong = false;
+            while (!stop.load()) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_ping).count();
+                if (awaiting_pong && since >= pong_ms) { std::cerr << "[gateway] mattermost websocket pong timeout — reconnecting\n"; break; }
+                if (!awaiting_pong && since >= ping_ms) {
+                    size_t ps = 0;
+                    if (curl_ws_send(c, "", 0, &ps, 0, CURLWS_PING) != CURLE_OK) { std::cerr << "[gateway] mattermost websocket ping failed\n"; break; }
+                    awaiting_pong = true; last_ping = now;
+                }
+                size_t n = 0; const curl_ws_frame* meta = nullptr;
+                const auto r = curl_ws_recv(c, buf, sizeof buf, &n, &meta);
+                if (r == CURLE_AGAIN) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
+                if (r != CURLE_OK || (meta && (meta->flags & CURLWS_CLOSE))) break;
+                if (meta && (meta->flags & CURLWS_PONG)) { awaiting_pong = false; last_ping = std::chrono::steady_clock::now(); continue; }
+                if (meta && (meta->flags & CURLWS_PING)) { size_t sent2 = 0; curl_ws_send(c, buf, n, &sent2, 0, CURLWS_PONG); continue; }
+                frame.append(buf, n);
+                if (meta && meta->bytesleft > 0) continue;
+                auto ev = json::parse(frame, nullptr, false); frame.clear();
+                if (!ev.is_object()) continue;
+                if (ev.value("event", "") == "hello" && me.empty() && ev.contains("broadcast")) me = ev["broadcast"].value("user_id", std::string());
+                if (ev.value("event", "") != "posted" || !ev.contains("data")) continue;
+                const auto& d = ev["data"];
+                auto p = d.contains("post") && d["post"].is_string() ? json::parse(d["post"].get<std::string>(), nullptr, false) : d.value("post", json());
+                if (!p.is_object() || p.value("user_id", "") == me || !p.value("type", std::string()).empty()) continue;
+                json body{{"token", hook_token}, {"channel_id", p.value("channel_id", "")}, {"user_id", p.value("user_id", "")}, {"text", p.value("message", "")},
+                          {"post_id", p.value("id", "")}, {"root_id", p.value("root_id", "")}, {"channel_type", d.value("channel_type", std::string("O"))}};
+                try { ad->HandleHttpInbound(body, deliver); } catch (const std::exception& e) { std::cerr << "[gateway] mattermost ws post: " << e.what() << "\n"; }
+            }
+        } else std::cerr << "[gateway] mattermost connection failed\n";
         curl_slist_free_all(h); curl_easy_cleanup(c);
-        if (!stop.load()) Nap(stop, backoff);
+        if (stop.load()) break;
+        const int delay = rc.Next(!connected);
+        std::cerr << "[gateway] mattermost reconnecting in " << delay << "ms\n";
+        Nap(stop, delay);
     }
 }
 

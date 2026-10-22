@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Offline fakes for 1.143 live channel transports. Usage: fake_live_transports.py <http_port> <irc_port> <log>
 HTTP: Mattermost REST + WebSocket (/api/v4/websocket), signal-cli JSON-RPC daemon (/api/v1/events SSE, /api/v1/rpc).
-TCP: a tiny IRC server. Test hooks: POST /__mm_push {post, channel_type}, /__signal_push {envelope}, /__irc_push {line}."""
+TCP: a tiny IRC server. Test hooks: POST /__mm_push {post, channel_type}, /__signal_push {envelope}, /__irc_push {line}.
+1.158: /__mm_ctl {fail: N (next N websocket GETs → 503), drop: true (close live sockets), nopong: bool}."""
+import select
 import base64, hashlib, json, socket, socketserver, struct, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HP, IP, LOG = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 LK = threading.Lock(); MMQ = []; SIGQ = []; IRC_CLIENTS = []
+MM = {"fail": 0, "drop": 0, "nopong": False}  # 1.158 reconnect hooks
 def log(o):
     with LK, open(LOG, "a") as f: f.write(json.dumps(o) + "\n")
 def ws_frame(text):
@@ -32,6 +35,12 @@ class H(BaseHTTPRequestHandler):
         log({"m": "GET", "path": self.path, "auth": self.headers.get("Authorization", "")})
         if p == "/api/v4/users/me": return self.send(200, {"id": "bot1", "username": "openclaw"})
         if p == "/api/v4/websocket":
+            log({"ws_connect": time.time()})
+            with LK:
+                if MM["fail"] > 0:
+                    MM["fail"] -= 1; failing = True
+                else: failing = False
+            if failing: return self.send(503, {"message": "unavailable"})
             if self.headers.get("Authorization") != "Bearer mm-tok": return self.send(401, {"message": "unauthorized"})
             key = self.headers["Sec-WebSocket-Key"]
             acc = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
@@ -41,8 +50,26 @@ class H(BaseHTTPRequestHandler):
             msg = ws_read(s); log({"ws_in": msg})
             j = json.loads(msg or "{}")
             if j.get("action") == "authentication_challenge": s.sendall(ws_frame(json.dumps({"status": "OK", "seq_reply": j.get("seq")})))
-            seq = 1
+            seq = 1; gen = MM["drop"]
             while True:
+                if MM["drop"] != gen:
+                    try: s.shutdown(socket.SHUT_RDWR)
+                    except Exception: pass
+                    s.close(); self.close_connection = True; return
+                r, _, _ = select.select([s], [], [], 0)
+                if r:
+                    hdr = s.recv(2)
+                    if len(hdr) < 2: return
+                    op = hdr[0] & 0x0f; n = hdr[1] & 0x7f
+                    if n == 126: n = struct.unpack(">H", s.recv(2))[0]
+                    mask = s.recv(4) if hdr[1] & 0x80 else b"\0\0\0\0"
+                    data = b""
+                    while len(data) < n: data += s.recv(n - len(data))
+                    data = bytes(c ^ mask[i % 4] for i, c in enumerate(data))
+                    if op == 9:
+                        log({"ws_ping": time.time()})
+                        if not MM["nopong"]: s.sendall(bytes([0x8a, len(data)]) + data)
+                    elif op == 8: return
                 with LK: items = MMQ[:]; MMQ.clear()
                 for it in items:
                     seq += 1
@@ -66,6 +93,12 @@ class H(BaseHTTPRequestHandler):
         p = self.path
         if p == "/__mm_push":
             with LK: MMQ.append(body)
+            return self.send(200, {"ok": True})
+        if p == "/__mm_ctl":
+            with LK:
+                if "fail" in body: MM["fail"] = int(body["fail"])
+                if body.get("drop"): MM["drop"] += 1
+                if "nopong" in body: MM["nopong"] = bool(body["nopong"])
             return self.send(200, {"ok": True})
         if p == "/__signal_push":
             with LK: SIGQ.append(body)
