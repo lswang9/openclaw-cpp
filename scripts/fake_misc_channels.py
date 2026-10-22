@@ -8,11 +8,18 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def send(self, code, obj):
         b = json.dumps(obj).encode(); self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self): self._other("GET")
+    def do_DELETE(self): self._other("DELETE")
+    def _other(self, m):
+        auth = self.headers.get("Authorization", "")
+        with open(LOG, "a") as f: f.write(json.dumps({"method": m, "path": self.path, "auth": auth, "body": {}}) + "\n")
+        if self.path.endswith("/v2/bot/richmenu/list"): return self.send(200, {"richmenus": [{"richMenuId": "richmenu-abc", "name": "main"}]})
+        return self.send(200, {})
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0)
         ctype = self.headers.get("Content-Type", "")
         auth = self.headers.get("Authorization", "")
-        if "application/x-www-form-urlencoded" in ctype:
+        if "application/x-www-form-urlencoded" in ctype and "/richmenu" not in self.path:
             form = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
             with open(LOG, "a") as f: f.write(json.dumps({"path": self.path, "auth": auth, "form": form, "headers": {k.lower(): v for k, v in self.headers.items()}}) + "\n")
             if "/Messages.json" in self.path:
@@ -24,6 +31,17 @@ class H(BaseHTTPRequestHandler):
         except Exception: pass
         with open(LOG, "a") as f: f.write(json.dumps({"path": self.path, "auth": auth, "body": body, "headers": {k.lower(): v for k, v in self.headers.items()}}) + "\n")
         p = self.path
+        if "/v2/bot/richmenu" in p or "/richmenu/" in p:  # 1.160 LINE rich menus
+            if auth != "Bearer line-tok": return self.send(401, {"message": "Unauthorized"})
+            if p.endswith("/content"):
+                with open(LOG, "a") as f: f.write(json.dumps({"path": p, "auth": auth, "ctype": ctype, "size": len(raw), "png": raw[:4] == b"\x89PNG", "body": {}}) + "\n")
+                return self.send(200, {})
+            body = {}
+            try: body = json.loads(raw or b"{}")
+            except Exception: pass
+            with open(LOG, "a") as f: f.write(json.dumps({"path": p, "auth": auth, "body": body}) + "\n")
+            if p.endswith("/v2/bot/richmenu"): return self.send(200, {"richMenuId": "richmenu-abc"})
+            return self.send(200, {})
         if p.endswith("/v2/bot/message/reply") or p.endswith("/v2/bot/message/push"):
             if auth != "Bearer line-tok": return self.send(401, {"message": "Unauthorized"})
             return self.send(200, {"ok": True})

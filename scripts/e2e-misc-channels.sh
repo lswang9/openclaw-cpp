@@ -20,7 +20,7 @@ F="http://127.0.0.1:$FP"
 # 16 scripted replies
 python3 - "$T/script.json" <<'PY'
 import json,sys
-ids=["line","zalo","zalo","sms","twitch","x","synology-chat","nextcloud-talk","irc","nostr","a2a","buzz","clickclack","raft","reef","tlon","zalouser"]
+ids=["line","line","zalo","zalo","sms","twitch","x","synology-chat","nextcloud-talk","irc","nostr","a2a","buzz","clickclack","raft","reef","tlon","zalouser"]
 json.dump([{"content":f"{i}-ok"} for i in ids], open(sys.argv[1],"w"))
 PY
 
@@ -70,6 +70,31 @@ has 'e["path"].endswith("/v2/bot/message/reply") and e["auth"]=="Bearer line-tok
 # 1.153: LINE flex push via send RPC (extra.flex as bubble contents)
 curl -s "http://127.0.0.1:$PORT/v1/rpc" -H 'Content-Type: application/json'   -d '{"id":2,"method":"send","params":{"channel":"line","to":"U1","message":"card","altText":"Welcome","flex":{"type":"bubble","body":{"type":"box","layout":"vertical","contents":[{"type":"text","text":"Hello flex"}]}}}}' >/dev/null
 has 'e["path"].endswith("/v2/bot/message/push") and e["body"]["to"]=="U1" and e["body"]["messages"][0]["type"]=="flex" and e["body"]["messages"][0]["altText"]=="Welcome" and e["body"]["messages"][0]["contents"]["type"]=="bubble"'
+
+# 1.160: LINE postback (rich-menu tap / picker) reaches the agent: action form + sorted params
+inb line '{"events":[{"type":"postback","replyToken":"rt2","source":{"type":"user","userId":"U1"},"postback":{"data":"line.action=open&line.device=lamp%201","params":{"time":"10:30","date":"2026-10-22"}}}]}' >/dev/null
+has 'e["path"].endswith("/v2/bot/message/reply") and e["body"]["replyToken"]=="rt2"'
+grep -rqF 'line action open device lamp 1 date=2026-10-22 time=10:30' "$T/s" || fail "postback text not in transcript"
+# 1.160: rich menu management CLI
+python3 - "$T/rm.json" <<'PY2'
+import json,sys
+json.dump({"size":{"width":2500,"height":843},"selected":True,"name":"main","chatBarText":"Menu","areas":[
+ {"bounds":{"x":0,"y":0,"width":1250,"height":843},"action":{"type":"postback","data":"line.action=help"}},
+ {"bounds":{"x":1250,"y":0,"width":1250,"height":843},"action":{"type":"richmenuswitch","richMenuAliasId":"page-2","data":"switch=2"}}]}, open(sys.argv[1],"w"))
+PY2
+printf '\x89PNG\r\n\x1a\nfakeimage' > "$T/rm.png"
+RM() { OPENCLAW_CONFIG_PATH="$T/cfg.json" HOME="$T" "$BIN" line richmenu "$@"; }
+RM create "$T/rm.json" --image "$T/rm.png" --alias page-1 --default | grep -q '"richMenuId": "richmenu-abc"' || fail "richmenu create"
+has 'e["path"].endswith("/v2/bot/richmenu") and e["body"]["chatBarText"]=="Menu"'
+has 'e["path"].endswith("/v2/bot/richmenu/richmenu-abc/content") and e.get("png") and e.get("ctype")=="image/png" and e.get("size")==17'
+has 'e["path"].endswith("/v2/bot/richmenu/alias") and e["body"]=={"richMenuAliasId":"page-1","richMenuId":"richmenu-abc"}'
+has 'e["path"].endswith("/v2/bot/user/all/richmenu/richmenu-abc")'
+RM link U1 richmenu-abc >/dev/null && has 'e["path"].endswith("/v2/bot/user/U1/richmenu/richmenu-abc")'
+RM unlink U1 >/dev/null && has 'e.get("method")=="DELETE" and e["path"].endswith("/v2/bot/user/U1/richmenu")'
+RM list | grep -q '"name": "main"' || fail "richmenu list"
+RM delete richmenu-abc >/dev/null && has 'e.get("method")=="DELETE" and e["path"].endswith("/v2/bot/richmenu/richmenu-abc")'
+python3 -c "import json;d=json.load(open('$T/rm.json'));d['areas'][1]['action']['richMenuAliasId']='x'*40;json.dump(d,open('$T/bad.json','w'))"
+{ RM create "$T/bad.json" || true; } | grep -q 'richMenuAliasId' || fail "alias limit not enforced"
 
 # Zalo
 inb zalo '{"message":{"chat":{"id":"c1"},"from":{"id":"u1"},"text":"yo"}}' >/dev/null

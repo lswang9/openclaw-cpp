@@ -1,3 +1,5 @@
+#include <cctype>
+#include <fstream>
 #include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/channels/irc_native.hpp"
 #include "openclaw/channels/nostr_nip04.hpp"
@@ -22,7 +24,7 @@ json Http(const std::string& method, const std::string& url, const std::string& 
     std::string resp; curl_slist* h = nullptr; for (auto& x : headers) h = curl_slist_append(h, x.c_str());
     curl_easy_setopt(c, CURLOPT_URL, url.c_str()); curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
     curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method.c_str());
-    if (method != "GET") curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
+    if (method != "GET") { curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size())); curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.data()); }
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, Wcb); curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L); curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     const auto rc = curl_easy_perform(c); long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
@@ -250,10 +252,47 @@ json MiscChannelInbound(const std::string& id, const json& cfg, const json& body
         json events = body.contains("events") ? body["events"] : json::array({body});
         if (!events.is_array() || events.empty()) return ignored("no events");
         const auto& ev = events[0];
+        // 1.160: postback events (buttons, date/time pickers, rich-menu taps / richmenuswitch) reach the agent like upstream
+        // buildLinePostbackContext: data (or "line action X [device Y]"), then sorted params as " key=value".
+        if (S(ev, "type") == "postback") {
+            const auto& pb = ev.value("postback", json::object());
+            std::string raw = S(pb, "data");
+            while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) raw.pop_back();
+            while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.front()))) raw.erase(0, 1);
+            if (raw.empty()) return ignored("empty postback");
+            std::string body_txt = raw;
+            if (raw.find("line.action=") != std::string::npos) {
+                auto qv = [&](const std::string& k) {
+                    std::size_t i = 0;
+                    while (i <= raw.size()) {
+                        auto amp = raw.find('&', i); if (amp == std::string::npos) amp = raw.size();
+                        auto kv = raw.substr(i, amp - i); auto eq = kv.find('=');
+                        if (eq != std::string::npos && kv.substr(0, eq) == k) {
+                            std::string v, e = kv.substr(eq + 1);
+                            for (std::size_t j = 0; j < e.size(); ++j) {
+                                if (e[j] == '+') v += ' ';
+                                else if (e[j] == '%' && j + 2 < e.size()) { v += static_cast<char>(std::stoi(e.substr(j + 1, 2), nullptr, 16)); j += 2; }
+                                else v += e[j];
+                            }
+                            return v;
+                        }
+                        i = amp + 1;
+                    }
+                    return std::string();
+                };
+                const auto dev = qv("line.device");
+                body_txt = "line action " + qv("line.action") + (dev.empty() ? "" : " device " + dev);
+            }
+            if (pb.contains("params") && pb["params"].is_object())
+                for (auto& [k, v] : pb["params"].items())  // nlohmann::json objects iterate in sorted key order
+                    if (v.is_string() && !v.get<std::string>().empty()) body_txt += " " + k + "=" + v.get<std::string>();
+            m.text = body_txt;
+        } else {
         if (S(ev, "type") != "message") return ignored("non-message");
         const auto& msg = ev.value("message", json::object());
         if (S(msg, "type") != "text") return ignored("non-text");
         m.text = S(msg, "text");
+        }
         const auto& src = ev.value("source", json::object());
         m.sender = FirstS(src, {"userId", "groupId", "roomId"});
         to = m.sender;
@@ -339,6 +378,72 @@ json MiscChannelInbound(const std::string& id, const json& cfg, const json& body
     json sent = send ? send(to, reply, ex) : json();
     out["sent"] = sent;
     return out;
+}
+
+
+// 1.160: LINE rich menus (Messaging API): create (+ image upload, alias, default), list, delete, link/unlink per user,
+// set default. Definitions are checked against LINE limits before any call (size, ≤20 areas, action data ≤300,
+// richmenuswitch alias ≤32, chatBarText ≤14).
+json LineRichMenu(const json& cfg, const json& op) {
+    const auto tok = Cred(cfg, "line", "channelAccessToken", "LINE_CHANNEL_ACCESS_TOKEN");
+    if (tok.empty()) return {{"ok", false}, {"error", "line channelAccessToken not configured"}};
+    const std::string base = Trim(Cred(cfg, "line", "apiBase", "LINE_API_BASE", "https://api.line.me"));
+    std::string dbase = Trim(Cred(cfg, "line", "apiDataBase", "LINE_API_DATA_BASE", ""));
+    if (dbase.empty()) dbase = base == "https://api.line.me" ? "https://api-data.line.me" : base;
+    const std::vector<std::string> auth{"Authorization: Bearer " + tok};
+    auto res = [](const json& r) {
+        const long h = r.value("http", 0L);
+        json o{{"ok", h >= 200 && h < 300}, {"http", h}};
+        if (r.contains("json")) o["response"] = r["json"];
+        else if (!o["ok"].get<bool>()) o["error"] = r.value("body", std::string());
+        return o;
+    };
+    const std::string act = op.value("action", std::string());
+    if (act == "validate" || act == "create") {
+        json def = op.value("definition", json());
+        if (!def.is_object()) return {{"ok", false}, {"error", "definition (rich menu object) required"}};
+        std::vector<std::string> errs;
+        const auto sz = def.value("size", json::object());
+        const int w = sz.value("width", 0), h = sz.value("height", 0);
+        if (w < 800 || w > 2500 || h < 250 || static_cast<double>(w) / std::max(1, h) < 1.45) errs.push_back("size must be 800–2500 wide with aspect ratio ≥ 1.45");
+        if (S(def, "name").empty() || S(def, "name").size() > 300) errs.push_back("name required (≤300 chars)");
+        if (S(def, "chatBarText").empty() || S(def, "chatBarText").size() > 14 * 4) errs.push_back("chatBarText required (≤14 chars)");
+        const auto areas = def.value("areas", json::array());
+        if (!areas.is_array() || areas.empty() || areas.size() > 20) errs.push_back("areas must have 1–20 entries");
+        for (auto& a : areas) {
+            const auto ac = a.value("action", json::object());
+            if (S(ac, "data").size() > 300) errs.push_back("action data exceeds 300 chars");
+            if (S(ac, "type") == "richmenuswitch" && (S(ac, "richMenuAliasId").empty() || S(ac, "richMenuAliasId").size() > 32))
+                errs.push_back("richmenuswitch needs richMenuAliasId ≤32 chars");
+        }
+        const auto alias = op.value("alias", std::string());
+        if (alias.size() > 32) errs.push_back("alias exceeds 32 chars");
+        if (!errs.empty()) return {{"ok", false}, {"errors", errs}};
+        if (act == "validate") return res(PostJson(base + "/v2/bot/richmenu/validate", def, auth));
+        auto cr = PostJson(base + "/v2/bot/richmenu", def, auth);
+        auto out = res(cr);
+        if (!out["ok"].get<bool>()) return out;
+        const std::string id = cr.contains("json") ? S(cr["json"], "richMenuId") : "";
+        out["richMenuId"] = id;
+        if (op.contains("image") && op["image"].is_string()) {
+            std::ifstream f(op["image"].get<std::string>(), std::ios::binary);
+            if (!f) return {{"ok", false}, {"richMenuId", id}, {"error", "cannot read image"}};
+            std::string bytes((std::istreambuf_iterator<char>(f)), {});
+            const std::string ct = bytes.size() > 3 && static_cast<unsigned char>(bytes[0]) == 0x89 ? "image/png" : "image/jpeg";
+            auto hdr = auth; hdr.push_back("Content-Type: " + ct);
+            out["image"] = res(Http("POST", dbase + "/v2/bot/richmenu/" + id + "/content", bytes, hdr));
+        }
+        if (!alias.empty()) out["alias"] = res(PostJson(base + "/v2/bot/richmenu/alias", {{"richMenuAliasId", alias}, {"richMenuId", id}}, auth));
+        if (op.value("default", false)) out["default"] = res(Http("POST", base + "/v2/bot/user/all/richmenu/" + id, "", auth));
+        return out;
+    }
+    const std::string id = op.value("richMenuId", std::string()), user = op.value("userId", std::string());
+    if (act == "list") return res(Http("GET", base + "/v2/bot/richmenu/list", "", auth));
+    if (act == "delete") { if (id.empty()) return {{"ok", false}, {"error", "richMenuId required"}}; return res(Http("DELETE", base + "/v2/bot/richmenu/" + id, "", auth)); }
+    if (act == "default") { if (id.empty()) return {{"ok", false}, {"error", "richMenuId required"}}; return res(Http("POST", base + "/v2/bot/user/all/richmenu/" + id, "", auth)); }
+    if (act == "link") { if (id.empty() || user.empty()) return {{"ok", false}, {"error", "userId and richMenuId required"}}; return res(Http("POST", base + "/v2/bot/user/" + user + "/richmenu/" + id, "", auth)); }
+    if (act == "unlink") { if (user.empty()) return {{"ok", false}, {"error", "userId required"}}; return res(Http("DELETE", base + "/v2/bot/user/" + user + "/richmenu", "", auth)); }
+    return {{"ok", false}, {"error", "unknown action (create|validate|list|delete|default|link|unlink)"}};
 }
 
 }  // namespace openclaw::channels

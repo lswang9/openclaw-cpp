@@ -20,5 +20,7 @@ nlohmann::json MiscChannelInbound(const std::string& id, const nlohmann::json& c
 // Ids of the 16 channels (for registration / adapters).
 const std::vector<std::pair<const char*, const char*>>& MiscChannelCatalog();
 // X Account Activity CRC challenge (GET ?crc_token=). Returns {ok, response_token} or error.
+// 1.160: LINE rich menu management; op = {action, definition?, image?, alias?, default?, richMenuId?, userId?}.
+nlohmann::json LineRichMenu(const nlohmann::json& cfg, const nlohmann::json& op);
 nlohmann::json MiscChannelCrcGet(const std::string& id, const nlohmann::json& cfg, const std::string& crc_token);
 }  // namespace openclaw::channels

@@ -4,6 +4,7 @@
 #include "openclaw/channels/feishu_frame.hpp"
 #include "openclaw/acp/acpx.hpp"
 #include "openclaw/channels/discord_voice.hpp"
+#include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/channels/waweb/auth_store.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
@@ -114,7 +115,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.159.0-dev";
+constexpr const char* kVersion = "1.160.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -4199,6 +4200,29 @@ int main(int argc, char** argv) {
             }
             std::cerr << "usage: voice tts [--voice V] <text> | voice stt <file> [--language L]\n";
             return 2;
+        }
+        if (cmd == "line" && argc > 2 && std::string(argv[2]) == "richmenu") {
+            // 1.160: openclaw-cpp line richmenu create <def.json> [--image F] [--alias A] [--default] | validate <def.json>
+            //        | list | delete <id> | default <id> | link <userId> <id> | unlink <userId>
+            std::string act = argc > 3 ? argv[3] : "list";
+            nlohmann::json op{{"action", act}};
+            std::vector<std::string> pos;
+            for (int i = 4; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--image" && i + 1 < argc) op["image"] = argv[++i];
+                else if (a == "--alias" && i + 1 < argc) op["alias"] = argv[++i];
+                else if (a == "--default") op["default"] = true;
+                else pos.push_back(a);
+            }
+            if (act == "create" || act == "validate") {
+                if (pos.empty()) { std::cerr << "usage: line richmenu " << act << " <definition.json>\n"; return 2; }
+                std::ifstream f(pos[0]); op["definition"] = nlohmann::json::parse(f, nullptr, false);
+            } else if (act == "delete" || act == "default") { if (!pos.empty()) op["richMenuId"] = pos[0]; }
+            else if (act == "link") { if (pos.size() > 0) op["userId"] = pos[0]; if (pos.size() > 1) op["richMenuId"] = pos[1]; }
+            else if (act == "unlink") { if (!pos.empty()) op["userId"] = pos[0]; }
+            auto r = openclaw::channels::LineRichMenu(openclaw::config::LoadOrDefault(openclaw::config::DefaultPath()).raw, op);
+            std::cout << r.dump(2) << "\n";
+            return r.value("ok", false) ? 0 : 1;
         }
         if (cmd == "whatsapp-web") {
             namespace ww = openclaw::channels::waweb;
