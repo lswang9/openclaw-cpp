@@ -32,7 +32,7 @@ cfg={"channels":{
  "zalo":{"botToken":"ztok","apiBase":F,"dmPolicy":"open"},
  "sms":{"accountSid":"ACxxx","authToken":"authtok","from":"+15550001","apiBase":F,"dmPolicy":"open"},
  "twitch":{"accessToken":"tw-tok","clientId":"tw-cid","senderId":"bot1","apiBase":F,"channel":"b1","dmPolicy":"open","groupPolicy":"open"},
- "x":{"accessToken":"x-tok","apiBase":F,"dmPolicy":"open"},
+ "x":{"accessToken":"x-tok","apiBase":F,"dmPolicy":"open","consumerSecret":"consumer-secret"},
  "synology-chat":{"incomingUrl":F+"/incoming","dmPolicy":"open"},
  "nextcloud-talk":{"baseUrl":F,"user":"u","appPassword":"p","dmPolicy":"open","groupPolicy":"open"},
  "irc":{"apiBase":F,"token":"bridge-tok","dmPolicy":"open","groupPolicy":"open"},
@@ -83,6 +83,25 @@ has 'e["path"].endswith("/helix/chat/messages") and e["body"]["message"]=="twitc
 # X
 inb x '{"message_create":{"sender_id":"x1","message_data":{"text":"hi"}}}' >/dev/null
 has '"/2/dm_conversations/with/x1/messages" in e["path"] and e["body"]["text"]=="x-ok"'
+# 1.152: X Account Activity CRC challenge
+python3 - "$PORT" <<'XP' || fail "x CRC"
+import json,sys,urllib.request,hmac,hashlib,base64
+port=sys.argv[1]
+want="sha256="+base64.b64encode(hmac.new(b"consumer-secret", b"challenge-token", hashlib.sha256).digest()).decode()
+with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/channels/x/inbound?crc_token=challenge-token", timeout=10) as r:
+    body=json.load(r)
+assert body.get("response_token")==want, body
+req=urllib.request.Request(f"http://127.0.0.1:{port}/api/channels/x/inbound",
+    data=json.dumps({"crc_token":"challenge-token"}).encode(),
+    headers={"Content-Type":"application/json"}, method="POST")
+with urllib.request.urlopen(req, timeout=10) as r:
+    body=json.load(r)
+# POST inbound wraps adapter result; accept top-level or nested response_token
+tok=body.get("response_token") or (body.get("result") or {}).get("response_token")
+if tok is None and body.get("ok") and "response_token" in body: tok=body["response_token"]
+# OutboundRecordAdapter returns the MiscChannelCrcGet result directly as the HTTP JSON body
+assert body.get("response_token")==want or tok==want, body
+XP
 
 # Synology
 inb synology-chat '{"text":"hi","user_id":"42"}' >/dev/null

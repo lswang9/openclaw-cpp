@@ -4,6 +4,9 @@
 
 #include <curl/curl.h>
 
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
 #include <map>
 #include <mutex>
 
@@ -60,7 +63,7 @@ const std::vector<std::pair<const char*, const char*>> kCatalog = {
     {"synology-chat", "Synology Chat (incoming webhook; outbound incoming webhook URL)"},
     {"tlon", "Tlon / Urbit (webhook inbound; outbound POST {apiBase}/dm)"},
     {"twitch", "Twitch chat (EventSub/webhook inbound; Helix send-chat-message outbound)"},
-    {"x", "X (Twitter) DMs (Account Activity inbound; POST DM events outbound)"},
+    {"x", "X (Twitter) DMs (Account Activity CRC + inbound; POST DM events outbound)"},
     {"zalo", "Zalo Bot API (webhook inbound; sendMessage outbound)"},
     {"zalouser", "Zalo user-bot bridge (webhook inbound; outbound POST {apiBase}/send)"},
 };
@@ -184,11 +187,33 @@ json MiscChannelSend(const std::string& id, const json& cfg, const std::string& 
     return nullptr;
 }
 
+json MiscChannelCrcGet(const std::string& id, const json& cfg, const std::string& crc_token) {
+    if (id != "x") return {{"ok", false}, {"error", "CRC only for x"}, {"status", 404}};
+    if (crc_token.empty()) return {{"ok", false}, {"error", "missing crc_token"}, {"status", 400}};
+    const auto secret = Cred(cfg, "x", "consumerSecret", "X_CONSUMER_SECRET");
+    if (secret.empty()) return {{"ok", false}, {"error", "x consumerSecret not configured"}, {"status", 503}};
+    unsigned char mac[EVP_MAX_MD_SIZE]; unsigned int mac_len = 0;
+    if (!HMAC(EVP_sha256(), secret.data(), (int)secret.size(),
+              reinterpret_cast<const unsigned char*>(crc_token.data()), crc_token.size(), mac, &mac_len)) {
+        return {{"ok", false}, {"error", "HMAC failed"}, {"status", 500}};
+    }
+    std::string b64(4 * ((mac_len + 2) / 3) + 1, '\0');
+    const int n = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(&b64[0]), mac, (int)mac_len);
+    b64.resize(n > 0 ? (size_t)n : 0);
+    return {{"ok", true}, {"response_token", "sha256=" + b64}};
+}
+
 json MiscChannelInbound(const std::string& id, const json& cfg, const json& body, const DeliverFn& deliver, const MiscSendFn& send) {
     auto ignored = [](const std::string& w) { return Ignored(w); };
     InboundMessage m; m.channel = id; m.chat_type = "direct";
     json ex = json::object();
     std::string to;
+
+    // X Account Activity CRC can arrive as a JSON body too.
+    if (id == "x") {
+        const auto crc = FirstS(body, {"crc_token", "crcToken"});
+        if (!crc.empty()) return MiscChannelCrcGet(id, cfg, crc);
+    }
 
     // Shared webhook token gate (channels.<id>.webhookToken)
     const auto want = Cred(cfg, id, "webhookToken", "");

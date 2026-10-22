@@ -19,4 +19,6 @@ nlohmann::json MiscChannelInbound(const std::string& id, const nlohmann::json& c
                                   const DeliverFn& deliver, const MiscSendFn& send);
 // Ids of the 16 channels (for registration / adapters).
 const std::vector<std::pair<const char*, const char*>>& MiscChannelCatalog();
+// X Account Activity CRC challenge (GET ?crc_token=). Returns {ok, response_token} or error.
+nlohmann::json MiscChannelCrcGet(const std::string& id, const nlohmann::json& cfg, const std::string& crc_token);
 }  // namespace openclaw::channels

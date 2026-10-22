@@ -65,7 +65,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.151.0-dev";
+constexpr const char* kVersion = "1.152.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2368,6 +2368,21 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                 }
                 // Meta expects plain-text challenge body
                 send(HttpResponse(200, "OK", challenge, "text/plain; charset=utf-8"));
+                return;
+            }
+        }
+        // 1.152: X Account Activity CRC challenge (GET ?crc_token=)
+        if (chan_id == "x") {
+            auto crc = QueryParam(path_raw, "crc_token");
+            if (crc.empty()) crc = QueryParam(path_raw, "crcToken");
+            if (!crc.empty()) {
+                auto result = channels::MiscChannelCrcGet("x", deps_.config.raw, crc);
+                if (!result.value("ok", false)) {
+                    send(HttpResponse(result.value("status", 403), "Forbidden", result.dump()));
+                    return;
+                }
+                nlohmann::json crc_body{{"response_token", result.at("response_token")}};
+                send(HttpResponse(200, "OK", crc_body.dump(), "application/json; charset=utf-8"));
                 return;
             }
         }
