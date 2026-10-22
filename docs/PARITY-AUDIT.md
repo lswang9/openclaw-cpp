@@ -24,7 +24,7 @@ Reproduce the numbers with:
 | Agent tools (core) | ~57 | 66 native (+JS/MCP bridged) | 66 (13 added in 1.134) | computer/mobile_ui need a node implementing the commands; web_search partial | 0 by name (§3) |
 | Config root keys | 46 | 46 accepted | ~20 deeply validated | 26 shallow (key accepted, sub-shape not validated) | 0 |
 | Channel extensions | 27 messaging | 11 working | telegram (1.126), discord, slack, feishu, whatsapp (Cloud API), imessage (bridge inbound); signal, matrix, msteams, googlechat, mattermost (1.129, text) | whatsapp-web (partial Noise/Baileys); 1.129 channels: no Mattermost WebSocket, no Signal daemon transport | 16 (§5) |
-| Model-provider extensions | ~85 | 28 built-in ids + any `models.providers.*` | 4 wire formats (chat completions, Responses, Anthropic Messages, Gemini) offline-tested | token streaming over SSE for all four formats (1.127); no OAuth/Bedrock/Vertex signing | Bedrock, Vertex, Copilot, Codex OAuth, … |
+| Model-provider extensions | ~85 | 31 built-in ids + any `models.providers.*` | 7 wire formats (chat completions, Responses, Anthropic Messages, Gemini, Bedrock Converse, Anthropic Vertex, Google Vertex) offline-tested | token streaming over SSE; Bedrock AWS SigV4 / bearer + Vertex Google ADC (1.137) | Copilot, Codex OAuth, Mantle, … |
 | Plugin API (`api.register*`) | 60 | 60 accepted (JS host) + C ABI | 12 consumed: Tool/Provider/GatewayMethod/HttpRoute/Hook/Command/Cli/Service/Channel + WebSearchProvider/TextTransforms/AgentToolResultMiddleware (1.130) | Channel/Service thin; 48 captured but not consumed | 0 rejected; 48 unconsumed (§6) |
 
 ## 1. CLI tree
@@ -186,8 +186,9 @@ The native C ABI (`docs/PLUGIN-SDK.md`) is a Linux-only subset with no upstream 
 - sandboxing (bwrap/docker, labelled)
 - pairing (device links, setup codes in upstream format since 1.124), OIDC/cookie auth
 - cron, skills, MCP client (stdio + streamable-http + OAuth), ACP server/client
-- **providers routed per `provider/model`** (1.125): config `models.providers.*` plus 28 built-in ids
-  (openai→Responses, anthropic→Messages, google→Gemini, and OpenAI-compatible for the rest)
+- **providers routed per `provider/model`** (1.125): config `models.providers.*` plus 31 built-in ids
+  (openai→Responses, anthropic→Messages, google→Gemini, amazon-bedrock→Converse, anthropic-vertex / google-vertex→ADC, and OpenAI-compatible for the rest)
+- **Bedrock / Vertex (1.137):** `auth: "aws-sdk"` signs Converse with AWS SigV4 (env access key / session token) or `AWS_BEARER_TOKEN_BEDROCK`; `auth: "google-adc"` refreshes ADC (`authorized_user` refresh_token or `service_account` JWT) against `OPENCLAW_GOOGLE_TOKEN_URL` / oauth2 and sends `Authorization: Bearer` to Vertex Anthropic `:rawPredict` / Gemini `:generateContent`. Offline fake: `scripts/fake_cloud_llm.py`.
 - `agents.defaults.model.primary` as the default route, per-agent `model`
 - local `chat` uses the same factory
 - **webhook ingress** (1.125): `/hooks/wake`, `/hooks/agent` (async 202 or `waitForCompletion`), mappings with
@@ -218,7 +219,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 
 1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards/callbacks in 1.135; reactions, commands menu, edits remain).
 2. ~~Signal, Matrix, MS Teams, Google Chat, Mattermost~~ (text transports in 1.129; live listeners/verification listed in §5).
-3. ~~Native streaming~~ (done in 1.127); Bedrock/Vertex auth remain.
+3. ~~Native streaming~~ (done in 1.127); ~~Bedrock/Vertex auth~~ (1.137: AWS SigV4 + `AWS_BEARER_TOKEN_BEDROCK`, Google ADC authorized_user/service_account → Vertex Anthropic rawPredict + Gemini generateContent; offline `scripts/e2e-bedrock-vertex.sh`).
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
 5. Plugin API: all register* accepted (1.130); still unconsumed: context engine, memory capability, media/speech providers, harness APIs.
 6. ~~SQLite session/transcript storage~~ (1.131, opt-in); other stores still JSON.

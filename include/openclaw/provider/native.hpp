@@ -1,6 +1,7 @@
 #pragma once
 // Config-driven model providers (1.125): `models.providers.<id>` + built-in defaults, routed per "provider/model".
-// Native wire formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages, Google Gemini generateContent.
+// Native wire formats: OpenAI chat completions, OpenAI Responses, Anthropic Messages, Google Gemini generateContent,
+// plus Bedrock Converse and Vertex (anthropic-vertex / google-vertex) via cloud.cpp (1.137).
 #include "openclaw/provider/provider.hpp"
 
 #include <memory>
@@ -10,6 +11,8 @@ namespace openclaw::provider {
 
 struct ProviderSpec {
     std::string id, api, base_url, api_key, model;
+    std::string auth;              // "", "api-key", "aws-sdk", "google-adc"
+    std::string region, project, location;  // Bedrock region / Vertex project+location
     nlohmann::json headers = nlohmann::json::object();
     int max_tokens = 4096;
 };

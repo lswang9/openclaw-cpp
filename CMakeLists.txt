@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.136.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.137.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,6 +60,8 @@ set(OPENCLAW_SOURCES
   src/provider/auth_resolve.cpp
   src/provider/router.cpp
   src/provider/native.cpp
+  src/provider/cloud_auth.cpp
+  src/provider/cloud.cpp
   src/tools/registry.cpp
   src/tools/runenv.cpp
   src/tools/exec.cpp

@@ -1,4 +1,5 @@
 #include "openclaw/provider/native.hpp"
+#include "openclaw/provider/cloud.hpp"
 
 #include "openclaw/config/config.hpp"
 
@@ -424,7 +425,10 @@ const std::map<std::string, Builtin>& Builtins() {
         {"vllm", {"openai-completions", "http://127.0.0.1:8000/v1", ""}},
         {"sglang", {"openai-completions", "http://127.0.0.1:30000/v1", ""}},
         {"llama-cpp", {"openai-completions", "http://127.0.0.1:8080/v1", ""}},
-        {"litellm", {"openai-completions", "http://127.0.0.1:4000/v1", "LITELLM_API_KEY"}}};
+        {"litellm", {"openai-completions", "http://127.0.0.1:4000/v1", "LITELLM_API_KEY"}},
+        {"amazon-bedrock", {"bedrock-converse", "https://bedrock-runtime.us-east-1.amazonaws.com", ""}},
+        {"anthropic-vertex", {"anthropic-vertex", "https://us-east1-aiplatform.googleapis.com", ""}},
+        {"google-vertex", {"google-vertex", "https://us-east1-aiplatform.googleapis.com", ""}}};
     return m;
 }
 
@@ -433,6 +437,9 @@ std::string NormalizeApi(std::string a) {
     if (a == "responses" || a == "openai-responses" || a == "openai-codex-responses") return "openai-responses";
     if (a == "anthropic" || a == "anthropic-messages") return "anthropic-messages";
     if (a == "google" || a == "gemini" || a == "google-generative-ai") return "google-generative-ai";
+    if (a == "bedrock" || a == "bedrock-converse" || a == "bedrock-converse-stream") return "bedrock-converse";
+    if (a == "anthropic-vertex") return "anthropic-vertex";
+    if (a == "google-vertex" || a == "vertex" || a == "vertex-ai") return "google-vertex";
     return a;
 }
 
@@ -464,15 +471,27 @@ bool ResolveProviderSpec(const json& cfg_raw, const std::string& route, Provider
         if (s.api_key.size() > 3 && s.api_key[0] == '$' && s.api_key[1] == '{' && s.api_key.back() == '}') { const char* e = std::getenv(s.api_key.substr(2, s.api_key.size() - 3).c_str()); s.api_key = e ? e : ""; }
     }
     if (s.api_key.empty() && !envs.empty()) { std::stringstream ss(envs); std::string k; while (std::getline(ss, k, ',')) if (const char* e = std::getenv(k.c_str()); e && *e) { s.api_key = e; break; } }
+    if (pc.contains("auth") && pc["auth"].is_string()) s.auth = pc["auth"].get<std::string>();
+    if (pc.contains("region") && pc["region"].is_string()) s.region = pc["region"].get<std::string>();
+    if (pc.contains("project") && pc["project"].is_string()) s.project = pc["project"].get<std::string>();
+    if (pc.contains("location") && pc["location"].is_string()) s.location = pc["location"].get<std::string>();
+    if (s.auth.empty()) {
+        if (s.api == "bedrock-converse") s.auth = "aws-sdk";
+        else if (s.api == "anthropic-vertex" || s.api == "google-vertex") s.auth = "google-adc";
+    }
+    const bool cloud_auth = s.auth == "aws-sdk" || s.auth == "google-adc";
     const bool local = base.find("127.0.0.1") != std::string::npos || base.find("localhost") != std::string::npos;
-    if (s.api_key.empty() && !local && builtin && !envs.empty()) { if (why) *why = "no API key for provider \"" + s.id + "\" (set models.providers." + s.id + ".apiKey or " + envs + ")"; return false; }
+    if (s.api_key.empty() && !local && builtin && !envs.empty() && !cloud_auth) { if (why) *why = "no API key for provider \"" + s.id + "\" (set models.providers." + s.id + ".apiKey or " + envs + ")"; return false; }
     if (pc.contains("headers") && pc["headers"].is_object()) s.headers = pc["headers"];
     for (auto& m : pc.value("models", json::array())) if (m.is_object() && m.value("id", "") == s.model) { s.max_tokens = m.value("maxTokens", s.max_tokens); if (m.contains("api") && m["api"].is_string()) s.api = NormalizeApi(m["api"].get<std::string>()); }
-    if (s.api != "openai-completions" && s.api != "openai-responses" && s.api != "anthropic-messages" && s.api != "google-generative-ai") { if (why) *why = "unsupported provider api \"" + s.api + "\""; return false; }
+    static const char* kOk[] = {"openai-completions","openai-responses","anthropic-messages","google-generative-ai","bedrock-converse","anthropic-vertex","google-vertex"};
+    bool ok_api = false; for (auto* x : kOk) if (s.api == x) { ok_api = true; break; }
+    if (!ok_api) { if (why) *why = "unsupported provider api \"" + s.api + "\""; return false; }
     *out = s; return true;
 }
 
 std::shared_ptr<Provider> MakeNativeProvider(const ProviderSpec& s) {
+    if (auto cloud = MakeCloudProvider(s)) return cloud;
     if (s.api == "anthropic-messages") return std::make_shared<AnthropicMessages>(s);
     if (s.api == "google-generative-ai") return std::make_shared<Gemini>(s);
     if (s.api == "openai-responses") return std::make_shared<Responses>(s);
