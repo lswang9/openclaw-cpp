@@ -6,6 +6,7 @@
 #include "openclaw/channels/discord_voice.hpp"
 #include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/channels/waweb/auth_store.hpp"
+#include "openclaw/channels/waweb/pairing.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/auth/mfa.hpp"
@@ -115,7 +116,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.161.0-dev";
+constexpr const char* kVersion = "1.162.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2580,6 +2581,34 @@ int CmdSelfTest() {
     }
     {
         namespace ww = openclaw::channels::waweb;
+        auto companion = ww::InitAuthCreds();
+        auto account = ww::GenerateKeyPair();
+        auto login = ww::EncodeClientPayloadLogin(15551234567ULL, 15);
+        auto reg = ww::EncodeClientPayloadRegistration(companion);
+        auto li = ww::DecodeClientPayload(login), ri = ww::DecodeClientPayload(reg);
+        bool ok = li && li->username == 15551234567ULL && li->device == 15 && li->passive && li->pull && !li->has_pairing;
+        ok = ok && ri && ri->has_pairing && ri->registration_id == companion.signal.registration_id &&
+             ri->e_ident == companion.signal.identity.pub && ri->e_skey_val == companion.signal.signed_prekey.pub &&
+             ri->e_skey_sig == companion.signed_prekey_sig && !ri->passive && !ri->pull && ri->build_hash.size() == 16;
+        auto iq = ww::BuildPairSuccessIq(companion, account, "15551234567:15@s.whatsapp.net", "123@lid", "smba", "pair1");
+        auto r = ww::ConfigureSuccessfulPairing(iq, companion);
+        ok = ok && r.ok && companion.registered && companion.me_jid == "15551234567:15@s.whatsapp.net" && companion.platform == "smba";
+        ok = ok && r.reply.tag == "iq" && r.reply.children.size() == 1 && r.reply.children[0].tag == "pair-device-sign";
+        ok = ok && r.account.device_signature.size() == 64 && !r.account.account_signature_key.empty();
+        // tampered HMAC is rejected
+        auto bad = iq; bad.children[0].children[0].content.back() ^= 1;
+        auto r2 = ww::ConfigureSuccessfulPairing(bad, companion);
+        ok = ok && !r2.ok && r2.error.find("signature") != std::string::npos;
+        // hosted path
+        auto companion2 = ww::InitAuthCreds();
+        auto iq_h = ww::BuildPairSuccessIq(companion2, account, "15550001111:1@s.whatsapp.net", "", "smbi", "pair2", true);
+        auto r3 = ww::ConfigureSuccessfulPairing(iq_h, companion2);
+        ok = ok && r3.ok && r3.account.hosted;
+        if (!ok) { std::cerr << "FAIL waweb pairing (ClientPayload + ADV)\n"; ++failures; }
+        else std::cerr << "PASS waweb pairing (ClientPayload encode/decode, ADV HMAC + account verify, pair-device-sign)\n";
+    }
+    {
+        namespace ww = openclaw::channels::waweb;
         namespace sg = openclaw::channels::waweb::signal;
         auto dir = std::filesystem::temp_directory_path() / ("oc-waauth-" + std::to_string(getpid()));
         std::filesystem::create_directories(dir);
@@ -4244,19 +4273,39 @@ int main(int argc, char** argv) {
                                {"identityKey", ww::Base64(c->signal.identity.pub)}, {"preKeys", c->signal.prekeys.size()},
                                {"nextPreKeyId", c->next_prekey_id},
                                {"signedPreKeyValid", ww::VerifyXEdDsa(c->signal.identity.pub, ww::signal::SerializePub(c->signal.signed_prekey.pub), c->signed_prekey_sig)}};
+            auto hex = [](const ww::Bytes& b) { static const char* hx = "0123456789abcdef"; std::string h; for (auto x : b) { h += hx[x >> 4]; h += hx[x & 15]; } return h; };
             if (sub == "prekeys") {
                 int n = server_count >= 0 ? ww::PreKeysToUpload(server_count) : 30;
                 out["upload"] = n;
                 if (n > 0) {
                     auto node = ww::BuildPreKeyUploadNode(*c, n, "pk-" + std::to_string(c->next_prekey_id));
-                    auto enc = ww::EncodeBinaryNode(node);
-                    static const char* hx = "0123456789abcdef";
-                    std::string h; for (auto b : enc) { h += hx[b >> 4]; h += hx[b & 15]; }
-                    out["iq"] = h;
+                    out["iq"] = hex(ww::EncodeBinaryNode(node));
                     ww::SaveAuthCreds(dir, *c);
                     out["preKeys"] = c->signal.prekeys.size(); out["nextPreKeyId"] = c->next_prekey_id;
                 }
-            } else if (sub != "show" && sub != "init") { std::cerr << "usage: whatsapp-web init|show|prekeys [--server-count N] [--dir D]\n"; return 2; }
+            } else if (sub == "payload") {
+                ww::ClientPayloadOpts o;
+                if (c->registered && !c->me_jid.empty()) {
+                    // me_jid like 1555:15@s.whatsapp.net
+                    auto at = c->me_jid.find('@'); auto colon = c->me_jid.find(':');
+                    std::uint64_t user = 0; std::uint32_t device = 0;
+                    if (colon != std::string::npos) { user = std::stoull(c->me_jid.substr(0, colon)); device = static_cast<std::uint32_t>(std::stoul(c->me_jid.substr(colon + 1, at - colon - 1))); }
+                    else if (at != std::string::npos) user = std::stoull(c->me_jid.substr(0, at));
+                    auto enc = ww::EncodeClientPayloadLogin(user, device, o);
+                    out["kind"] = "login"; out["payload"] = hex(enc); out["bytes"] = enc.size();
+                } else {
+                    auto enc = ww::EncodeClientPayloadRegistration(*c, o);
+                    out["kind"] = "registration"; out["payload"] = hex(enc); out["bytes"] = enc.size();
+                }
+            } else if (sub == "pair") {
+                // Offline self-pair: fabricate a pair-success against a throwaway account key, then verify + reply.
+                auto account = ww::GenerateKeyPair();
+                std::string jid = "15550009999:1@s.whatsapp.net";
+                auto iq = ww::BuildPairSuccessIq(*c, account, jid, "999@lid", "smba", "offline-pair");
+                auto r = ww::ConfigureSuccessfulPairing(iq, *c);
+                out["ok"] = r.ok; out["error"] = r.error; out["me"] = c->me_jid; out["platform"] = c->platform;
+                if (r.ok) { out["reply"] = hex(ww::EncodeBinaryNode(r.reply)); ww::SaveAuthCreds(dir, *c); }
+            } else if (sub != "show" && sub != "init") { std::cerr << "usage: whatsapp-web init|show|prekeys|payload|pair [--server-count N] [--dir D]\n"; return 2; }
             std::cout << out.dump(2) << "\n";
             return 0;
         }

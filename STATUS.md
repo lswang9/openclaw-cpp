@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.161.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.162.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.162.0-dev 新增
+
+WhatsApp Web：ClientPayload（注册/登录）编解码与 ADV pair-success（HMAC 校验、账户签名验证、设备签名、pair-device-sign 回复）；离线 CLI whatsapp-web payload|pair（e2e：scripts/e2e-waweb-pairing.sh）。
 
 ## 1.161.0-dev 新增
 

@@ -1,6 +1,6 @@
 # WhatsApp Web (Baileys-equivalent) — gap assessment (1.61)
 
-> Refreshed 1.156: rows below updated where later slices landed; WABinary v3 and cert-chain verify are done (self-test fixtures). Next gaps: ClientPayload + ADV pair-success, live Noise WS login, SenderKeys, app-state.
+> Refreshed 1.156: rows below updated where later slices landed; WABinary v3 and cert-chain verify are done (self-test fixtures). 1.162 landed ClientPayload + ADV pair-success (offline). Next gaps: live Noise WS login, SenderKeys, app-state.
 
 Upstream OpenClaw's `whatsapp` channel logs in as a **linked device** through Baileys (WhatsApp Web multi-device
 protocol): QR or pairing-code login, persistent auth state, DMs and groups, media, reactions, read receipts.
@@ -13,10 +13,10 @@ Meta Business number. That is a different product.
 |---|---|---|
 | Transport | `wss://web.whatsapp.com/ws/chat`, binary frames: `WA 6 3` intro, then 3-byte BE length | **real** framing (`NoiseState::EncodeFrame/DecodeFrames`). The WebSocket client exists elsewhere (Slack/Discord) but is not wired here yet. |
 | Noise handshake | `Noise_XX_25519_AESGCM_SHA256`; HandshakeMessage protobuf (clientHello/serverHello/clientFinish) | **real**: both roles, tested in-process; tampering is rejected. Not yet tested against the real WA server. |
-| Server cert check | Verify the serverHello payload `CertChain` (WA root key, intermediate) | **partial (1.64+)**: `DecodeCertChain` / `VerifyCertChain` structural decode; Ed25519/XEdDSA verify against WA root still missing |
-| ClientPayload | Protobuf: `UserAgent`, `WebInfo`, `DevicePairingRegistrationData` (reg id, signed pre-key, identity) for the first login, `username`/`device` afterwards | **missing**. Needs the WAProto schema (≈ 3k lines of .proto); we have only a varint/len-delimited codec. |
-| WABinary nodes | XMPP-like `<iq>`/`<message>`/`<receipt>` trees, token dictionary v3 (single- and double-byte), JID encodings, nibble/hex packing | **partial (1.64+)**: `EncodeBinaryNode` / `DecodeBinaryNode` without the token dictionary (string tags only). Dictionary v3 still missing. |
-| Pairing | `pair-device` refs → QR `ref,noisePub,identityPub,advSecret`; `pair-success` → verify ADV HMAC, sign the device identity, reply `pair-device-sign` | QR payload format **real**. ADV signature/verification **missing**. |
+| Server cert check | Verify the serverHello payload `CertChain` (WA root key, intermediate) | **real (later 1.14x)**: `VerifyCertChain` with XEdDSA against WA root + intermediate, leaf key / validity checks. |
+| ClientPayload | Protobuf: `UserAgent`, `WebInfo`, `DevicePairingRegistrationData` (reg id, signed pre-key, identity) for the first login, `username`/`device` afterwards | **1.162**: hand-written encode/decode (`pairing.hpp`); registration + login shapes; CLI `whatsapp-web payload`. |
+| WABinary nodes | XMPP-like `<iq>`/`<message>`/`<receipt>` trees, token dictionary v3 (single- and double-byte), JID encodings, nibble/hex packing | **real (later 1.14x)**: dictionary v3, Baileys fixtures byte-identical in self-test. |
+| Pairing | `pair-device` refs → QR `ref,noisePub,identityPub,advSecret`; `pair-success` → verify ADV HMAC, sign the device identity, reply `pair-device-sign` | QR payload format **real**. **1.162**: ADV HMAC (E2EE + HOSTED), account XEdDSA verify, device XEdDSA sign, `pair-device-sign` reply; CLI `whatsapp-web pair` (offline self-pair). Live QR scan still missing. |
 | Signal protocol | X3DH session setup with pre-key bundles (`encrypt` iq), Double Ratchet (`pkmsg`/`msg`), group SenderKeys (`skmsg`), XEdDSA signatures | **offline-real (1.14x–1.156)**: libsignal-shaped X3DH + Double Ratchet (`signal.hpp`), XEdDSA verify + sign (1.156). Not byte-verified against libsignal; SenderKeys still missing. |
 | Pre-key management | Upload 30+ one-time pre-keys, rotate the signed pre-key, `count` iq | **1.156**: `BuildPreKeyUploadNode` (encrypt iq: registration/type/identity/list/skey with XEdDSA-signed SPK), `ParsePreKeyCount`, Baileys MIN 5 / INITIAL 30 policy; CLI `whatsapp-web prekeys`. Signed pre-key rotation and live upload missing. |
 | App state sync | `app-state-sync-key-share`, LTHash mutations (contacts, mute, pin, archive) | **missing**. Not required for messaging. |
