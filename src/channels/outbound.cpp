@@ -11,6 +11,9 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
+#include <regex>
+#include <sstream>
 #include <fstream>
 #include <cstdlib>
 
@@ -24,6 +27,22 @@ std::string TelegramBase(const nlohmann::json& cfg) {
 std::string DiscordBase(const nlohmann::json& cfg) {
     auto b = ChannelCred(cfg, "discord", "apiBase", "DISCORD_API_BASE");
     return b.empty() ? "https://discord.com/api/v10" : TrimSlash(b);
+}
+// 1.135 Telegram media + inline keyboards (defined below, after the multipart helper).
+nlohmann::json TelegramSendMedia(const std::string& api, const std::string& chat_id, const nlohmann::json& item, const nlohmann::json& extra);
+nlohmann::json TelegramInlineKeyboard(const nlohmann::json& buttons);
+// Upstream MEDIA directives (src/media/parse-output.ts): a line "MEDIA: <path|url>" (optionally backticked) is an
+// attachment, removed from the visible text.
+std::string ExtractMediaDirectives(const std::string& text, nlohmann::json* media) {
+    std::istringstream in(text); std::string line, out; bool first = true;
+    static const std::regex re(R"(^\s*MEDIA:\s*`?([^`\n]+?)`?\s*$)", std::regex::icase);
+    while (std::getline(in, line)) {
+        std::smatch m;
+        if (std::regex_match(line, m, re)) { media->push_back(m[1].str()); continue; }
+        if (!first) out += "\n"; out += line; first = false;
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+    return out;
 }
 }  // namespace
 namespace {
@@ -119,25 +138,43 @@ nlohmann::json OutboundRecordAdapter::SendText(const std::string& chat_id, const
     if (id_ == "telegram") {
         const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
         if (!token.empty() && !chat_id.empty()) {
-            const std::string url = TelegramBase(Config()) + "/bot" + token + "/sendMessage";
+            const std::string api = TelegramBase(Config()) + "/bot" + token + "/";
+            const std::string url = api + "sendMessage";
+            nlohmann::json media = nlohmann::json::array();
+            if (extra.is_object() && extra.contains("media")) {
+                if (extra["media"].is_array()) media = extra["media"]; else media.push_back(extra["media"]);
+            }
+            const std::string text_out = ExtractMediaDirectives(text, &media);
+            const nlohmann::json keyboard = extra.is_object() && extra.contains("buttons") ? TelegramInlineKeyboard(extra["buttons"]) : nlohmann::json();
             // Bot API caps text at 4096 chars: split on paragraph/line/space boundaries (upstream chunker semantics).
-            std::vector<std::string> chunks; std::string rest = text; const std::size_t lim = 4096;
+            std::vector<std::string> chunks; std::string rest = text_out; const std::size_t lim = 4096;
             while (rest.size() > lim) {
                 std::size_t cut = rest.rfind("\n\n", lim); if (cut == std::string::npos || cut < lim / 2) cut = rest.rfind('\n', lim);
                 if (cut == std::string::npos || cut < lim / 2) cut = rest.rfind(' ', lim);
                 if (cut == std::string::npos || cut == 0) { cut = lim; while (cut > 0 && (static_cast<unsigned char>(rest[cut]) & 0xC0) == 0x80) --cut; }
                 chunks.push_back(rest.substr(0, cut)); rest = rest.substr(cut); while (!rest.empty() && (rest[0] == '\n' || rest[0] == ' ')) rest.erase(0, 1);
             }
-            if (!rest.empty() || chunks.empty()) chunks.push_back(rest);
+            if (!rest.empty() || (chunks.empty() && media.empty())) chunks.push_back(rest);
             bool all_ok = true; nlohmann::json parts = nlohmann::json::array();
             for (std::size_t i = 0; i < chunks.size(); ++i) {
                 nlohmann::json b = {{"chat_id", chat_id}, {"text", chunks[i]}};
+                if (i + 1 == chunks.size() && keyboard.is_object()) b["reply_markup"] = keyboard;
                 if (extra.is_object() && extra.contains("message_thread_id")) b["message_thread_id"] = extra["message_thread_id"];
                 if (i == 0 && extra.is_object() && extra.contains("reply_to_message_id")) b["reply_parameters"] = {{"message_id", extra["reply_to_message_id"]}, {"allow_sending_without_reply", true}};
                 auto r = HttpPostJson(url, b, {});
                 all_ok = all_ok && r.value("http", 0) >= 200 && r.value("http", 0) < 300; parts.push_back(r);
             }
-            http_result = parts.size() == 1 ? parts[0] : nlohmann::json{{"http", all_ok ? 200 : 502}, {"chunks", parts}};
+            nlohmann::json media_sent = nlohmann::json::array();
+            for (std::size_t i = 0; i < media.size(); ++i) {
+                nlohmann::json mx = extra.is_object() ? extra : nlohmann::json::object();
+                if (chunks.empty() && i + 1 == media.size() && keyboard.is_object()) mx["__keyboard"] = keyboard;  // media-only reply keeps its buttons
+                auto r = TelegramSendMedia(api, chat_id, media[i], mx);
+                all_ok = all_ok && r.value("http", 0) >= 200 && r.value("http", 0) < 300; media_sent.push_back(r);
+            }
+            http_result = parts.size() == 1 && media_sent.empty() ? parts[0] : nlohmann::json{{"http", all_ok ? 200 : 502}, {"chunks", parts}};
+            if (!media_sent.empty()) { http_result["media"] = media_sent; entry["media"] = media.size(); }
+            if (keyboard.is_object()) entry["buttons"] = keyboard["inline_keyboard"];
+            entry["text"] = text_out;
             entry["mode"] = "live_http";
             entry["chunks"] = chunks.size();
             entry["delivered"] = all_ok;
@@ -293,6 +330,69 @@ nlohmann::json RawPost(const std::string& url, const std::string& data, const st
     return out;
 }
 bool Ok2xx(const nlohmann::json& r) { auto c = r.value("http", 0L); return c >= 200 && c < 300; }
+}  // namespace
+namespace {
+nlohmann::json TelegramInlineKeyboard(const nlohmann::json& buttons) {
+    // buttons: [[btn, ...], ...] rows, or a flat [btn, ...] (one per row). btn: "label" (callback_data = label) or
+    // {text, callback_data | data | value | url}. callback_data is capped at Telegram's 64 bytes.
+    if (!buttons.is_array() || buttons.empty()) return {};
+    nlohmann::json rows = nlohmann::json::array();
+    auto btn = [](const nlohmann::json& b) -> nlohmann::json {
+        if (b.is_string()) return {{"text", b}, {"callback_data", b.get<std::string>().substr(0, 64)}};
+        if (!b.is_object()) return {};
+        const auto text = b.value("text", b.value("label", std::string()));
+        if (text.empty()) return {};
+        if (b.contains("url") && b["url"].is_string()) return {{"text", text}, {"url", b["url"]}};
+        std::string data = b.value("callback_data", b.value("data", b.value("value", text)));
+        return {{"text", text}, {"callback_data", data.substr(0, 64)}};
+    };
+    for (auto& r : buttons) {
+        nlohmann::json row = nlohmann::json::array();
+        if (r.is_array()) { for (auto& b : r) { auto x = btn(b); if (!x.is_null()) row.push_back(x); } }
+        else { auto x = btn(r); if (!x.is_null()) row.push_back(x); }
+        if (!row.empty()) rows.push_back(row);
+    }
+    if (rows.empty()) return {};
+    return {{"inline_keyboard", rows}};
+}
+nlohmann::json TelegramSendMedia(const std::string& api, const std::string& chat_id, const nlohmann::json& item, const nlohmann::json& extra) {
+    std::string src = item.is_string() ? item.get<std::string>() : item.is_object() ? item.value("path", item.value("url", std::string())) : std::string();
+    const std::string caption = item.is_object() ? item.value("caption", std::string()) : std::string();
+    if (src.rfind("file://", 0) == 0) src = src.substr(7);
+    if (!src.empty() && src[0] == '~') if (const char* h = std::getenv("HOME")) src = std::string(h) + src.substr(1);
+    std::string ext = src.substr(src.find_last_of('.') == std::string::npos ? src.size() : src.find_last_of('.'));
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (const auto q = ext.find('?'); q != std::string::npos) ext.resize(q);
+    std::string method = "sendDocument", field = "document", mime = "application/octet-stream";
+    if (ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp") { method = "sendPhoto"; field = "photo"; mime = ext == ".png" ? "image/png" : ext == ".webp" ? "image/webp" : "image/jpeg"; }
+    else if (ext == ".gif") { method = "sendAnimation"; field = "animation"; mime = "image/gif"; }
+    else if (ext == ".mp4" || ext == ".mov" || ext == ".webm") { method = "sendVideo"; field = "video"; mime = "video/mp4"; }
+    else if (ext == ".ogg" || ext == ".oga" || ext == ".opus") { method = "sendVoice"; field = "voice"; mime = "audio/ogg"; }
+    else if (ext == ".mp3" || ext == ".m4a" || ext == ".wav" || ext == ".flac") { method = "sendAudio"; field = "audio"; mime = "audio/mpeg"; }
+    if (item.is_object() && item.value("asDocument", false)) { method = "sendDocument"; field = "document"; }
+    nlohmann::json out{{"method", method}, {"source", src}};
+    if (src.empty()) { out["http"] = 0; out["error"] = "empty media source"; return out; }
+    const bool remote = src.rfind("http://", 0) == 0 || src.rfind("https://", 0) == 0;
+    if (remote) {  // Telegram fetches URLs itself
+        nlohmann::json b{{"chat_id", chat_id}, {field, src}};
+        if (!caption.empty()) b["caption"] = caption.substr(0, 1024);
+        if (extra.contains("__keyboard")) b["reply_markup"] = extra["__keyboard"];
+        if (extra.contains("message_thread_id")) b["message_thread_id"] = extra["message_thread_id"];
+        auto r = RawPost(api + method, b.dump(), {"Content-Type: application/json"});
+        out["http"] = r.value("http", 0L); return out;
+    }
+    std::ifstream f(src, std::ios::binary);
+    if (!f) { out["http"] = 0; out["error"] = "media file not found: " + src; return out; }
+    std::string data((std::istreambuf_iterator<char>(f)), {});
+    if (data.size() > 50u * 1024 * 1024) { out["http"] = 0; out["error"] = "media larger than Telegram's 50 MB bot upload limit"; return out; }
+    std::vector<Part> parts{{"chat_id", chat_id, "", ""}, {field, data, std::filesystem::path(src).filename().string(), mime}};
+    if (!caption.empty()) parts.push_back({"caption", caption.substr(0, 1024), "", ""});
+    if (extra.contains("__keyboard")) parts.push_back({"reply_markup", extra["__keyboard"].dump(), "", ""});
+    if (extra.contains("message_thread_id")) parts.push_back({"message_thread_id", extra["message_thread_id"].dump(), "", ""});
+    auto r = Multipart(api + method, {}, parts);
+    out["http"] = r.value("http", 0L); out["bytes"] = data.size();
+    return out;
+}
 // Transcode to Ogg/Opus via ffmpeg (if installed). Returns empty on failure.
 std::string ToOggOpus(const std::string& audio) {
     if (audio.rfind("OggS", 0) == 0) return audio;
@@ -463,13 +563,43 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
         return ExtChannelInbound(id_, Config(), body, deliver, [this](const std::string& to, const std::string& t, const nlohmann::json& ex) { return SendText(to, t, ex); });
     if (id_ != "telegram") return {{"ok", false}, {"error", "unsupported"}};
     // Secret is verified by the gateway HTTP layer from X-Telegram-Bot-Api-Secret-Token (1.79).
-    const auto& tm = body.contains("message") ? body["message"] : (body.contains("edited_message") ? body["edited_message"] : nlohmann::json());
+    // 1.135: inline-keyboard presses (callback_query) arrive as a user message carrying the button's callback_data;
+    // the query is acknowledged with answerCallbackQuery so the client stops its spinner.
+    nlohmann::json cbq = body.contains("callback_query") && body["callback_query"].is_object() ? body["callback_query"] : nlohmann::json();
+    nlohmann::json synth;
+    if (cbq.is_object()) {
+        const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
+        if (!token.empty() && cbq.contains("id"))
+            HttpPostJson(TelegramBase(Config()) + "/bot" + token + "/answerCallbackQuery", {{"callback_query_id", cbq["id"]}}, {});
+        if (!cbq.contains("message") || !cbq["message"].is_object() || !cbq.contains("data")) return {{"ok", true}, {"ignored", true}, {"note", "callback without message/data"}};
+        synth = cbq["message"];
+        synth["text"] = cbq["data"];
+        synth.erase("caption"); synth.erase("photo"); synth.erase("document");
+        if (cbq.contains("from")) synth["from"] = cbq["from"];
+        synth["__callback"] = true;
+    }
+    const auto& tm = synth.is_object() ? synth : body.contains("message") ? body["message"] : (body.contains("edited_message") ? body["edited_message"] : nlohmann::json());
     if (!tm.is_object() || !tm.contains("chat")) return {{"ok", true}, {"ignored", true}, {"note", "no message"}};
     InboundMessage m;
     m.channel = "telegram";
     m.text = tm.value("text", tm.value("caption", std::string()));
-    m.media = voice::ExtractAudioRefs(body);
-    if (m.text.empty() && m.media.empty()) return {{"ok", true}, {"ignored", true}, {"note", "no text or audio"}};
+    m.media = synth.is_object() ? nlohmann::json::array() : voice::ExtractAudioRefs(body);
+    // 1.135: photos (largest size), image/video/other documents, videos, animations and stickers become media refs
+    // ({kind, telegram_file_id, mime, filename}); the gateway downloads them (getFile) before the turn.
+    auto add_ref = [&](const char* kind, const nlohmann::json& o, const std::string& mime, const std::string& fname) {
+        if (!o.is_object() || !o.contains("file_id")) return;
+        m.media.push_back({{"kind", kind}, {"telegram_file_id", o["file_id"]}, {"mime", o.value("mime_type", mime)}, {"filename", o.value("file_name", fname)},
+                           {"size", o.value("file_size", 0)}});
+    };
+    if (tm.contains("photo") && tm["photo"].is_array() && !tm["photo"].empty()) add_ref("image", tm["photo"].back(), "image/jpeg", "photo.jpg");
+    if (tm.contains("document") && tm["document"].is_object()) {
+        const auto mt = tm["document"].value("mime_type", std::string());
+        add_ref(mt.rfind("image/", 0) == 0 ? "image" : mt.rfind("video/", 0) == 0 ? "video" : "document", tm["document"], "application/octet-stream", "file");
+    }
+    if (tm.contains("video")) add_ref("video", tm["video"], "video/mp4", "video.mp4");
+    if (tm.contains("animation")) add_ref("video", tm["animation"], "video/mp4", "animation.mp4");
+    if (tm.contains("sticker") && !tm["sticker"].value("is_animated", false) && !tm["sticker"].value("is_video", false)) add_ref("image", tm["sticker"], "image/webp", "sticker.webp");
+    if (m.text.empty() && m.media.empty()) return {{"ok", true}, {"ignored", true}, {"note", "no text or media"}};
     const auto& chat = tm["chat"];
     const std::string cid = chat["id"].is_string() ? chat["id"].get<std::string>() : chat["id"].dump();
     m.sender = tm.contains("from") ? (tm["from"]["id"].is_string() ? tm["from"]["id"].get<std::string>() : tm["from"]["id"].dump()) : cid;

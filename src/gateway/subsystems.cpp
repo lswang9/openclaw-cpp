@@ -3913,8 +3913,13 @@ std::string GatewayTool(const std::string& name, const nlohmann::json& a, const 
     if (name == "message") {
         const auto action = a.value("action", std::string("send"));
         if (action == "send")
-            return rpc("send", {{"channel", a.value("channel", std::string())}, {"to", a.value("to", a.value("target", std::string()))},
-                                {"message", a.value("message", a.value("text", std::string()))}});
+        {
+            json sp{{"channel", a.value("channel", std::string())}, {"to", a.value("to", a.value("target", std::string()))},
+                    {"message", a.value("message", a.value("text", std::string()))}};
+            for (auto k : {"buttons", "media", "message_thread_id"}) if (a.contains(k)) sp[k] = a[k];  // 1.135: inline keyboards + attachments
+            if (a.contains("path") && !a.contains("media")) sp["media"] = a["path"];
+            return rpc("send", sp);
+        }
         json p = a; p["action"] = action;
         return rpc("message.action", p);
     }

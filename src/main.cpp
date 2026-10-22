@@ -111,7 +111,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.134.0-dev";
+constexpr const char* kVersion = "1.135.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3475,6 +3475,9 @@ int CmdGateway(int argc, char** argv, int argi) {
              obj({{"conversationRef", {{"type", "string"}}}, {"message", {{"type", "string"}}}})},
             {"conversations_turn", "Send through a conversationRef and wait for the correlated inbound reply (timeoutSeconds 1-300).",
              obj({{"conversationRef", {{"type", "string"}}}, {"message", {{"type", "string"}}}, {"timeoutSeconds", {{"type", "integer"}}}})},
+            {"message", "Send a message through a channel (action send: channel, to, message; buttons = rows of inline buttons [[\"Yes\",\"No\"]] or {text, callback_data|url}; media = file path/URL or list, sent as photo/video/audio/document). Other actions go to message.action.",
+             obj({{"action", {{"type", "string"}}}, {"channel", {{"type", "string"}}}, {"to", {{"type", "string"}}}, {"message", {{"type", "string"}}},
+                  {"buttons", {{"type", "array"}}}, {"media", {{"type", {"string", "array"}}}}, {"message_thread_id", {{"type", "integer"}}}})},
             // 1.134: remaining upstream core tools (src/gateway/core_tools.cpp)
             {"gateway", "Read gateway config/schema. update.run: owner request or operator schedule; automatic restart + completion notice. Never via shell.",
              obj({{"action", {{"type", "string"}, {"enum", {"config.get", "config.schema.lookup", "update.run"}}}}, {"path", {{"type", "string"}}}, {"note", {{"type", "string"}}}})},

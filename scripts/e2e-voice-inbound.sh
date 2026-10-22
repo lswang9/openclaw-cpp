@@ -14,6 +14,8 @@ FAKE_VOICE_LOG="$T/voice.log" python3 "$ROOT/scripts/fake-voice-media.py" > "$T/
 for _ in $(seq 50); do [[ -s "$T/fp" ]] && break; sleep 0.1; done
 FP=$(cat "$T/fp"); B="http://127.0.0.1:$FP"
 export OPENCLAW_STT_PROVIDER=openai OPENCLAW_STT_URL="$B/v1/audio/transcriptions" OPENCLAW_STT_API_KEY=k
+export OPENCLAW_DEFAULT_PROVIDER=mock  # offline: transcripts are asserted, not model output
+unset DEEPSEEK_API_KEY
 export TELEGRAM_API_BASE="$B" TELEGRAM_BOT_TOKEN=TOK WHATSAPP_API_BASE="$B" WHATSAPP_TOKEN=WATOK OPENCLAW_MEDIA_ALLOW_PRIVATE=1
 export TELEGRAM_WEBHOOK_SECRET=S3cret OPENCLAW_TTS_AUTO=inbound
 export OPENCLAW_TTS_PROVIDER=elevenlabs OPENCLAW_TTS_URL="$B" OPENCLAW_TTS_API_KEY=k

@@ -2,6 +2,8 @@
 
 #include <iostream>
 #include <chrono>
+#include <cctype>
+#include <unordered_map>
 
 namespace openclaw::agent {
 
@@ -42,7 +44,23 @@ LoopResult RunAgentLoop(provider::Provider& provider,
                         LoopOptions opts) {
     LoopResult out;
     out.messages = std::move(messages);
-    const auto tools = registry.OpenAiToolsArray();
+    // Provider-facing tool names must match ^[a-zA-Z0-9_-]{1,64}$ (OpenAI/DeepSeek/Anthropic reject e.g. "mcp.echo");
+    // plugin/MCP names are sent sanitized and mapped back before invocation (upstream sanitizes the same way).
+    auto tools = registry.OpenAiToolsArray();
+    std::unordered_map<std::string, std::string> wire_to_real;
+    if (tools.is_array())
+        for (auto& t : tools) {
+            if (!t.is_object() || !t.contains("function") || !t["function"].contains("name")) continue;
+            const std::string real = t["function"]["name"].get<std::string>();
+            std::string w = real;
+            for (auto& c : w) if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-') c = '_';
+            if (w.size() > 64) w.resize(64);
+            if (w == real) continue;
+            while (wire_to_real.count(w) || registry.Has(w)) w += "_";
+            wire_to_real[w] = real;
+            t["function"]["name"] = w;
+        }
+    auto real_name = [&](const std::string& n) { auto it = wire_to_real.find(n); return it == wire_to_real.end() ? n : it->second; };
 
     std::string last_sig;
     std::size_t same_count = 0;
@@ -137,7 +155,7 @@ LoopResult RunAgentLoop(provider::Provider& provider,
             std::string result;
             bool blocked = false;
             if (opts.before_tool_call) {
-                auto h = opts.before_tool_call(tc.name, args);
+                auto h = opts.before_tool_call(real_name(tc.name), args);
                 if (h.is_object() && h.value("block", false)) {
                     blocked = true;
                     result = nlohmann::json{{"error", h.value("blockReason", std::string("blocked by plugin hook"))},
@@ -149,12 +167,12 @@ LoopResult RunAgentLoop(provider::Provider& provider,
             if (!blocked) {
                 const auto t0 = std::chrono::steady_clock::now();
                 std::string err;
-                try { result = registry.Invoke(tc.name, args); }
+                try { result = registry.Invoke(real_name(tc.name), args); }
                 catch (const std::exception& e) { err = e.what(); result = nlohmann::json{{"error", err}}.dump(); }
                 if (opts.after_tool_call)
-                    opts.after_tool_call(tc.name, args, result,
+                    opts.after_tool_call(real_name(tc.name), args, result,
                                          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(), err);
-                if (opts.tool_result_middleware) result = opts.tool_result_middleware(tc.name, args, result, !err.empty());
+                if (opts.tool_result_middleware) result = opts.tool_result_middleware(real_name(tc.name), args, result, !err.empty());
             }
             if (opts.inline_tool_images && result.find("\"dataUrl\"") != std::string::npos) {
                 nlohmann::json rj = nlohmann::json::parse(result, nullptr, false);

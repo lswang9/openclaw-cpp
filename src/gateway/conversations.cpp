@@ -102,10 +102,10 @@ json WaitQuestion(const std::string& id, long long timeout_ms) {
     if (!q.done) return Ok({{"status", "pending"}, {"id", id}});
     return Ok({{"status", q.rec.value("status", std::string("answered"))}, {"id", id}, {"answers", q.rec.value("answers", json::object())}});
 }
-json Send(const json& e, const std::string& text) {
+json Send(const json& e, const std::string& text, const json& extra_in = json::object()) {
     ConvSendFn fn; { fn = g_send; }
     if (!fn) return Fail("gateway outbound is not available");
-    json extra = json::object();
+    json extra = extra_in.is_object() ? extra_in : json::object();
     if (!e.value("threadId", std::string()).empty()) extra["message_thread_id"] = e["threadId"];
     if (!e.value("accountId", std::string()).empty()) extra["accountId"] = e["accountId"];
     return fn(e.value("channel", std::string()), e.value("to", std::string()), text, extra);
@@ -370,7 +370,12 @@ std::string AskUser(const json& a, const std::string& agent, const std::string& 
     json conv;
     { std::lock_guard<std::mutex> l(g_mu); json db = Load(); for (auto& [k, v] : db.items()) if (!session_key.empty() && v.value("sessionKey", std::string()) == session_key) conv = v; }
     bool mirrored = false;
-    if (conv.is_object()) { auto s = Send(conv, text); mirrored = !(s.is_object() && s.contains("ok") && s["ok"] == false); }
+    // 1.135: single-question prompts with options render as inline buttons on channels that support them (Telegram);
+    // a press arrives as the option text, which resolves the question like a typed answer.
+    json buttons = json::array();
+    if (rec["questions"].size() == 1)
+        for (auto& o : rec["questions"][0].value("options", json::array())) buttons.push_back(json::array({o.is_string() ? o.get<std::string>() : o.value("label", o.dump())}));
+    if (conv.is_object()) { auto s = Send(conv, text, buttons.empty() ? json::object() : json{{"buttons", buttons}}); mirrored = !(s.is_object() && s.contains("ok") && s["ok"] == false); }
     auto w = WaitQuestion(id, timeout_ms);
     json res = w.value("payload", json::object());
     if (res.value("status", std::string()) == "pending") {

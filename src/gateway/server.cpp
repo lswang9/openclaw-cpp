@@ -63,7 +63,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.134.0-dev";
+constexpr const char* kVersion = "1.135.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -1077,6 +1077,9 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         { auto l = LockDeps(); cfg_snapshot = deps_.config.raw; }
         auto ai = voice::TranscribeInboundAudio(cfg_snapshot, msg);
         if (!ai.empty()) Emit("media.audio.transcribed", {{"channel", msg.channel}, {"results", ai}});
+        const auto media_dir = (deps_.persist ? deps_.persist->Root() : std::filesystem::path(EnvOr("OPENCLAW_DATA_DIR", "/tmp/openclaw-cpp-data"))) / "media" / "inbound";
+        auto mi = voice::ResolveInboundMedia(cfg_snapshot, msg, media_dir.string());
+        if (!mi.empty()) Emit("media.inbound", {{"channel", msg.channel}, {"results", mi}});
     }
     auto deps_lock = LockDeps();
     std::string legacy_migrate_from;
@@ -1314,7 +1317,22 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
     if (!msg.sender.empty()) {
         content = "[" + msg.channel + "/" + msg.sender + "] " + text_in;
     }
-    messages.push_back(agent::Message{.role = "user", .content = content});
+    {
+        // 1.135: inbound channel media. Images become real image input (multimodal parts); other files are saved and
+        // named in the text so tools (read/pdf/exec) can open them.
+        agent::Message um{.role = "user", .content = content};
+        nlohmann::json parts = nlohmann::json::array();
+        std::string notes;
+        for (auto& ref : msg.media) {
+            if (!ref.is_object() || ref.value("kind", std::string("audio")) == "audio") continue;
+            if (ref.contains("dataUrl")) parts.push_back({{"type", "image_url"}, {"image_url", {{"url", ref["dataUrl"]}}}});
+            if (ref.contains("path")) notes += "\n[attachment: " + ref["path"].get<std::string>() + " (" + ref.value("mime", std::string("?")) + ", " + std::to_string(ref.value("bytes", 0)) + " bytes)]";
+            else if (ref.contains("error")) notes += "\n[attachment unavailable: " + ref.value("filename", std::string("file")) + ": " + ref["error"].get<std::string>() + "]";
+        }
+        um.content += notes;
+        if (!parts.empty()) { parts.insert(parts.begin(), {{"type", "text"}, {"text", um.content}}); um.multimodal_parts = parts; }
+        messages.push_back(std::move(um));
+    }
     {
         auto pol = context::CompactionFromConfig(deps_.config.raw);
         if (context::NeedsCompaction(pol, messages)) {
@@ -3142,9 +3160,10 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
         const std::string channel = params.value("channel", params.value("to_channel", ""));
         const std::string text = params.value("text", params.value("message", ""));
         const std::string chat_id = params.value("chat_id", params.value("to", ""));
-        if (method == "send" && (params.value("to", std::string()).empty() || channel.empty() || text.empty()))
-            return err("invalid params: send requires to, channel and message");
-        if (channel.empty() || text.empty()) {
+        const bool has_media = params.contains("media");
+        if (method == "send" && (params.value("to", std::string()).empty() || channel.empty() || (text.empty() && !has_media)))
+            return err("invalid params: send requires to, channel and message (or media)");
+        if (channel.empty() || (text.empty() && !has_media)) {
             // fall through if not an outbound send shape
         } else {
             auto* adapter = deps_.adapters.Get(channel);

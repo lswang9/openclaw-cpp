@@ -5,6 +5,8 @@ set -euo pipefail
 _reap(){ kill $(jobs -p) 2>/dev/null || true; }
 trap '_reap; exit 143' INT TERM HUP
 export OPENCLAW_KEYCHAIN="${OPENCLAW_KEYCHAIN:-off}"  # deterministic: no host Secret Service in smoke
+# Offline only: never let a host provider key reach a live LLM from the test suite (1.135).
+unset DEEPSEEK_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY OPENROUTER_API_KEY XAI_API_KEY MISTRAL_API_KEY GROQ_API_KEY
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${OPENCLAW_BIN:-$ROOT/build/build/Release/openclaw-cpp}"
 PORT="${OPENCLAW_SMOKE_PORT:-18796}"
@@ -273,7 +275,7 @@ CSRF=$(awk '$6=="oc_csrf"{print $7}' "$CJ")
 [[ -n "$CSRF" ]] || fail2 "csrf cookie"
 [[ $(code -b "$CJ" "$U2/pairing") == 200 ]] || fail2 "/pairing with cookie"
 [[ $(code -b "$CJ" "$U2/board") == 200 ]] || fail2 "/board with cookie"
-curl -sf -b "$CJ" "$U2/pairing" | grep -q 'X-CSRF-Token' || fail2 "csrf shim injected"
+PG=$(curl -sf -b "$CJ" "$U2/pairing"); [[ "$PG" == *X-CSRF-Token* ]] || fail2 "csrf shim injected"  # no pipe: grep -q + pipefail SIGPIPE flake
 curl -sf -b "$CJ" "$U2/v1/whoami" | grep -q operator || fail2 "whoami operator"
 echo "[smoke] csrf: cookie POST without/with X-CSRF-Token"
 [[ $(code -b "$CJ" -X POST "$U2/v1/rpc" -H 'Content-Type: application/json' -d '{"method":"pairing.link.list","params":{}}') == 403 ]] || fail2 "cookie POST without csrf must 403"
@@ -360,6 +362,7 @@ OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-sqlite-sessions.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-ext-live.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-view-image.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-core-tools.sh"
+OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-telegram-media.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-rpc-groups.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-rpc-local.sh"
 OPENCLAW_BIN="$BIN" bash "$ROOT/scripts/e2e-config-schema.sh"

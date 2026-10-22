@@ -137,7 +137,7 @@ provider factory. Some raw-config consumers still read raw values.
 - **iMessage:** bridge inbound.
 - **Generic:** webhook, HTTP, WS, CLI.
 
-**Telegram (1.126, real):** getUpdates long polling (deleteWebhook first, offset persisted across restarts, backoff, 409 conflict logged) or webhook inbound with secret header; replies chunked at 4096 chars, group replies use `reply_parameters`, forum topics keep `message_thread_id`. Offline e2e: `scripts/e2e-telegram.sh`. Not yet: media send (except voice), inline keyboards/callback actions, reactions, native commands menu.
+**Telegram (1.126, real):** getUpdates long polling (deleteWebhook first, offset persisted across restarts, backoff, 409 conflict logged) or webhook inbound with secret header; replies chunked at 4096 chars, group replies use `reply_parameters`, forum topics keep `message_thread_id`. Offline e2e: `scripts/e2e-telegram.sh`. **1.135:** outbound media (sendPhoto/Animation/Video/Voice/Audio/Document; local files multipart, URLs by reference; `MEDIA:` reply directives), inline keyboards from `buttons` (message tool + ask_user options), `callback_query` → answerCallbackQuery + user turn, inbound photo/document/video/animation/sticker downloaded via getFile (images reach the model as image input, other files as attachment notes). Offline e2e: `scripts/e2e-telegram-media.sh`. Not yet: reactions, native commands menu (setMyCommands), message edits/streaming edits.
 
 **Signal, Matrix, MS Teams, Google Chat, Mattermost (1.129 text transports; 1.132 live listeners + inbound auth):** offline e2e `scripts/e2e-ext-channels.sh` and `scripts/e2e-ext-live.sh` against `scripts/fake_chatops.py`.
 - Signal: signal-cli REST `POST /v2/send` (DM + `group.<id>`); inbound receive envelopes are pushed to `/api/channels/signal/inbound`. 1.132: polls `/v1/receive/{number}` (signal-cli REST normal mode) unless `receiveMode: "webhook"`; webhook pushes need `X-Webhook-Secret` when `webhookSecret` is set. Not yet: the JSON-RPC/SSE daemon transport, attachments, reactions.
@@ -216,7 +216,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 
 ## 9. Largest remaining gaps (priority order)
 
-1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards remain).
+1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards/callbacks in 1.135; reactions, commands menu, edits remain).
 2. ~~Signal, Matrix, MS Teams, Google Chat, Mattermost~~ (text transports in 1.129; live listeners/verification listed in §5).
 3. ~~Native streaming~~ (done in 1.127); Bedrock/Vertex auth remain.
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
@@ -233,3 +233,6 @@ its own data dir, polls with the correct secret on a still-pending link no longe
 still do), and `connect` polls once a second.
 
 - 1.130: the smoke `tools.list` checks piped large RPC output into `grep -q` under `pipefail`; once the tool list grew, the writer occasionally got SIGPIPE (rc 141). They now use a here-string / `grep >/dev/null`.
+
+
+**Test-suite offline guard (1.135):** integration-smoke unsets host provider keys; e2e-voice-inbound pins the mock provider. Before 1.135, scripts that didn't pin `mock` could reach a live provider when the host had a key exported (DeepSeek was set on the dev box). Also fixed in 1.135: plugin/MCP tool names with `.` are sanitized to `[A-Za-z0-9_-]` for providers and mapped back on invoke (DeepSeek rejected `tools[5].function.name`).

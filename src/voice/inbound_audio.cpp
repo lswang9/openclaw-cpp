@@ -7,6 +7,10 @@
 #include <curl/curl.h>
 
 #include <cstdlib>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <openssl/evp.h>
 
 namespace openclaw::voice {
 namespace {
@@ -114,6 +118,54 @@ nlohmann::json TranscribeInboundAudio(const nlohmann::json& cfg, channels::Inbou
         transcript += tr.value("text", std::string());
     }
     if (!transcript.empty()) m.text = "[Audio] Transcript: " + transcript + (m.text.empty() ? "" : "\n\n" + m.text);
+    return info;
+}
+
+nlohmann::json ResolveInboundMedia(const nlohmann::json& cfg, channels::InboundMessage& m, const std::string& media_dir) {
+    nlohmann::json info = nlohmann::json::array();
+    if (!m.media.is_array()) return info;
+    for (auto& ref : m.media) {
+        if (!ref.is_object() || ref.value("kind", std::string("audio")) == "audio") continue;
+        std::string bytes, err;
+        if (ref.contains("telegram_file_id")) {
+            auto base = channels::ChannelCred(cfg, "telegram", "apiBase", "TELEGRAM_API_BASE");
+            base = base.empty() ? "https://api.telegram.org" : Trim(base);
+            const auto tok = channels::ChannelCred(cfg, "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
+            std::string meta;
+            if (tok.empty()) err = "no telegram token";
+            else if (ref.value("size", 0) > 20 * 1024 * 1024) err = "file larger than the Bot API's 20 MB download limit";
+            else if (!Get(base + "/bot" + tok + "/getFile?file_id=" + ref["telegram_file_id"].get<std::string>(), "", meta)) err = "getFile failed";
+            else {
+                try {
+                    auto fp = nlohmann::json::parse(meta)["result"].value("file_path", std::string());
+                    if (fp.empty() || fp.find("..") != std::string::npos) err = "bad file_path";
+                    else if (!Get(base + "/file/bot" + tok + "/" + fp, "", bytes)) err = "telegram download failed";
+                } catch (...) { err = "bad getFile json"; }
+            }
+        } else if (ref.contains("url")) {
+            auto r = net::SafeFetch(ref["url"].get<std::string>(), 20u << 20, Env("OPENCLAW_MEDIA_ALLOW_PRIVATE") == "1");
+            if (!r.ok) err = "fetch: " + r.error; else bytes = r.body;
+        } else continue;
+        nlohmann::json one{{"kind", ref.value("kind", "")}, {"mime", ref.value("mime", "")}};
+        if (!err.empty()) { ref["error"] = err; one["error"] = err; info.push_back(one); continue; }
+        std::error_code ec; std::filesystem::create_directories(media_dir, ec);
+        std::string fname = std::filesystem::path(ref.value("filename", std::string("file"))).filename().string();
+        if (fname.empty() || fname == "." || fname == "..") fname = "file";
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto path = (std::filesystem::path(media_dir) / (std::to_string(ms) + "-" + fname)).string();
+        std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        ref["path"] = path; ref["bytes"] = bytes.size();
+        if (ref.value("kind", "") == "image" && bytes.size() <= 5u * 1024 * 1024) {
+            std::string mime = ref.value("mime", std::string("image/jpeg"));
+            const auto u = [&](size_t i) { return i < bytes.size() ? static_cast<unsigned char>(bytes[i]) : 0u; };
+            if (u(0) == 0x89 && u(1) == 'P') mime = "image/png"; else if (u(0) == 0xFF && u(1) == 0xD8) mime = "image/jpeg";
+            else if (u(0) == 'G' && u(1) == 'I') mime = "image/gif"; else if (u(8) == 'W' && u(9) == 'E') mime = "image/webp";
+            std::string b64(4 * ((bytes.size() + 2) / 3) + 1, '\0');
+            const int n = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(b64.data()), reinterpret_cast<const unsigned char*>(bytes.data()), static_cast<int>(bytes.size()));
+            b64.resize(n); ref["dataUrl"] = "data:" + mime + ";base64," + b64; ref["mime"] = mime;
+        }
+        one["path"] = path; one["bytes"] = bytes.size(); info.push_back(one);
+    }
     return info;
 }
 
