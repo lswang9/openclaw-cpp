@@ -64,7 +64,7 @@ const std::vector<std::pair<const char*, const char*>> kCatalog = {
     {"tlon", "Tlon / Urbit (webhook inbound; outbound POST {apiBase}/dm)"},
     {"twitch", "Twitch chat (EventSub/webhook inbound; Helix send-chat-message outbound)"},
     {"x", "X (Twitter) DMs (Account Activity CRC + inbound; POST DM events outbound)"},
-    {"zalo", "Zalo Bot API (webhook inbound; sendMessage outbound)"},
+    {"zalo", "Zalo Bot API (webhook inbound; sendMessage/sendSticker outbound)"},
     {"zalouser", "Zalo user-bot bridge (webhook inbound; outbound POST {apiBase}/send)"},
 };
 }  // namespace
@@ -112,6 +112,11 @@ json MiscChannelSend(const std::string& id, const json& cfg, const std::string& 
         const auto tok = Cred(cfg, "zalo", "botToken", "ZALO_BOT_TOKEN");
         if (tok.empty()) return nullptr;
         std::string base = Trim(Cred(cfg, "zalo", "apiBase", "ZALO_API_BASE", "https://bot-api.zaloplatforms.com"));
+        // 1.154: stickers via extra.sticker / sticker_id / stickerId (OA Bot API sendSticker).
+        const auto sticker = FirstS(ex, {"sticker", "sticker_id", "stickerId"});
+        if (!sticker.empty()) {
+            return PostJson(base + "/bot" + tok + "/sendSticker", {{"chat_id", to}, {"sticker_id", sticker}}, {});
+        }
         return PostJson(base + "/bot" + tok + "/sendMessage", {{"chat_id", to}, {"text", text}}, {});
     }
     if (id == "sms") {
@@ -257,8 +262,14 @@ json MiscChannelInbound(const std::string& id, const json& cfg, const json& body
         if (!reply.empty() && !to.empty()) { std::lock_guard<std::mutex> l(g_mu); g_line_reply[to] = reply; ex["replyToken"] = reply; }
     } else if (id == "zalo") {
         // Zalo Bot API style: {message:{chat:{id}, from:{id}, text}} or {chat_id, from_id, text}
+        // Also event_name message.sticker.received with message.sticker.
         const auto& msg = body.contains("message") ? body["message"] : body;
-        m.text = FirstS(msg, {"text", "message"});
+        m.text = FirstS(msg, {"text", "message", "caption"});
+        const auto sticker = FirstS(msg, {"sticker", "sticker_id", "stickerId"});
+        const auto ev = FirstS(body, {"event_name", "eventName"});
+        if (m.text.empty() && (!sticker.empty() || ev == "message.sticker.received")) {
+            m.text = std::string("[sticker]") + (sticker.empty() ? "" : " " + sticker);
+        }
         m.sender = msg.contains("from") ? FirstS(msg["from"], {"id", "user_id"}) : FirstS(msg, {"from_id", "sender"});
         to = msg.contains("chat") ? FirstS(msg["chat"], {"id"}) : FirstS(msg, {"chat_id", "to"});
         if (to.empty()) to = m.sender;

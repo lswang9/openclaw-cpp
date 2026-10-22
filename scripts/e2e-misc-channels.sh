@@ -20,7 +20,7 @@ F="http://127.0.0.1:$FP"
 # 16 scripted replies
 python3 - "$T/script.json" <<'PY'
 import json,sys
-ids=["line","zalo","sms","twitch","x","synology-chat","nextcloud-talk","irc","nostr","a2a","buzz","clickclack","raft","reef","tlon","zalouser"]
+ids=["line","zalo","zalo","sms","twitch","x","synology-chat","nextcloud-talk","irc","nostr","a2a","buzz","clickclack","raft","reef","tlon","zalouser"]
 json.dump([{"content":f"{i}-ok"} for i in ids], open(sys.argv[1],"w"))
 PY
 
@@ -74,6 +74,10 @@ has 'e["path"].endswith("/v2/bot/message/push") and e["body"]["to"]=="U1" and e[
 # Zalo
 inb zalo '{"message":{"chat":{"id":"c1"},"from":{"id":"u1"},"text":"yo"}}' >/dev/null
 has '"/botztok/sendMessage" in e["path"] and e["body"]["chat_id"]=="c1" and e["body"]["text"]=="zalo-ok"'
+# 1.154: sticker inbound → [sticker] note; outbound sendSticker via send RPC
+inb zalo '{"event_name":"message.sticker.received","message":{"chat":{"id":"c1"},"from":{"id":"u1"},"sticker":"stk42"}}' >/dev/null
+curl -s "http://127.0.0.1:$PORT/v1/rpc" -H 'Content-Type: application/json'   -d '{"id":3,"method":"send","params":{"channel":"zalo","to":"c1","message":"x","sticker":"stk99"}}' >/dev/null
+has '"/botztok/sendSticker" in e["path"] and e["body"]["chat_id"]=="c1" and e["body"]["sticker_id"]=="stk99"'
 
 # SMS (Twilio)
 inb sms '{"From":"+15551111","To":"+15550001","Body":"ping"}' >/dev/null

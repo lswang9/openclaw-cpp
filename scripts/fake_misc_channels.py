@@ -27,7 +27,7 @@ class H(BaseHTTPRequestHandler):
         if p.endswith("/v2/bot/message/reply") or p.endswith("/v2/bot/message/push"):
             if auth != "Bearer line-tok": return self.send(401, {"message": "Unauthorized"})
             return self.send(200, {"ok": True})
-        if "/bot" in p and p.endswith("/sendMessage"):
+        if "/bot" in p and (p.endswith("/sendMessage") or p.endswith("/sendSticker")):
             return self.send(200, {"ok": True, "result": {"message_id": 1}})
         if p.endswith("/helix/chat/messages"):
             if auth != "Bearer tw-tok" or self.headers.get("Client-Id") != "tw-cid": return self.send(401, {"error": "auth"})
