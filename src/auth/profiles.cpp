@@ -1,4 +1,5 @@
 #include "openclaw/auth/profiles.hpp"
+#include "openclaw/persist/state_db.hpp"
 
 #include "openclaw/auth/keychain.hpp"
 #include "openclaw/util.hpp"
@@ -31,8 +32,8 @@ fs::path DefaultProfilesPath(const std::string& agent_id) {
 ProfileStore::ProfileStore(fs::path path) : path_(std::move(path)) {}
 
 nlohmann::json ProfileStore::Load() const {
-    std::ifstream in(path_);
-    auto j = in ? nlohmann::json::parse(in, nullptr, false) : nlohmann::json();
+    auto text = persist::StateRead(path_);
+    auto j = text ? nlohmann::json::parse(*text, nullptr, false) : nlohmann::json();
     if (!j.is_object()) j = nlohmann::json::object();
     if (!j.contains("profiles") || !j["profiles"].is_object()) j["profiles"] = nlohmann::json::object();
     j["version"] = 1;
@@ -40,17 +41,12 @@ nlohmann::json ProfileStore::Load() const {
 }
 
 void ProfileStore::Save(const nlohmann::json& doc) const {
-    std::error_code ec;
-    fs::create_directories(path_.parent_path(), ec);
-    const auto tmp = path_.string() + ".tmp";
-    {
-        mode_t old = ::umask(077);
-        std::ofstream o(tmp, std::ios::trunc);
-        o << doc.dump(2) << "\n";
-        ::umask(old);
+    persist::StateWrite(path_, doc.dump(2) + "\n");
+    if (!persist::StateDbEnabled()) {
+        std::error_code ec;
+        ::chmod(path_.c_str(), 0600);
+        fs::permissions(path_, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
     }
-    ::chmod(tmp.c_str(), 0600);
-    fs::rename(tmp, path_, ec);
 }
 
 bool ProfileStore::Upsert(const std::string& id, const nlohmann::json& cred) {

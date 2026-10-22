@@ -1,4 +1,5 @@
 #include "openclaw/canvas/a2ui.hpp"
+#include "openclaw/persist/state_db.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -184,17 +185,15 @@ std::string BuildTextJsonl(const std::string& text, const std::string& sid) {
 }
 
 Host::Host(fs::path file) : file_(std::move(file)) {
-    std::ifstream f(file_);
-    try { if (f) state_ = J::parse(f); } catch (...) {}
+    auto text = persist::StateRead(file_);
+    try { if (text) state_ = J::parse(*text); } catch (...) {}
     if (!state_.is_object()) state_ = J::object();
     if (!state_.contains("surfaces")) state_["surfaces"] = J::object();
     if (!state_.contains("rev")) state_["rev"] = 0;
 }
 
 void Host::Save() const {
-    std::error_code ec;
-    fs::create_directories(file_.parent_path(), ec);
-    std::ofstream(file_, std::ios::trunc) << state_.dump();
+    persist::StateWrite(file_, state_.dump());
 }
 
 nlohmann::json Host::Apply(const std::vector<J>& msgs) {

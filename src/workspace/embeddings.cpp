@@ -11,6 +11,7 @@
 #include <sqlite3.h>
 #include <cstring>
 #include "openclaw/workspace/embeddings.hpp"
+#include "openclaw/persist/state_db.hpp"
 #include "openclaw/workspace/workspace.hpp"
 
 #include <curl/curl.h>
@@ -442,7 +443,11 @@ void CosineDistanceFn(sqlite3_context* ctx, int, sqlite3_value** argv) {
 }
 }  // namespace
 
-VectorIndex::VectorIndex(fs::path file) : file_(std::move(file)) { sqlite_ = file_.extension() == ".sqlite"; }
+VectorIndex::VectorIndex(fs::path file) : file_(std::move(file)) {
+    // 1.145: when gateway state is SQLite and a legacy .json path was passed, use .sqlite instead (and import).
+    if (persist::StateDbEnabled() && file_.extension() == ".json") file_.replace_extension(".sqlite");
+    sqlite_ = file_.extension() == ".sqlite";
+}
 VectorIndex::~VectorIndex() { if (db_) sqlite3_close(static_cast<sqlite3*>(db_)); }
 
 bool VectorIndex::OpenSqliteLocked() {

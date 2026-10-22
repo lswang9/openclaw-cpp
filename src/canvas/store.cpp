@@ -1,4 +1,5 @@
 #include "openclaw/canvas/store.hpp"
+#include "openclaw/persist/state_db.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -56,13 +57,13 @@ std::filesystem::path Store::DocPath(const std::string& id) const {
 
 void Store::LoadIndex() {
     auto p = dir_ / "index.json";
-    if (!std::filesystem::exists(p)) {
+    auto text = persist::StateRead(p);
+    if (!text) {
         index_ = {{"version", 1}, {"active_id", ""}, {"docs", nlohmann::json::array()}};
         return;
     }
-    std::ifstream in(p);
     try {
-        in >> index_;
+        index_ = nlohmann::json::parse(*text);
     } catch (...) {
         index_ = {{"version", 1}, {"active_id", ""}, {"docs", nlohmann::json::array()}};
     }
@@ -72,18 +73,16 @@ void Store::LoadIndex() {
 }
 
 void Store::SaveIndex() const {
-    std::ofstream out(dir_ / "index.json");
-    out << index_.dump(2);
+    persist::StateWrite(dir_ / "index.json", index_.dump(2));
 }
 
 void Store::LoadEvents() {
     events_.clear();
     auto p = dir_ / "events.json";
-    if (!std::filesystem::exists(p)) return;
-    std::ifstream in(p);
+    auto text = persist::StateRead(p);
+    if (!text) return;
     try {
-        nlohmann::json j;
-        in >> j;
+        nlohmann::json j = nlohmann::json::parse(*text);
         if (j.is_array()) {
             for (auto& e : j) events_.push_back(std::move(e));
         }
@@ -95,8 +94,7 @@ void Store::LoadEvents() {
 void Store::SaveEvents() const {
     nlohmann::json arr = nlohmann::json::array();
     for (const auto& e : events_) arr.push_back(e);
-    std::ofstream out(dir_ / "events.json");
-    out << arr.dump(2);
+    persist::StateWrite(dir_ / "events.json", arr.dump(2));
 }
 
 std::string Store::NextId() { return "canvas-" + std::to_string(seq_++); }
@@ -120,9 +118,8 @@ const nlohmann::json* Store::Find(const std::string& id) const {
 void Store::PersistDoc(const nlohmann::json& doc) const {
     auto id = StrField(doc, "id");
     if (id.empty()) return;
-    std::ofstream out(DocPath(id));
-    out << doc.dump(2);
-    // Also write .html sibling for easy inspection
+    persist::StateWrite(DocPath(id), doc.dump(2));
+    // Also write .html sibling for easy inspection (always a plain file)
     if (doc.contains("html") && doc["html"].is_string()) {
         std::ofstream html(dir_ / (id + ".html"));
         html << doc["html"].get<std::string>();
@@ -131,12 +128,10 @@ void Store::PersistDoc(const nlohmann::json& doc) const {
 
 nlohmann::json Store::LoadDocFile(const std::string& id) const {
     auto p = DocPath(id);
-    if (!std::filesystem::exists(p)) return nlohmann::json::object();
-    std::ifstream in(p);
+    auto text = persist::StateRead(p);
+    if (!text) return nlohmann::json::object();
     try {
-        nlohmann::json j;
-        in >> j;
-        return j;
+        return nlohmann::json::parse(*text);
     } catch (...) {
         return nlohmann::json::object();
     }

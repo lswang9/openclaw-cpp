@@ -1,4 +1,5 @@
 #include "openclaw/auth/webauthn.hpp"
+#include "openclaw/persist/state_db.hpp"
 
 #include <openssl/core_names.h>
 #include <openssl/evp.h>
@@ -483,18 +484,18 @@ Rp RpFor(const std::string& host) {
 Store::Store(std::filesystem::path path) : path_(std::move(path)) { Load(); }
 void Store::Load() {
     data_ = {{"credentials", nlohmann::json::array()}, {"challenges", nlohmann::json::array()}};
-    std::ifstream f(path_);
-    if (f) try { data_ = nlohmann::json::parse(f); } catch (...) {}
+    if (auto text = persist::StateRead(path_)) try { data_ = nlohmann::json::parse(*text); } catch (...) {}
     if (!data_.contains("credentials")) data_["credentials"] = nlohmann::json::array();
     if (!data_.contains("challenges")) data_["challenges"] = nlohmann::json::array();
 }
 void Store::Save() const {
-    std::error_code ec;
-    std::filesystem::create_directories(path_.parent_path(), ec);
-    auto tmp = path_; tmp += ".tmp";
-    { std::ofstream f(tmp); f << data_.dump(2); }
-    ::chmod(tmp.c_str(), 0600);
-    std::filesystem::rename(tmp, path_, ec);
+    persist::StateWrite(path_, data_.dump(2));
+    if (!persist::StateDbEnabled()) {
+        std::error_code ec;
+        ::chmod(path_.c_str(), 0600);
+        std::filesystem::permissions(path_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace, ec);
+    }
 }
 bool Store::Enabled() const { std::lock_guard l(mu_); return !data_["credentials"].empty(); }
 bool Store::Active(const std::string& id) const {

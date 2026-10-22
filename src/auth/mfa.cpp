@@ -1,4 +1,5 @@
 #include "openclaw/auth/mfa.hpp"
+#include "openclaw/persist/state_db.hpp"
 
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
@@ -29,16 +30,12 @@ std::string Sha256Hex(const std::string& s) {
     return o;
 }
 nlohmann::json LoadJ(const std::string& p) {
-    std::ifstream f(p);
-    if (!f) return nlohmann::json::object();
-    try { return nlohmann::json::parse(f); } catch (...) { return nlohmann::json::object(); }
+    auto text = persist::StateRead(p);
+    if (!text) return nlohmann::json::object();
+    try { return nlohmann::json::parse(*text); } catch (...) { return nlohmann::json::object(); }
 }
 void SaveJ(const std::string& p, const nlohmann::json& j) {
-    fs::create_directories(fs::path(p).parent_path());
-    const auto tmp = p + ".tmp";
-    { std::ofstream f(tmp, std::ios::trunc); f << j.dump(2); }
-    fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
-    fs::rename(tmp, p);
+    persist::StateWrite(p, j.dump(2));
 }
 std::string EnvSecret() { const char* s = std::getenv("OPENCLAW_MFA_TOTP_SECRET"); return s ? s : ""; }
 std::string Normalize(std::string c) {
