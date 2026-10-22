@@ -4130,7 +4130,7 @@ std::vector<std::string> GatewayToolNames() {
             "sessions_search", "subagents", "message", "automations", "reminder", "image", "pdf", "tts", "image_generate", "video_generate",
             "music_generate", "create_goal", "get_goal", "update_goal", "docs_search", "skills_search", "skills_read", "transcripts", "secrets", "presence",
             "web_search", "ask_user", "view_image", "agents_wait", "conversations_list", "conversations_send", "conversations_turn",
-            "computer", "dashboard", "decision_evaluate", "gateway", "github_identity_status", "mobile_ui", "personal_instructions",
+            "computer", "dashboard", "decision_evaluate", "gateway", "github_identity_status", "line_richmenu", "mobile_ui", "personal_instructions",
             "plugins", "portal", "progress_card", "screen", "skill_workshop", "terminal"};
 }
 

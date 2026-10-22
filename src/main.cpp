@@ -119,7 +119,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.167.0-dev";
+constexpr const char* kVersion = "1.168.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -3680,6 +3680,11 @@ int CmdGateway(int argc, char** argv, int argi) {
             {"personal_instructions", "Read or update the requesting user's personal USER.md. Use get first, then set the complete content with expectedHash = the returned hash (null when missing). Limit 4,000 characters; only when the user asks.",
              obj({{"action", {{"type", "string"}, {"enum", {"get", "set"}}}}, {"agentId", {{"type", "string"}}}, {"content", {{"type", "string"}}}, {"expectedHash", {{"type", {"string", "null"}}}}})},
             {"github_identity_status", "Inspect the secret-free effective GitHub account, credential health, Git author, expiry, and scopes for this agent.", obj(J::object())},
+            {"line_richmenu", "Manage LINE Messaging API rich menus: create (definition object or path, optional imagePath/alias/default), validate, list, delete (richMenuId), default (richMenuId), link (userId + richMenuId), unlink (userId). Local limits match LINE (size/aspect, ≤20 areas, action data ≤300, richmenuswitch alias ≤32).",
+             obj({{"action", {{"type", "string"}, {"enum", {"create", "validate", "list", "delete", "default", "link", "unlink"}}}},
+                  {"definition", {{"type", "object"}}}, {"def", {{"type", "object"}}}, {"definitionPath", {{"type", "string"}}},
+                  {"imagePath", {{"type", "string"}}}, {"image", {{"type", "string"}}}, {"alias", {{"type", "string"}}}, {"default", {{"type", "boolean"}}},
+                  {"richMenuId", {{"type", "string"}}}, {"id", {{"type", "string"}}}, {"userId", {{"type", "string"}}}, {"user", {{"type", "string"}}}})},
             {"skill_workshop", "Your learned skills: reusable procedures saved as <name>/SKILL.md that load in future sessions; versioned. Actions: list | view name [file_path] [version] | create name content | patch name old_text new_text [file_path] | write_file name file_path content | remove_file name file_path | archive name (absorbed_into or reason) | restore name [version].",
              obj({{"action", {{"type", "string"}, {"enum", {"list", "view", "create", "patch", "write_file", "remove_file", "archive", "restore"}}}}, {"name", {{"type", "string"}}}, {"file_path", {{"type", "string"}}},
                   {"content", {{"type", "string"}}}, {"old_text", {{"type", "string"}}}, {"new_text", {{"type", "string"}}}, {"reason", {{"type", "string"}}}, {"absorbed_into", {{"type", "string"}}}, {"version", {{"type", "integer"}}}})},

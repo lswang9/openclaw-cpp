@@ -96,6 +96,19 @@ RM delete richmenu-abc >/dev/null && has 'e.get("method")=="DELETE" and e["path"
 python3 -c "import json;d=json.load(open('$T/rm.json'));d['areas'][1]['action']['richMenuAliasId']='x'*40;json.dump(d,open('$T/bad.json','w'))"
 { RM create "$T/bad.json" || true; } | grep -q 'richMenuAliasId' || fail "alias limit not enforced"
 
+# 1.168: line_richmenu agent tool (same API as CLI)
+tl() { curl -s "http://127.0.0.1:$PORT/v1/rpc" -H 'Content-Type: application/json' --data-binary @- <<JSON
+{"jsonrpc":"2.0","id":1,"method":"tools.invoke","params":$1}
+JSON
+}
+tl "{\"name\":\"line_richmenu\",\"args\":{\"action\":\"create\",\"definitionPath\":\"$T/rm.json\",\"imagePath\":\"$T/rm.png\",\"alias\":\"page-tool\",\"default\":true}}" | grep -q '"richMenuId"' || fail "line_richmenu create tool"
+has 'e["path"].endswith("/v2/bot/richmenu/alias") and e["body"].get("richMenuAliasId")=="page-tool"'
+tl '{"name":"line_richmenu","args":{"action":"list"}}' | grep -q '"name": "main"' || fail "line_richmenu list tool"
+tl '{"name":"line_richmenu","args":{"action":"link","userId":"U2","richMenuId":"richmenu-abc"}}' >/dev/null
+has 'e["path"].endswith("/v2/bot/user/U2/richmenu/richmenu-abc")'
+tl '{"name":"line_richmenu","args":{"action":"unlink","userId":"U2"}}' >/dev/null
+has 'e.get("method")=="DELETE" and e["path"].endswith("/v2/bot/user/U2/richmenu")'
+
 # Zalo
 inb zalo '{"message":{"chat":{"id":"c1"},"from":{"id":"u1"},"text":"yo"}}' >/dev/null
 has '"/botztok/sendMessage" in e["path"] and e["body"]["chat_id"]=="c1" and e["body"]["text"]=="zalo-ok"'

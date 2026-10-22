@@ -4,6 +4,7 @@
 #include "openclaw/config/config.hpp"
 #include "openclaw/gateway/node_hub.hpp"
 #include "openclaw/gateway/subsystems.hpp"
+#include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/provider/router.hpp"
 
 #include <openssl/sha.h>
@@ -574,13 +575,37 @@ std::string SkillWorkshopTool(const json& a, const std::string& agent) {
     }
     return Err("Unknown action \"" + action + "\". Use list, view, create, patch, write_file, remove_file, archive, or restore.");
 }
+
+// ---------------------------------------------------------------- line_richmenu (1.168: agent tool wrapping LineRichMenu CLI)
+std::string LineRichMenuTool(const json& a, const json& cfg) {
+    json op = a.is_object() ? a : json::object();
+    if (!op.contains("action") || !op["action"].is_string() || op["action"].get<std::string>().empty())
+        return Err("action required: create|validate|list|delete|default|link|unlink");
+    if (!op.contains("definition") && op.contains("def")) op["definition"] = op["def"];
+    if (!op.contains("richMenuId") && op.contains("id")) op["richMenuId"] = op["id"];
+    if (!op.contains("userId") && op.contains("user")) op["userId"] = op["user"];
+    if (!op.contains("image") && op.contains("imagePath")) op["image"] = op["imagePath"];
+    // Load definition from a workspace path when the agent passes definitionPath (or a string definition).
+    std::string def_path = S(op, "definitionPath");
+    if (def_path.empty() && op.contains("definition") && op["definition"].is_string()) def_path = op["definition"].get<std::string>();
+    if (!def_path.empty()) {
+        auto body = ReadFile(def_path);
+        if (body.empty()) return Err("cannot read definitionPath: " + def_path);
+        auto j = json::parse(body, nullptr, false);
+        if (!j.is_object()) return Err("definitionPath must be a JSON object: " + def_path);
+        op["definition"] = j;
+    }
+    auto r = channels::LineRichMenu(cfg, op);
+    return r.dump();
+}
+
 }  // namespace
 
 std::string WorkshopSkillsDir(const std::string& agent) { return (agent::AgentsRoot() / (agent.empty() ? "main" : agent) / "agent" / "workshop-skills").string(); }
 void SetModelRouter(provider::Router* router) { g_router.store(router); }
 
 std::vector<std::string> CoreGatewayToolNames() {
-    return {"computer", "dashboard", "decision_evaluate", "gateway", "github_identity_status", "mobile_ui", "personal_instructions",
+    return {"computer", "dashboard", "decision_evaluate", "gateway", "github_identity_status", "line_richmenu", "mobile_ui", "personal_instructions",
             "plugins", "portal", "progress_card", "screen", "skill_workshop", "terminal"};
 }
 
@@ -598,6 +623,7 @@ bool CoreGatewayTool(const std::string& name, const json& a, const std::string& 
     else if (name == "personal_instructions") *out = PersonalInstructionsTool(a, agent);
     else if (name == "github_identity_status") *out = GithubIdentityTool(agent);
     else if (name == "skill_workshop") *out = SkillWorkshopTool(a, agent);
+    else if (name == "line_richmenu") *out = LineRichMenuTool(a, cfg);
     else return false;
     return true;
 }
