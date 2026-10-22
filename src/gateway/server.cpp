@@ -5,6 +5,7 @@
 #include "openclaw/auth/oidc.hpp"
 #include "openclaw/auth/mfa.hpp"
 #include "openclaw/gateway/server.hpp"
+#include "openclaw/gateway/core_tools.hpp"
 #include "openclaw/config/schema.hpp"
 #include "openclaw/gateway/subsystems.hpp"
 #include "openclaw/gateway/conversations.hpp"
@@ -62,7 +63,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.133.0-dev";
+constexpr const char* kVersion = "1.134.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -305,6 +306,7 @@ Server::Server(ServerOptions opts, ServerDeps deps) : opts_(std::move(opts)), de
         Emit("chat", {{"outbound", true}, {"channel", ch}, {"chat_id", to}, {"via", "conversations"}});
         return r;
     });
+    SetModelRouter(deps_.router);
     SetGatewayRpc([this](const std::string& m, const nlohmann::json& p) { return DispatchRpc({{"type", "req"}, {"id", "tool"}, {"method", m}, {"params", p}}); });
     std::error_code ec;
     cfg_mtime_ = std::filesystem::last_write_time(config::DefaultPath(), ec);

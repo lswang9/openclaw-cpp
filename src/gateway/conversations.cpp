@@ -1,4 +1,5 @@
 #include "openclaw/gateway/conversations.hpp"
+#include "openclaw/gateway/core_tools.hpp"
 
 #include <curl/curl.h>
 #include <openssl/evp.h>
@@ -397,7 +398,9 @@ std::string AskUser(const json& a, const std::string& agent, const std::string& 
 void SetPluginWebSearch(std::function<json(const std::string&, const json&)> fn) { g_plugin_search = std::move(fn); }
 
 std::vector<std::string> ExtraGatewayToolNames() {
-    return {"web_search", "ask_user", "view_image", "agents_wait", "conversations_list", "conversations_send", "conversations_turn"};
+    std::vector<std::string> v{"web_search", "ask_user", "view_image", "agents_wait", "conversations_list", "conversations_send", "conversations_turn"};
+    for (auto& n : CoreGatewayToolNames()) v.push_back(n);
+    return v;
 }
 
 bool ExtraGatewayTool(const std::string& name, const json& a, const std::string& agent, const std::string& session_key, const json& cfg,
@@ -411,6 +414,6 @@ bool ExtraGatewayTool(const std::string& name, const json& a, const std::string&
     if (name == "conversations_send") return rpc("conversations.send", {{"conversationRef", a.value("conversationRef", std::string())}, {"message", a.value("message", std::string())}});
     if (name == "conversations_turn")
         return rpc("conversations.turn", {{"conversationRef", a.value("conversationRef", std::string())}, {"message", a.value("message", std::string())}, {"timeoutSeconds", a.value("timeoutSeconds", 60)}});
-    return false;
+    return CoreGatewayTool(name, a, agent, session_key, cfg, out);
 }
 }  // namespace openclaw::gateway

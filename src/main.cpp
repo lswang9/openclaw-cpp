@@ -26,6 +26,7 @@
 #include "openclaw/channels/adapter.hpp"
 #include "openclaw/config/config.hpp"
 #include "openclaw/cron/scheduler.hpp"
+#include "openclaw/gateway/core_tools.hpp"
 #include "openclaw/gateway/methods.hpp"
 #include "openclaw/gateway/server.hpp"
 #include "openclaw/gateway/subsystems.hpp"
@@ -110,7 +111,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.133.0-dev";
+constexpr const char* kVersion = "1.134.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -152,6 +153,7 @@ openclaw::skills::Library LoadSkills() {
         {ws / "skills", "workspace"},
         {home / ".openclaw" / "skills", "managed"},
         {home / ".openclaw-cpp" / "skills", "managed"},
+        {fs::path(openclaw::gateway::WorkshopSkillsDir("main")), "workshop"},
         {RepoRoot() / "skills" / "examples", "bundled"},
     };
     std::string extra = openclaw::EnvOr("OPENCLAW_SKILLS_DIR", "");
@@ -2985,7 +2987,11 @@ int CmdNodeRun(int argc, char** argv) {
         }
         return true;
     };
-    const std::vector<std::string> commands{"ping", "worker.launch.v1", "worker.status.v1", "worker.cancel.v1"};
+    std::vector<std::string> commands{"ping", "worker.launch.v1", "worker.status.v1", "worker.cancel.v1"};
+    // Test fixture: OPENCLAW_NODE_SIMULATE_UI=1 declares computer.act / mobile.ui.* with canned, deterministic answers
+    // (no real input injection) so the gateway's computer / mobile_ui tools can be exercised offline.
+    const bool simulate_ui = openclaw::EnvOr("OPENCLAW_NODE_SIMULATE_UI", "") == "1";
+    if (simulate_ui) for (auto c : {"computer.act", "mobile.ui.observe", "mobile.ui.act"}) commands.push_back(c);
     send({{"type", "req"}, {"id", "connect"}, {"method", "connect"},
           {"params", {{"role", "node"}, {"client", {{"id", node_id}, {"displayName", name}, {"platform", "linux"}, {"version", "openclaw-cpp"}}},
                       {"caps", {"worker"}}, {"commands", commands}}}});
@@ -3001,6 +3007,19 @@ int CmdNodeRun(int argc, char** argv) {
         nlohmann::json p = nlohmann::json::object();
         try { p = nlohmann::json::parse(req.value("paramsJSON", std::string("{}"))); } catch (...) { throw std::runtime_error("INVALID_REQUEST: paramsJSON malformed JSON"); }
         if (cmd == "ping") return {{"pong", true}, {"nodeId", node_id}};
+        if (simulate_ui && cmd == "computer.act") {
+            const auto act = p.value("action", "");
+            if (act == "screenshot")  // 1x1 PNG
+                return {{"action", act}, {"mimeType", "image/png"}, {"width", 1}, {"height", 1},
+                        {"image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}};
+            return {{"action", act}, {"ok", true}, {"echo", p}};
+        }
+        if (simulate_ui && cmd == "mobile.ui.observe")
+            return {{"snapshotId", "snap-1"}, {"nodes", {{{"ref", "n1"}, {"role", "button"}, {"text", "OK"}, {"actions", {"activate"}}}}}};
+        if (simulate_ui && cmd == "mobile.ui.act") {
+            if (p.value("snapshotId", "") != "snap-1") throw std::runtime_error("STALE_SNAPSHOT: observe again");
+            return {{"ok", true}, {"performed", p["action"]}};
+        }
         if (cmd == "worker.launch.v1") {
             if (p.value("environmentSession", 0) != 1) throw std::runtime_error("INVALID_REQUEST: node worker environment lifetime support required");
             const auto launch = p.value("launchId", "");
@@ -3456,6 +3475,43 @@ int CmdGateway(int argc, char** argv, int argi) {
              obj({{"conversationRef", {{"type", "string"}}}, {"message", {{"type", "string"}}}})},
             {"conversations_turn", "Send through a conversationRef and wait for the correlated inbound reply (timeoutSeconds 1-300).",
              obj({{"conversationRef", {{"type", "string"}}}, {"message", {{"type", "string"}}}, {"timeoutSeconds", {{"type", "integer"}}}})},
+            // 1.134: remaining upstream core tools (src/gateway/core_tools.cpp)
+            {"gateway", "Read gateway config/schema. update.run: owner request or operator schedule; automatic restart + completion notice. Never via shell.",
+             obj({{"action", {{"type", "string"}, {"enum", {"config.get", "config.schema.lookup", "update.run"}}}}, {"path", {{"type", "string"}}}, {"note", {{"type", "string"}}}})},
+            {"plugins", "Inspect, search, install from the official catalog or ClawHub, enable, disable, uninstall, or reload plugins.",
+             obj({{"action", {{"type", "string"}, {"enum", {"list", "inspect", "search", "install", "enable", "disable", "uninstall", "reload", "reloadAndResume"}}}}, {"pluginId", {{"type", "string"}}},
+                  {"query", {{"type", "string"}}}, {"source", {{"type", "string"}, {"enum", {"official", "clawhub"}}}}, {"packageName", {{"type", "string"}}}, {"version", {{"type", "string"}}},
+                  {"reviewToken", {{"type", "string"}}}, {"acknowledgeInstallPolicyWarning", {{"type", "boolean"}}}})},
+            {"progress_card", "Maintain this session's progress card: the single durable status surface shown next to the session. Create one only for substantial work with at least two sequential steps; send markdown and/or the full plan (steps with title + status pending|in_progress|completed|cancelled|blocked).",
+             obj({{"markdown", {{"type", "string"}}}, {"plan", {{"type", "array"}, {"items", {{"type", "object"}}}}}})},
+            {"screen", "Drive the requesting user's Control UI: split/close/focus panes, sidebar, terminal/browser/desktop/portal panels, navigate.",
+             obj({{"action", {{"type", "string"}, {"enum", {"split_right", "split_down", "close_pane", "focus", "sidebar_show", "sidebar_hide", "terminal_show", "terminal_hide", "browser_show", "browser_hide",
+                                                         "desktop_show", "desktop_hide", "portal_show", "portal_hide", "navigate"}}}}, {"sessionKey", {{"type", "string"}}}, {"environmentId", {{"type", "string"}}},
+                  {"portalId", {{"type", "string"}}}, {"dock", {{"type", "string"}, {"enum", {"bottom", "right"}}}}})},
+            {"terminal", "Manage terminals the operator opened from this chat's Control UI panel: list, read (buffer snapshot), resize, close, input (needs a full exec policy).",
+             obj({{"action", {{"type", "string"}, {"enum", {"read", "list", "resize", "close", "input"}}}}, {"sessionId", {{"type", "string"}}}, {"data", {{"type", "string"}}}, {"cols", {{"type", "integer"}}}, {"rows", {{"type", "integer"}}}})},
+            {"portal", "Allocate, list or close portal routes for a running web app (open {port, title?, description?, path?}).",
+             obj({{"action", {{"type", "string"}, {"enum", {"open", "list", "close"}}}}, {"port", {{"type", "integer"}}}, {"id", {{"type", "string"}}}, {"title", {{"type", "string"}}},
+                  {"description", {{"type", "string"}}}, {"path", {{"type", "string"}}}, {"environmentId", {{"type", "string"}}}})},
+            {"dashboard", "Read and arrange this session dashboard. Actions: read; tab_create/tab_update/tab_delete/tabs_reorder; widget_put (plugin widgets: pluginKind <pluginId>:<name>, props <=8KB)/widget_move/widget_resize/widget_remove; focus_tab; set_presentation; set_default_presentation.",
+             obj({{"action", {{"type", "string"}, {"enum", {"read", "tab_create", "tab_update", "tab_delete", "tabs_reorder", "widget_put", "widget_move", "widget_resize", "widget_remove", "focus_tab", "set_presentation", "set_default_presentation"}}}},
+                  {"tabId", {{"type", "string"}}}, {"title", {{"type", "string"}}}, {"presentation", {{"type", "string"}, {"enum", {"split", "expanded"}}}}, {"position", {{"type", "integer"}}},
+                  {"tabIds", {{"type", "array"}, {"items", {{"type", "string"}}}}}, {"name", {{"type", "string"}}}, {"after", {{"type", "string"}}}, {"sizeW", {{"type", "integer"}}}, {"sizeH", {{"type", "integer"}}},
+                  {"size", {{"type", "string"}, {"enum", {"sm", "md", "lg", "xl", "full"}}}}, {"pluginKind", {{"type", "string"}}}, {"props", {{"type", "object"}}}})},
+            {"computer", "Computer use on a paired desktop node (computer.act): screenshot, clicks, mouse, drag, scroll, type, key, hold_key, wait. Screenshots return as image input.",
+             obj({{"action", {{"type", "string"}, {"enum", {"screenshot", "left_click", "right_click", "middle_click", "double_click", "triple_click", "mouse_move", "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key", "wait"}}}},
+                  {"coordinate", {{"type", "array"}, {"items", {{"type", "number"}}}}}, {"text", {{"type", "string"}}}, {"scroll_direction", {{"type", "string"}}}, {"scroll_amount", {{"type", "integer"}}},
+                  {"duration", {{"type", "number"}}}, {"node", {{"type", "string"}}}})},
+            {"mobile_ui", "Observe or act on a paired Android device's UI (mobile.ui.observe / mobile.ui.act). act needs the snapshotId of the latest observation and exactly one uiAction {type: activate|set_text|scroll|tap|swipe|global_action|wait, ...}.",
+             obj({{"action", {{"type", "string"}, {"enum", {"observe", "act"}}}}, {"snapshotId", {{"type", "string"}}}, {"uiAction", {{"type", "object"}}}, {"node", {{"type", "string"}}}, {"timeoutMs", {{"type", "integer"}}}})},
+            {"decision_evaluate", "Evaluate only supplied state with this agent's decision model (agents.defaults.decisionModel). questions: {id: {type: boolean|choice|score, instructions?, criteria}}. Results never authorize actions.",
+             obj({{"state", J::object()}, {"questions", {{"type", "object"}}}})},
+            {"personal_instructions", "Read or update the requesting user's personal USER.md. Use get first, then set the complete content with expectedHash = the returned hash (null when missing). Limit 4,000 characters; only when the user asks.",
+             obj({{"action", {{"type", "string"}, {"enum", {"get", "set"}}}}, {"agentId", {{"type", "string"}}}, {"content", {{"type", "string"}}}, {"expectedHash", {{"type", {"string", "null"}}}}})},
+            {"github_identity_status", "Inspect the secret-free effective GitHub account, credential health, Git author, expiry, and scopes for this agent.", obj(J::object())},
+            {"skill_workshop", "Your learned skills: reusable procedures saved as <name>/SKILL.md that load in future sessions; versioned. Actions: list | view name [file_path] [version] | create name content | patch name old_text new_text [file_path] | write_file name file_path content | remove_file name file_path | archive name (absorbed_into or reason) | restore name [version].",
+             obj({{"action", {{"type", "string"}, {"enum", {"list", "view", "create", "patch", "write_file", "remove_file", "archive", "restore"}}}}, {"name", {{"type", "string"}}}, {"file_path", {{"type", "string"}}},
+                  {"content", {{"type", "string"}}}, {"old_text", {{"type", "string"}}}, {"new_text", {{"type", "string"}}}, {"reason", {{"type", "string"}}}, {"absorbed_into", {{"type", "string"}}}, {"version", {{"type", "integer"}}}})},
         };
         for (auto& nm : gateway::GatewayToolNames()) {
             bool have = false; for (auto& [x, d2, s2] : gw_tools) have = have || x == nm;
