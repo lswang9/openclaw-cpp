@@ -133,7 +133,7 @@ provider factory. Some raw-config consumers still read raw values.
 - **Discord:** webhook, Gateway WS, slash commands, voice/DAVE.
 - **Slack:** Events API, Socket Mode, interactive.
 - **Feishu:** webhook and long-connection WS.
-- **WhatsApp:** Cloud API in/out. WhatsApp-Web (Baileys-equivalent) is partial; see `docs/whatsapp-web-gap.md`.
+- **WhatsApp:** Cloud API in/out. WhatsApp-Web (Baileys-equivalent) is partial; see `docs/whatsapp-web-gap.md`. 1.156 adds auth-state persistence (creds + pre-keys + sessions in the state store), XEdDSA signing, and the pre-key upload IQ/count policy (offline only; no live login).
 - **iMessage:** bridge inbound.
 - **Generic:** webhook, HTTP, WS, CLI.
 

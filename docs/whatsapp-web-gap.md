@@ -1,5 +1,7 @@
 # WhatsApp Web (Baileys-equivalent) — gap assessment (1.61)
 
+> Refreshed 1.156: rows below updated where later slices landed; WABinary v3 and cert-chain verify are done (self-test fixtures). Next gaps: ClientPayload + ADV pair-success, live Noise WS login, SenderKeys, app-state.
+
 Upstream OpenClaw's `whatsapp` channel logs in as a **linked device** through Baileys (WhatsApp Web multi-device
 protocol): QR or pairing-code login, persistent auth state, DMs and groups, media, reactions, read receipts.
 openclaw-cpp has only the **WhatsApp Cloud API** webhook/outbound subset (`src/channels/whatsapp.cpp`), which needs a
@@ -15,12 +17,12 @@ Meta Business number. That is a different product.
 | ClientPayload | Protobuf: `UserAgent`, `WebInfo`, `DevicePairingRegistrationData` (reg id, signed pre-key, identity) for the first login, `username`/`device` afterwards | **missing**. Needs the WAProto schema (≈ 3k lines of .proto); we have only a varint/len-delimited codec. |
 | WABinary nodes | XMPP-like `<iq>`/`<message>`/`<receipt>` trees, token dictionary v3 (single- and double-byte), JID encodings, nibble/hex packing | **partial (1.64+)**: `EncodeBinaryNode` / `DecodeBinaryNode` without the token dictionary (string tags only). Dictionary v3 still missing. |
 | Pairing | `pair-device` refs → QR `ref,noisePub,identityPub,advSecret`; `pair-success` → verify ADV HMAC, sign the device identity, reply `pair-device-sign` | QR payload format **real**. ADV signature/verification **missing**. |
-| Signal protocol | X3DH session setup with pre-key bundles (`encrypt` iq), Double Ratchet (`pkmsg`/`msg`), group SenderKeys (`skmsg`), XEdDSA signatures | **stub (1.64+)**: `GenerateSignalIdentity`, `SignalX3dhInitiate`, `SignalRatchetEncrypt/Decrypt` — HKDF-based stand-ins, **not** interoperable with WhatsApp. Real Double Ratchet / XEdDSA / SenderKeys still missing. |
-| Pre-key management | Upload 30+ one-time pre-keys, rotate the signed pre-key, `count` iq | **missing** |
+| Signal protocol | X3DH session setup with pre-key bundles (`encrypt` iq), Double Ratchet (`pkmsg`/`msg`), group SenderKeys (`skmsg`), XEdDSA signatures | **offline-real (1.14x–1.156)**: libsignal-shaped X3DH + Double Ratchet (`signal.hpp`), XEdDSA verify + sign (1.156). Not byte-verified against libsignal; SenderKeys still missing. |
+| Pre-key management | Upload 30+ one-time pre-keys, rotate the signed pre-key, `count` iq | **1.156**: `BuildPreKeyUploadNode` (encrypt iq: registration/type/identity/list/skey with XEdDSA-signed SPK), `ParsePreKeyCount`, Baileys MIN 5 / INITIAL 30 policy; CLI `whatsapp-web prekeys`. Signed pre-key rotation and live upload missing. |
 | App state sync | `app-state-sync-key-share`, LTHash mutations (contacts, mute, pin, archive) | **missing**. Not required for messaging. |
 | History sync | Compressed `HistorySyncNotification` blobs | **missing**. Optional. |
 | Media | HKDF("WhatsApp {Image,Video,Audio,Document} Keys") → AES-256-CBC + HMAC-SHA256/10; upload to `mmg.whatsapp.net` with `media_conn` auth | Crypto **real** (round trip, wrong-type MAC rejected). Upload/download hosts **missing**. |
-| Auth persistence | `creds.json` + keys store (sessions, pre-keys, sender keys, app-state keys) | **missing**. The SQLite KV is available to reuse. |
+| Auth persistence | `creds.json` + keys store (sessions, pre-keys, sender keys, app-state keys) | **1.156**: `waweb-creds.json` / `waweb-keys.json` (pre-keys, sessions) through the state store (SQLite when enabled); `whatsapp-web init|show`. Sender keys / app-state keys missing. |
 
 ## Why we stop at primitives now
 

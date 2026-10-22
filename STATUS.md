@@ -1,6 +1,10 @@
 # openclaw-cpp 使用状态（中文）
 
-当前版本：**1.155.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+当前版本：**1.156.0-dev**。这是 OpenClaw **2026.10.5** 的 C++ 重写方向，**不是**上游全功能等价物。细节见 [PARITY.md](PARITY.md)。
+
+## 1.156.0-dev 新增
+
+WhatsApp Web：认证状态持久化（creds/预密钥/会话存入状态库）、XEdDSA 签名、预密钥上传 IQ 与数量策略（离线 e2e：scripts/e2e-waweb-auth.sh）。
 
 ## 1.155.0-dev 新增
 

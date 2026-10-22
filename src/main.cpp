@@ -4,6 +4,7 @@
 #include "openclaw/channels/feishu_frame.hpp"
 #include "openclaw/acp/acpx.hpp"
 #include "openclaw/channels/discord_voice.hpp"
+#include "openclaw/channels/waweb/auth_store.hpp"
 #include "openclaw/channels/waweb/signal.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/auth/mfa.hpp"
@@ -113,7 +114,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.155.0-dev";
+constexpr const char* kVersion = "1.156.0-dev";
 
 std::string JoinArgs(int argc, char** argv, int start) {
     std::ostringstream oss;
@@ -2577,6 +2578,47 @@ int CmdSelfTest() {
         else std::cerr << "PASS discord voice HChaCha20 vector + rtpsize AEAD (GCM, XChaCha) + IP discovery framing + opus encode/decode + RTP ext strip\n";
     }
     {
+        namespace ww = openclaw::channels::waweb;
+        namespace sg = openclaw::channels::waweb::signal;
+        auto dir = std::filesystem::temp_directory_path() / ("oc-waauth-" + std::to_string(getpid()));
+        std::filesystem::create_directories(dir);
+        auto kp = ww::GenerateKeyPair();
+        auto msg = ww::FromString("xeddsa message");
+        auto sig = ww::SignXEdDsa(kp.priv, msg);
+        bool ok = ww::VerifyXEdDsa(kp.pub, msg, sig) && !ww::VerifyXEdDsa(kp.pub, ww::FromString("other"), sig);
+        auto c = ww::InitAuthCreds();
+        ok = ok && ww::VerifyXEdDsa(c.signal.identity.pub, sg::SerializePub(c.signal.signed_prekey.pub), c.signed_prekey_sig);
+        auto node = ww::BuildPreKeyUploadNode(c, 3, "pk1");
+        auto enc = ww::EncodeBinaryNode(node);
+        auto dec = ww::DecodeBinaryNode(enc);
+        ok = ok && dec && dec->tag == "iq" && dec->children.size() == 5 && dec->children[3].children.size() == 3 && c.next_prekey_id == 4;
+        ok = ok && ww::SaveAuthCreds(dir, c);
+        auto l = ww::LoadAuthCreds(dir);
+        ok = ok && l && l->signal.identity.priv == c.signal.identity.priv && l->signal.prekeys.size() == 3 && l->adv_secret == c.adv_secret &&
+             l->signed_prekey_sig == c.signed_prekey_sig && l->next_prekey_id == 4 && l->signal.registration_id == c.signal.registration_id;
+        // peer uses our persisted bundle (signed pre-key signature verified), we decrypt after reload
+        auto peer = sg::NewIdentity(77);
+        sg::PreKeyBundle b = l->signal.Bundle(2); b.signed_prekey_sig = l->signed_prekey_sig;
+        std::string e;
+        auto ps = sg::InitiateOutgoing(peer, b, &e);
+        ok = ok && ps.has_value();
+        if (ps) {
+            auto m = sg::Encrypt(*ps, ww::FromString("persisted hi"));
+            std::optional<sg::Session> mine;
+            auto pt = sg::DecryptPreKey(l->signal, mine, m.body, &e);
+            ok = ok && pt && *pt == ww::FromString("persisted hi") && mine && ww::SaveSession(dir, "peer.0", *mine);
+            auto again = ww::LoadSession(dir, "peer.0");
+            auto m2 = sg::Encrypt(*ps, ww::FromString("second"));
+            auto pt2 = again ? sg::DecryptPreKey(l->signal, again, m2.body, &e) : std::nullopt;
+            ok = ok && pt2 && *pt2 == ww::FromString("second");
+        }
+        ww::BinaryNode cnt; cnt.tag = "iq"; ww::BinaryNode cc; cc.tag = "count"; cc.attrs = {{"value", "3"}}; cnt.children = {cc}; cnt.has_content = true;
+        ok = ok && ww::ParsePreKeyCount(cnt) == 3 && ww::PreKeysToUpload(3) == 30 && ww::PreKeysToUpload(12) == 0;
+        std::filesystem::remove_all(dir);
+        if (!ok) { std::cerr << "FAIL waweb auth store\n"; ++failures; }
+        else std::cerr << "PASS waweb auth store (XEdDSA sign, creds/keys persist, pre-key upload IQ, session resume)\n";
+    }
+    {
         namespace sg = openclaw::channels::waweb::signal;
         namespace ww = openclaw::channels::waweb;
         auto alice = sg::NewIdentity(111), bob = sg::NewIdentity(222);
@@ -4157,6 +4199,42 @@ int main(int argc, char** argv) {
             }
             std::cerr << "usage: voice tts [--voice V] <text> | voice stt <file> [--language L]\n";
             return 2;
+        }
+        if (cmd == "whatsapp-web") {
+            namespace ww = openclaw::channels::waweb;
+            std::string sub = argc > 2 ? argv[2] : "show";
+            std::filesystem::path dir;
+            if (const char* sd = std::getenv("OPENCLAW_STATE_DIR"); sd && *sd) dir = std::filesystem::path(sd) / "whatsapp-web";
+            else dir = std::filesystem::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".openclaw" / "whatsapp-web";
+            int server_count = -1;
+            for (int i = 3; i + 1 < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--dir") dir = argv[++i];
+                else if (a == "--server-count") server_count = std::atoi(argv[++i]);
+            }
+            std::filesystem::create_directories(dir);
+            auto c = ww::LoadAuthCreds(dir);
+            bool created = false;
+            if (!c) { c = ww::InitAuthCreds(); created = true; ww::SaveAuthCreds(dir, *c); }
+            nlohmann::json out{{"created", created}, {"registrationId", c->signal.registration_id},
+                               {"identityKey", ww::Base64(c->signal.identity.pub)}, {"preKeys", c->signal.prekeys.size()},
+                               {"nextPreKeyId", c->next_prekey_id},
+                               {"signedPreKeyValid", ww::VerifyXEdDsa(c->signal.identity.pub, ww::signal::SerializePub(c->signal.signed_prekey.pub), c->signed_prekey_sig)}};
+            if (sub == "prekeys") {
+                int n = server_count >= 0 ? ww::PreKeysToUpload(server_count) : 30;
+                out["upload"] = n;
+                if (n > 0) {
+                    auto node = ww::BuildPreKeyUploadNode(*c, n, "pk-" + std::to_string(c->next_prekey_id));
+                    auto enc = ww::EncodeBinaryNode(node);
+                    static const char* hx = "0123456789abcdef";
+                    std::string h; for (auto b : enc) { h += hx[b >> 4]; h += hx[b & 15]; }
+                    out["iq"] = h;
+                    ww::SaveAuthCreds(dir, *c);
+                    out["preKeys"] = c->signal.prekeys.size(); out["nextPreKeyId"] = c->next_prekey_id;
+                }
+            } else if (sub != "show" && sub != "init") { std::cerr << "usage: whatsapp-web init|show|prekeys [--server-count N] [--dir D]\n"; return 2; }
+            std::cout << out.dump(2) << "\n";
+            return 0;
         }
         if (cmd == "tokenizer") {
             namespace tk = openclaw::tokenizer;
