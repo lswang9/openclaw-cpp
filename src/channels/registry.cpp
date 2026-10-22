@@ -1,3 +1,4 @@
+#include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/channels/registry.hpp"
 
 namespace openclaw::channels {
@@ -35,6 +36,12 @@ Registry MakeDefaultChannels() {
     r.Register({"whatsapp", "WhatsApp Cloud API inbound+outbound (not Baileys)", true});
     r.Register({"imessage", "iMessage bridge inbound", true});
     r.Register({"feishu", "Feishu webhook + long-connection WS inbound+outbound", true});
+    r.Register({"signal", "Signal via signal-cli REST", true});
+    r.Register({"matrix", "Matrix client-server API", true});
+    r.Register({"msteams", "Microsoft Teams Bot Framework", true});
+    r.Register({"googlechat", "Google Chat HTTP app", true});
+    r.Register({"mattermost", "Mattermost REST + outgoing webhooks", true});
+    for (auto& [cid, note] : MiscChannelCatalog()) r.Register({cid, note, true});
     return r;
 }
 

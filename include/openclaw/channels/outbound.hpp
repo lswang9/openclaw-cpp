@@ -3,6 +3,8 @@
 #include "openclaw/config/config.hpp"
 
 #include "openclaw/channels/adapter.hpp"
+#include "openclaw/channels/ext_channels.hpp"
+#include "openclaw/channels/misc_channels.hpp"
 
 #include <mutex>
 #include <string>
@@ -48,7 +50,9 @@ public:
     // Typing indicator: Telegram sendChatAction, Discord POST /channels/{id}/typing; others record only.
     nlohmann::json SendTyping(const std::string& chat_id);
     // Telegram webhook updates (text/caption, voice/audio → auto-transcribed by the gateway); reply via sendMessage.
-    bool SupportsHttpInbound() const override { return id_ == "telegram" || id_ == "signal" || id_ == "matrix" || id_ == "msteams" || id_ == "googlechat" || id_ == "mattermost"; }
+    bool SupportsHttpInbound() const override {
+        return id_ == "telegram" || IsExtChannel(id_) || IsMiscChannel(id_);
+    }
     nlohmann::json HandleHttpInbound(const nlohmann::json& body, const DeliverFn& deliver) override;
     // Streamed TTS → voice note. Telegram sendVoice/sendAudio; Discord voice message (flags 8192, waveform,
     // duration) or plain attachment; Slack files.getUploadURLExternal + completeUploadExternal; Feishu im/v1/files

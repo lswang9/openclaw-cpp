@@ -1,4 +1,5 @@
 #include "openclaw/channels/adapter.hpp"
+#include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/feishu.hpp"
 #include "openclaw/channels/slack.hpp"
@@ -101,6 +102,8 @@ AdapterHub AdapterHub::MakeDefault() {
              {"msteams", "Microsoft Teams Bot Framework: client-credentials token + POST {serviceUrl}/v3/conversations/{id}/activities"},
              {"googlechat", "Google Chat HTTP app: synchronous reply in the event response, or spaces.messages.create with accessToken"},
              {"mattermost", "Mattermost REST POST /api/v4/posts; inbound outgoing-webhook (token-verified)"}})
+        hub.Add(std::make_unique<OutboundRecordAdapter>(cid, note, std::string("/api/channels/") + cid + "/inbound"));
+    for (auto& [cid, note] : MiscChannelCatalog())
         hub.Add(std::make_unique<OutboundRecordAdapter>(cid, note, std::string("/api/channels/") + cid + "/inbound"));
     hub.Add(std::make_unique<DiscordAdapter>());
     hub.Add(std::make_unique<SlackAdapter>());

@@ -147,9 +147,12 @@ provider factory. Some raw-config consumers still read raw values.
 - Mattermost: `POST /api/v4/posts` (thread `root_id`); inbound outgoing webhooks verified by `webhookToken`. 1.132: polls the posts of channels listed in `channels.mattermost.channels` (bot's own posts and system posts ignored). Not yet: the WebSocket event stream (so DMs need the channel id listed), slash commands.
 - All five record a conversationRef, so conversations_* and ask_user work over them. Idle adapters now pick up hot-reloaded config.
 
-**Missing channel extensions (16):**
-- a2a, buzz, clickclack, irc, line, nextcloud-talk, nostr
-- raft, reef, sms, synology-chat, tlon, twitch, x, zalo, zalouser
+**Misc channel extensions (1.138 — text transports for the former 16):**
+`a2a`, `buzz`, `clickclack`, `irc`, `line`, `nextcloud-talk`, `nostr`, `raft`, `reef`, `sms`, `synology-chat`, `tlon`, `twitch`, `x`, `zalo`, `zalouser`.
+Webhook inbound on `/api/channels/<id>/inbound` + HTTP outbound when credentials are set:
+LINE reply/push, Zalo sendMessage, Twilio SMS, Twitch Helix chat, X DM API, Synology incoming webhook, Nextcloud Talk OCS chat, and HTTP bridges for IRC/Nostr/a2a/buzz/clickclack/raft/reef/tlon/zalouser (`apiBase` + optional bearer).
+Offline e2e: `scripts/e2e-misc-channels.sh` against `scripts/fake_misc_channels.py`.
+Not yet: native IRC sockets, Nostr NIP-04 crypto in-process, Twitch IRC, X Account Activity CRC, LINE rich menus/flex, Zalo OA stickers.
 
 **Other extension families with no or only partial C++ counterpart:**
 - memory-lancedb, memory-wiki
@@ -218,7 +221,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 ## 9. Largest remaining gaps (priority order)
 
 1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards/callbacks in 1.135; reactions, commands menu, edits remain).
-2. ~~Signal, Matrix, MS Teams, Google Chat, Mattermost~~ (text transports in 1.129; live listeners/verification listed in §5).
+2. ~~Signal, Matrix, MS Teams, Google Chat, Mattermost~~ (text transports in 1.129; live listeners/verification listed in §5). ~~16 misc channels~~ (1.138 text transports).
 3. ~~Native streaming~~ (done in 1.127); ~~Bedrock/Vertex auth~~ (1.137: AWS SigV4 + `AWS_BEARER_TOKEN_BEDROCK`, Google ADC authorized_user/service_account → Vertex Anthropic rawPredict + Gemini generateContent; offline `scripts/e2e-bedrock-vertex.sh`).
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).
 5. Plugin API: all register* accepted (1.130); still unconsumed: context engine, memory capability, media/speech providers, harness APIs.

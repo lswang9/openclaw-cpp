@@ -11,6 +11,7 @@
 #include "openclaw/gateway/conversations.hpp"
 #include "openclaw/channels/ext_auth.hpp"
 #include "openclaw/channels/ext_channels.hpp"
+#include "openclaw/channels/misc_channels.hpp"
 #include "openclaw/gateway/node_hub.hpp"
 #include "openclaw/util.hpp"
 #include "openclaw/net/safe_fetch.hpp"
@@ -63,7 +64,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.137.0-dev";
+constexpr const char* kVersion = "1.138.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -2323,6 +2324,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                                                  {"status", adapter->Status()}}.dump()));
                 return;
             }
+            adapter->SetEnabled(true);
             const std::string raw_body = BodyOf(req);
             auto cfg_str = [&](const std::string& p, const char* env) {
                 if (const char* e = std::getenv(env); e && *e) return std::string(e);
@@ -2349,7 +2351,7 @@ void Server::HandleHttp(int client_fd, const std::string& req) {
                         return;
                     }
                 }
-            } else if (channels::IsExtChannel(chan_id)) {
+            } else if (channels::IsExtChannel(chan_id) || channels::IsMiscChannel(chan_id)) {
                 const auto q = path_raw.find('?');
                 if (!channels::VerifyExtInbound(chan_id, deps_.config.raw, [&](const std::string& h) { return HeaderValue(req, h); },
                                                 q == std::string::npos ? std::string() : path_raw.substr(q + 1), &why)) {

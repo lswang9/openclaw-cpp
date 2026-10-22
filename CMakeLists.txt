@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(openclaw-cpp VERSION 1.137.0 LANGUAGES C CXX)
+project(openclaw-cpp VERSION 1.138.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -86,6 +86,7 @@ set(OPENCLAW_SOURCES
   src/channels/adapter.cpp
   src/channels/outbound.cpp
   src/channels/ext_channels.cpp
+  src/channels/misc_channels.cpp
   src/channels/ext_auth.cpp
   src/gateway/core_tools.cpp
   src/memory/store.cpp
