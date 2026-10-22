@@ -563,6 +563,64 @@ nlohmann::json OutboundRecordAdapter::MaybeAutoVoice(const std::string& chat_id,
     return nullptr;
 }
 
+nlohmann::json OutboundRecordAdapter::TelegramAction(const std::string& action, const nlohmann::json& p) {
+    const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
+    if (token.empty()) return {{"ok", false}, {"error", "telegram botToken not configured"}};
+    const std::string api = TelegramBase(Config()) + "/bot" + token + "/";
+    auto idv = [](const nlohmann::json& v) -> nlohmann::json {
+        if (v.is_string()) { const auto s = v.get<std::string>(); if (!s.empty() && (std::isdigit((unsigned char)s[0]) || s[0] == '-') && s.find_first_not_of("-0123456789") == std::string::npos) return std::stoll(s); }
+        return v; };
+    nlohmann::json chat = p.contains("chat_id") ? p["chat_id"] : p.contains("to") ? p["to"] : p.value("target", nlohmann::json());
+    nlohmann::json mid = p.contains("message_id") ? p["message_id"] : p.value("messageId", nlohmann::json());
+    if (chat.is_null() || chat == "") return {{"ok", false}, {"error", "to (chat id) is required"}};
+    nlohmann::json body{{"chat_id", chat.is_string() ? chat : nlohmann::json(chat.dump())}};
+    std::string method;
+    const bool need_mid = action != "typing";
+    if (need_mid) { if (mid.is_null() || mid == "") return {{"ok", false}, {"error", "messageId is required"}}; body["message_id"] = idv(mid); }
+    if (action == "react") {
+        method = "setMessageReaction";
+        const std::string emoji = p.value("emoji", p.value("reaction", std::string()));
+        const bool remove = p.value("remove", false) || emoji.empty();
+        body["reaction"] = remove ? nlohmann::json::array() : nlohmann::json::array({{{"type", "emoji"}, {"emoji", emoji}}});
+        if (p.value("big", false)) body["is_big"] = true;
+    } else if (action == "edit") {
+        const std::string text = p.value("message", p.value("text", std::string()));
+        if (p.contains("buttons")) body["reply_markup"] = TelegramInlineKeyboard(p["buttons"]);
+        if (text.empty()) { if (!p.contains("buttons")) return {{"ok", false}, {"error", "message (new text) or buttons required"}}; method = "editMessageReplyMarkup"; }
+        else { method = "editMessageText"; body["text"] = text; }
+    } else if (action == "delete" || action == "unsend") method = "deleteMessage";
+    else if (action == "pin") { method = "pinChatMessage"; if (p.value("silent", false)) body["disable_notification"] = true; }
+    else if (action == "unpin") method = "unpinChatMessage";
+    else if (action == "typing") { method = "sendChatAction"; body["action"] = "typing"; }
+    else return {{"ok", false}, {"error", "unsupported telegram action: " + action}};
+    auto r = HttpPostJson(api + method, body, {});
+    nlohmann::json rec{{"channel", "telegram"}, {"action", action}, {"method", method}, {"body", body}, {"http", r.value("http", 0)}};
+    sent_.push_back(rec);
+    const bool ok = r.value("http", 0) == 200;
+    return {{"ok", ok}, {"method", method}, {"http", r.value("http", 0)}, {"response", r.value("body", nlohmann::json())}};
+}
+
+nlohmann::json OutboundRecordAdapter::TelegramSyncCommands() {
+    const auto token = ChannelCred(Config(), "telegram", "botToken", "TELEGRAM_BOT_TOKEN");
+    if (token.empty()) return {{"ok", false}, {"error", "no token"}};
+    nlohmann::json cmds = nlohmann::json::array();
+    auto cv = config::GetPath(Config(), "channels.telegram.commands");
+    if (cv && cv->is_boolean() && !cv->get<bool>()) return {{"ok", true}, {"skipped", true}};
+    if (cv && cv->is_array()) {
+        for (auto& c : *cv) {
+            if (c.is_string()) cmds.push_back({{"command", c.get<std::string>()}, {"description", c.get<std::string>()}});
+            else if (c.is_object() && c.contains("command")) cmds.push_back({{"command", c["command"]}, {"description", c.value("description", c["command"].get<std::string>())}});
+        }
+    } else {
+        cmds = nlohmann::json::array({{{"command", "new"}, {"description", "Start a new session"}}, {{"command", "reset"}, {"description", "Reset the current session"}},
+                                      {{"command", "status"}, {"description", "Show session status"}}, {{"command", "model"}, {"description", "Show or switch the model"}},
+                                      {{"command", "stop"}, {"description", "Stop the current run"}}, {{"command", "help"}, {"description", "Show available commands"}}});
+    }
+    for (auto& c : cmds) { auto s = c["command"].get<std::string>(); if (!s.empty() && s[0] == '/') s.erase(0, 1); for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch); c["command"] = s.substr(0, 32); }
+    auto r = HttpPostJson(TelegramBase(Config()) + "/bot" + token + "/setMyCommands", {{"commands", cmds}}, {});
+    return {{"ok", r.value("http", 0) == 200}, {"commands", cmds}};
+}
+
 nlohmann::json OutboundRecordAdapter::OutboundLog() const { return sent_; }
 void OutboundRecordAdapter::ClearLog() { sent_.clear(); }
 
@@ -588,11 +646,31 @@ nlohmann::json OutboundRecordAdapter::HandleHttpInbound(const nlohmann::json& bo
         if (cbq.contains("from")) synth["from"] = cbq["from"];
         synth["__callback"] = true;
     }
+    // 1.140: message_reaction updates become a short system-style user note in the chat's session.
+    if (body.contains("message_reaction") && body["message_reaction"].is_object()) {
+        const auto& mr = body["message_reaction"];
+        if (!mr.contains("chat")) return {{"ok", true}, {"ignored", true}};
+        std::string added;
+        for (auto& r : mr.value("new_reaction", nlohmann::json::array())) if (r.value("type", "") == "emoji") added += (added.empty() ? "" : " ") + r.value("emoji", std::string());
+        if (added.empty()) return {{"ok", true}, {"ignored", true}, {"note", "reaction removed"}};
+        InboundMessage m; m.channel = "telegram";
+        const auto& chat = mr["chat"]; const std::string cid = chat["id"].is_string() ? chat["id"].get<std::string>() : chat["id"].dump();
+        m.sender = mr.contains("user") ? mr["user"]["id"].dump() : cid; m.peer_id = m.sender;
+        m.chat_type = chat.value("type", std::string("private")) == "private" ? "direct" : "group";
+        if (m.chat_type == "group") m.conversation_id = cid;
+        m.session_key = "telegram-" + cid;
+        m.text = "[reaction " + added + " on message " + mr.value("message_id", nlohmann::json(0)).dump() + "]";
+        m.inject_only = true;
+        if (deliver) deliver(m);
+        return {{"ok", true}, {"channel", "telegram"}, {"reaction", added}};
+    }
+    const bool edited = !synth.is_object() && !body.contains("message") && body.contains("edited_message");
     const auto& tm = synth.is_object() ? synth : body.contains("message") ? body["message"] : (body.contains("edited_message") ? body["edited_message"] : nlohmann::json());
     if (!tm.is_object() || !tm.contains("chat")) return {{"ok", true}, {"ignored", true}, {"note", "no message"}};
     InboundMessage m;
     m.channel = "telegram";
     m.text = tm.value("text", tm.value("caption", std::string()));
+    if (edited && !m.text.empty()) m.text = "[edited message " + tm.value("message_id", nlohmann::json(0)).dump() + "] " + m.text;
     m.media = synth.is_object() ? nlohmann::json::array() : voice::ExtractAudioRefs(body);
     // 1.135: photos (largest size), image/video/other documents, videos, animations and stickers become media refs
     // ({kind, telegram_file_id, mime, filename}); the gateway downloads them (getFile) before the turn.

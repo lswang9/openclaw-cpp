@@ -63,6 +63,11 @@ public:
     nlohmann::json MaybeAutoVoice(const std::string& chat_id, const std::string& reply, bool inbound_had_audio);
     nlohmann::json OutboundLog() const;
     void ClearLog();
+    // 1.140 Telegram: message actions (react → setMessageReaction, edit → editMessageText / editMessageReplyMarkup,
+    // delete|unsend → deleteMessage, pin/unpin → (un)pinChatMessage, typing → sendChatAction).
+    nlohmann::json TelegramAction(const std::string& action, const nlohmann::json& params);
+    // 1.140 Telegram: publish the slash-command menu (setMyCommands) from channels.telegram.commands or defaults.
+    nlohmann::json TelegramSyncCommands();
 
 protected:
     nlohmann::json HttpPostJson(const std::string& url, const nlohmann::json& body,

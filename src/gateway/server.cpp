@@ -65,7 +65,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.139.0-dev";
+constexpr const char* kVersion = "1.140.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -644,11 +644,14 @@ void Server::TelegramPollLoop() {
     long long offset = 0;
     { std::ifstream f(state); if (f) { try { offset = nlohmann::json::parse(f).value("offset", 0LL); } catch (...) {} } }
     { std::string b; TgGet(api + "deleteWebhook?drop_pending_updates=false", 10, &b); }
+    if (auto* oa = dynamic_cast<channels::OutboundRecordAdapter*>(deps_.adapters.Get("telegram"))) {
+        try { oa->SetConfig(deps_.config.raw); oa->TelegramSyncCommands(); } catch (...) {}
+    }
     std::cerr << "[gateway] telegram: long polling getUpdates (offset " << offset << ")\n";
     int backoff_ms = 500;
     while (!pump_stop_.load()) {
         std::string body;
-        const long st = TgGet(api + "getUpdates?timeout=" + std::to_string(timeout) + "&offset=" + std::to_string(offset) + "&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%5D", timeout, &body);
+        const long st = TgGet(api + "getUpdates?timeout=" + std::to_string(timeout) + "&offset=" + std::to_string(offset) + "&allowed_updates=%5B%22message%22%2C%22edited_message%22%2C%22callback_query%22%2C%22message_reaction%22%5D", timeout, &body);
         nlohmann::json j; try { j = nlohmann::json::parse(body); } catch (...) {}
         if (st == 409) { std::cerr << "[gateway] telegram: getUpdates conflict (another poller or webhook active)\n"; }
         if (st != 200 || !j.value("ok", false)) {
@@ -1132,6 +1135,13 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
             sessions.Save(msg.session_key, deps_.sessions.Load(legacy_migrate_from));
             Emit("session.migrated", {{"from", legacy_migrate_from}, {"to", msg.session_key}});
         }
+    }
+    if (msg.inject_only) {
+        auto hist = sessions.Load(msg.session_key);
+        hist.push_back({.role = "user", .content = "[" + msg.channel + " event] " + msg.text});
+        sessions.Save(msg.session_key, hist);
+        Emit("session.event", {{"sessionKey", msg.session_key}, {"channel", msg.channel}, {"text", msg.text}});
+        return "";
     }
     if (!msg.channel.empty() && msg.channel != "cli" && msg.channel != "http" && msg.channel != "webchat") {
         const bool direct = msg.chat_type.empty() || msg.chat_type == "direct";
@@ -3160,7 +3170,7 @@ nlohmann::json Server::DispatchRpc(const nlohmann::json& msg) {
     }
 
     // channel outbound (telegram/feishu record)
-    if (method == "message.action" || method == "conversations.send" || method == "send") {
+    if ((method == "message.action" && [&] { const auto a = params.value("action", std::string("send")); return a.empty() || a == "send"; }()) || method == "conversations.send" || method == "send") {
         const std::string channel = params.value("channel", params.value("to_channel", ""));
         const std::string text = params.value("text", params.value("message", ""));
         const std::string chat_id = params.value("chat_id", params.value("to", ""));

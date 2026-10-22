@@ -24,7 +24,8 @@ struct InboundMessage {
     std::string guild_id;    // Discord guild (routing)
     std::string team_id;     // Slack workspace/team (routing)
     // Inbound media refs (1.76): [{kind:"audio", mime, url | telegram_file_id | whatsapp_media_id, filename}]
-    nlohmann::json media = nlohmann::json::array();    // caller supplied session_key verbatim → never canonicalised
+    nlohmann::json media = nlohmann::json::array();
+    bool inject_only = false;  // 1.140: append to the transcript as a system note; no agent turn (reactions)    // caller supplied session_key verbatim → never canonicalised
 };
 
 using InboundHandler = std::function<void(const InboundMessage&)>;

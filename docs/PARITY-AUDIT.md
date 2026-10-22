@@ -219,7 +219,7 @@ offline fakes that copy the documented wire formats. The same applies to:
 
 ## 9. Largest remaining gaps (priority order)
 
-1. ~~Telegram live Bot API~~ (done in 1.126; media/keyboards/callbacks in 1.135; reactions, commands menu, edits remain).
+1. ~~Telegram live Bot API~~ (1.126; media/keyboards/callbacks 1.135; 1.140: reactions (setMessageReaction out, `message_reaction` in → transcript note without a turn), edit (editMessageText / editMessageReplyMarkup), delete/pin/unpin via `message.action`, `setMyCommands` menu from `channels.telegram.commands` or defaults, inbound edits marked; offline `scripts/e2e-telegram-actions.sh`). Remaining: polls, forum-topic management, business/payments APIs.
 2. ~~Signal, Matrix, MS Teams, Google Chat, Mattermost~~ (text transports in 1.129; live listeners/verification listed in §5). ~~16 misc channels~~ (1.138 text transports).
 3. ~~Native streaming~~ (done in 1.127); ~~Bedrock/Vertex auth~~ (1.137: AWS SigV4 + `AWS_BEARER_TOKEN_BEDROCK`, Google ADC authorized_user/service_account → Vertex Anthropic rawPredict + Gemini generateContent; offline `scripts/e2e-bedrock-vertex.sh`).
 4. ~~Core tools web_search, ask_user, view_image, agents_wait, conversations_*~~ (done in 1.128, with the partials in §3).

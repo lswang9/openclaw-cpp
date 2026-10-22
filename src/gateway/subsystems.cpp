@@ -1,3 +1,4 @@
+#include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/waweb/noise.hpp"
 #include "openclaw/desktop/desktop.hpp"
 #include "openclaw/clawhub/client.hpp"
@@ -1416,6 +1417,7 @@ ExtraResult DeviceRename(const fs::path& root, const json& p) {
     db[id] = nm; WriteJsonFile(root / "device-names.json", db);
     return Ok({{"deviceId", id}, {"displayName", nm}});
 }
+bool ChannelCredPresent(const json& cfg) { return !channels::ChannelCred(cfg, "telegram", "botToken", "TELEGRAM_BOT_TOKEN").empty(); }
 ExtraResult MessageAction(const fs::path& root, const json& p) {
     const auto channel = p.value("channel", std::string()), action = p.value("action", std::string());
     if (channel.empty() || action.empty()) return Fail("channel and action are required");
@@ -1423,6 +1425,18 @@ ExtraResult MessageAction(const fs::path& root, const json& p) {
     if (!known.count(action)) return Fail("unsupported message action: " + action);
     if (action == "send") { auto r = GatewayRpc("send", {{"channel", channel}, {"to", p.value("to", p.value("target", std::string()))}, {"message", p.value("message", p.value("params", json::object()).value("message", std::string()))}});
         return r.value("ok", false) ? Ok(r["payload"]) : Fail(r.value("error", json()).is_object() ? r["error"].value("message", "send failed") : "send failed"); }
+    // 1.140: Telegram actions go to the Bot API when a bot token is configured.
+    if (channel == "telegram" && g_tool_deps) {
+        if (auto* oa = dynamic_cast<channels::OutboundRecordAdapter*>(g_tool_deps->adapters.Get("telegram"))) {
+            json pp = p.value("params", json::object());
+            for (auto k : {"to", "target", "messageId", "message_id", "emoji", "message", "buttons", "remove"}) if (p.contains(k) && !pp.contains(k)) pp[k] = p[k];
+            oa->SetConfig(g_tool_deps->config.raw);
+            if (!ChannelCredPresent(g_tool_deps->config.raw)) {} else {
+                auto r = oa->TelegramAction(action, pp);
+                return r.value("ok", false) ? Ok(r) : Fail(r.value("error", std::string("telegram ") + r.value("method", action) + " failed (http " + std::to_string(r.value("http", 0)) + ")"));
+            }
+        }
+    }
     // Non-send actions are recorded in the outbound action log (offline adapters replay them; live adapters are out of scope).
     std::lock_guard<std::mutex> l(g_mu);
     json rec{{"id", "act-" + std::to_string(NowMs())}, {"channel", channel}, {"action", action}, {"accountId", p.value("accountId", std::string())},
