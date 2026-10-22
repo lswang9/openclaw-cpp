@@ -435,7 +435,7 @@ SchemaReport ValidateSchema(const nlohmann::json& raw) {
     expect("tools.exec.timeoutSec", ispos, "positive integer");
     // memory search
     expect("agents.defaults.memorySearch.enabled", isbool, "boolean");
-    expect("agents.defaults.memorySearch.provider", oneof({"local", "openai", "gemini", "voyage", "mistral", "ollama", "gguf", "local-gguf", "auto"}), "local|openai|gemini|voyage|mistral|ollama|auto");
+    expect("agents.defaults.memorySearch.provider", oneof({"local", "openai", "gemini", "voyage", "mistral", "ollama", "gguf", "local-gguf", "auto", "plugin"}), "local|openai|gemini|voyage|mistral|ollama|auto|plugin");
     expect("agents.defaults.memorySearch.model", isstr, "string");
     expect("agents.defaults.memorySearch.remote.baseUrl", isstr, "string");
     expect("agents.defaults.memorySearch.remote.apiKey", isstr, "string");

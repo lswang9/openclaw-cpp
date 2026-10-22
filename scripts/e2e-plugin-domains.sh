@@ -20,7 +20,8 @@ export HOME="$T/home" OPENCLAW_CONFIG_PATH="$T/cfg.json" OPENCLAW_EXTENSIONS_DIR
 echo '[]' > "$T/script.json"
 cat > "$T/cfg.json" <<'J'
 {"plugins": {"slots": {"contextEngine": "trim-engine"}},
- "agents": {"list": [{"id": "main", "default": true}, {"id": "hx", "agentRuntime": {"id": "dom-harness"}}]},
+ "agents": {"defaults": {"memorySearch": {"provider": "plugin"}},
+  "list": [{"id": "main", "default": true}, {"id": "hx", "agentRuntime": {"id": "dom-harness"}}]},
  "messages": {"tts": {"provider": "dom-speech"}}}
 J
 echo '{ "id": "domplug", "name": "Domain wiring" }' > "$T/src/domplug/openclaw.plugin.json"
@@ -31,21 +32,44 @@ const log = (o) => fs.appendFileSync(LOG, JSON.stringify(o) + '\n');
 export default function register(api) {
   api.registerContextEngine('trim-engine', () => ({
     info: { id: 'trim-engine', name: 'Trim' },
+    async bootstrap({ sessionKey }) { log({ bootstrap: sessionKey }); return { ok: true }; },
     async ingest() { return { ingested: true }; },
     async assemble({ messages }) {
       const lastUser = [...messages].reverse().find((m) => m.role === 'user');
       return { messages: lastUser ? [lastUser] : messages, estimatedTokens: 1, systemPromptAddition: 'ENGINE-ON' };
     },
     async afterTurn({ messages, prePromptMessageCount }) { log({ afterTurn: messages.length, pre: prePromptMessageCount }); },
+    async maintain({ sessionKey }) { log({ maintain: sessionKey }); },
+    async compact({ messages }) {
+      log({ compact: messages.length });
+      const keep = messages.filter((m) => m.role === 'system').concat(messages.slice(-2));
+      return { messages: keep, compacted: true, summary: 'trimmed' };
+    },
   }));
   api.registerMemoryPromptSupplement(({ agentId }) => ['MEM-SUPP for ' + agentId]);
   api.registerAgentHarness({ id: 'dom-harness', label: 'Dom', supports: () => ({ supported: true }),
     async runAttempt({ prompt, agentId }) { log({ harness: prompt, agentId }); return { assistantTexts: ['harness says: ' + prompt] }; } });
   api.registerSpeechProvider({ id: 'dom-speech', label: 'Dom Speech', isConfigured: () => true,
     async synthesize({ text }) { return { audioBuffer: Buffer.from('RIFF-fake:' + text), outputFormat: 'wav', fileExtension: '.wav' }; } });
+  api.registerEmbeddingProvider({ id: 'dom-embed', label: 'Dom Embed',
+    async embed({ texts }) { return texts.map((t) => Array.from({ length: 4 }, (_, i) => ((t.length + i) % 7) / 7)); } });
+  api.registerTrustedToolPolicy({ id: 'dom-policy',
+    async evaluate({ toolName }) { log({ policy: toolName }); return toolName === 'exec' ? { decision: 'deny', reason: 'no-exec' } : { decision: 'allow' }; } });
+  api.registerRealtimeVoiceProvider({ id: 'dom-rt', label: 'Dom RT' });
+  api.registerRealtimeTranscriptionProvider({ id: 'dom-stt-rt', label: 'Dom STT RT' });
 }
 J
 "$BIN" plugins install "$T/src/domplug" >/dev/null
+# Re-apply domain config — plugins install rewrites plugins.* and can drop slots.
+python3 - "$T/cfg.json" <<'CF'
+import json,sys
+p=sys.argv[1]; cfg=json.load(open(p))
+cfg.setdefault("plugins",{})["slots"]={"contextEngine":"trim-engine"}
+cfg.setdefault("agents",{}).setdefault("defaults",{})["memorySearch"]={"provider":"plugin"}
+cfg["agents"]["list"]=[{"id":"main","default":True},{"id":"hx","agentRuntime":{"id":"dom-harness"}}]
+cfg.setdefault("messages",{})["tts"]={"provider":"dom-speech"}
+json.dump(cfg, open(p,"w"))
+CF
 PORT=$(freeport)
 OPENCLAW_MOCK_SCRIPT="$T/script.json" OPENCLAW_MOCK_ECHO=1 OPENCLAW_GATEWAY_PORT="$PORT" OPENCLAW_SESSION_DIR="$T/s" OPENCLAW_DATA_DIR="$T/d" OPENCLAW_PIDFILE="$T/pid" \
   "$BIN" gateway >"$T/gw.log" 2>&1 & GW=$!
@@ -75,4 +99,33 @@ p=p.get("result",p) if isinstance(p,dict) else p
 assert p["mode"]=="plugin" and p["provider"]=="dom-speech" and p["path"].endswith(".wav"), p
 assert open(p["path"],"rb").read()==b"RIFF-fake:hello voice"
 PY
+# 1.155: bootstrap + maintain
+grep -q '"bootstrap"' "$T/plugin.log" || fail "bootstrap not called"
+grep -q '"maintain"' "$T/plugin.log" || fail "maintain not called"
+rpc chat.send '{"sessionKey":"agent:main:d","message":"/compact keep it"}' > "$T/c.json"
+grep -q 'via trim-engine' "$T/c.json" || fail "engine compact: $(head -c 400 $T/c.json)"
+grep -q '"compact"' "$T/plugin.log" || fail "compact not called"
+rpc plugins.invokeRegistration '{"kind":"registerEmbeddingProvider","id":"dom-embed","method":"embed","args":{"texts":["hi"]}}' > "$T/e.json"
+python3 - "$T/e.json" <<'EY' || fail "embedding invoke: $(head -c 400 $T/e.json)"
+import json,sys
+p=json.load(open(sys.argv[1]))["payload"]
+r=p.get("result",p)
+if isinstance(r,dict) and "result" in r: r=r["result"]
+assert isinstance(r,list) and len(r)==1 and len(r[0])==4, p
+EY
+rpc plugins.invokeRegistration '{"kind":"registerTrustedToolPolicy","id":"dom-policy","method":"evaluate","args":{"toolName":"exec"}}' > "$T/pol.json"
+python3 - "$T/pol.json" <<'PY' || fail "policy: $(head -c 400 $T/pol.json)"
+import json,sys
+p=json.load(open(sys.argv[1]))["payload"]
+r=p.get("result",p)
+if isinstance(r,dict) and "result" in r: r=r["result"]
+assert (isinstance(r,dict) and r.get("decision")=="deny") or r=="deny", p
+PY
+rpc talk.catalog '{}' > "$T/rt.json"
+python3 - "$T/rt.json" <<'RY' || fail "realtime catalog: $(head -c 400 $T/rt.json)"
+import json,sys
+p=json.load(open(sys.argv[1]))["payload"]
+ids={e.get("id") for e in (p.get("realtime") or [])}
+assert "dom-rt" in ids and "dom-stt-rt" in ids, p
+RY
 echo "[e2e-plugin-domains] OK"

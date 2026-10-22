@@ -698,8 +698,55 @@ async function handle(req) {
         try {
           if (eng && typeof eng.afterTurn === 'function') await eng.afterTurn({ sessionId: params.sessionKey || 'main', sessionKey: params.sessionKey, messages: params.messages || [], prePromptMessageCount: params.prePromptMessageCount || 0 });
           else if (eng && typeof eng.ingest === 'function') for (const m of (params.messages || []).slice(params.prePromptMessageCount || 0)) await eng.ingest({ sessionId: params.sessionKey || 'main', sessionKey: params.sessionKey, message: m });
+          // 1.155: maintain after each finished turn when the engine exposes it.
+          if (eng && typeof eng.maintain === 'function') await eng.maintain({ sessionId: params.sessionKey || 'main', sessionKey: params.sessionKey, messages: params.messages || [] });
           return respond(id, { ok: true });
         } catch (e) { return respond(id, { ok: false, error: String(e && e.message || e) }); }
+      }
+      case 'context_engine_bootstrap': {
+        const eng = await contextEngine(params.engineId);
+        if (!eng || typeof eng.bootstrap !== 'function') return respond(id, { ok: true, skipped: true });
+        try {
+          const r = await eng.bootstrap({ sessionId: params.sessionKey || 'main', sessionKey: params.sessionKey, agentId: params.agentId, config: hostConfig });
+          return respond(id, { ok: true, result: r || null });
+        } catch (e) { return respond(id, { ok: false, error: String(e && e.message || e) }); }
+      }
+      case 'context_engine_compact': {
+        const eng = await contextEngine(params.engineId);
+        if (!eng || typeof eng.compact !== 'function') return respond(id, { ok: false, unsupported: true });
+        try {
+          const r = await eng.compact({ sessionId: params.sessionKey || 'main', sessionKey: params.sessionKey, messages: params.messages || [], tokenBudget: params.tokenBudget, instructions: params.instructions || '' });
+          return respond(id, { ok: true, messages: Array.isArray(r && r.messages) ? r.messages : null, summary: r && r.summary || null, compacted: !!(r && (r.compacted || r.messages)) });
+        } catch (e) { return respond(id, { ok: false, error: String(e && e.message || e) }); }
+      }
+      case 'embedding_embed': {
+        const list = regs('registerEmbeddingProvider');
+        const entry = params.providerId ? list.find((r) => r.value && r.value.id === params.providerId) : list[0];
+        if (!entry) return respond(id, { ok: false, error: 'no embedding provider' });
+        const v = entry.value; const fn = v.embed || v.execute || v.createEmbedding;
+        try {
+          const texts = params.texts || (params.text ? [params.text] : []);
+          const r = await fn.call(v, { texts, text: texts[0], query: params.query || false, config: hostConfig });
+          const vecs = Array.isArray(r) ? r : r && (r.embeddings || r.vectors || r.data) || null;
+          if (!Array.isArray(vecs)) return respond(id, { ok: false, error: 'embedding provider returned no vectors' });
+          return respond(id, { ok: true, provider: v.id || null, plugin: entry.plugin, embeddings: vecs, dimensions: vecs[0] && vecs[0].length || 0 });
+        } catch (e) { return respond(id, { ok: false, error: String(e && e.message || e) }); }
+      }
+      case 'trusted_tool_policy': {
+        const list = regs('registerTrustedToolPolicy');
+        if (!list.length) return respond(id, { ok: true, decision: 'allow', skipped: true });
+        for (const entry of list) {
+          const v = entry.value; const fn = (typeof v === 'function' ? v : null) || (v && (v.evaluate || v.check || v.allow || v.execute));
+          if (typeof fn !== 'function') continue;
+          try {
+            const r = await fn.call(v, { toolName: params.toolName, params: params.params || {}, agentId: params.agentId, sessionKey: params.sessionKey, config: hostConfig }, { config: hostConfig });
+            const decision = typeof r === 'string' ? r : r && (r.decision || r.action || (r.allow === false ? 'deny' : r.allow === true ? 'allow' : null));
+            if (decision === 'deny' || decision === 'block') return respond(id, { ok: true, decision: 'deny', plugin: entry.plugin, reason: r && r.reason || 'denied by trusted tool policy' });
+            if (decision === 'ask') return respond(id, { ok: true, decision: 'ask', plugin: entry.plugin, reason: r && r.reason || 'ask' });
+          } catch (e) { process.stderr.write(`[plugin:${entry.plugin}] trusted tool policy failed: ${e}
+`); }
+        }
+        return respond(id, { ok: true, decision: 'allow' });
       }
       case 'memory_prompt_supplements': {
         const out = [];

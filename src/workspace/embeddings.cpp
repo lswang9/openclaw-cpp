@@ -383,6 +383,41 @@ std::shared_ptr<EmbeddingProvider> MakeVoyageEmbedder(std::string b, std::string
     return std::make_shared<VoyageEmbedder>(std::move(b), std::move(k), std::move(m));
 }
 
+
+namespace {
+std::mutex g_plugin_mu;
+PluginEmbedFn g_plugin_fn;
+std::string g_plugin_id = "plugin", g_plugin_model = "plugin";
+class PluginEmbedder : public EmbeddingProvider {
+public:
+    std::string Id() const override { return g_plugin_id; }
+    std::string Model() const override { return g_plugin_model; }
+    std::vector<Vec> Embed(const std::vector<std::string>& texts) override {
+        std::lock_guard<std::mutex> l(g_plugin_mu);
+        if (!g_plugin_fn) throw std::runtime_error("plugin embedder not installed");
+        return g_plugin_fn(texts, false);
+    }
+    Vec EmbedQuery(const std::string& t) override {
+        std::lock_guard<std::mutex> l(g_plugin_mu);
+        if (!g_plugin_fn) throw std::runtime_error("plugin embedder not installed");
+        auto v = g_plugin_fn({t}, true);
+        if (v.empty()) throw std::runtime_error("plugin embedder returned no vector");
+        return v[0];
+    }
+};
+}  // namespace
+
+void SetPluginEmbedder(PluginEmbedFn fn, std::string id, std::string model) {
+    std::lock_guard<std::mutex> l(g_plugin_mu);
+    g_plugin_fn = std::move(fn); g_plugin_id = id.empty() ? "plugin" : std::move(id); g_plugin_model = model.empty() ? g_plugin_id : std::move(model);
+}
+bool HasPluginEmbedder() { std::lock_guard<std::mutex> l(g_plugin_mu); return static_cast<bool>(g_plugin_fn); }
+std::shared_ptr<EmbeddingProvider> MakePluginEmbedder() {
+    std::lock_guard<std::mutex> l(g_plugin_mu);
+    if (!g_plugin_fn) return nullptr;
+    return std::make_shared<PluginEmbedder>();
+}
+
 std::shared_ptr<EmbeddingProvider> MakeEmbedderFromConfig(const nlohmann::json& raw) {
     nlohmann::json ms = nlohmann::json::object();
     try { ms = raw.at("agents").at("defaults").at("memorySearch"); } catch (...) {}
@@ -400,8 +435,16 @@ std::shared_ptr<EmbeddingProvider> MakeEmbedderFromConfig(const nlohmann::json& 
         return std::string();
     };
     if (prov == "auto") {
-        prov = "local";
-        for (const char* p : {"openai", "gemini", "voyage"}) if (!key_for(p).empty()) { prov = p; break; }
+        if (HasPluginEmbedder()) prov = "plugin";
+        else {
+            prov = "local";
+            for (const char* p : {"openai", "gemini", "voyage"}) if (!key_for(p).empty()) { prov = p; break; }
+        }
+    }
+    if (prov == "plugin") {
+        auto pe = MakePluginEmbedder();
+        if (!pe) throw std::runtime_error("memorySearch.provider=plugin but no registerEmbeddingProvider is loaded");
+        return pe;
     }
     const std::string key = key_for(prov);
     if (prov == "openai")

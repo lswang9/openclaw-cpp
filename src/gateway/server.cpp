@@ -24,6 +24,7 @@
 #include "openclaw/diagnostics/doctor.hpp"
 #include "openclaw/logging/tail.hpp"
 #include "openclaw/context/assemble.hpp"
+#include "openclaw/workspace/embeddings.hpp"
 #include "openclaw/config/validate.hpp"
 #include "openclaw/channels/outbound.hpp"
 #include "openclaw/channels/slack.hpp"
@@ -65,7 +66,7 @@ namespace openclaw::gateway {
 #endif
 namespace {
 
-constexpr const char* kVersion = "1.154.0-dev";
+constexpr const char* kVersion = "1.155.0-dev";
 constexpr const char* kAlign = "OpenClaw 2026.10.5";
 
 std::string HttpResponse(int code, const std::string& status, const std::string& body,
@@ -264,9 +265,22 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
         "timeout_ms", agent.value("timeout_ms", raw.value("timeout_ms", 0)));
     if (timeout_ms > 0) o.timeout = std::chrono::milliseconds(timeout_ms);
     if (auto* js = deps.js_host) {
-        if (js->HasHook("before_tool_call"))
+        if (js->HasHook("before_tool_call") || js->HasRegistration("registerTrustedToolPolicy"))
             o.before_tool_call = [js](const std::string& t, const nlohmann::json& p) {
-                return js->EmitHook("before_tool_call", {{"toolName", t}, {"params", p}}).value("merged", nlohmann::json::object());
+                nlohmann::json merged = nlohmann::json::object();
+                if (js->HasRegistration("registerTrustedToolPolicy")) {
+                    auto ctx = tools::exec::CurrentContext();
+                    auto pol = js->Rpc("trusted_tool_policy", {{"toolName", t}, {"params", p}, {"agentId", ctx.agent_id}, {"sessionKey", ctx.session_key}});
+                    if (pol.value("decision", "") == "deny" || pol.value("decision", "") == "block") {
+                        merged["block"] = true;
+                        merged["blockReason"] = pol.value("reason", std::string("denied by trusted tool policy"));
+                    }
+                }
+                if (js->HasHook("before_tool_call")) {
+                    auto h = js->EmitHook("before_tool_call", {{"toolName", t}, {"params", p}}).value("merged", nlohmann::json::object());
+                    if (h.is_object()) for (auto it = h.begin(); it != h.end(); ++it) merged[it.key()] = it.value();
+                }
+                return merged;
             };
         if (js->HasHook("after_tool_call"))
             o.after_tool_call = [js](const std::string& t, const nlohmann::json& p, const std::string& r, long long ms, const std::string& e) {
@@ -291,6 +305,12 @@ agent::LoopOptions MakeLoopOpts(const ServerDeps& deps, const nlohmann::json& ov
                 std::vector<agent::Message> out = msgs;
                 std::string addition;
                 if (has_engine) {
+                    // 1.155: bootstrap once per sessionKey (in-process set; survives the turn, not restarts).
+                    static std::mutex boot_mu; static std::set<std::string> bootstrapped;
+                    { std::lock_guard<std::mutex> l(boot_mu);
+                      if (bootstrapped.insert(ctx.session_key.empty() ? std::string("main") : ctx.session_key).second)
+                          js->Rpc("context_engine_bootstrap", {{"engineId", engine_id}, {"sessionKey", ctx.session_key}, {"agentId", ctx.agent_id}});
+                    }
                     nlohmann::json arr = nlohmann::json::array(); for (auto& m : msgs) arr.push_back(m.ToJson());
                     auto r = js->Rpc("context_engine_assemble", {{"engineId", engine_id}, {"messages", arr}, {"sessionKey", ctx.session_key}, {"agentId", ctx.agent_id}});
                     if (r.value("ok", false)) {
@@ -492,6 +512,22 @@ void Server::RefreshPluginExtensions() {
                 if (m.is_string()) deps_.router->Add(id + "/" + m.get<std::string>(),
                                                      std::make_shared<plugins::PluginProvider>(deps_.js_host, id, m.get<std::string>()));
         }
+    }
+    // 1.155: install plugin embedding provider as the workspace embedder callback.
+    if (deps_.js_host->HasRegistration("registerEmbeddingProvider")) {
+        auto* js = deps_.js_host;
+        workspace::SetPluginEmbedder([js](const std::vector<std::string>& texts, bool query) {
+            auto r = js->Rpc("embedding_embed", {{"texts", texts}, {"query", query}});
+            if (!r.value("ok", false) || !r.contains("embeddings") || !r["embeddings"].is_array())
+                throw std::runtime_error(r.value("error", std::string("plugin embed failed")));
+            std::vector<workspace::Vec> out;
+            for (auto& row : r["embeddings"]) {
+                workspace::Vec v;
+                if (row.is_array()) for (auto& x : row) v.push_back(x.get<float>());
+                out.push_back(std::move(v));
+            }
+            return out;
+        }, "plugin", "plugin");
     }
 }
 
@@ -1280,7 +1316,21 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
         std::string instr;
         if (context::ParseCompactCommand(text_in, instr)) {
             auto pol = context::CompactionFromConfig(deps_.config.raw);
-            auto cr = context::CompactWithSummary(*cprov, sessions.Load(msg.session_key), pol.keep_recent, instr);
+            auto hist = sessions.Load(msg.session_key);
+            // 1.155: prefer plugin context-engine compact when registered.
+            std::string engine_id;
+            if (auto e = config::GetPath(deps_.config.raw, "plugins.slots.contextEngine"); e && e->is_string() && *e != "none" && *e != "legacy" && *e != "") engine_id = e->get<std::string>();
+            if (!engine_id.empty() && deps_.js_host && deps_.js_host->HasRegistration("registerContextEngine")) {
+                nlohmann::json arr = nlohmann::json::array(); for (auto& m : hist) arr.push_back(m.ToJson());
+                auto r = deps_.js_host->Rpc("context_engine_compact", {{"engineId", engine_id}, {"sessionKey", msg.session_key}, {"messages", arr}, {"instructions", instr}, {"tokenBudget", pol.context_tokens}});
+                if (r.value("ok", false) && r.contains("messages") && r["messages"].is_array()) {
+                    std::vector<agent::Message> kept; for (auto& j : r["messages"]) kept.push_back(agent::Message::FromJson(j));
+                    sessions.Save(msg.session_key, kept);
+                    Emit("session.compacted", {{"sessionKey", msg.session_key}, {"before", hist.size()}, {"after", kept.size()}, {"summarized", r.value("summary", std::string())}, {"manual", true}, {"engine", engine_id}});
+                    return "🧹 Compacted session via " + engine_id + ": " + std::to_string(hist.size()) + " → " + std::to_string(kept.size()) + " messages.";
+                }
+            }
+            auto cr = context::CompactWithSummary(*cprov, hist, pol.keep_recent, instr);
             if (!cr.compacted) return "Nothing to compact.";
             sessions.Save(msg.session_key, cr.messages);
             Emit("session.compacted", {{"sessionKey", msg.session_key}, {"before", cr.before_tokens},
@@ -1420,11 +1470,25 @@ std::string Server::DeliverInbound(const channels::InboundMessage& msg_in) {
                 deps_.logs.Append("info", "memory flush session=" + msg.session_key + " ok=" + (fr.ok ? "1" : "0"));
                 Emit("session.memoryFlush", {{"sessionKey", msg.session_key}, {"ok", fr.ok}, {"turns", fr.turns}});
             }
-            auto cr = context::CompactWithSummary(*cprov, messages, pol.keep_recent);
-            if (cr.compacted) {
-                messages = std::move(cr.messages);
-                Emit("session.compacted", {{"sessionKey", msg.session_key}, {"before", cr.before_tokens},
-                                           {"after", cr.after_tokens}, {"summarized", cr.summarized}, {"manual", false}});
+            bool engine_did = false;
+            std::string engine_id;
+            if (auto e = config::GetPath(deps_.config.raw, "plugins.slots.contextEngine"); e && e->is_string() && *e != "none" && *e != "legacy" && *e != "") engine_id = e->get<std::string>();
+            if (!engine_id.empty() && deps_.js_host && deps_.js_host->HasRegistration("registerContextEngine")) {
+                nlohmann::json arr = nlohmann::json::array(); for (auto& m : messages) arr.push_back(m.ToJson());
+                auto r = deps_.js_host->Rpc("context_engine_compact", {{"engineId", engine_id}, {"sessionKey", msg.session_key}, {"messages", arr}, {"tokenBudget", pol.context_tokens}});
+                if (r.value("ok", false) && r.contains("messages") && r["messages"].is_array()) {
+                    messages.clear(); for (auto& j : r["messages"]) messages.push_back(agent::Message::FromJson(j));
+                    Emit("session.compacted", {{"sessionKey", msg.session_key}, {"before", arr.size()}, {"after", messages.size()}, {"summarized", r.value("summary", std::string())}, {"manual", false}, {"engine", engine_id}});
+                    engine_did = true;
+                }
+            }
+            if (!engine_did) {
+                auto cr = context::CompactWithSummary(*cprov, messages, pol.keep_recent);
+                if (cr.compacted) {
+                    messages = std::move(cr.messages);
+                    Emit("session.compacted", {{"sessionKey", msg.session_key}, {"before", cr.before_tokens},
+                                               {"after", cr.after_tokens}, {"summarized", cr.summarized}, {"manual", false}});
+                }
             }
         }
     }

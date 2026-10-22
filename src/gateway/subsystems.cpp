@@ -1958,7 +1958,16 @@ ExtraResult Talk(ServerDeps& d, const fs::path& root, const std::string& m, cons
     if (m == "talk.config") return Ok({{"enabled", db["mode"].value("enabled", false)}, {"tts", d.tts ? d.tts->Status() : json(nullptr)},
                                        {"stt", {{"configured", stt_ok}, {"provider", stt_mock ? stt_mock : (stt_url ? "http" : "none")}}}, {"transports", json::array({"gateway-relay"})}});
     if (m == "talk.mode") { if (p.contains("enabled")) db["mode"]["enabled"] = p.value("enabled", false); if (p.contains("phase")) db["mode"]["phase"] = p["phase"]; save(); return Ok(db["mode"]); }
-    if (m == "talk.catalog") return Ok({{"providers", d.tts ? d.tts->Providers() : json::array()}, {"stt", {{"configured", stt_ok}}}, {"realtime", json::array()}});
+    if (m == "talk.catalog") {
+        json realtime = json::array();
+        if (d.js_host && d.js_host->HasRegistration("registerRealtimeVoiceProvider")) {
+            auto r = d.js_host->Rpc("list_capability_providers", {{"kinds", json::array({"registerRealtimeVoiceProvider", "registerRealtimeTranscriptionProvider"})}});
+            for (auto kind : {"registerRealtimeVoiceProvider", "registerRealtimeTranscriptionProvider"})
+                for (auto& e : r.value("providers", json::object()).value(kind, json::array()))
+                    realtime.push_back({{"kind", kind}, {"id", e.value("id", "")}, {"plugin", e.value("plugin", "")}, {"label", e.value("label", "")}});
+        }
+        return Ok({{"providers", d.tts ? d.tts->Providers() : json::array()}, {"stt", {{"configured", stt_ok}}}, {"realtime", realtime}});
+    }
     if (m == "talk.speak") {
         if (str("text").empty()) return Fail("text is required");
         if (!d.tts) return Fail("TTS engine not available");

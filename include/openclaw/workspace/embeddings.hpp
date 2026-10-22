@@ -1,6 +1,7 @@
 #pragma once
 #include <nlohmann/json.hpp>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,6 +43,11 @@ std::shared_ptr<EmbeddingProvider> MakeVoyageEmbedder(std::string base_url, std:
 // From agents.defaults.memorySearch: provider local|openai|gemini|voyage|auto (+model, remote.baseUrl, remote.apiKey; apiKey
 // falls back to OPENAI_API_KEY). auto = openai when a key is available, else local. Disabled → nullptr.
 std::shared_ptr<EmbeddingProvider> MakeEmbedderFromConfig(const nlohmann::json& raw);
+// 1.155: plugin registerEmbeddingProvider — gateway installs a callback; memorySearch.provider=plugin|auto picks it up.
+using PluginEmbedFn = std::function<std::vector<Vec>(const std::vector<std::string>& texts, bool query)>;
+void SetPluginEmbedder(PluginEmbedFn fn, std::string id = "plugin", std::string model = "plugin");
+bool HasPluginEmbedder();
+std::shared_ptr<EmbeddingProvider> MakePluginEmbedder();
 
 // Persistent vector index + embedding cache, keyed by sha256(text) per provider/model so unchanged chunks are
 // never re-embedded. Backend by file extension:
